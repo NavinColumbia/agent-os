@@ -66,7 +66,11 @@ def stage_step(product: str, stage: str) -> str:
     decision = cerbos_check.decide("builder", action, attr)   # logs to audit_log
     if decision != "allow":
         raise RuntimeError(f"PDP denied {action} {attr} in {stage}")
-    # 3) do the work: produce this stage's artifacts
+    # 3) do the work. With AGENT_WORKERS=1 a real governed agent does the BUILD stage
+    # (proven in agent_worker.py); otherwise stages produce their artifacts directly (cheap+deterministic).
+    if stage == "BUILD" and os.environ.get("AGENT_WORKERS") == "1":
+        import agent_worker
+        agent_worker.run_agent(str(repo), "Implement the spec in src/. Edit/create files under src/ only.")
     for rel in STAGE_PLAN[stage]["artifacts"]:
         p = repo / rel
         p.parent.mkdir(parents=True, exist_ok=True)

@@ -35,7 +35,9 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ `scripts/controller.py`: DBOS workflow runs a product SPEC→BUILD→QA→REVIEW→LAUNCH, composing
   gate_check (refuses stage w/o artifacts) + Cerbos PDP + tamper-evident audit + metrics, crash-resumable.
   PROVEN: full lifecycle → LAUNCHED; audit chain intact (5 decisions); idempotent re-run (no stage re-runs).
-- ☐ NEXT: wire real enforce_manifest hook → audit/Cerbos in prod; Controller upward-feedback (CR) + human-approval-via-ask-await; real agent workers in stages.
+- ✅ Live hook → tamper-evident audit (proven, 8/8). 
+- ✅ REAL AGENT WORKERS (`scripts/agent_worker.py`): headless `claude -p` does governed work — proven both (a) allowed edit (added multiply) and (b) DENIED .env write (cage held, audited). Wired into Controller BUILD behind AGENT_WORKERS=1.
+- ☐ NEXT: Controller upward-feedback (CR re-flow) + human-approval-via-ask-await; native AGE; prod hook→Cerbos cutover.
 
 ## P5 — Org maturity  ✅ DONE
 - ✅ `gate_check.py`: block stage advance without required artifacts (no BUILD w/o approved SPEC+ADR; no LAUNCH w/o QA report).

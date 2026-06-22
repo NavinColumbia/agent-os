@@ -38,6 +38,20 @@ hdr "4. Reply listener (host process)"
 bash "$ROOT/scripts/bridge.sh" start >/dev/null 2>&1
 pgrep -f reply_listener.py >/dev/null && ok "listener running" || warn "listener not running"
 
+hdr "4b. NoUpload static site (private over Tailscale :8443)"
+NU_DIST="$HOME/projects/products/noupload/dist"
+if [ -d "$NU_DIST" ]; then
+  if pgrep -f "http.server 5000" >/dev/null; then ok "static server running"
+  else
+    ( cd "$NU_DIST" && setsid bash -c "exec python3 -m http.server 5000 --bind 127.0.0.1" >/tmp/noupload_serve.log 2>&1 </dev/null & )
+    sleep 1; pgrep -f "http.server 5000" >/dev/null && ok "static server started" || warn "static server failed"
+  fi
+  tailscale serve status 2>/dev/null | grep -q 8443 || tailscale serve --bg --https=8443 http://127.0.0.1:5000 >/dev/null 2>&1
+  ok "exposed at https://nyaan.tail502e3f.ts.net:8443"
+else
+  warn "noupload dist/ not built (run: cd ~/projects/products/noupload && npm run build)"
+fi
+
 hdr "5. Health checks"
 curl -s --max-time 5 http://127.0.0.1:8080/v1/health 2>/dev/null | grep -q healthy && ok "ntfy healthy (local)" || warn "ntfy not healthy"
 DK "docker exec agentos-postgres pg_isready -U agentos -d agentos" >/dev/null 2>&1 && ok "postgres ready" || warn "postgres not ready"

@@ -21,12 +21,19 @@ from pathlib import Path
 import psycopg
 
 ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+_cfg = {l.split("=", 1)[0].strip(): l.split("=", 1)[1].strip()
+        for l in ENV.read_text().splitlines() if l.strip() and not l.startswith("#") and "=" in l}
+DB = _cfg["DATABASE_URL"]
 
 
-def put(data, mime=None, ttl_seconds=None):
-    """Store bytes (or a file path); returns the content id (sha256). Idempotent/dedup."""
+def _fernet():
+    from cryptography.fernet import Fernet
+    return Fernet(_cfg["VAULT_KEY"].encode())
+
+
+def put(data, mime=None, ttl_seconds=None, encrypt=False):
+    """Store bytes (or a file path); returns the content id (sha256 of plaintext). Dedup.
+    encrypt=True stores the bytes Fernet-encrypted at rest (id still addresses the plaintext)."""
     if isinstance(data, (str, Path)) and Path(data).exists():
         if mime is None:
             ext = Path(data).suffix.lower()
@@ -34,12 +41,13 @@ def put(data, mime=None, ttl_seconds=None):
                     ".json": "application/json", ".csv": "text/csv"}.get(ext, "application/octet-stream")
         data = Path(data).read_bytes()
     bid = hashlib.sha256(data).hexdigest()
+    stored = _fernet().encrypt(data) if encrypt else data
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute(
-            """INSERT INTO blobs (id, mime, size_bytes, data, expires_at)
-               VALUES (%s,%s,%s,%s, CASE WHEN %s::int IS NULL THEN NULL ELSE now() + (%s::int || ' seconds')::interval END)
+            """INSERT INTO blobs (id, mime, size_bytes, data, encrypted, expires_at)
+               VALUES (%s,%s,%s,%s,%s, CASE WHEN %s::int IS NULL THEN NULL ELSE now() + (%s::int || ' seconds')::interval END)
                ON CONFLICT (id) DO UPDATE SET expires_at = EXCLUDED.expires_at""",
-            (bid, mime, len(data), data, ttl_seconds, ttl_seconds),
+            (bid, mime, len(data), stored, encrypt, ttl_seconds, ttl_seconds),
         )
         c.commit()
     return bid
@@ -48,9 +56,11 @@ def put(data, mime=None, ttl_seconds=None):
 def get(blob_id):
     """Return bytes, or None if missing or expired."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT data FROM blobs WHERE id=%s AND (expires_at IS NULL OR expires_at > now())", (blob_id,))
+        cur.execute("SELECT data, encrypted FROM blobs WHERE id=%s AND (expires_at IS NULL OR expires_at > now())", (blob_id,))
         r = cur.fetchone()
-        return bytes(r[0]) if r else None
+        if not r:
+            return None
+        return _fernet().decrypt(bytes(r[0])) if r[1] else bytes(r[0])
 
 
 def meta(blob_id):

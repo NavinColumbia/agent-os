@@ -19,6 +19,9 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ Governed data connectors (`connectors.py`): live web/API/SNS ingestion via egress allowlist → object store, audited.
 - ✅ Object store (`objstore.py`): images/objects shared by sha256 ref, dedup, TTL+GC.
 - ✅ Retention sweeps (`retention.py`): expire blobs/conversations/secrets/waits (audit kept permanent).
+- ✅ Experiment tracking (`experiments.py`): log/compare/best runs for data-science/ML (proven).
+- ✅ Blob encryption at rest (objstore `encrypt=True`, Fernet) — proven.
+- ✅ One-command governed product scaffolder (`new-product.sh`): repo+manifest+hook+docs+git in one shot.
 - ✅ Cloud-migratability documented (`docs/CLOUD-MIGRATION.md`): every store/bus config-driven → RDS/S3/managed-NATS/KMS, no rewrite.
 
 ## P0 — Safety  ✅ DONE

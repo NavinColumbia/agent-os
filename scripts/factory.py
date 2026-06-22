@@ -151,6 +151,18 @@ def build_product(product: str, charter: str) -> dict:
         log["result"] = "BLOCKED_AT_QA"   # the line refuses to ship red code
     audit.append(actor="factory:controller", action="ProductComplete", resource=product,
                  decision=log["result"], payload={"stages": len(log["stages"])})
+    # proactive push so you learn the outcome without watching anything
+    try:
+        import notify
+        fixes = qa_res.get("fix_attempts", 0)
+        if log["result"] == "LAUNCHED":
+            notify.send(f"✅ {product} shipped — LAUNCHED (QA green, {fixes} fix loops)",
+                        title="app factory", tags="rocket")
+        else:
+            notify.send(f"⛔ {product} BLOCKED_AT_QA after {fixes} fix attempts — needs you",
+                        title="app factory", priority="high", tags="warning")
+    except Exception:
+        pass
     print(f"\n[factory] {product}: {log['result']}", flush=True)
     return log
 

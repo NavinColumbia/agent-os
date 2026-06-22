@@ -41,6 +41,27 @@ def load_env():
     return cfg
 
 
+def send(message, title="agent-os", priority="default", tags="", topic=""):
+    """Importable notifier (agent -> your phone). Best-effort: returns True/False, never raises —
+    so a down ntfy never breaks the caller. Reuses the secret-guard so we never leak over the bridge."""
+    try:
+        cfg = load_env()
+        topic = topic or cfg.get("NTFY_TOPIC", "")
+        if not topic or "CHANGE-ME" in topic:
+            return False
+        sec, _ = looks_like_secret(message)
+        if sec:
+            return False
+        prio = {"min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5}.get(priority, 3)
+        payload = {"topic": topic, "message": message, "title": title, "priority": prio}
+        if tags:
+            payload["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+        r = requests.post(cfg["NTFY_BASE_URL"].rstrip("/"), json=payload, timeout=10)
+        return r.status_code < 400
+    except Exception:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("message")

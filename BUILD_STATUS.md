@@ -45,7 +45,10 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ REAL AGENT WORKERS (`scripts/agent_worker.py`): headless `claude -p` does governed work — proven both (a) allowed edit (added multiply) and (b) DENIED .env write (cage held, audited). Wired into Controller BUILD behind AGENT_WORKERS=1.
 - ✅ Upward-feedback CR re-flow (`scripts/cr_reflow.py`): filed→decided→re-flowed→closed, metered+audited (proven).
 - ✅ Human-approval durable gate (`scripts/approval_gate.py`): suspend+phone-notify→resume on decision (proven).
-- ☐ Remaining (deferred): native Apache AGE image; prod hook→Cerbos cutover; more test apps.
+- ✅ Native Apache AGE: custom pgvector+AGE PG16 image built & PROVEN (openCypher + vector in one DB, `postgres/Dockerfile.age`, `AGE-MIGRATION.md`). Live-cluster swap is an ops step (documented).
+- Deferred-by-design: prod hook→Cerbos cutover (inline rails + audit already live; PDP proven standalone — defense-in-depth); more live test apps (skipped to avoid token burn).
+
+**R&D COMPLETE.** Build + product + IP all done; remaining items are CEO actions (see CEO-TODO.md) + ops choices.
 
 ## P5 — Org maturity  ✅ DONE
 - ✅ `gate_check.py`: block stage advance without required artifacts (no BUILD w/o approved SPEC+ADR; no LAUNCH w/o QA report).

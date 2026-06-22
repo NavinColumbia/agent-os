@@ -1,0 +1,15 @@
+# pgvector + Apache AGE in one Postgres 16 image: vector similarity AND openCypher graph in one DB.
+# The live cluster can migrate to this image when convenient (same PG16 -> data-dir compatible);
+# until then it is proven in isolation. Build: docker build -f postgres/Dockerfile.age -t agentos-pg-age .
+FROM pgvector/pgvector:pg16
+USER root
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends build-essential git ca-certificates \
+        postgresql-server-dev-16 bison flex libreadline-dev zlib1g-dev; \
+    git clone --depth 1 -b PG16 https://github.com/apache/age.git /tmp/age; \
+    cd /tmp/age; make PG_CONFIG=/usr/bin/pg_config; make PG_CONFIG=/usr/bin/pg_config install; \
+    cd /; rm -rf /tmp/age; \
+    apt-get purge -y --auto-remove build-essential git postgresql-server-dev-16 bison flex libreadline-dev zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/*
+USER postgres

@@ -1,0 +1,123 @@
+# platform/inventory.yaml — THE source of truth for "what runs, where it lives, where it migrates."
+#
+# Every component of agent-os is listed here exactly once: its local form, the cloud service it maps
+# to, the config keys that point it somewhere, whether a snapshot captures its data, and the migration
+# order. selftest.sh asserts this inventory covers every running container (drift guard) — so this file
+# CANNOT silently fall out of date. Keep it current whenever a component is added.
+#
+# kind: container (docker) | process (host) | embedded (lives inside Postgres) | reach (networking)
+# in_snapshot: true means `snapshot.py export` captures its state (so a restore brings it back).
+
+version: 3
+
+components:
+  - name: postgres
+    kind: container
+    role: "State of everything: durable exec, audit, comms, memory, metrics, vault, blobs, skills."
+    local: "pgvector/pgvector:pg16 @ 127.0.0.1:5433"
+    compose: postgres/docker-compose.yml
+    config_keys: [DATABASE_URL, POSTGRES_PASSWORD]
+    in_snapshot: true            # pg_dump captures ALL embedded stores below
+    cloud_target: "RDS / Cloud SQL / Neon / Crunchy (managed Postgres + pgvector)"
+    migrate: "swap DATABASE_URL; pg_dump -Fc | pg_restore. DBOS/audit/vault/objstore all follow the URL."
+    order: 1
+
+  - name: nats
+    kind: container
+    role: "Work queue / JetStream — distributed dispatch, deadlock-free."
+    local: "nats:2.10 @ 127.0.0.1:4222 (mon :8222)"
+    compose: nats/docker-compose.yml
+    config_keys: [NATS_URL]
+    in_snapshot: false           # transient transport; no durable user data
+    cloud_target: "Synadia Cloud / self-hosted NATS cluster (or Kafka/Redpanda at huge scale)"
+    migrate: "swap NATS_URL; JetStream config is portable."
+    order: 3
+
+  - name: ntfy
+    kind: container
+    role: "Phone notification bridge + 2-way human approval."
+    local: "binwiederhier/ntfy @ 127.0.0.1:8080"
+    compose: ntfy/docker-compose.yml
+    config_keys: [NTFY_BASE_URL, NTFY_TOPIC]
+    in_snapshot: false
+    cloud_target: "hosted ntfy / managed push (APNs/FCM)"
+    migrate: "swap NTFY_BASE_URL."
+    order: 6
+
+  - name: cerbos
+    kind: container
+    role: "Policy decision point (PDP) — authorization for every governed action."
+    local: "ghcr.io/cerbos/cerbos @ 127.0.0.1:3592"
+    compose: cerbos/docker-compose.yml
+    config_keys: [CERBOS_URL]
+    in_snapshot: false           # policies are git-versioned in control-plane, not DB state
+    cloud_target: "Cerbos container on k8s / Cerbos Cloud"
+    migrate: "swap PDP URL; policies travel in git."
+    order: 4
+
+  - name: object-store
+    kind: embedded
+    role: "Content-addressed blobs (images/video/files), dedup, TTL/GC, encrypt-at-rest."
+    local: "objstore.py over Postgres BYTEA"
+    config_keys: [DATABASE_URL, OBJSTORE_BACKEND]
+    in_snapshot: true            # inside the pg_dump
+    cloud_target: "S3 / GCS / R2 (set OBJSTORE_BACKEND=s3; metadata stays in Postgres)"
+    migrate: "add s3 backend keyed by the same sha256; large media moves to the bucket."
+    order: 2
+
+  - name: vault
+    kind: embedded
+    role: "Scoped encrypted secrets (Fernet), scoped by product+env+role."
+    local: "vault.py over Postgres"
+    config_keys: [DATABASE_URL, VAULT_KEY]
+    in_snapshot: true
+    cloud_target: "AWS Secrets Manager / HashiCorp Vault / GCP Secret Manager"
+    migrate: "back vault.py with cloud KMS; scoping + audit logic unchanged."
+    order: 5
+
+  - name: controller
+    kind: process
+    role: "Standing orchestrator — runs products SPEC→BUILD→QA→REVIEW→LAUNCH (DBOS, crash-resumable)."
+    local: "host python process (scripts/controller.py)"
+    config_keys: [DATABASE_URL, AGENT_WORKERS]
+    in_snapshot: false           # stateless reducer; all state is in Postgres
+    cloud_target: "container on k8s / ECS, autoscaled"
+    migrate: "containerize; scale horizontally — state stays in Postgres."
+    order: 7
+
+  - name: api
+    kind: process
+    role: "Token-auth HTTP API + dashboard (127.0.0.1:8090)."
+    local: "host python process (scripts/api.py)"
+    config_keys: [AOS_API_TOKEN]
+    in_snapshot: false
+    cloud_target: "container behind an ALB / API gateway + auth"
+    migrate: "containerize; put behind gateway."
+    order: 7
+
+  - name: bridge-listener
+    kind: process
+    role: "ntfy reply listener — turns phone replies into governed approvals."
+    local: "host python process (scripts/reply_listener.py)"
+    config_keys: [NTFY_BASE_URL, NTFY_TOPIC]
+    in_snapshot: false
+    cloud_target: "container subscribed to the push backend"
+    migrate: "containerize alongside controller."
+    order: 7
+
+  - name: reach
+    kind: reach
+    role: "Private reach — Tailscale tailnet + HTTPS serve (never 0.0.0.0)."
+    local: "tailscaled + tailscale serve"
+    config_keys: [TS_HOSTNAME]
+    in_snapshot: false
+    cloud_target: "Tailscale works identically in cloud, or ALB + IdP auth"
+    migrate: "unchanged, or front with a load balancer."
+    order: 8
+
+# Secrets that must travel with a snapshot but NEVER enter git (captured by snapshot.py, gitignored):
+secret_files:
+  - .env.local
+  - postgres/.env
+  - ntfy/.env
+  - keys/            # Ed25519 signing keys (provenance + identity)

@@ -30,8 +30,11 @@ KEY_ID = "agent-os-org"
 OUT = ROOT / "agent-os" / "PROVENANCE.json"
 # the IP we are protecting: design docs (control-plane ADRs/schemas/protocols) + agent-os code
 INCLUDE = [
-    ("agent-os", ["scripts/**/*.py", "scripts/*.sh", "postgres/initdb/*.sql", "*.md", "*/docker-compose.yml", "cerbos/policies/*.yaml"]),
-    ("control-plane", ["docs/adr/*.md", "schemas/*.json", "protocols/*.md", "policies/*.md", "roles/*.yaml", "hooks/*.py", "constitution/*.md", "templates/*.md"]),
+    ("agent-os", ["scripts/**/*.py", "scripts/*.sh", "postgres/initdb/*.sql", "*.md", "docs/*.md",
+                  "*/docker-compose.yml", "cerbos/policies/*.yaml",
+                  "platform/*.py", "platform/*.sh", "platform/*.yaml", "platform/**/*.tf", "platform/**/*.md"]),
+    ("control-plane", ["docs/adr/*.md", "schemas/*.json", "protocols/*.md", "policies/*.md", "roles/*.yaml",
+                       "hooks/*.py", "scripts/*.py", "constitution/*.md", "templates/*.md"]),
 ]
 
 

@@ -1,5 +1,9 @@
 # Cloud / Scale Migration — agent-os
 
+> **The executable counterpart of this doc is `platform/`** — `inventory.yaml` (component registry),
+> `rebuild.sh` (stand up anywhere), `snapshot.py` (encrypted portable backup), `terraform/` (cloud IaC).
+> This doc is the *what maps to what*; `platform/README.md` is the *how*.
+
 Design principle: **single-box by default, cloud-portable by construction.** Every service is a
 container or a process configured by env vars — nothing is hard-wired to localhost beyond bind
 addresses. Moving to cloud (for scale, GPUs, or many users) is a config + endpoint swap, not a rewrite.

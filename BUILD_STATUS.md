@@ -13,6 +13,9 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ BYO-agent provider layer (`scripts/providers.py`): Claude full-agent + any OpenAI-compatible (DeepSeek/OpenAI/Together/Ollama/Groq), uniformly governed. Routing proven.
 - ☐ Whitepaper, patent guide, CR re-flow, human-approval ask-await, test apps.
 
+- ✅ Multi-tenancy (`tenancy.py`): per-customer isolation (token→tenant, product ownership) — SaaS boundary.
+- ✅ Full backup/restore (`backup.sh`) + status dashboard. See CAPABILITIES.md for the full index.
+
 ## SCALE + OPS layer (proactive) ✅
 - ✅ HTTP API (`api.py`): token-auth service surface (health/status/metrics/scaffold/run), localhost-bound, in recover.sh. The SaaS entry point.
 - ✅ Distributed dispatch (`dispatch.py`): tasks over NATS work-queue → decoupled workers (separate processes/machines), audited.

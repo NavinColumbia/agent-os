@@ -27,6 +27,12 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ Eval harness: Inspect AI installed + a tiny agent eval that runs.
 - ✅ OTel-GenAI tracing (OpenLLMetry→Phoenix) — best-effort/local.
 
+## INTEGRATION — Standing Controller  ✅ DONE
+- ✅ `scripts/controller.py`: DBOS workflow runs a product SPEC→BUILD→QA→REVIEW→LAUNCH, composing
+  gate_check (refuses stage w/o artifacts) + Cerbos PDP + tamper-evident audit + metrics, crash-resumable.
+  PROVEN: full lifecycle → LAUNCHED; audit chain intact (5 decisions); idempotent re-run (no stage re-runs).
+- ☐ NEXT: wire real enforce_manifest hook → audit/Cerbos in prod; Controller upward-feedback (CR) + human-approval-via-ask-await; real agent workers in stages.
+
 ## P5 — Org maturity  ✅ DONE
 - ✅ `gate_check.py`: block stage advance without required artifacts (no BUILD w/o approved SPEC+ADR; no LAUNCH w/o QA report).
 - ✅ Templates: PROJECT-RUNBOOK + CHANGE-REQUEST + SPEC/ADR/QA in control-plane `templates/`.

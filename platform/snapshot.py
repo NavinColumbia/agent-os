@@ -66,6 +66,36 @@ def _prune(keep=KEEP):
         print(f"   pruned old snapshot {old.name}")
 
 
+def _cfg(key):
+    """Read a key from env, else from gitignored .env.local."""
+    v = os.environ.get(key)
+    if not v and ENV.exists():
+        for l in ENV.read_text().splitlines():
+            if l.strip().startswith(f"{key}="):
+                return l.split("=", 1)[1].strip().strip('"').strip("'")
+    return v
+
+
+def _offsite(path, keep=KEEP):
+    """Best-effort off-box copy to the Mac over Tailscale, capped at `keep`. A sleeping/unreachable
+    Mac NEVER fails the backup — the local snapshot already succeeded."""
+    mac_dir = _cfg("AOSNAP_MAC_DIR")
+    if not mac_dir:
+        return
+    try:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import mac_runner
+        r = mac_runner.push(str(path), mac_dir)
+        if r["rc"] == 0:
+            # keep newest `keep`, delete the rest on the Mac
+            mac_runner.run(f"ls -t {mac_dir}/agent-os-*.aosnap 2>/dev/null | tail -n +{keep + 1} | xargs -r rm -f")
+            print(f"   off-site copy -> Mac:{mac_dir} (kept newest {keep})")
+        else:
+            print(f"   ! off-site copy skipped (Mac scp rc={r['rc']}: {r['err'][:80]})")
+    except Exception as e:
+        print(f"   ! off-site copy skipped (Mac unreachable): {str(e)[:100]}")
+
+
 def _db_password() -> str:
     for l in ENV.read_text().splitlines():
         if l.startswith("DATABASE_URL=") and "@" in l:
@@ -128,6 +158,7 @@ def export_snapshot():
     out.write_bytes(MAGIC + salt + token)
     shutil.rmtree(stage, ignore_errors=True)
     _prune()
+    _offsite(out)
     mb = out.stat().st_size / 1e6
     print(f"✅ snapshot -> {out} ({mb:.1f} MB, encrypted)")
     print(f"   git: agent-os@{manifest['git']['agent-os'][:10]} control-plane@{manifest['git']['control-plane'][:10]}")

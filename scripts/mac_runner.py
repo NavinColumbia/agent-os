@@ -14,6 +14,7 @@ Config in ~/projects/agent-os/.env.local:
     mac_runner.py ios-e2e <app.app> <bundle_id>   # boot sim, install, launch (E2E scaffold)
 Run with the agent-os venv python.
 """
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -50,6 +51,19 @@ def list_sims():
     return run("xcrun simctl list devices available")["out"]
 
 
+def push(local, remote_dir, timeout=600):
+    """Copy a local file to the Mac over scp (Tailscale). Creates remote_dir, audits. {rc, dest, err}."""
+    if not (HOST and USER):
+        raise RuntimeError("MAC_HOST/MAC_USER not set in .env.local — add the Mac (see MAC-SETUP.md)")
+    run(f"mkdir -p {shlex.quote(remote_dir)}")
+    dest = f"{USER}@{HOST}:{remote_dir}/"
+    scp = ["scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", local, dest]
+    p = subprocess.run(scp, capture_output=True, text=True, timeout=timeout)
+    audit.append(actor="mac-runner", action="PushFile", resource=Path(local).name,
+                 decision="executed", payload={"rc": p.returncode, "host": HOST, "dir": remote_dir})
+    return {"rc": p.returncode, "dest": dest, "err": p.stderr.strip()[:300]}
+
+
 def ios_e2e(app_path, bundle_id, device="iPhone 15"):
     """Minimal native E2E: boot a simulator, install the app, launch it. Extend with Appium/XCUITest
     for click-through assertions + screenshots (which flow back to the QA harness / object store)."""
@@ -76,6 +90,8 @@ def _main(a):
         print(list_sims())
     elif a[0] == "run":
         print(run(a[1]))
+    elif a[0] == "push":
+        print(push(a[1], a[2]))
     elif a[0] == "ios-e2e":
         for step in ios_e2e(a[1], a[2]):
             print(step)

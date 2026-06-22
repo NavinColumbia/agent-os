@@ -7,6 +7,12 @@
 Resume rule: this file is the source of truth for what's done. Each task: ☐ todo · ⏳ in-progress · ✅ done (proven) · ⚠️ blocked/deferred.
 Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fabric). Build code lives in `agent-os/scripts/`.
 
+
+## PRODUCT/IP layer (autonomous epic) ✅ in progress
+- ✅ IP: proprietary LICENSE+NOTICE, Ed25519-signed PROVENANCE.json over 85 files, watermark/canary.
+- ✅ BYO-agent provider layer (`scripts/providers.py`): Claude full-agent + any OpenAI-compatible (DeepSeek/OpenAI/Together/Ollama/Groq), uniformly governed. Routing proven.
+- ☐ Whitepaper, patent guide, CR re-flow, human-approval ask-await, test apps.
+
 ## P0 — Safety  ✅ DONE
 - ✅ Sandbox `srt` (bubblewrap+seccomp+Landlock+egress proxy) — proven: blocks egress + read-only FS.
 - ✅ Tamper-evident audit log (`scripts/audit.py`, `postgres/initdb/02-audit.sql`) — proven: detects deny→allow tamper.

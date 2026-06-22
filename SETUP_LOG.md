@@ -203,6 +203,24 @@ Three layers of recovery:
 Scripts: `scripts/recover.sh`, `scripts/agentos-boot.sh` (installed to /usr/local/sbin),
 `scripts/install_autostart.sh`.
 
+## Reference-architecture build (ADR 0004/0005) — progress
+**P0 — Safety (DONE & PROVEN):**
+- Sandbox: `@anthropic-ai/sandbox-runtime` (`srt`) + bubblewrap+socat installed; smoke-proven to block
+  network egress AND make the FS read-only by default. (Landlock "Up and running" on this WSL2 kernel.)
+- Audit: `scripts/audit.py` + `postgres/initdb/02-audit.sql` — HMAC-SHA256 hash-chained, tamper-evident
+  log in Postgres; proven to detect a deny→allow tamper by a privileged DB writer. Key in `.env.local`.
+
+**P1 — Durable-execution backbone (DONE & PROVEN):**
+- `dbos` 2.24.0 on the existing Postgres (system DB `agentos_dbos_sys`). `scripts/dbos_durable_demo.py`:
+  workflow hard-killed mid-run **resumes from the exact step** on restart; completed step NOT re-run
+  (counter stayed 1) → workflow SUCCESS. This is the substrate for the ADR 0005 ask-await fabric.
+- Lessons banked: concurrent `CREATE TABLE IF NOT EXISTS` races pg_type → create tables up front;
+  `os._exit` skips stdout/file flush (rely on DB state); `pkill -f <scriptname>` self-kills the shell
+  whose argv contains that name — never pattern-match the running command.
+
+**Next (not yet built):** P2 ask-await comm fabric (typed envelope + DBOS recv/send + deadlock detector),
+P3 typed/signed identity + Cerbos PDP, P4 graph-memory/observability/eval, P5 org maturity (runbook/gate-check/Audit role).
+
 ## Remote
 Private GitHub repo: **https://github.com/NavinColumbia/agent-os** (account NavinColumbia, SSH).
 Push updates with `git push`. Secrets (`.env.local`, `postgres/.env`) and all data/runtime dirs are

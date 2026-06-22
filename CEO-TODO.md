@@ -1,6 +1,6 @@
 # CEO / Founder TODO — agent-os
 
-Actions only **you** (Navin Ashok Swaminathan) can take. The engineering is built, proven (18/18),
+Actions only **you** (Navinashok Swaminathan) can take. The engineering is built, proven (18/18),
 and IP-protected; these unlock money, protection, and recognition. Ordered by priority.
 
 ## 🔴 NOW — protect the IP before any disclosure
@@ -32,7 +32,7 @@ and IP-protected; these unlock money, protection, and recognition. Ordered by pr
    provenance. Back them up offline — losing them means you can't re-sign as the same author.
 
 ## What I needed from you
-- ✅ Full legal name (got it: Navin Ashok Swaminathan) — now in LICENSE/NOTICE.
+- ✅ Full legal name (got it: Navinashok Swaminathan) — now in LICENSE/NOTICE.
 - Nothing else for signing — keys are generated and held locally; provenance is already signed.
 - For the PPA itself you'll enter your own name/address/payment at USPTO; I don't need your payment info.
 

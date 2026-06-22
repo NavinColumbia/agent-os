@@ -1,6 +1,6 @@
 # A Single-Box, Privacy-First, Governed Operating System for Heterogeneous AI Agents
 
-**Author:** Navin (github.com/NavinColumbia). **Status:** working paper, v1 (2026). **Proprietary — see LICENSE.**
+**Author:** Navinashok Swaminathan (github.com/NavinColumbia). **Status:** working paper, v1 (2026). **Proprietary — see LICENSE.**
 Provenance: this document is covered by the Ed25519-signed manifest in `PROVENANCE.json`.
 
 ## Abstract

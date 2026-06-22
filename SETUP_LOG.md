@@ -3,6 +3,17 @@
 Host: Windows + WSL2 / Ubuntu. User: **swami** (uid 1000, NOT root). Running inside tmux session `agents`.
 Started: 2026-06-21.
 
+## ▶ RESUME HERE (read this first if context was lost)
+**Status as of 2026-06-22: Steps 1–5 all built, proven, and pushed. Setup is essentially done.**
+- Repos (private): `github.com/NavinColumbia/agent-os` + `…/control-plane`. Local at `~/projects/`.
+- Running (localhost/tailnet only): ntfy `agentos-ntfy`, Postgres `agentos-postgres`, NATS `agentos-nats`,
+  the reply listener, tailscaled + `tailscale serve` (https://nyaan.tail502e3f.ts.net).
+- To restore after any reboot: `bash ~/projects/agent-os/scripts/recover.sh` (auto on WSL boot via /etc/wsl.conf).
+- Secrets live only in gitignored `.env.local`, `postgres/.env`, `ntfy/.env`.
+- **Open items:** (1) optionally narrow `NOPASSWD:ALL` sudo back to `/etc/sudoers.d/swami-docker`;
+  (2) phone has Claude app (remote control) + ntfy app. Native remote control enabled in `~/.claude/settings.json`.
+- A fresh session can fully catch up by reading this file end-to-end.
+
 ## Golden rules in effect
 - Never run as root; sudo only for system-package installs, and ask first.
 - Never bind services to 0.0.0.0 — localhost or Tailscale iface only.

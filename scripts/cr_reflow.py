@@ -33,7 +33,8 @@ def _validate_cr(cr):
 
 
 def demo():
-    product = "reflow-demo"
+    import os
+    product = f"reflow-demo-{os.urandom(3).hex()}"  # unique so KPIs are deterministic across re-runs
     print("[stage BUILD] implementing against SPEC §4.2 (SendGrid v2)…")
     # 1) downstream discovers infeasibility -> file a CR instead of improvising
     cr = {

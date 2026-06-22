@@ -105,7 +105,18 @@ After enable: `tailscale serve --bg --https=443 http://127.0.0.1:8080`; phone se
 `https://nyaan.tail502e3f.ts.net` (same topics). MagicDNS name: nyaan.tail502e3f.ts.net.
 
 ## Step 2 (old marker) — BLOCKED on Docker + topic name
-## Step 3 — Durable memory (Postgres+pgvector) — BLOCKED on Docker
+## Step 3 — Durable memory + crash recovery (Postgres + pgvector)
+Status: ✅ DONE & PROVEN (2026-06-22)
+- `postgres/docker-compose.yml` — image `pgvector/pgvector:pg16`, container `agentos-postgres`,
+  bound **127.0.0.1:5433 only** (5433 to avoid clashing with any system pg on 5432). Healthcheck pg_isready.
+- `postgres/initdb/01-schema.sql` — `CREATE EXTENSION vector` (pgvector 0.8.3 verified) +
+  tables `task_checkpoints` (crash recovery) and `memories` (vector(384) durable memory).
+- Secrets: password in `postgres/.env` (chmod 600, gitignored); `DATABASE_URL` in `.env.local` (gitignored).
+- venv at `~/projects/agent-os/.venv` (psycopg 3.3.4, requests) — use `.venv/bin/python` for DB code.
+- `scripts/checkpoint.py` — save/restore/list task state (upsert + monotonic seq).
+- TEST `scripts/crash_recovery_test.sh`: save → `kill -9` worker → restore from fresh process →
+  **PASS: exact state survived**. Re-run anytime.
+- Stop DB: `cd ~/projects/agent-os/postgres && docker compose down` (data persists in `pgdata/`).
 ## Step 4 — Message bus (NATS+JetStream) — BLOCKED on Docker
 ## Step 5 — Reach (Tailscale) + voice (faster-whisper)
 Status: 🟡 IN PROGRESS (brought forward to unblock Step 2 phone test)

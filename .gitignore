@@ -15,6 +15,10 @@ bridge/*.log
 __pycache__/
 *.pyc
 
-# Postgres/NATS local data (Steps 3-4)
-pgdata/
+# Python venv
+.venv/
+
+# Postgres/NATS local data + per-stack secret env (Steps 3-4)
+postgres/pgdata/
+postgres/.env
 nats/data/

@@ -17,11 +17,32 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+
+import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
+
+_ENV = Path.home() / "projects" / "agent-os" / ".env.local"
+_DB = next((l.split("=", 1)[1].strip() for l in _ENV.read_text().splitlines()
+            if l.strip().startswith("DATABASE_URL=")), None)
+
+
+def _log_comm(cid, sender, recipient, intent, content):
+    """Record a durable handoff in the conversation fabric so the dashboard's comms graph + message
+    queue reflect REAL agent-to-agent communication (not just the audit stream). Best-effort."""
+    try:
+        with psycopg.connect(_DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO conversations (conversation_id, message_id, intent, sender, recipient, content)
+                           VALUES (%s,%s,%s,%s,%s,%s)""",
+                        (cid, f"{sender}->{recipient}-{int(time.time()*1000)}", intent, sender, recipient,
+                         json.dumps(content)))
+            c.commit()
+    except Exception:
+        pass
 
 ROLES = Path.home() / "projects" / "control-plane" / "roles"
 PRODUCTS = Path.home() / "projects" / "products"
@@ -101,20 +122,25 @@ def build_product(product: str, charter: str) -> dict:
     (repo / "docs" / "CHARTER.md").write_text(f"# {product} — charter\n\n{charter}\n")
     log = {"product": product, "stages": []}
 
-    def stage(name, fn):
+    cid = f"build-{product}"
+
+    def stage(name, role, fn):
         print(f"\n[factory] === {name} ===", flush=True)
+        _log_comm(cid, "controller", role, "delegate", {"stage": name})        # hand-off out
         r = fn()
+        ok = (r.get("passed", True) if isinstance(r, dict) else True)
+        _log_comm(cid, role, "controller", "done" if ok else "blocked", {"stage": name})  # hand-back
         log["stages"].append({name: r})
         print(f"[factory] {name}: {r}", flush=True)
         return r
 
     # SPEC — a PM turns the charter into a real spec + acceptance criteria
-    stage("SPEC", lambda: agent("product-manager", str(repo),
+    stage("SPEC", "product-manager", lambda: agent("product-manager", str(repo),
           f"Read docs/CHARTER.md. Write docs/SPEC.md: scope, public API, and explicit acceptance "
           f"criteria as a bullet list of testable behaviours. Keep it tight and unambiguous."))
 
     # BUILD — a builder implements the library + a real pytest suite from the spec
-    stage("BUILD", lambda: agent("builder", str(repo),
+    stage("BUILD", "builder", lambda: agent("builder", str(repo),
           f"Read docs/SPEC.md. Implement the product as importable Python under src/ "
           f"(package '{product.replace('-', '_')}') AND write a real pytest suite under tests/ that "
           f"covers every acceptance criterion, including edge cases. Use `from src...` imports. "
@@ -133,17 +159,17 @@ def build_product(product: str, charter: str) -> dict:
                   f"Do not delete tests to make them pass.")
             ok, out = run_tests(str(repo))
         return {"passed": ok, "fix_attempts": attempts, "tail": out[-400:]}
-    qa_res = stage("QA", qa)
+    qa_res = stage("QA", "qa-security", qa)
 
     # REVIEW — an independent reviewer records a verdict (read-mostly)
-    stage("REVIEW", lambda: agent("reviewer", str(repo),
+    stage("REVIEW", "reviewer", lambda: agent("reviewer", str(repo),
           f"Review src/ against docs/SPEC.md. Write docs/REVIEW.md: what's correct, any risks, and a "
           f"clear APPROVE/REQUEST-CHANGES verdict. Tests are currently "
           f"{'GREEN' if qa_res.get('passed') else 'RED'}."))
 
     # LAUNCH — only if QA is green (a real gate, not a placeholder)
     if qa_res.get("passed"):
-        stage("LAUNCH", lambda: agent("tech-lead", str(repo),
+        stage("LAUNCH", "tech-lead", lambda: agent("tech-lead", str(repo),
               "Write docs/LAUNCH-CHECKLIST.md (how to install, run, and the test command) and a short "
               "README.md. This product passed QA and is cleared to ship."))
         log["result"] = "LAUNCHED"

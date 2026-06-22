@@ -27,11 +27,11 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ Eval harness: Inspect AI installed + a tiny agent eval that runs.
 - ✅ OTel-GenAI tracing (OpenLLMetry→Phoenix) — best-effort/local.
 
-## P5 — Org maturity  ☐
-- ☐ `gate_check.py`: block stage advance without required artifacts (no BUILD w/o approved SPEC+ADR; no LAUNCH w/o QA report).
-- ☐ Templates: PROJECT-RUNBOOK + CHANGE-REQUEST + SPEC/ADR/QA in control-plane `templates/`.
-- ☐ Metrics schema + `org_metrics` table.
-- ☐ Change-request schema (`schemas/change-request.schema.json`) + the two board states.
+## P5 — Org maturity  ✅ DONE
+- ✅ `gate_check.py`: block stage advance without required artifacts (no BUILD w/o approved SPEC+ADR; no LAUNCH w/o QA report).
+- ✅ Templates: PROJECT-RUNBOOK + CHANGE-REQUEST + SPEC/ADR/QA in control-plane `templates/`.
+- ✅ Metrics schema + `org_metrics` table.
+- ✅ Change-request schema (`schemas/change-request.schema.json`) + the two board states.
 
 ## Notes for resumer
 - Postgres: `agentos` db @127.0.0.1:5433; creds + AUDIT_HMAC_KEY in `~/projects/agent-os/.env.local`. DBOS sys db = `agentos_dbos_sys`.

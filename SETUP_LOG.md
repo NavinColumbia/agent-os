@@ -165,6 +165,11 @@ VOICE-IN — done & proven:
 - Tailscale **1.98.4** installed (apt). No systemd here, so `tailscaled` started MANUALLY & detached:
   `sudo sh -c 'setsid tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 </dev/null &'`
   (kernel mode; /dev/net/tun present). To restart after WSL boot: same line + `sudo tailscale up`.
+## Remote
+Private GitHub repo: **https://github.com/NavinColumbia/agent-os** (account NavinColumbia, SSH).
+Push updates with `git push`. Secrets (`.env.local`, `postgres/.env`) and all data/runtime dirs are
+gitignored and confirmed absent from the remote.
+
 ## Running services (all localhost / tailnet only)
 | Service | Container | Bind | Start | Stop |
 |---|---|---|---|---|

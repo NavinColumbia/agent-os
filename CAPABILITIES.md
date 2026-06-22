@@ -1,11 +1,20 @@
 # agent-os — Capability Index (v2)
 
-Every capability below is implemented and **proven by `bash scripts/selftest.sh` → 30/30**.
+Every capability below is implemented and **proven by `bash scripts/selftest.sh` → 31/31**.
 Proprietary (LICENSE); authorship attested in PROVENANCE.json.
+
+## The model: one brain, a thin tool layer (ADR 0006)
+- **Claude is the single cognitive engine — no model zoo.** It replaces the old sprawl of task-specific
+  ML models (summarizer/classifier/NER/translation/…). We keep only a *thin deterministic tool tier*
+  for output that isn't text (render/device/GPU).
+- **95 capabilities — 68 are Claude-native and ready with zero extra infra**; 22 local tools; 2 device;
+  only **5 deferred** (GPU/paid — the heavy/paid work you chose to postpone). Nothing cognitive is missing.
 
 ## Orchestration & governance
 - Standing **Controller** runs products through SPEC→BUILD→QA→REVIEW→LAUNCH, crash-resumable.
-- **21 governed roles** (PM, tech-lead, builders, QA, security, data-scientist, ML-engineer, data-engineer, analyst, finance, incident-commander, …).
+- **~90 governed roles, pre-built** (`generate_org.py`) spanning every common company function +
+  industry — engineering, data/AI, design, content, media, product, growth/sales/support, finance,
+  legal, people, industry specialists, and personal advisory. Hiring is *selection, not creation*.
 - **Capability manifests** enforced by a PreToolUse reference monitor + **OS sandbox** (bubblewrap/seccomp/Landlock, deny-egress) + **Cerbos PDP**.
 - **Tamper-evident audit** (HMAC hash-chain) of every decision; **gate-checks** (no stage without artifacts).
 - **Upward-feedback Change-Requests** (re-flow), **durable human-approval** (phone), **bounded meetings**.

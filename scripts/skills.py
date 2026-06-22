@@ -137,6 +137,7 @@ CATALOG = [
     ("executive-assistant", "personal", "Scheduling, inbox triage, drafting, planning", ["executive-assistant"], ["reasoning"], R, CL),
     # ── governance / meta ─────────────────────────────────────────────────────
     ("orchestration", "governance", "Run products through SPEC→BUILD→QA→REVIEW→LAUNCH", ["controller"], ["controller"], R, TO),
+    ("autonomous-app-factory", "governance", "Real role-agents build+test products end-to-end: sandboxed QA, test-driven re-flow, LAUNCH gated on green", ["controller", "tech-lead"], ["factory", "claude", "srt", "pytest"], R, TO),
     ("resource-allocation", "governance", "Hire/route roles, manage the registry", ["resource-allocator"], ["allocator"], R, TO),
     ("ethics-safety-review", "governance", "Ethics/safety gate on plans + outputs", ["ethics-safety-reviewer", "audit-governance"], ["reasoning"], R, CL),
     ("web-research", "research", "Live web search + read + synthesize sources", ["research-growth", "analyst"], ["websearch", "webfetch"], R, CL),

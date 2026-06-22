@@ -1,0 +1,19 @@
+# Secrets and local-only config
+.env.local
+*.local
+
+# ntfy runtime state
+ntfy/cache/
+ntfy/lib/
+
+# Bridge runtime (captured replies may contain task data)
+bridge/inbox/
+bridge/rejected/
+
+# Python
+__pycache__/
+*.pyc
+
+# Postgres/NATS local data (Steps 3-4)
+pgdata/
+nats/data/

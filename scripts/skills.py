@@ -138,6 +138,8 @@ CATALOG = [
     # ── governance / meta ─────────────────────────────────────────────────────
     ("orchestration", "governance", "Run products through SPEC→BUILD→QA→REVIEW→LAUNCH", ["controller"], ["controller"], R, TO),
     ("autonomous-app-factory", "governance", "Real role-agents build+test products end-to-end: sandboxed QA, test-driven re-flow, LAUNCH gated on green", ["controller", "tech-lead"], ["factory", "claude", "srt", "pytest"], R, TO),
+    ("concurrent-app-fleet", "governance", "Build many products at once through the governed line (the app factory at scale)", ["controller"], ["factory", "claude"], R, TO),
+    ("fleet-observability", "ops", "Live mission-control dashboard + watchdog paging on stalls/outages/SLA", ["controller", "incident-commander"], ["dashboard", "watchdog", "fleet", "ntfy"], R, TO),
     ("resource-allocation", "governance", "Hire/route roles, manage the registry", ["resource-allocator"], ["allocator"], R, TO),
     ("ethics-safety-review", "governance", "Ethics/safety gate on plans + outputs", ["ethics-safety-reviewer", "audit-governance"], ["reasoning"], R, CL),
     ("web-research", "research", "Live web search + read + synthesize sources", ["research-growth", "analyst"], ["websearch", "webfetch"], R, CL),

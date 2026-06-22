@@ -9,6 +9,7 @@ Every step is audited.
 
   factory.py agent <role> <repo> "<task>"        # run one role-specialized real agent
   factory.py build <product> "<charter>"         # run a product end-to-end through the line
+  factory.py fleet <specs.json> [workers]        # build SEVERAL products concurrently (the factory)
   factory.py selftest                            # offline check (prompt assembly, no model calls)
 Run with the agent-os venv python. Needs the `claude` CLI authenticated; pytest in the venv.
 """
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import psycopg
@@ -193,14 +195,43 @@ def build_product(product: str, charter: str) -> dict:
     return log
 
 
+def dispatch_fleet(specs, max_workers=3):
+    """Build several products CONCURRENTLY — the app factory at scale. Each runs its own governed line
+    (own repo, own audit/comms rows), so they all show up together on the mission-control dashboard.
+    specs = [{"product": "...", "charter": "..."}, ...]. Bounded by max_workers parallel lines."""
+    results = {}
+    audit.append(actor="factory:controller", action="FleetStart", resource=f"{len(specs)} products",
+                 decision="executed", payload={"workers": max_workers})
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(build_product, s["product"], s.get("charter", "")): s["product"] for s in specs}
+        for f in as_completed(futs):
+            name = futs[f]
+            try:
+                results[name] = (f.result() or {}).get("result", "UNKNOWN")
+            except Exception as e:
+                results[name] = f"ERROR: {e}"
+    launched = sum(1 for v in results.values() if v == "LAUNCHED")
+    try:
+        import notify
+        notify.send(f"🏭 fleet done: {launched}/{len(results)} LAUNCHED — " +
+                    ", ".join(f"{k}:{v}" for k, v in results.items()), title="app factory", tags="factory")
+    except Exception:
+        pass
+    print(f"\n[factory] FLEET COMPLETE: {results}", flush=True)
+    return results
+
+
 def _main(a):
     if not a:
-        sys.exit("usage: factory.py agent|build|selftest ...")
+        sys.exit("usage: factory.py agent|build|fleet|selftest ...")
     if a[0] == "agent":
         print(agent(a[1], a[2], a[3]))
     elif a[0] == "build":
         charter = a[2] if len(a) > 2 else "Build a small, well-tested Python library."
         build_product(a[1], charter)
+    elif a[0] == "fleet":
+        raw = Path(a[1]).read_text() if len(a) > 1 and Path(a[1]).exists() else (a[1] if len(a) > 1 else "[]")
+        dispatch_fleet(json.loads(raw), int(a[2]) if len(a) > 2 else 3)
     elif a[0] == "selftest":
         brief = role_brief("builder")
         ok = "builder" in brief and "NEVER" in brief.upper() and PRODUCTS.parent.exists()

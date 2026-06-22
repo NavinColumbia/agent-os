@@ -16,5 +16,6 @@ trap 'rm -f "$PIDFILE"' EXIT
 
 while true; do
   "$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" tick >>/tmp/scheduler.log 2>&1 || true
+  "$ROOT/.venv/bin/python" "$ROOT/scripts/watchdog.py" beat ticker >/dev/null 2>&1 || true
   sleep "$INTERVAL"
 done

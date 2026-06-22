@@ -73,6 +73,16 @@ else
     && ok "ticker started (every 15 min)" || warn "ticker failed"
 fi
 
+hdr "4e. Watchdog (pages you on stalls / outages / SLA breaches, every ~2 min)"
+if [ -f /tmp/agentos-watchdog.pid ] && kill -0 "$(cat /tmp/agentos-watchdog.pid 2>/dev/null)" 2>/dev/null; then
+  ok "watchdog already running (pid $(cat /tmp/agentos-watchdog.pid))"
+else
+  ( setsid bash "$ROOT/scripts/watchdog.sh" >/dev/null 2>&1 </dev/null & )
+  sleep 2
+  [ -f /tmp/agentos-watchdog.pid ] && kill -0 "$(cat /tmp/agentos-watchdog.pid 2>/dev/null)" 2>/dev/null \
+    && ok "watchdog started (every 2 min)" || warn "watchdog failed"
+fi
+
 hdr "5. Health checks"
 curl -s --max-time 5 http://127.0.0.1:8080/v1/health 2>/dev/null | grep -q healthy && ok "ntfy healthy (local)" || warn "ntfy not healthy"
 DK "docker exec agentos-postgres pg_isready -U agentos -d agentos" >/dev/null 2>&1 && ok "postgres ready" || warn "postgres not ready"

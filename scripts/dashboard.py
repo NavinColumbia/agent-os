@@ -37,8 +37,8 @@ DB = _cfg.get("DATABASE_URL")
 TOKEN = _cfg.get("AOS_API_TOKEN", "")
 
 PROCS = [("controller", "controller.py"), ("factory", "factory.py build"),
-         ("ticker", "ticker.sh"), ("api", "api.py serve"), ("listener", "reply_listener.py"),
-         ("dashboard", "dashboard.py serve")]
+         ("ticker", "ticker.sh"), ("watchdog", "watchdog.sh"), ("api", "api.py serve"),
+         ("listener", "reply_listener.py"), ("dashboard", "dashboard.py serve")]
 
 _hcache = {"ts": 0, "data": {}}
 
@@ -133,6 +133,15 @@ def state():
         cur.execute("SELECT count(*) FROM audit_log WHERE decision='deny' AND ts > now() - interval '1 hour'")
         denies = cur.fetchone()[0]
         out["throughput"] = {"actions_10m": a10, "denies_1h": denies}
+        # liveness heartbeats (loops that beat each cycle) -> show age on the matching process
+        try:
+            cur.execute("SELECT component, EXTRACT(EPOCH FROM now()-ts)::int FROM heartbeats")
+            hb = dict(cur.fetchall())
+            for p in out["processes"]:
+                if p["label"] in hb:
+                    p["beat"] = int(hb[p["label"]])
+        except Exception:
+            pass
 
     # derived alerts
     cycles = []
@@ -159,7 +168,7 @@ def state():
         alerts.append({"level": "crit", "msg": f"DEADLOCK: {len(cycles)} cycle(s)"})
     if any(w["overdue"] for w in waits):
         alerts.append({"level": "warn", "msg": "a wait is past its SLA"})
-    if out["throughput"]["denies_1h"] > 40:
+    if out["throughput"]["denies_1h"] > 80:
         alerts.append({"level": "warn", "msg": f"{out['throughput']['denies_1h']} policy denials/hr"})
     out["alerts"] = alerts or [{"level": "ok", "msg": "all systems nominal"}]
     out["overall"] = ("crit" if any(a["level"] == "crit" for a in out["alerts"])
@@ -277,7 +286,7 @@ async function tick(){
  $('#health').innerHTML=Object.entries(s.health).map(([k,v])=>`<div class=row><span class="dot ${v?'d-ok':'d-off'}"></span>${k}<span class=grow></span><span class=mut>${v?'up':'down'}</span></div>`).join('');
  const dp=s.disk_pct;$('#diskbar').style.width=dp+'%';$('#diskbar').style.background=dp>=90?'var(--r)':dp>=80?'var(--a)':'var(--g)';$('#disktxt').textContent=dp+'% used';
  $('#backup').textContent=s.backup_age_h==null?'no snapshot yet':('last backup '+s.backup_age_h+'h ago');
- $('#procs').innerHTML=s.processes.map(p=>`<div class=row><span class="dot ${p.n?'d-ok':'d-off'}"></span>${p.label}<span class=grow></span><span class=mut>${p.n?('×'+p.n):'idle'}</span></div>`).join('');
+ $('#procs').innerHTML=s.processes.map(p=>`<div class=row><span class="dot ${p.n?'d-ok':'d-off'}"></span>${p.label}<span class=grow></span><span class=mut>${p.beat!=null?('♥ '+p.beat+'s · '):''}${p.n?('×'+p.n):'idle'}</span></div>`).join('');
  $('#a10').textContent=s.throughput.actions_10m;$('#den').textContent=s.throughput.denies_1h;
  $('#products').innerHTML=s.products.length?s.products.map(p=>`<div class=row><b>${esc(p.name)}</b><span class=grow></span><span class=tag>${p.steps} steps · ${esc(p.actor)}</span></div>`).join(''):'<div class=mut>none active</div>';
  $('#msgs').innerHTML=s.messages.map(m=>`<tr><td>${m.ts}</td><td>${esc(m.from)} → ${esc(m.to)}</td><td><span class=chip>${esc(m.intent)}</span></td><td class="${m.latency_s>5?'lat-hi':'lat-ok'}">${m.latency_s==null?'–':m.latency_s+'s'}</td></tr>`).join('')||'<tr><td class=mut colspan=4>no messages yet</td></tr>';

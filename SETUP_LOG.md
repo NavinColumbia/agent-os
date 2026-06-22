@@ -135,23 +135,48 @@ subjects + streams invisible to the others, enforced server-side. To enable: add
 creds; mount it via the compose `command`/volume. v1 runs a single implicit account. A stub note is
 in `nats/docker-compose.yml`.
 ## Step 5 — Reach (Tailscale) + voice (faster-whisper)
-Status: 🟡 IN PROGRESS (brought forward to unblock Step 2 phone test)
+Status: ✅ DONE & PROVEN (2026-06-22)
+
+REACH (Tailscale) — done:
+- nyaan=100.93.201.41, phone navinashoks-s24=100.98.116.33, same tailnet (artmusicasia@gmail.com).
+  Host↔phone ping OK. ntfy reachable from phone via `tailscale serve` HTTPS (https://nyaan.tail502e3f.ts.net).
+
+VOICE-IN — done & proven:
+- `scripts/transcribe.py` — faster-whisper `small.en`, CPU int8 (model cached in ~/.cache). Pure STT.
+- `scripts/voice_guard.py` — fail-closed classifier for gated/risky intents (deploy, push main, delete,
+  sudo, secrets, money, public comms, pipe-to-shell, host disruption, empty/garbled).
+- `scripts/voice_to_agent.py` — SAFE transcript → delivered to agent (tmux send-keys or FIFO) + echoed;
+  GATED → NOT delivered, parked in `bridge/pending/<task>.voice`, echoed back to phone via notify,
+  awaits confirmation through the normal approval path. Voice = input method, never an auto-executor.
+- TEST: espeak-ng samples. SAFE "edit the source file and run the tests" → transcribed → landed in
+  agent pane stdin. RISKY "deploy to production right now" → transcribed → GATED(deploy) → NOT delivered
+  (stdin unchanged) → parked + phone echo. **PASS.**
+- Reproduce: `.venv/bin/python scripts/voice_to_agent.py samples/safe.wav --tmux <target>`.
+
+### Original take-stock items now resolved
+- swami granted **full** passwordless sudo (`/etc/sudoers.d/swami-nopasswd`, NOPASSWD:ALL).
+  ⚠️ broad — consider narrowing back to the scoped docker file after setup.
+- Tailscale **1.98.4** (apt). No systemd, so `tailscaled` started MANUALLY & detached:
+  `sudo sh -c 'setsid tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 </dev/null &'`
+  After a WSL boot, re-run that line, then `sudo tailscale up`, then `tailscale serve --bg --https=443 http://127.0.0.1:8080`.
 
 - swami granted **full** passwordless sudo (`/etc/sudoers.d/swami-nopasswd`, NOPASSWD:ALL).
   ⚠️ broad — consider narrowing back to the scoped docker file after setup.
 - Tailscale **1.98.4** installed (apt). No systemd here, so `tailscaled` started MANUALLY & detached:
   `sudo sh -c 'setsid tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 </dev/null &'`
   (kernel mode; /dev/net/tun present). To restart after WSL boot: same line + `sudo tailscale up`.
-- `tailscale up --operator=swami --hostname=nyaan` running in bg; auth URL issued to swami.
-  `--operator=swami` lets me run `tailscale` CLI without sudo once authenticated.
-- PENDING swami: approve node in browser; install Tailscale + ntfy on phone.
-- NEXT (me, after auth): `tailscale ip -4` → rebind ntfy to loopback+tailscale IP → real phone buzz.
-- Voice-in (faster-whisper small.en + tmux/FIFO): NOT STARTED.
+## Running services (all localhost / tailnet only)
+| Service | Container | Bind | Start | Stop |
+|---|---|---|---|---|
+| ntfy | agentos-ntfy | 127.0.0.1:8080 (tailnet via `tailscale serve` 443) | `cd ~/projects/agent-os/ntfy && docker compose up -d` | `docker compose down` |
+| Postgres+pgvector | agentos-postgres | 127.0.0.1:5433 | `cd ~/projects/agent-os/postgres && docker compose up -d` | `docker compose down` |
+| NATS+JetStream | agentos-nats | 127.0.0.1:4222 + 8222 | `cd ~/projects/agent-os/nats && docker compose up -d` | `docker compose down` |
+| reply listener | (host process) | — | `scripts/bridge.sh start` | `scripts/bridge.sh stop` |
+| tailscaled | (host daemon) | tailnet | see Step 5 boot note | `sudo tailscale down` |
 
-## Step 5 (old marker) — pending
+After a WSL reboot: `sudo service docker start`; restart tailscaled (Step 5 note) + `tailscale serve`;
+`docker compose up -d` in each of ntfy/ postgres/ nats/; `scripts/bridge.sh start`.
 
----
-
-## What I need from you (open)
-1. **Docker**: it is not installed in this WSL. See ⏸ block in chat. Needed before Steps 2–4.
-2. (Step 2) a hard-to-guess ntfy topic name + confirm phone app installed/subscribed.
+## What I need from you (open / optional)
+1. (optional, security) Narrow sudo back from NOPASSWD:ALL to the scoped `/etc/sudoers.d/swami-docker`.
+2. (future) Multi-tenant NATS accounts; durable systemd-style autostart for tailscaled (no systemd in this WSL).

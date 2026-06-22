@@ -9,7 +9,11 @@ ntfy/lib/
 # Bridge runtime (captured replies / logs may contain task data)
 bridge/inbox/
 bridge/rejected/
+bridge/pending/
 bridge/*.log
+
+# Voice test artifacts
+samples/*.wav
 
 # Python
 __pycache__/

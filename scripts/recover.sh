@@ -54,6 +54,16 @@ fi
 
 ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/api.py serve 8090" >/tmp/api.log 2>&1 </dev/null & ) ; ok "API on 127.0.0.1:8090"
 
+hdr "4c. Scheduler ticker (drives recurring jobs incl. daily encrypted snapshot)"
+if [ -f /tmp/agentos-ticker.pid ] && kill -0 "$(cat /tmp/agentos-ticker.pid 2>/dev/null)" 2>/dev/null; then
+  ok "ticker already running (pid $(cat /tmp/agentos-ticker.pid))"
+else
+  ( setsid bash "$ROOT/scripts/ticker.sh" >/dev/null 2>&1 </dev/null & )
+  sleep 2
+  [ -f /tmp/agentos-ticker.pid ] && kill -0 "$(cat /tmp/agentos-ticker.pid 2>/dev/null)" 2>/dev/null \
+    && ok "ticker started (every 15 min)" || warn "ticker failed"
+fi
+
 hdr "5. Health checks"
 curl -s --max-time 5 http://127.0.0.1:8080/v1/health 2>/dev/null | grep -q healthy && ok "ntfy healthy (local)" || warn "ntfy not healthy"
 DK "docker exec agentos-postgres pg_isready -U agentos -d agentos" >/dev/null 2>&1 && ok "postgres ready" || warn "postgres not ready"

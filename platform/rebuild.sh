@@ -36,6 +36,10 @@ if [ ! -f "$ROOT/.env.local" ]; then
   warn ".env.local created — review NTFY_TOPIC / AOS_API_TOKEN before going live"
 else ok ".env.local present (kept)"; fi
 [ -f "$ROOT/ntfy/.env" ] || cp "$ROOT/ntfy/.env.example" "$ROOT/ntfy/.env" 2>/dev/null || true
+if ! grep -q '^AOSNAP_PASS=' "$ROOT/.env.local" 2>/dev/null; then
+  printf '\n# Encrypted-snapshot passphrase (STORE A COPY OFFLINE for disaster recovery)\nAOSNAP_PASS=%s\n' "$(openssl rand -hex 24)" >> "$ROOT/.env.local"
+  warn "generated AOSNAP_PASS in .env.local — save a copy offline (without it, snapshots are unrecoverable)"
+fi
 
 say "2. Python venv + deps"
 [ -x "$ROOT/.venv/bin/python" ] || python3 -m venv "$ROOT/.venv" 2>/dev/null || warn "venv failed (sudo apt-get install python3-venv)"
@@ -58,6 +62,8 @@ say "5. Seed the org (skills + roles)"
 "$ROOT/.venv/bin/python" "$ROOT/scripts/skills.py" seed >/dev/null 2>&1 && ok "skills seeded" || warn "skills seed failed"
 [ -d "$CP" ] && python3 "$CP/scripts/generate_org.py" >/dev/null 2>&1 && ok "roles generated" || warn "control-plane not present (clone it for roles)"
 [ -d "$CP" ] && python3 "$CP/scripts/validate_manifests.py" >/dev/null 2>&1 && ok "manifests valid" || true
+"$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register snapshot-backup 86400 \
+  '.venv/bin/python platform/snapshot.py export' >/dev/null 2>&1 && ok "daily encrypted snapshot job registered" || warn "snapshot job registration failed"
 
 say "6. Prove the box (full self-test)"
 if bash "$ROOT/scripts/selftest.sh" >/tmp/rebuild-selftest.log 2>&1; then
@@ -66,4 +72,5 @@ else
   warn "self-test had failures — see /tmp/rebuild-selftest.log"; tail -3 /tmp/rebuild-selftest.log
 fi
 
-printf '\n\033[1mrebuild.sh done.\033[0m Stack is up + proven. For phone/Tailscale reach run scripts/recover.sh.\n'
+printf '\n\033[1mrebuild.sh done.\033[0m Stack is up + proven. Run scripts/recover.sh for phone/Tailscale reach\n'
+printf 'and to start the scheduler ticker (drives the daily encrypted snapshot in platform/snapshot.py).\n'

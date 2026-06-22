@@ -44,10 +44,26 @@ def _key(passphrase: bytes, salt: bytes) -> bytes:
 
 
 def _passphrase() -> bytes:
+    # 1) env var (interactive use); 2) AOSNAP_PASS= in gitignored .env.local (unattended/scheduled).
     p = os.environ.get("AOSNAP_PASS")
+    if not p and ENV.exists():
+        for l in ENV.read_text().splitlines():
+            if l.strip().startswith("AOSNAP_PASS="):
+                p = l.split("=", 1)[1].strip().strip('"').strip("'")
+                break
     if not p:
-        sys.exit("set AOSNAP_PASS in the environment (the snapshot passphrase) — never on the CLI")
+        sys.exit("no passphrase — set AOSNAP_PASS env var or AOSNAP_PASS= in .env.local")
     return p.encode()
+
+
+KEEP = 14  # retain the most recent N snapshots locally; older ones are pruned each export
+
+
+def _prune(keep=KEEP):
+    snaps = sorted((ROOT / "backups").glob("agent-os-*.aosnap"))
+    for old in snaps[:-keep] if len(snaps) > keep else []:
+        old.unlink(missing_ok=True)
+        print(f"   pruned old snapshot {old.name}")
 
 
 def _db_password() -> str:
@@ -111,6 +127,7 @@ def export_snapshot():
     out.parent.mkdir(exist_ok=True)
     out.write_bytes(MAGIC + salt + token)
     shutil.rmtree(stage, ignore_errors=True)
+    _prune()
     mb = out.stat().st_size / 1e6
     print(f"✅ snapshot -> {out} ({mb:.1f} MB, encrypted)")
     print(f"   git: agent-os@{manifest['git']['agent-os'][:10]} control-plane@{manifest['git']['control-plane'][:10]}")

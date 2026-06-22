@@ -87,13 +87,23 @@ components:
 
   - name: api
     kind: process
-    role: "Token-auth HTTP API + dashboard (127.0.0.1:8090)."
+    role: "Token-auth machine HTTP API (127.0.0.1:8090)."
     local: "host python process (scripts/api.py)"
     config_keys: [AOS_API_TOKEN]
     in_snapshot: false
     cloud_target: "container behind an ALB / API gateway + auth"
     migrate: "containerize; put behind gateway."
     order: 7
+
+  - name: dashboard
+    kind: process
+    role: "Mission-control human UI: live fleet, agent comms graph, message queue+latency, health/alerts, two-way messaging."
+    local: "host python process (scripts/dashboard.py) @ 127.0.0.1:8092, Tailscale :9443"
+    config_keys: [AOS_API_TOKEN]
+    in_snapshot: false
+    cloud_target: "container behind an ALB / IdP auth; data follows DATABASE_URL"
+    migrate: "containerize; serve behind gateway. Reads the same Postgres + audit stream."
+    order: 8
 
   - name: bridge-listener
     kind: process

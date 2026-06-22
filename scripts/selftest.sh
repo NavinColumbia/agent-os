@@ -50,6 +50,7 @@ ck "portable encrypted snapshot"           "$PY platform/snapshot.py selftest | 
 ck "platform inventory covers stack"       "for s in postgres nats ntfy cerbos; do grep -q \"name: \$s\" platform/inventory.yaml || exit 1; done"
 ck "autonomous factory (governed line)"     "$PY scripts/factory.py selftest | grep -q PASS"
 ck "fleet visibility view"                  "$PY scripts/fleet.py status | grep -q 'agent-os fleet'"
+ck "dashboard state (real data)"            "$PY scripts/dashboard.py state | grep -q '\"overall\"'"
 
 echo "=== integration: standing Controller ==="
 ck "controller full lifecycle -> LAUNCHED"  "rm -rf ~/projects/products/st-demo; dbexec \"DELETE FROM dbos.workflow_status\" >/dev/null 2>&1 || true; sg docker -c \"docker exec -e PGPASSWORD=$PW agentos-postgres psql -U agentos -d agentos_dbos_sys -c \\\"DELETE FROM dbos.workflow_status WHERE workflow_uuid='prod-st-demo'\\\"\" >/dev/null 2>&1; $PY scripts/controller.py run st-demo | grep -q LAUNCHED"

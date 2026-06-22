@@ -54,6 +54,15 @@ fi
 
 ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/api.py serve 8090" >/tmp/api.log 2>&1 </dev/null & ) ; ok "API on 127.0.0.1:8090"
 
+hdr "4d. Mission-control dashboard (127.0.0.1:8092)"
+if pgrep -f "dashboard.py serve" >/dev/null; then ok "dashboard already running"
+else
+  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/dashboard.py serve 8092" >/tmp/dashboard.log 2>&1 </dev/null & )
+  sleep 1; pgrep -f "dashboard.py serve" >/dev/null && ok "dashboard started" || warn "dashboard failed"
+fi
+tailscale serve status 2>/dev/null | grep -q 9443 || tailscale serve --bg --https=9443 http://127.0.0.1:8092 >/dev/null 2>&1
+ok "dashboard private over Tailscale: https://nyaan.tail502e3f.ts.net:9443"
+
 hdr "4c. Scheduler ticker (drives recurring jobs incl. daily encrypted snapshot)"
 if [ -f /tmp/agentos-ticker.pid ] && kill -0 "$(cat /tmp/agentos-ticker.pid 2>/dev/null)" 2>/dev/null; then
   ok "ticker already running (pid $(cat /tmp/agentos-ticker.pid))"

@@ -4,7 +4,7 @@ services:
     container_name: agentos-ntfy
     command: serve
     environment:
-      - NTFY_BASE_URL=http://localhost:8080
+      - NTFY_BASE_URL=https://nyaan.tail502e3f.ts.net
       - NTFY_LISTEN_HTTP=:80
       - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
       - NTFY_CACHE_DURATION=48h
@@ -16,7 +16,8 @@ services:
     volumes:
       - ./cache:/var/cache/ntfy
       - ./lib:/var/lib/ntfy
-    # CRITICAL: bind to loopback ONLY — never 0.0.0.0.
+    # CRITICAL: loopback ONLY — never 0.0.0.0. Tailnet reaches it via `tailscale serve`
+    # (HTTPS 443 -> 127.0.0.1:8080), so no direct external port binding is needed.
     ports:
       - "127.0.0.1:8080:80"
     restart: unless-stopped

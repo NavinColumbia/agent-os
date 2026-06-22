@@ -52,12 +52,35 @@ def safe_task_name(name):
 
 
 def parse_task_and_body(title, message):
+    """Resolve (task, command) from a phone reply.
+
+    Accepts, in priority order:
+      1) ntfy Title field = task name, message = command.
+      2) body starting with 'task: NAME' on line 1, command on the rest.
+      3) labeled body 'Title: NAME\\nMessage: CMD' (what's easy to type in the app).
+    Falls back to task 'default' with the whole body as the command.
+    """
     body = (message or "").strip()
-    task = title or ""
+    task = (title or "").strip()
+
     if body.lower().startswith("task:"):
         first, _, rest = body.partition("\n")
-        task = first.split(":", 1)[1].strip()
-        body = rest.strip()
+        return safe_task_name(first.split(":", 1)[1]), rest.strip()
+
+    # labeled "Title:/Message:" form
+    lines = body.splitlines()
+    labeled_task, labeled_cmd, used = "", [], False
+    for ln in lines:
+        low = ln.lower()
+        if low.startswith("title:") and not labeled_task:
+            labeled_task = ln.split(":", 1)[1].strip(); used = True
+        elif low.startswith("message:") or low.startswith("msg:") or low.startswith("cmd:"):
+            labeled_cmd.append(ln.split(":", 1)[1].strip()); used = True
+        elif used:
+            labeled_cmd.append(ln)
+    if used and (labeled_task or labeled_cmd):
+        return safe_task_name(labeled_task or task), "\n".join(labeled_cmd).strip()
+
     return safe_task_name(task), body
 
 

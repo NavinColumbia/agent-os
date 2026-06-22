@@ -60,13 +60,16 @@ def main():
     if sec:
         sys.exit(f"REFUSED: message looks like a secret ({why}); not sending over the bridge.")
 
-    url = f"{cfg['NTFY_BASE_URL'].rstrip('/')}/{topic}"
-    headers = {"Title": args.title, "Priority": args.priority}
+    # Publish via JSON API: UTF-8 body, so emoji/unicode in title/message are safe
+    # (HTTP headers are latin-1-only and would crash on emoji).
+    prio = {"min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5}[args.priority]
+    payload = {"topic": topic, "message": args.message, "title": args.title, "priority": prio}
     if args.tags:
-        headers["Tags"] = args.tags
-    r = requests.post(url, data=args.message.encode(), headers=headers, timeout=10)
+        payload["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+    base = cfg["NTFY_BASE_URL"].rstrip("/")
+    r = requests.post(base, json=payload, timeout=10)
     r.raise_for_status()
-    print(f"sent -> {url}  (priority={args.priority})")
+    print(f"sent -> {base}/{topic}  (priority={args.priority})")
 
 
 if __name__ == "__main__":

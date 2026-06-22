@@ -61,7 +61,14 @@ Status: ✅ DONE & PROVEN (2026-06-21)
 - Re-run anytime: `bash ~/projects/agent-os/scripts/constraint_smoke_test.sh`
 
 ## Step 2 — Phone notifications (ntfy)
-Status: 🟡 mechanism PROVEN locally; real phone buzz pending (needs your topic + reachability)
+Status: ✅ DONE & PROVEN END-TO-END (2026-06-21)
+- Real phone (navinashoks-s24) buzzed on urgent notify; reply captured to `bridge/inbox/deploy-fix.cmd`
+  (`restart the worker`); secret reply (anthropic key) REFUSED → `bridge/rejected/`. 
+- Phone subscribes via HTTPS: server `https://nyaan.tail502e3f.ts.net`, topics
+  `swami-agentos-f20c58aa777c` (+ `-reply`). Tailscale Serve terminates TLS; ntfy stays localhost-only.
+- notify.py uses ntfy JSON API (UTF-8; emoji-safe). Parser accepts ntfy Title, `task:` prefix,
+  or `Title:/Message:` labeled body.
+- Manage listener: `scripts/bridge.sh start|stop|status`. Send: `python3 scripts/notify.py "msg"`.
 
 Built:
 - `ntfy/docker-compose.yml` — `binwiederhier/ntfy`, container `agentos-ntfy`, bound **127.0.0.1:8080 only**
@@ -81,13 +88,40 @@ Local proof (no phone needed) — PASSED:
 "phone buzzed" test needs a network path (Tailscale, Step 5) or rebinding ntfy to the
 Tailscale interface. Raised to swami as ⏸.
 
-Pending from swami: hard-to-guess topic name; phone app install + subscription; decision on
-reachability (bring Tailscale forward vs. accept local proof for now).
+Reachability RESOLVED via Tailscale (Step 5 brought forward):
+- ntfy rebound to listen on `127.0.0.1:8080` + `100.93.201.41:8080` (Tailscale IP) — never 0.0.0.0.
+  Verified port map + `ss`. Health green on both. NTFY_BASE_URL=http://100.93.201.41:8080.
+- Topic: `swami-agentos-f20c58aa777c`  (replies on `…-reply`).
+- Reply listener runs persistently; manage with `scripts/bridge.sh start|stop|status`.
+- Phone (navinashoks-s24, 100.98.116.33) must: add server http://100.93.201.41:8080 in ntfy app,
+  subscribe to topic + `-reply`. Tailscale must be ON on phone.
+- PENDING swami: subscribe on phone, then I send the real buzz + capture a real reply.
+
+Update: phone ntfy app forced HTTPS → "unable to parse TLS packet header" against plain-HTTP ntfy.
+Fix: front ntfy with Tailscale Serve HTTPS at `https://nyaan.tail502e3f.ts.net` (TLS terminated by
+Tailscale, ntfy stays localhost-bound). Serve needs one-time tailnet enable:
+`https://login.tailscale.com/f/serve?node=nw2JQkE9aP11CNTRL` → PENDING swami "enabled".
+After enable: `tailscale serve --bg --https=443 http://127.0.0.1:8080`; phone server becomes
+`https://nyaan.tail502e3f.ts.net` (same topics). MagicDNS name: nyaan.tail502e3f.ts.net.
 
 ## Step 2 (old marker) — BLOCKED on Docker + topic name
 ## Step 3 — Durable memory (Postgres+pgvector) — BLOCKED on Docker
 ## Step 4 — Message bus (NATS+JetStream) — BLOCKED on Docker
-## Step 5 — Reach (Tailscale) + voice (faster-whisper) — pending
+## Step 5 — Reach (Tailscale) + voice (faster-whisper)
+Status: 🟡 IN PROGRESS (brought forward to unblock Step 2 phone test)
+
+- swami granted **full** passwordless sudo (`/etc/sudoers.d/swami-nopasswd`, NOPASSWD:ALL).
+  ⚠️ broad — consider narrowing back to the scoped docker file after setup.
+- Tailscale **1.98.4** installed (apt). No systemd here, so `tailscaled` started MANUALLY & detached:
+  `sudo sh -c 'setsid tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 </dev/null &'`
+  (kernel mode; /dev/net/tun present). To restart after WSL boot: same line + `sudo tailscale up`.
+- `tailscale up --operator=swami --hostname=nyaan` running in bg; auth URL issued to swami.
+  `--operator=swami` lets me run `tailscale` CLI without sudo once authenticated.
+- PENDING swami: approve node in browser; install Tailscale + ntfy on phone.
+- NEXT (me, after auth): `tailscale ip -4` → rebind ntfy to loopback+tailscale IP → real phone buzz.
+- Voice-in (faster-whisper small.en + tmux/FIFO): NOT STARTED.
+
+## Step 5 (old marker) — pending
 
 ---
 

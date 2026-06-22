@@ -16,6 +16,13 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ Multi-tenancy (`tenancy.py`): per-customer isolation (token→tenant, product ownership) — SaaS boundary.
 - ✅ Full backup/restore (`backup.sh`) + status dashboard. See CAPABILITIES.md for the full index.
 
+## CREATIVE / PROFESSIONAL ORG layer (proactive) ✅
+- ✅ Skills/capability registry (`skills.py`, `13-skills.sql`): 28 skills × 14 categories, roles know their tools + readiness (ready/needs_key/needs_setup).
+- ✅ Media tools installed+proven: AI voiceover (piper), video editing/demo-production (ffmpeg — generated a narrated demo video), image edit/recolor (ImageMagick), transcription (faster-whisper).
+- ✅ Mobile: iOS + Android E2E live (sims/emulator on Mac).
+- ✅ Professional/creative ROLES added (29 total): video-producer, voiceover-engineer, creative-artist, game-developer, legal-compliance-regional, tax-advisor, visa-travel-advisor, marketing-growth.
+- needs_key/setup (declared, not paid for): 3D (Blender), game engine (Godot), anime/manga + music gen (image/audio models), GPU recommenders.
+
 ## SCALE + OPS layer (proactive) ✅
 - ✅ HTTP API (`api.py`): token-auth service surface (health/status/metrics/scaffold/run), localhost-bound, in recover.sh. The SaaS entry point.
 - ✅ Distributed dispatch (`dispatch.py`): tasks over NATS work-queue → decoupled workers (separate processes/machines), audited.

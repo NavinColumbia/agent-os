@@ -45,6 +45,7 @@ ck "feature flags + rollout"               "$PY scripts/flags.py test | grep -q 
 ck "health monitor + alerting"             "$PY scripts/monitor.py test | grep -q PASS"
 ck "HTTP API (health+auth)"                 "curl -s http://127.0.0.1:8090/health | grep -q agent-os && [ $(curl -s -o /dev/null -w %{http_code} http://127.0.0.1:8090/status) = 401 ]"
 ck "multi-tenant isolation"                 "$PY scripts/tenancy.py test | grep -q PASS"
+ck "skills/capability registry"            "$PY scripts/skills.py test | grep -q PASS"
 
 echo "=== integration: standing Controller ==="
 ck "controller full lifecycle -> LAUNCHED"  "rm -rf ~/projects/products/st-demo; dbexec \"DELETE FROM dbos.workflow_status\" >/dev/null 2>&1 || true; sg docker -c \"docker exec -e PGPASSWORD=$PW agentos-postgres psql -U agentos -d agentos_dbos_sys -c \\\"DELETE FROM dbos.workflow_status WHERE workflow_uuid='prod-st-demo'\\\"\" >/dev/null 2>&1; $PY scripts/controller.py run st-demo | grep -q LAUNCHED"

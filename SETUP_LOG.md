@@ -117,7 +117,23 @@ Status: ✅ DONE & PROVEN (2026-06-22)
 - TEST `scripts/crash_recovery_test.sh`: save → `kill -9` worker → restore from fresh process →
   **PASS: exact state survived**. Re-run anytime.
 - Stop DB: `cd ~/projects/agent-os/postgres && docker compose down` (data persists in `pgdata/`).
-## Step 4 — Message bus (NATS+JetStream) — BLOCKED on Docker
+## Step 4 — Message bus (NATS + JetStream)
+Status: ✅ DONE & PROVEN (2026-06-22)
+- `nats/docker-compose.yml` — `nats:2.10-alpine`, container `agentos-nats`, JetStream on (`-js -sd /data`).
+  Bound **127.0.0.1:4222** (client) + **127.0.0.1:8222** (monitoring) only. Cluster port 6222 exposed but
+  NOT published to host. Health: `curl 127.0.0.1:8222/healthz` → `{"status":"ok"}`.
+- Stream `WORK` = **WorkQueuePolicy** over subject `work.tasks` (each task to exactly one worker, removed on ack).
+- `scripts/nats_roundtrip_test.py`: controller publishes task → JetStream → durable pull consumer
+  `workers` fetches+acks → replies on `work.reply.<id>` → controller receives.
+  **PASS: round-trip, result=42.** Run: `.venv/bin/python scripts/nats_roundtrip_test.py`.
+- Stop bus: `cd ~/projects/agent-os/nats && docker compose down` (JetStream data persists in `nats/data/`).
+
+### Multi-tenant later (NOT built now — by design)
+NATS **accounts** are the isolation primitive: one account per product/tenant makes each tenant's
+subjects + streams invisible to the others, enforced server-side. To enable: add a server config
+(`server.conf` with an `accounts {}` block, or operator/account JWTs) and give each tenant its own
+creds; mount it via the compose `command`/volume. v1 runs a single implicit account. A stub note is
+in `nats/docker-compose.yml`.
 ## Step 5 — Reach (Tailscale) + voice (faster-whisper)
 Status: 🟡 IN PROGRESS (brought forward to unblock Step 2 phone test)
 

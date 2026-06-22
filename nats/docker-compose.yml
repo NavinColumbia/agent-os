@@ -1,0 +1,17 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: agentos-nats
+    # -js: enable JetStream; -sd: durable store dir; -m: monitoring (health) port.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - ./data:/data
+    # localhost ONLY — client 4222, monitoring 8222. Never 0.0.0.0.
+    # NOTE (multi-tenant later): add a NATS accounts config here (operator/accounts JWT or
+    # a server.conf with `accounts {}`) to isolate each tenant's subjects/streams. One account
+    # per product/tenant => their work-queues + subjects are invisible to others, enforced by
+    # the server. We deliberately do NOT build that now — single implicit account for v1.
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    restart: unless-stopped

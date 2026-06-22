@@ -46,6 +46,7 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ Upward-feedback CR re-flow (`scripts/cr_reflow.py`): filed→decided→re-flowed→closed, metered+audited (proven).
 - ✅ Human-approval durable gate (`scripts/approval_gate.py`): suspend+phone-notify→resume on decision (proven).
 - ✅ Native Apache AGE: custom pgvector+AGE PG16 image built & PROVEN (openCypher + vector in one DB, `postgres/Dockerfile.age`, `AGE-MIGRATION.md`). Live-cluster swap is an ops step (documented).
+- ✅ Visual/behavioral QA harness (ADR 0003): live multi-viewport screenshots + axe a11y + E2E, proven on NoUpload (`products/noupload/tests/qa_harness.mjs`). Vision-critique demonstrated (agent reads screenshots, critiques spacing).
 - Deferred-by-design: prod hook→Cerbos cutover (inline rails + audit already live; PDP proven standalone — defense-in-depth); more live test apps (skipped to avoid token burn).
 
 **R&D COMPLETE.** Build + product + IP all done; remaining items are CEO actions (see CEO-TODO.md) + ops choices.

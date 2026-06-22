@@ -21,11 +21,11 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ Cerbos PDP (Docker, localhost) + policy mirroring builder.yaml; prove allow/deny via PDP.
 - ✅ Wire audit.append into the enforcement decision path.
 
-## P4 — Memory / Observability / Eval  ☐
-- ☐ Apache AGE graph extension in Postgres (or note blocker); prove a graph query alongside pgvector.
-- ☐ Reflection/consolidation job stub (episodic→semantic).
-- ☐ Eval harness: Inspect AI installed + a tiny agent eval that runs.
-- ☐ OTel-GenAI tracing (OpenLLMetry→Phoenix) — best-effort/local.
+## P4 — Memory / Observability / Eval  ✅ DONE
+- ✅ Graph memory over Postgres (edges table + recursive CTE); native AGE deferred (needs custom image+migration). Proven.
+- ✅ Reflection/consolidation job stub (episodic→semantic).
+- ✅ Eval harness: Inspect AI installed + a tiny agent eval that runs.
+- ✅ OTel-GenAI tracing (OpenLLMetry→Phoenix) — best-effort/local.
 
 ## P5 — Org maturity  ☐
 - ☐ `gate_check.py`: block stage advance without required artifacts (no BUILD w/o approved SPEC+ADR; no LAUNCH w/o QA report).

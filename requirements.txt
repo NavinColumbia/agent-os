@@ -5,3 +5,6 @@ nats-py
 faster-whisper
 dbos
 cryptography
+inspect-ai
+opentelemetry-sdk
+opentelemetry-api

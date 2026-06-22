@@ -39,6 +39,18 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path); path = u.path
+        if path == "/":
+            import monitor
+            h = monitor.check()
+            rows = "".join(f"<tr><td>{k}</td><td>{'🟢 up' if v else '🔴 down'}</td></tr>" for k, v in h.items())
+            html = (f"<!doctype html><meta charset=utf-8><title>agent-os</title>"
+                    f"<style>body{{font-family:system-ui;background:#0f1115;color:#e6e8ec;max-width:680px;margin:3rem auto}}"
+                    f"h1{{color:#4cc2a3}}table{{border-collapse:collapse;width:100%}}td{{border:1px solid #283041;padding:.5rem}}</style>"
+                    f"<h1>agent-os</h1><p>Private, governed operating system for AI agents.</p>"
+                    f"<h3>Services</h3><table>{rows}</table>"
+                    f"<p style='color:#9aa3b2'>API: token-auth at /status /metrics, POST /products/&lt;name&gt;, /run/&lt;name&gt;</p>")
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            return self.wfile.write(html.encode())
         if path == "/health":
             return self._send(200, {"ok": True, "service": "agent-os"})
         if not self._authed():

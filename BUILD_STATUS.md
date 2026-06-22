@@ -13,6 +13,14 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ BYO-agent provider layer (`scripts/providers.py`): Claude full-agent + any OpenAI-compatible (DeepSeek/OpenAI/Together/Ollama/Groq), uniformly governed. Routing proven.
 - ☐ Whitepaper, patent guide, CR re-flow, human-approval ask-await, test apps.
 
+## ENTERPRISE / ANY-PRODUCT layer (proactive) ✅
+- ✅ Scoped secrets vault (`vault.py`,`07-vault.sql`): encrypted, scoped by product+env+role; test/QA gets test secrets, prod never leaks to test; audited. (Answers iOS/QA secret-sharing.)
+- ✅ Enterprise roles added (control-plane): data-scientist, ml-engineer, data-engineer, analyst (21 manifests valid).
+- ✅ Governed data connectors (`connectors.py`): live web/API/SNS ingestion via egress allowlist → object store, audited.
+- ✅ Object store (`objstore.py`): images/objects shared by sha256 ref, dedup, TTL+GC.
+- ✅ Retention sweeps (`retention.py`): expire blobs/conversations/secrets/waits (audit kept permanent).
+- ✅ Cloud-migratability documented (`docs/CLOUD-MIGRATION.md`): every store/bus config-driven → RDS/S3/managed-NATS/KMS, no rewrite.
+
 ## P0 — Safety  ✅ DONE
 - ✅ Sandbox `srt` (bubblewrap+seccomp+Landlock+egress proxy) — proven: blocks egress + read-only FS.
 - ✅ Tamper-evident audit log (`scripts/audit.py`, `postgres/initdb/02-audit.sql`) — proven: detects deny→allow tamper.

@@ -14,6 +14,7 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ☐ Whitepaper, patent guide, CR re-flow, human-approval ask-await, test apps.
 
 ## SCALE + OPS layer (proactive) ✅
+- ✅ HTTP API (`api.py`): token-auth service surface (health/status/metrics/scaffold/run), localhost-bound, in recover.sh. The SaaS entry point.
 - ✅ Distributed dispatch (`dispatch.py`): tasks over NATS work-queue → decoupled workers (separate processes/machines), audited.
 - ✅ Budget governor (`budget.py`): per-product token caps, over-budget denied + audited.
 - ✅ Feature flags + gradual rollout (`flags.py`): deterministic bucketing for safe launches/A-B.

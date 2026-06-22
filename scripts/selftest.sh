@@ -43,6 +43,7 @@ ck "distributed dispatch (NATS workers)"     "$PY scripts/dispatch.py demo | gre
 ck "budget governor (token caps)"          "$PY scripts/budget.py test | grep -q PASS"
 ck "feature flags + rollout"               "$PY scripts/flags.py test | grep -q PASS"
 ck "health monitor + alerting"             "$PY scripts/monitor.py test | grep -q PASS"
+ck "HTTP API (health+auth)"                 "curl -s http://127.0.0.1:8090/health | grep -q agent-os && [ $(curl -s -o /dev/null -w %{http_code} http://127.0.0.1:8090/status) = 401 ]"
 
 echo "=== integration: standing Controller ==="
 ck "controller full lifecycle -> LAUNCHED"  "rm -rf ~/projects/products/st-demo; dbexec \"DELETE FROM dbos.workflow_status\" >/dev/null 2>&1 || true; sg docker -c \"docker exec -e PGPASSWORD=$PW agentos-postgres psql -U agentos -d agentos_dbos_sys -c \\\"DELETE FROM dbos.workflow_status WHERE workflow_uuid='prod-st-demo'\\\"\" >/dev/null 2>&1; $PY scripts/controller.py run st-demo | grep -q LAUNCHED"

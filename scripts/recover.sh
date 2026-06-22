@@ -52,6 +52,8 @@ else
   warn "noupload dist/ not built (run: cd ~/projects/products/noupload && npm run build)"
 fi
 
+( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/api.py serve 8090" >/tmp/api.log 2>&1 </dev/null & ) ; ok "API on 127.0.0.1:8090"
+
 hdr "5. Health checks"
 curl -s --max-time 5 http://127.0.0.1:8080/v1/health 2>/dev/null | grep -q healthy && ok "ntfy healthy (local)" || warn "ntfy not healthy"
 DK "docker exec agentos-postgres pg_isready -U agentos -d agentos" >/dev/null 2>&1 && ok "postgres ready" || warn "postgres not ready"

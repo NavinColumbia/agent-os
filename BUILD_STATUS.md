@@ -70,7 +70,7 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ Native Apache AGE: custom pgvector+AGE PG16 image built & PROVEN (openCypher + vector in one DB, `postgres/Dockerfile.age`, `AGE-MIGRATION.md`). Live-cluster swap is an ops step (documented).
 - ✅ Visual/behavioral QA harness (ADR 0003): live multi-viewport screenshots + axe a11y (0 violations) + E2E (2/2), proven on NoUpload (`products/noupload/tests/qa_harness.mjs`). Vision-critique demonstrated (agent reads screenshots, critiques spacing).
 - ✅ DESIGN-AS-CODE (ADR 0003): DTCG tokens → Style Dictionary → CSS vars, app derives from tokens (in products/noupload/design/). Agent-editable, machine-readable. Penpot remains the optional visual layer.
-- ✅ Mac runner INTEGRATED (`mac_runner.py`): WSL↔Mac over Tailscale SSH proven (Xcode 26.5, simctl live, remote exec works). iOS simulator E2E pending the iOS 26.5 runtime download finishing on the Mac.
+- ✅ Mac runner INTEGRATED (`mac_runner.py`): WSL↔Mac over Tailscale SSH proven (Xcode 26.5, simctl live, remote exec works). iOS simulator E2E LIVE ✅ (booted iPhone 17 Pro on the Mac, screenshotted home screen, pulled to WSL, stored in object store — proven). Android: SDK+adb+build-tools on WSL (builds APKs); emulator runs on Mac/device via `adb connect` (`android_runner.py`).
 - Deferred-by-design: prod hook→Cerbos cutover (inline rails + audit already live; PDP proven standalone — defense-in-depth); more live test apps (skipped to avoid token burn).
 
 **R&D COMPLETE.** Build + product + IP all done; remaining items are CEO actions (see CEO-TODO.md) + ops choices.

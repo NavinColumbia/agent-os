@@ -10,11 +10,11 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 ## P1 — Durable-execution backbone (DBOS)  ✅ DONE
 - ✅ DBOS 2.24 on Postgres; crash-resume proven (`scripts/dbos_durable_demo.py`): killed mid-run, resumed exact step, exactly-once.
 
-## P2 — Communication fabric  ☐
-- ☐ Typed message envelope + 12-intent vocabulary (`scripts/messaging.py`).
-- ☐ `conversations` + `waits` tables (`postgres/initdb/03-comms.sql`).
-- ☐ Ask-await on DBOS (`scripts/commfabric.py`): suspend-until-reply, resume on send; prove round-trip + crash-survival.
-- ☐ Deadlock detector (`scripts/deadlock.py`): wait-for graph + Tarjan SCC; prove A↔B cycle detected + victim chosen.
+## P2 — Communication fabric  ✅ DONE
+- ✅ Typed message envelope + 12-intent vocabulary (`scripts/messaging.py`).
+- ✅ `conversations` + `waits` tables (`postgres/initdb/03-comms.sql`).
+- ✅ Ask-await on DBOS (`scripts/commfabric.py`): suspend-until-reply, resume on send; prove round-trip + crash-survival.
+- ✅ Deadlock detector (`scripts/deadlock.py`): wait-for graph + Tarjan SCC; prove A↔B cycle detected + victim chosen.
 
 ## P3 — Identity + PDP  ☐
 - ☐ Ed25519 signed-manifest identity (`scripts/identity.py`): sign/verify a role manifest; prove tamper rejected.

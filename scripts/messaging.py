@@ -44,6 +44,7 @@ class Message:
     reply_to: str | None = None      # NATS _INBOX or DBOS workflow_id
     reply_by: str | None = None      # ISO deadline — REQUIRED for acts expecting a reply
     priority: int = 5
+    attachments: list = field(default_factory=list)  # FileParts by reference: [{kind:file, blob_id, mime, size}]
 
     def __post_init__(self):
         self.intent = Intent(self.intent)

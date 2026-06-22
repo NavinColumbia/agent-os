@@ -1,0 +1,21 @@
+PROPRIETARY AND CONFIDENTIAL — ALL RIGHTS RESERVED
+
+Copyright (c) 2026 Navin (github.com/NavinColumbia). All rights reserved.
+[Insert full legal name + jurisdiction before any filing or external distribution.]
+
+This software, its architecture, designs, schemas, protocols, documents, and all
+associated materials (the "Work") are the confidential and proprietary intellectual
+property of the copyright holder. The Work is NOT open source.
+
+No license, express or implied, is granted to any person or entity to use, copy,
+modify, merge, publish, distribute, sublicense, sell, train models on, or create
+derivative works from the Work, in whole or in part, without the prior written
+permission of the copyright holder.
+
+The Work embeds cryptographic provenance (see PROVENANCE.json) and a unique build
+fingerprint (see NOTICE). Any copy or derivative carrying this fingerprint, or whose
+design hashes match the signed provenance manifest, is identifiable as derived from
+this Work. Unauthorized use constitutes infringement and misappropriation of trade secrets.
+
+Unauthorized use, reproduction, or distribution may result in civil and criminal penalties.
+For licensing inquiries, contact the copyright holder.

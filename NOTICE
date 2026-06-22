@@ -1,0 +1,13 @@
+agent-os — Proprietary AI Operating System
+Copyright (c) 2026 Navin (github.com/NavinColumbia). All rights reserved.
+
+Build fingerprint (watermark): see .watermark and PROVENANCE.json "build_fingerprint".
+This unique identifier is embedded as a provenance canary. Any copy or derivative work
+carrying this fingerprint — or whose source files match the SHA-256 entries in the signed
+PROVENANCE.json manifest — is identifiable as derived from this Work.
+
+Authorship is cryptographically attested: PROVENANCE.json contains an Ed25519 signature
+(by key 'agent-os-org', public key included) over the root hash of the full design+code
+manifest, timestamped and pinned to a git commit. To verify:  python scripts/provenance.py verify
+
+This is confidential, proprietary intellectual property. See LICENSE. Not open source.

@@ -30,7 +30,7 @@ tailscale status >/dev/null 2>&1 && ok "tailnet up ($(tailscale ip -4 2>/dev/nul
 tailscale serve status 2>/dev/null | grep -q ts.net && ok "serve (HTTPS) active" || warn "serve not active — run: tailscale serve --bg --https=443 http://127.0.0.1:8080"
 
 hdr "3. Containers (restart:unless-stopped should auto-start; ensure anyway)"
-for stack in ntfy postgres nats; do
+for stack in ntfy postgres nats cerbos; do
   DK "cd $ROOT/$stack && docker compose up -d" >/dev/null 2>&1 && ok "$stack up" || warn "$stack failed"
 done
 

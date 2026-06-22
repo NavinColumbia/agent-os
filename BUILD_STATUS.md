@@ -13,6 +13,12 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ BYO-agent provider layer (`scripts/providers.py`): Claude full-agent + any OpenAI-compatible (DeepSeek/OpenAI/Together/Ollama/Groq), uniformly governed. Routing proven.
 - ☐ Whitepaper, patent guide, CR re-flow, human-approval ask-await, test apps.
 
+## SCALE + OPS layer (proactive) ✅
+- ✅ Distributed dispatch (`dispatch.py`): tasks over NATS work-queue → decoupled workers (separate processes/machines), audited.
+- ✅ Budget governor (`budget.py`): per-product token caps, over-budget denied + audited.
+- ✅ Feature flags + gradual rollout (`flags.py`): deterministic bucketing for safe launches/A-B.
+- ✅ Health monitor + alerting (`monitor.py`): checks all services, ntfy alert on failure (schedulable).
+
 ## ENTERPRISE / ANY-PRODUCT layer (proactive) ✅
 - ✅ Scoped secrets vault (`vault.py`,`07-vault.sql`): encrypted, scoped by product+env+role; test/QA gets test secrets, prod never leaks to test; audited. (Answers iOS/QA secret-sharing.)
 - ✅ Enterprise roles added (control-plane): data-scientist, ml-engineer, data-engineer, analyst (21 manifests valid).

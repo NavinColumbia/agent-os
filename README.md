@@ -35,6 +35,12 @@ proves Step 1, then prints the manual one-time steps (Docker/Tailscale/phone/gh)
 
 See [`SETUP_LOG.md`](SETUP_LOG.md) for the full build record, restart-after-reboot steps, and open items.
 
+## Recovery after a reboot
+Data is on disk and survives (Postgres/NATS volumes, Tailscale state, checkpoints, git). Only running
+services need restarting, and that's automatic:
+- **Auto** — `/etc/wsl.conf` `[boot] command` runs `agentos-boot.sh` on every WSL start. Install/reinstall: `bash scripts/install_autostart.sh`.
+- **Manual / on demand** — `bash scripts/recover.sh` (or just tell Claude "run recover.sh"). Idempotent, health-checks everything.
+
 ## Secrets
 `.env.local`, `postgres/.env`, `.venv/`, `*/pgdata`, `nats/data`, and all `bridge/` runtime are
 **gitignored**. Copy `.env.example` → `.env.local` and fill it in on a fresh host.

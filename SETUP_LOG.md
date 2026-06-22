@@ -165,6 +165,33 @@ VOICE-IN — done & proven:
 - Tailscale **1.98.4** installed (apt). No systemd here, so `tailscaled` started MANUALLY & detached:
   `sudo sh -c 'setsid tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 </dev/null &'`
   (kernel mode; /dev/net/tun present). To restart after WSL boot: same line + `sudo tailscale up`.
+## Reboot resilience & recovery (Windows restart / WSL shutdown)
+**Data is never lost on reboot** — it lives on disk: `postgres/pgdata` (47M cluster), `nats/data`
+(JetStream), `ntfy/cache`, `/var/lib/tailscale/tailscaled.state` (no re-auth needed), task state in
+the `task_checkpoints` table, and both git repos pushed to GitHub. A reboot only stops *running*
+services; nothing is erased.
+
+What a reboot stops + how it comes back:
+- Docker daemon (no systemd) → restarted by the boot hook. Containers have `restart:unless-stopped`
+  so they auto-start once the daemon is up.
+- `tailscaled` (manual daemon) → restarted by the boot hook; **auto-reconnects and resumes
+  `tailscale serve` from saved state** (no browser re-auth, no re-running serve).
+- Reply listener (host process) → restarted by the boot hook.
+
+Three layers of recovery:
+1. **Automatic on boot** — `/etc/wsl.conf` `[boot] command = /usr/local/sbin/agentos-boot.sh`
+   runs as root on every WSL start → docker + tailscaled + `recover.sh`. Tested via
+   `sudo /usr/local/sbin/agentos-boot.sh` (all green). Takes effect on next WSL start.
+   Reinstall/reproduce with `scripts/install_autostart.sh`.
+2. **One command** — `bash ~/projects/agent-os/scripts/recover.sh` (idempotent; brings the whole
+   stack back and health-checks each piece). Use this if you ever want to recover manually, or just
+   tell Claude "run recover.sh".
+3. **Total rebuild** — if the WSL distro is wiped: re-clone both repos and run `bash bootstrap.sh`
+   (data in old volumes is gone, but code/config/secrets-template are reproducible; DB/NATS start fresh).
+
+Scripts: `scripts/recover.sh`, `scripts/agentos-boot.sh` (installed to /usr/local/sbin),
+`scripts/install_autostart.sh`.
+
 ## Remote
 Private GitHub repo: **https://github.com/NavinColumbia/agent-os** (account NavinColumbia, SSH).
 Push updates with `git push`. Secrets (`.env.local`, `postgres/.env`) and all data/runtime dirs are

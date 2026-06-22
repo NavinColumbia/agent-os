@@ -5,10 +5,10 @@
 #   exit 2 => DENY, exit 0 => ALLOW.
 set -u
 
-CP="${CP:-/home/swami/projects/control-plane}"
+CP="${CP:-$HOME/projects/control-plane}"
 export CP_MANIFEST="${CP_MANIFEST:-$CP/roles/builder.yaml}"
 HOOK="$CP/hooks/enforce_manifest.py"
-REPO="/home/swami/projects/products/noupload"
+REPO="${REPO:-$HOME/projects/products/noupload}"
 
 pass=0; fail=0
 

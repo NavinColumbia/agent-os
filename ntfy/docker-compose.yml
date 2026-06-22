@@ -4,7 +4,9 @@ services:
     container_name: agentos-ntfy
     command: serve
     environment:
-      - NTFY_BASE_URL=https://nyaan.tail502e3f.ts.net
+      # Set NTFY_BASE_URL in ntfy/.env (gitignored). On this host it's the Tailscale Serve
+      # HTTPS name; on a fresh host it defaults to localhost until Tailscale is wired.
+      - NTFY_BASE_URL=${NTFY_BASE_URL:-http://localhost:8080}
       - NTFY_LISTEN_HTTP=:80
       - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
       - NTFY_CACHE_DURATION=48h

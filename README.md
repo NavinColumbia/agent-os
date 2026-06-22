@@ -4,6 +4,16 @@ Infrastructure for a self-hosted "agent OS" on a Windows + WSL2 / Ubuntu host (u
 built one layer at a time, each proven by a test before moving on. Everything binds to
 **localhost or the Tailscale interface only** — never `0.0.0.0`. No secrets are committed.
 
+## From scratch
+```bash
+git clone git@github.com:NavinColumbia/agent-os.git ~/projects/agent-os
+cd ~/projects/agent-os && bash bootstrap.sh
+```
+`bootstrap.sh` clones the companion **control-plane** repo
+(`git@github.com:NavinColumbia/control-plane.git`), builds the venv, wires the product repo, and
+proves Step 1, then prints the manual one-time steps (Docker/Tailscale/phone/gh). Full walkthrough:
+**[QUICKSTART.md](QUICKSTART.md)**. Build history + restart-after-reboot: **[SETUP_LOG.md](SETUP_LOG.md)**.
+
 ## Layers (all proven)
 
 | Step | What | Test |

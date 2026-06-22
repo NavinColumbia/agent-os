@@ -1,0 +1,5 @@
+# agent-os Python deps (install into ./.venv). See bootstrap.sh.
+requests
+psycopg[binary]
+nats-py
+faster-whisper

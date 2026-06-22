@@ -26,3 +26,6 @@ __pycache__/
 postgres/pgdata/
 postgres/.env
 nats/data/
+
+# ntfy per-host base url
+ntfy/.env

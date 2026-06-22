@@ -1,3 +1,0 @@
-listening on http://localhost:8080/swami-agentos-f20c58aa777c-reply/json  (inbox: /home/swami/projects/agent-os/bridge/inbox)
-[CAPTURED] task=deploy-fix -> /home/swami/projects/agent-os/bridge/inbox/deploy-fix.cmd  body='restart the worker'
-[REFUSED] task=deploy-fix reason=anthropic key (secret not written)

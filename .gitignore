@@ -6,9 +6,10 @@
 ntfy/cache/
 ntfy/lib/
 
-# Bridge runtime (captured replies may contain task data)
+# Bridge runtime (captured replies / logs may contain task data)
 bridge/inbox/
 bridge/rejected/
+bridge/*.log
 
 # Python
 __pycache__/

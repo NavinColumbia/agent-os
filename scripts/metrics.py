@@ -53,7 +53,8 @@ def kpis(product=None):
 
 
 def _demo():
-    p = "noupload"
+    import os
+    p = f"metricsdemo-{os.urandom(3).hex()}"  # unique product so counts are deterministic across re-runs
     record("state_change", product=p, task_id="t1", to_state="done", tokens_in=1200, tokens_out=300, outcome="success")
     record("state_change", product=p, task_id="t2", to_state="done", tokens_in=900, tokens_out=250, outcome="success")
     record("cr_filed", product=p, task_id="t3", outcome="rework")     # a spec-change loop

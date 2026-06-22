@@ -1,5 +1,9 @@
 # Agent-OS Reference-Architecture Build — STATUS / RESUME POINTER
 
+> **v1 COMPLETE (2026-06-22).** P0–P5 + standing-Controller integration all built & PROVEN.
+> Re-prove the whole stack anytime: `bash ~/projects/agent-os/scripts/selftest.sh` → **15/15**.
+> Next epic: real agent workers (Controller stages invoke live agents), CR re-flow, human-approval-via-ask-await, native AGE, prod hook→Cerbos.
+
 Resume rule: this file is the source of truth for what's done. Each task: ☐ todo · ⏳ in-progress · ✅ done (proven) · ⚠️ blocked/deferred.
 Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fabric). Build code lives in `agent-os/scripts/`.
 

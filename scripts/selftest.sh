@@ -38,6 +38,7 @@ ck "scoped secrets vault"                    "$PY scripts/vault.py test | grep -
 ck "governed data connector (egress allowlist)" "$PY scripts/connectors.py test | grep -q PASS"
 ck "retention sweep (record expiry)"        "$PY scripts/retention.py test | grep -q PASS"
 ck "experiment tracking (log/compare/best)" "$PY scripts/experiments.py demo | grep -q PASS"
+ck "scheduler (recurring jobs)"             "$PY scripts/scheduler.py test | grep -q PASS"
 
 echo "=== integration: standing Controller ==="
 ck "controller full lifecycle -> LAUNCHED"  "rm -rf ~/projects/products/st-demo; dbexec \"DELETE FROM dbos.workflow_status\" >/dev/null 2>&1 || true; sg docker -c \"docker exec -e PGPASSWORD=$PW agentos-postgres psql -U agentos -d agentos_dbos_sys -c \\\"DELETE FROM dbos.workflow_status WHERE workflow_uuid='prod-st-demo'\\\"\" >/dev/null 2>&1; $PY scripts/controller.py run st-demo | grep -q LAUNCHED"

@@ -16,10 +16,10 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
 - ✅ Ask-await on DBOS (`scripts/commfabric.py`): suspend-until-reply, resume on send; prove round-trip + crash-survival.
 - ✅ Deadlock detector (`scripts/deadlock.py`): wait-for graph + Tarjan SCC; prove A↔B cycle detected + victim chosen.
 
-## P3 — Identity + PDP  ☐
-- ☐ Ed25519 signed-manifest identity (`scripts/identity.py`): sign/verify a role manifest; prove tamper rejected.
-- ☐ Cerbos PDP (Docker, localhost) + policy mirroring builder.yaml; prove allow/deny via PDP.
-- ☐ Wire audit.append into the enforcement decision path.
+## P3 — Identity + PDP  ✅ DONE
+- ✅ Ed25519 signed-manifest identity (`scripts/identity.py`): sign/verify a role manifest; prove tamper rejected.
+- ✅ Cerbos PDP (Docker, localhost) + policy mirroring builder.yaml; prove allow/deny via PDP.
+- ✅ Wire audit.append into the enforcement decision path.
 
 ## P4 — Memory / Observability / Eval  ☐
 - ☐ Apache AGE graph extension in Postgres (or note blocker); prove a graph query alongside pgvector.

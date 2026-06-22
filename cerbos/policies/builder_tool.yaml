@@ -1,0 +1,35 @@
+apiVersion: api.cerbos.dev/v1
+resourcePolicy:
+  resource: "tool"
+  version: "default"
+  rules:
+    # Base allow: the builder's permitted tools (mirrors roles/builder.yaml tools[]).
+    - actions: ["Read", "Grep", "Glob", "Edit", "Bash"]
+      effect: EFFECT_ALLOW
+      roles: ["builder"]
+    # Deny writes to protected paths (mirrors denied_paths). Deny overrides allow in Cerbos.
+    - actions: ["Edit", "Write"]
+      effect: EFFECT_DENY
+      roles: ["builder"]
+      condition:
+        match:
+          expr: >
+            has(request.resource.attr.path) && (
+              request.resource.attr.path.startsWith(".env") ||
+              request.resource.attr.path.contains("secrets/") ||
+              request.resource.attr.path.contains("registry/") ||
+              request.resource.attr.path.contains(".github/workflows")
+            )
+    # Deny dangerous bash (mirrors the hook's forbidden patterns).
+    - actions: ["Bash"]
+      effect: EFFECT_DENY
+      roles: ["builder"]
+      condition:
+        match:
+          expr: >
+            has(request.resource.attr.cmd) && (
+              (request.resource.attr.cmd.contains("push") && request.resource.attr.cmd.contains("main")) ||
+              request.resource.attr.cmd.contains("--force") ||
+              request.resource.attr.cmd.startsWith("curl") ||
+              request.resource.attr.cmd.contains("deploy")
+            )

@@ -29,3 +29,6 @@ nats/data/
 
 # ntfy per-host base url
 ntfy/.env
+
+# Ed25519 private keys
+keys/

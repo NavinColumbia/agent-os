@@ -1,0 +1,13 @@
+services:
+  cerbos:
+    image: ghcr.io/cerbos/cerbos:latest
+    container_name: agentos-cerbos
+    command: ["server", "--config=/config/config.yaml"]
+    volumes:
+      - ./config:/config:ro
+      - ./policies:/policies:ro
+    # localhost ONLY — the PDP is never exposed beyond this box.
+    ports:
+      - "127.0.0.1:3592:3592"
+      - "127.0.0.1:3593:3593"
+    restart: unless-stopped

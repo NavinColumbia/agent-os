@@ -4,3 +4,4 @@ psycopg[binary]
 nats-py
 faster-whisper
 dbos
+cryptography

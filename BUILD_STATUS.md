@@ -43,7 +43,9 @@ Design refs: control-plane `docs/adr/0004` (keystones K1–K7) + `0005` (comm fa
   PROVEN: full lifecycle → LAUNCHED; audit chain intact (5 decisions); idempotent re-run (no stage re-runs).
 - ✅ Live hook → tamper-evident audit (proven, 8/8). 
 - ✅ REAL AGENT WORKERS (`scripts/agent_worker.py`): headless `claude -p` does governed work — proven both (a) allowed edit (added multiply) and (b) DENIED .env write (cage held, audited). Wired into Controller BUILD behind AGENT_WORKERS=1.
-- ☐ NEXT: Controller upward-feedback (CR re-flow) + human-approval-via-ask-await; native AGE; prod hook→Cerbos cutover.
+- ✅ Upward-feedback CR re-flow (`scripts/cr_reflow.py`): filed→decided→re-flowed→closed, metered+audited (proven).
+- ✅ Human-approval durable gate (`scripts/approval_gate.py`): suspend+phone-notify→resume on decision (proven).
+- ☐ Remaining (deferred): native Apache AGE image; prod hook→Cerbos cutover; more test apps.
 
 ## P5 — Org maturity  ✅ DONE
 - ✅ `gate_check.py`: block stage advance without required artifacts (no BUILD w/o approved SPEC+ADR; no LAUNCH w/o QA report).

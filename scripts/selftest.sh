@@ -67,6 +67,7 @@ ck "app circuit-breaker (auto-pause)"       "$PY scripts/appguard.py selftest | 
 ck "OS query plane (agent-queryable)"       "$PY scripts/osq.py selftest | grep -q PASS"
 ck "self-serve front door (signup loop)"    "curl -s http://127.0.0.1:8093/health | grep -q frontdoor && [ \$(curl -s -o /dev/null -w %{http_code} http://127.0.0.1:8093/api/builds) = 401 ]"
 ck "risk register (real risks)"             "$PY scripts/risk.py selftest | grep -q PASS"
+ck "dispatcher (wakes idle agents)"         "$PY scripts/dispatcher.py selftest | grep -q PASS"
 ck "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ck "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"
 

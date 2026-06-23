@@ -92,6 +92,16 @@ else
     && ok "watchdog started (every 2 min)" || warn "watchdog failed"
 fi
 
+hdr "4g. Dispatcher (wakes idle agents with queued work, every ~5 min)"
+if [ -f /tmp/agentos-dispatcher.pid ] && kill -0 "$(cat /tmp/agentos-dispatcher.pid 2>/dev/null)" 2>/dev/null; then
+  ok "dispatcher already running (pid $(cat /tmp/agentos-dispatcher.pid))"
+else
+  ( setsid bash "$ROOT/scripts/dispatcher.sh" >/dev/null 2>&1 </dev/null & )
+  sleep 2
+  [ -f /tmp/agentos-dispatcher.pid ] && kill -0 "$(cat /tmp/agentos-dispatcher.pid 2>/dev/null)" 2>/dev/null \
+    && ok "dispatcher started (every 5 min)" || warn "dispatcher failed"
+fi
+
 hdr "5. Health checks"
 curl -s --max-time 5 http://127.0.0.1:8080/v1/health 2>/dev/null | grep -q healthy && ok "ntfy healthy (local)" || warn "ntfy not healthy"
 DK "docker exec agentos-postgres pg_isready -U agentos -d agentos" >/dev/null 2>&1 && ok "postgres ready" || warn "postgres not ready"

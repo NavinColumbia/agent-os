@@ -140,6 +140,7 @@ CATALOG = [
     ("autonomous-app-factory", "governance", "Real role-agents build+test products end-to-end: sandboxed QA, test-driven re-flow, LAUNCH gated on green", ["controller", "tech-lead"], ["factory", "claude", "srt", "pytest"], R, TO),
     ("concurrent-app-fleet", "governance", "Build many products at once through the governed line (the app factory at scale)", ["controller"], ["factory", "claude"], R, TO),
     ("fleet-observability", "ops", "Live mission-control dashboard + watchdog paging on stalls/outages/SLA", ["controller", "incident-commander"], ["dashboard", "watchdog", "fleet", "ntfy"], R, TO),
+    ("debug-tracing", "ops", "Persist + replay full per-run traces (every agent prompt/response + test output) for debugging", ["incident-commander", "qa-security", "controller"], ["trace", "dashboard"], R, TO),
     ("autonomous-self-healing", "ops", "Watchdog detects + responder auto-fixes safe incidents (restart/GC/snapshot); escalates judgement calls", ["incident-commander", "controller"], ["responder", "watchdog"], R, TO),
     ("chaos-resilience", "ops", "Fault-injection: kill daemons mid-run, assert autonomous recovery", ["incident-commander", "qa-security"], ["chaos", "watchdog"], R, TO),
     ("factory-benchmark", "qa", "Measure factory build success (pass@1/fixloop/latency) across std + hard (stateful API) tiers", ["qa-security", "controller"], ["eval_factory"], R, TO),

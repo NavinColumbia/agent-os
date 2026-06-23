@@ -153,6 +153,14 @@ def state():
     except Exception:
         out["directory"], out["conflicts"] = [], []
 
+    # recent runs (for the debug drill-down)
+    try:
+        import trace as tracemod
+        out["runs"] = [{"product": r["product"], "steps": r["steps"], "total_s": r["total_s"],
+                        "errors": r["errors"]} for r in tracemod.runs(8)]
+    except Exception:
+        out["runs"] = []
+
     # derived alerts
     cycles = []
     try:
@@ -287,6 +295,10 @@ font-weight:600;cursor:pointer}button:hover{filter:brightness(1.08)}
 
   <div class="card col12"><h2>Agent directory <span class=mut>· live presence · who's working on what · direct-contact (no sockets, brokered mailboxes)</span></h2>
      <div id=directory class=feed style="max-height:180px"></div></div>
+
+  <div class="card col12"><h2>Runs <span class=mut>· click a run to replay its full trace — every agent prompt/response + test output (debug)</span></h2>
+     <div id=runs class=feed style="max-height:140px"></div>
+     <div id=tracebox style="margin-top:8px;max-height:420px;overflow:auto"></div></div>
 </div>
 <script>
 const $=s=>document.querySelector(s);
@@ -310,6 +322,7 @@ async function tick(){
  // recipients dropdown
  const to=$('#to');const cur=to.value;const names=[...new Set(s.graph.nodes.map(n=>n.id).filter(n=>!n.startsWith('human')))].sort();
  to.innerHTML=names.map(n=>`<option>${esc(n)}</option>`).join('');if(cur)to.value=cur;
+ $('#runs').innerHTML=(s.runs&&s.runs.length)?s.runs.map(r=>`<div class=row style="cursor:pointer" onclick="showTrace('${esc(r.product)}')"><span class="dot ${r.errors?'d-warn':'d-ok'}"></span><b>${esc(r.product)}</b><span class=grow></span><span class=mut>${r.steps} steps · ${r.total_s}s · errs ${r.errors} ▸</span></div>`).join(''):'<div class=mut>no traced runs yet (only new builds are traced)</div>';
  const conf=new Set((s.conflicts||[]).flatMap(c=>c.agents));
  $('#directory').innerHTML=(s.directory&&s.directory.length)?s.directory.map(d=>`<div class=row><span class="dot ${conf.has(d.agent_id)?'d-crit':'d-ok'}"></span><b>${esc(d.agent_id)}</b> <span class=tag>${esc(d.role)}</span><span class=grow></span><span class=mut>${esc(d.product||'-')} · ${esc(d.task||'-')} · ${esc((d.resources||[]).join(' '))}</span></div>`).join(''):'<div class=mut>no active agents right now</div>';
  drawGraph(s.graph,s.waits);
@@ -342,6 +355,17 @@ async function send(){
    body:JSON.stringify({recipient:$('#to').value,intent:$('#intent').value,content:text})});
  $('#sendnote').textContent=r.ok?'sent ✓':'failed — check token';if(r.ok)$('#msg').value='';tick();
 }
+async function showTrace(p){
+ const box=$('#tracebox');box.innerHTML='<div class=mut>loading trace…</div>';
+ let d; try{d=await (await fetch('/api/trace?product='+encodeURIComponent(p))).json()}catch(e){box.innerHTML='<div class=mut>failed</div>';return}
+ box.innerHTML='<div style="font-family:var(--mono);font-size:12px"><b>'+esc(p)+' — '+d.steps.length+' steps</b>'+
+  d.steps.map((x,i)=>{const bad=x.rc&&x.rc!=0;return `<div style="border-top:1px solid var(--line);padding:7px 0">`+
+   `<b>[${i+1}] ${esc(x.stage||'')} · ${esc(x.role||'')} · ${esc(x.kind||'')}</b> `+
+   `<span class="${bad?'crit':'ok'} pill" style="padding:1px 6px">${bad?('rc='+x.rc):'ok'}</span> `+
+   `<span class=mut>${x.elapsed_s?(x.elapsed_s+'s'):''}</span>`+
+   `<div class=mut style="white-space:pre-wrap;margin-top:4px">▸ prompt: ${esc((x.prompt||'').slice(0,400))}${(x.prompt||'').length>400?'…':''}</div>`+
+   `<div style="white-space:pre-wrap;margin-top:4px;color:#9fb0c3">◂ output: ${esc((x.output||'').slice(-700))}</div></div>`}).join('')+'</div>';
+}
 tick();setInterval(tick,3000);
 </script></body></html>"""
 
@@ -366,6 +390,17 @@ class H(BaseHTTPRequestHandler):
         elif p == "/api/state":
             try:
                 self._json(200, state())
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+        elif p == "/api/trace":
+            from urllib.parse import parse_qs
+            prod = (parse_qs(urlparse(self.path).query).get("product") or [""])[0]
+            try:
+                import trace as tracemod
+                self._json(200, {"product": prod, "steps": [
+                    {"stage": s["stage"], "role": s["role"], "kind": s["kind"], "rc": s["rc"],
+                     "elapsed_s": s["elapsed_s"], "prompt": (s["prompt"] or "")[:4000],
+                     "output": (s["output"] or "")[-4000:]} for s in tracemod.steps(prod)]})
             except Exception as e:
                 self._json(500, {"error": str(e)})
         else:

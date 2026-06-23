@@ -33,6 +33,26 @@ _DB = next((l.split("=", 1)[1].strip() for l in _ENV.read_text().splitlines()
             if l.strip().startswith("DATABASE_URL=")), None)
 
 
+import threading
+_ctx = threading.local()   # per-build context (run/product/stage) so concurrent builds don't mix traces
+
+
+def _trace(kind, role, prompt, output, rc, elapsed=None):
+    """Persist a step's full I/O for later debugging/replay. Best-effort; bounded size."""
+    run = getattr(_ctx, "run", None)
+    if not run:
+        return
+    try:
+        with psycopg.connect(_DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, prompt, output, rc, elapsed_s)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (run, getattr(_ctx, "product", None), getattr(_ctx, "stage", None), role, kind,
+                         (prompt or "")[:20000], (output or "")[:20000], rc, elapsed))
+            c.commit()
+    except Exception:
+        pass
+
+
 def _log_comm(cid, sender, recipient, intent, content):
     """Record a durable handoff in the conversation fabric so the dashboard's comms graph + message
     queue reflect REAL agent-to-agent communication (not just the audit stream). Best-effort."""
@@ -72,10 +92,12 @@ def role_brief(role: str) -> str:
 def agent(role: str, repo: str, task: str, timeout: int = 420) -> dict:
     """Run one real, role-specialized agent (headless claude) inside the product repo. Audited."""
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
+    t0 = time.time()
     p = subprocess.run(["claude", "-p", prompt, "--permission-mode", "acceptEdits"],
                        cwd=repo, capture_output=True, text=True, timeout=timeout)
     audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
                  decision="executed", payload={"rc": p.returncode, "task": task[:80]})
+    _trace("agent", role, prompt, p.stdout or "", p.returncode, round(time.time() - t0, 1))
     return {"rc": p.returncode, "out": (p.stdout or "")[-1500:], "err": (p.stderr or "")[-500:]}
 
 
@@ -160,6 +182,7 @@ def build_product(product: str, charter: str, kind: str = "lib") -> dict:
     log = {"product": product, "kind": kind, "stages": []}
 
     cid = f"build-{product}"
+    _ctx.run = cid; _ctx.product = product; _ctx.stage = "INIT"   # debug-trace context for this build
 
     def _claims(role):
         f = ROLES / f"{role}.yaml"
@@ -170,6 +193,7 @@ def build_product(product: str, charter: str, kind: str = "lib") -> dict:
 
     def stage(name, role, fn):
         print(f"\n[factory] === {name} ===", flush=True)
+        _ctx.stage = name
         aid = f"{role}@{product}"
         t0 = time.time()
         try:                                          # publish presence to the live directory
@@ -230,6 +254,7 @@ def build_product(product: str, charter: str, kind: str = "lib") -> dict:
     def qa():
         run = (lambda: run_web_qa(str(repo))) if web else (lambda: run_tests(str(repo)))
         ok, out = run()
+        _trace("test", "qa-security", "QA run (browser smoke)" if web else "QA run (pytest)", out, 0 if ok else 1)
         attempts = 0
         while not ok and attempts < MAX_FIX:
             attempts += 1

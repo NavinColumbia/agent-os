@@ -56,6 +56,7 @@ ck "auto-remediation routing"               "$PY scripts/responder.py selftest |
 ck "incident-commander context"             "$PY scripts/incident.py selftest | grep -q PASS"
 ck "SaaS billing (meter/plan/invoice)"      "$PY scripts/billing.py test | grep -q PASS"
 ck "agent directory + conflict detection"   "$PY scripts/directory.py selftest | grep -q PASS"
+ck "orchestration (route/spawn/priority)"   "$PY scripts/orchestrate.py selftest | grep -q PASS"
 ck "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ck "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"
 

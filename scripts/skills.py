@@ -151,6 +151,7 @@ CATALOG = [
     ("ethics-safety-review", "governance", "Ethics/safety gate on plans + outputs", ["ethics-safety-reviewer", "audit-governance"], ["reasoning"], R, CL),
     ("web-research", "research", "Live web search + read + synthesize sources", ["research-growth", "analyst"], ["websearch", "webfetch"], R, CL),
     ("agent-directory", "governance", "Live presence/work registry: discover peers, direct brokered contact (no sockets), conflict detection", ["controller", "resource-allocator"], ["directory", "commfabric"], R, TO),
+    ("agent-orchestration", "governance", "Reuse-vs-spawn routing, per-agent priority task queues, hire requests, uncovered-role escalation", ["controller", "resource-allocator"], ["orchestrate", "directory"], R, TO),
 ]
 
 

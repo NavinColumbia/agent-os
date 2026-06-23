@@ -100,6 +100,7 @@ CATALOG = [
     ("model-serving", "ml", "Package + serve models behind an API", ["mlops-engineer", "ml-engineer"], ["reasoning"], R, CL),
     # ── growth / marketing / sales / success ──────────────────────────────────
     ("marketing-growth", "growth", "Campaigns, content, SEO, ads, analytics", ["marketing-growth"], ["web-research", "ffmpeg", "piper"], R, CL),
+    ("launch-kit-generation", "growth", "Auto-generate a product's go-to-market kit (landing page + Show HN/Product Hunt/tweet/SEO copy); publish stays human-gated", ["marketing-growth", "controller"], ["launch_kit", "factory"], R, CL),
     ("seo-content", "growth", "SEO strategy, keyword + content optimization", ["seo-specialist", "content-marketer"], ["web-research"], R, CL),
     ("social-media", "growth", "Social content calendars + post drafting (publish gated)", ["social-media-manager", "community-manager"], ["reasoning"], R, CL),
     ("paid-ads", "growth", "Plan/draft paid campaigns (spend gated)", ["performance-ads", "marketing-growth"], ["reasoning"], R, CL),

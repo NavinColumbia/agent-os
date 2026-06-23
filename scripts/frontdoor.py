@@ -64,8 +64,14 @@ def _status(product):
 
 def _run_build(tid, product, charter, kind):
     _own(product, tid)
+    key = None
+    try:                                             # BYO: build on the tenant's own key if they gave one
+        v = vault.get_secret("byo_llm_key", f"tenant:{tid}", "prod", "builder")
+        key = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
+    except Exception:
+        key = None
     try:
-        factory.build_product(product, charter, kind)
+        factory.build_product(product, charter, kind, api_key=key)
     except Exception:
         pass
 

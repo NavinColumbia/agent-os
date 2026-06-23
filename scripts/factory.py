@@ -95,9 +95,13 @@ def role_brief(role: str) -> str:
 def agent(role: str, repo: str, task: str, timeout: int = 420) -> dict:
     """Run one real, role-specialized agent (headless claude) inside the product repo. Audited."""
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
+    env = None
+    key = getattr(_ctx, "api_key", None)
+    if key:                                          # BYO: run on the TENANT's key (they pay, not us)
+        env = {**os.environ, "ANTHROPIC_API_KEY": key}
     t0 = time.time()
     p = subprocess.run(["claude", "-p", prompt, "--permission-mode", "acceptEdits", "--output-format", "json"],
-                       cwd=repo, capture_output=True, text=True, timeout=timeout)
+                       cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
     out_text, cost, tin, tout = (p.stdout or ""), 0.0, 0, 0
     try:                                            # real economics from the JSON envelope
         j = json.loads(p.stdout)
@@ -182,9 +186,11 @@ def run_web_qa(repo: str) -> tuple[bool, str]:
         httpd.shutdown()
 
 
-def build_product(product: str, charter: str, kind: str = "lib") -> dict:
+def build_product(product: str, charter: str, kind: str = "lib", api_key: str = None) -> dict:
     """Drive one product end-to-end through the governed line with real agents + a real QA fix loop.
-    kind='lib' -> Python library QA'd by pytest; kind='web' -> static web app QA'd by a real browser."""
+    kind='lib' -> Python library QA'd by pytest; kind='web' -> static web app QA'd by a real browser.
+    api_key (BYO): if set, every agent runs on the tenant's own key — they pay their own inference."""
+    _ctx.api_key = api_key
     web = kind == "web"
     service = kind == "service"
     repo = PRODUCTS / product

@@ -63,6 +63,32 @@ def test_factory_resume_sweep_detects_interrupted_only():
             c.commit()
 
 
+# ── app registry: kind / version / dependency detection from the repo on disk ──
+def test_appregistry_detection(tmp_path):
+    import json as _json
+    import appregistry as ar
+    # extension: kind + version from manifest.json, vanilla-JS deps
+    ext = tmp_path / "ext"; ext.mkdir()
+    (ext / "manifest.json").write_text(_json.dumps({"manifest_version": 3, "version": "2.1.0"}))
+    (ext / "popup.js").write_text("//")
+    assert ar.detect_kind(ext) == "extension"
+    assert ar.detect_version(ext, "extension") == "2.1.0"
+    assert "vanilla JS" in ar.detect_dependencies(ext)[0]
+    # service: src/<pkg>/__main__.py ; stdlib python deps
+    svc = tmp_path / "svc"; (svc / "src" / "p").mkdir(parents=True)
+    (svc / "src" / "p" / "__main__.py").write_text("")
+    assert ar.detect_kind(svc) == "service"
+    assert ar.detect_dependencies(svc) == ["python: stdlib only"]
+    # real requirements.txt is parsed
+    (svc / "requirements.txt").write_text("# c\nflask==3.0\nrequests>=2\n")
+    assert ar.detect_dependencies(svc) == ["flask==3.0", "requests>=2"]
+    # web vs project vs lib
+    web = tmp_path / "web"; web.mkdir(); (web / "index.html").write_text("<html>")
+    assert ar.detect_kind(web) == "web"
+    proj = tmp_path / "pr"; (proj / "docs").mkdir(parents=True); (proj / "docs" / "PLAN.json").write_text("{}")
+    assert ar.detect_kind(proj) == "project"
+
+
 # ── QA depth: web/extension QA actually RUNS the builder's functional tests ───
 def test_run_js_tests_gates_on_functional_behaviour(tmp_path):
     """The functional-test gate must FAIL when no behaviour tests exist (a smoke-load is not QA), PASS

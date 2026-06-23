@@ -234,6 +234,11 @@ def build_complex(product, goal, api_key=None):
     audit.append(actor="project:controller", action="ProjectComplete", resource=product,
                  decision=log["result"], payload={"components": len(by_id), "layers": len(layers)})
     try:
+        import appregistry
+        appregistry.register(product, repo)
+    except Exception:
+        pass
+    try:
         import notify
         notify.send(f"🧩 complex build '{product}': {log['result']} "
                     f"({len(by_id)} components, {len(layers)} layers)", title="project", tags="jigsaw")

@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""appregistry.py — the lifecycle registry for every app the factory builds.
+
+portfolio.py is the P&L *view* (cost/revenue); THIS is the source-of-truth registry: per app its kind,
+version, status, dependencies (tracked), README presence, its private GitHub repo URL, and dev/prod URLs
+once deployed. It self-initialises its table, scans the products directory to backfill, auto-registers on
+LAUNCH (wired into factory), and can publish each app to its OWN private GitHub repo (git init + deps +
+README + gh repo create --private --push).
+
+    appregistry.py scan                 # detect+upsert every product (kind/version/deps/readme/git/status)
+    appregistry.py list                 # human view   |   appregistry.py json   (machine view)
+    appregistry.py publish <name>       # init git, track deps, create PRIVATE GitHub repo, push, record url
+    appregistry.py publish-all <n1> <n2>...   # publish the named apps
+    appregistry.py set-url <name> dev|prod <url>
+Run with the agent-os venv python.
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import psycopg
+
+SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS))
+import audit  # noqa: E402
+
+PRODUCTS = Path.home() / "projects" / "products"
+_ENV = Path.home() / "projects" / "agent-os" / ".env.local"
+_DB = next((l.split("=", 1)[1].strip() for l in _ENV.read_text().splitlines()
+            if l.strip().startswith("DATABASE_URL=")), None)
+_SKIP = {"_inbox", "noupload"}
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS app_registry (
+  name         text PRIMARY KEY,
+  kind         text NOT NULL,
+  status       text NOT NULL DEFAULT 'built',
+  version      text NOT NULL DEFAULT '0.1.0',
+  repo_url     text,
+  dev_url      text,
+  prod_url     text,
+  dependencies jsonb NOT NULL DEFAULT '[]',
+  has_readme   boolean NOT NULL DEFAULT false,
+  last_commit  text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
+"""
+
+
+def _conn():
+    c = psycopg.connect(_DB)
+    with c.cursor() as cur:
+        cur.execute(_DDL)
+    c.commit()
+    return c
+
+
+# ── detection (the repo on disk is the ground truth) ────────────────────────────
+def detect_kind(repo: Path) -> str:
+    if (repo / "manifest.json").exists():
+        return "extension"
+    if (repo / "docs" / "PLAN.json").exists():
+        return "project"
+    if (repo / "index.html").exists() or next(repo.glob("*/index.html"), None):
+        return "web"
+    for main in repo.glob("src/*/__main__.py"):
+        return "service"
+    if (repo / "src").exists():
+        return "lib"
+    return "unknown"
+
+
+def detect_version(repo: Path, kind: str) -> str:
+    if kind == "extension" and (repo / "manifest.json").exists():
+        try:
+            return json.loads((repo / "manifest.json").read_text()).get("version", "0.1.0")
+        except Exception:
+            pass
+    vf = repo / "VERSION"
+    return vf.read_text().strip() if vf.exists() else "0.1.0"
+
+
+def detect_dependencies(repo: Path) -> list:
+    """Tracked dependencies with versions. The factory builds stdlib/vanilla, so this is usually 'none' —
+    but it's recorded explicitly (auditable) and parses a real requirements.txt/package.json if present."""
+    req = repo / "requirements.txt"
+    if req.exists():
+        deps = [l.strip() for l in req.read_text().splitlines() if l.strip() and not l.startswith("#")]
+        if deps:
+            return deps
+    pkg = repo / "package.json"
+    if pkg.exists():
+        try:
+            return [f"{k}@{v}" for k, v in (json.loads(pkg.read_text()).get("dependencies") or {}).items()]
+        except Exception:
+            pass
+    if next(repo.rglob("*.py"), None):
+        return ["python: stdlib only"]
+    if next(repo.rglob("*.js"), None):
+        return ["none (vanilla JS, no external deps)"]
+    return []
+
+
+def detect_status(name: str, conn) -> str:
+    with conn.cursor() as cur:
+        cur.execute("""SELECT decision FROM audit_log
+                       WHERE action IN ('ProductComplete','ProjectComplete') AND resource=%s
+                       ORDER BY id DESC LIMIT 1""", (name,))
+        r = cur.fetchone()
+    if not r:
+        return "built"
+    d = r[0] or ""
+    if d in ("LAUNCHED", "INTEGRATED"):
+        return "launched"
+    if d.startswith("BLOCKED"):
+        return "blocked"
+    return "built"
+
+
+def git_info(repo: Path) -> tuple:
+    """(repo_url, last_commit) if this product dir is a git repo with a remote, else (None, None)."""
+    if not (repo / ".git").exists():
+        return None, None
+    def g(*a):
+        p = subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+        return p.stdout.strip() if p.returncode == 0 else None
+    url = g("remote", "get-url", "origin")
+    if url and url.startswith("git@github.com:"):
+        url = "https://github.com/" + url[len("git@github.com:"):].removesuffix(".git")
+    return url, g("rev-parse", "--short", "HEAD")
+
+
+# ── registry ────────────────────────────────────────────────────────────────────
+def register(name, repo: Path = None, conn=None):
+    repo = repo or (PRODUCTS / name)
+    own = conn is None
+    conn = conn or _conn()
+    try:
+        kind = detect_kind(repo)
+        version = detect_version(repo, kind)
+        deps = detect_dependencies(repo)
+        status = detect_status(name, conn)
+        repo_url, last_commit = git_info(repo)
+        has_readme = (repo / "README.md").exists()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO app_registry (name,kind,status,version,repo_url,dependencies,has_readme,last_commit,updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now())
+                ON CONFLICT (name) DO UPDATE SET
+                  kind=EXCLUDED.kind, status=EXCLUDED.status, version=EXCLUDED.version,
+                  repo_url=COALESCE(EXCLUDED.repo_url, app_registry.repo_url),
+                  dependencies=EXCLUDED.dependencies, has_readme=EXCLUDED.has_readme,
+                  last_commit=COALESCE(EXCLUDED.last_commit, app_registry.last_commit), updated_at=now()
+            """, (name, kind, status, version, repo_url, json.dumps(deps), has_readme, last_commit))
+        conn.commit()
+        return {"name": name, "kind": kind, "status": status, "version": version,
+                "repo_url": repo_url, "dependencies": deps, "has_readme": has_readme}
+    finally:
+        if own:
+            conn.close()
+
+
+def scan(conn=None):
+    own = conn is None
+    conn = conn or _conn()
+    try:
+        out = []
+        for d in sorted(PRODUCTS.iterdir()):
+            if not d.is_dir() or d.name in _SKIP or d.name.startswith("."):
+                continue
+            if detect_kind(d) == "unknown" and not (d / "docs").exists():
+                continue
+            out.append(register(d.name, d, conn))
+        return out
+    finally:
+        if own:
+            conn.close()
+
+
+def as_rows(conn=None):
+    own = conn is None
+    conn = conn or _conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT name,kind,status,version,repo_url,dev_url,prod_url,dependencies,has_readme,last_commit
+                           FROM app_registry ORDER BY updated_at DESC""")
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        if own:
+            conn.close()
+
+
+def set_url(name, which, url):
+    assert which in ("dev", "prod")
+    with _conn() as c, c.cursor() as cur:
+        cur.execute(f"UPDATE app_registry SET {which}_url=%s, updated_at=now() WHERE name=%s", (url, name))
+        c.commit()
+    audit.append(actor="appregistry", action="SetUrl", resource=name, decision="updated",
+                 payload={"which": which, "url": url})
+
+
+# ── publish: each app -> its own PRIVATE GitHub repo, deps + README tracked ──────
+_GITIGNORE = "*.db\n*.sqlite*\n__pycache__/\n*.pyc\n.pytest_cache/\nnode_modules/\n.DS_Store\n*.log\n"
+
+
+def _ensure_repo_hygiene(repo: Path, kind: str):
+    """Make the product a self-documenting repo: .gitignore, a tracked deps file, a VERSION, a README."""
+    (repo / ".gitignore").write_text(_GITIGNORE)
+    if not (repo / "VERSION").exists():
+        (repo / "VERSION").write_text(detect_version(repo, kind) + "\n")
+    is_py = next(repo.rglob("*.py"), None) is not None
+    if is_py and not (repo / "requirements.txt").exists():
+        (repo / "requirements.txt").write_text("# stdlib-only — no external runtime dependencies\n")
+    if not (repo / "README.md").exists():
+        (repo / "README.md").write_text(f"# {repo.name}\n\nAn {kind} built by the agent-os factory.\n")
+
+
+def publish(name, private=True):
+    """Init git (if needed), track deps/version/README, create a PRIVATE GitHub repo, push, record the URL.
+    GATED action (creates a repo + pushes) — invoked only on explicit owner request. Idempotent-ish: if a
+    remote already exists it just commits + pushes."""
+    repo = PRODUCTS / name
+    if not repo.exists():
+        return {"name": name, "error": "no such product"}
+    kind = detect_kind(repo)
+    _ensure_repo_hygiene(repo, kind)
+    def git(*a, check=True):
+        p = subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+        if check and p.returncode != 0 and "nothing to commit" not in (p.stdout + p.stderr):
+            raise RuntimeError(f"git {' '.join(a)}: {(p.stderr or p.stdout)[:200]}")
+        return p
+    if not (repo / ".git").exists():
+        git("init", "-q")
+        git("symbolic-ref", "HEAD", "refs/heads/main", check=False)
+    git("add", "-A")
+    git("commit", "-q", "-m", f"{name} {detect_version(repo, kind)} — built by agent-os factory\n\n"
+        f"Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>", check=False)
+    has_remote = git("remote", "get-url", "origin", check=False).returncode == 0
+    if not has_remote:
+        vis = "--private" if private else "--public"
+        p = subprocess.run(["gh", "repo", "create", name, vis, "--source", str(repo),
+                            "--remote", "origin", "--push"], capture_output=True, text=True)
+        if p.returncode != 0:
+            return {"name": name, "error": f"gh repo create failed: {(p.stderr or p.stdout)[:200]}"}
+    else:
+        git("push", "-u", "origin", "HEAD", check=False)
+    repo_url, last_commit = git_info(repo)
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""UPDATE app_registry SET repo_url=%s, last_commit=%s, status='published', updated_at=now()
+                       WHERE name=%s""", (repo_url, last_commit, name))
+        if cur.rowcount == 0:
+            register(name, repo)
+            cur.execute("UPDATE app_registry SET repo_url=%s, last_commit=%s, status='published' WHERE name=%s",
+                        (repo_url, last_commit, name))
+        c.commit()
+    audit.append(actor="appregistry", action="PublishRepo", resource=name, decision="published",
+                 payload={"repo_url": repo_url, "private": private})
+    return {"name": name, "repo_url": repo_url, "last_commit": last_commit, "status": "published"}
+
+
+def _print_table(rows):
+    if not rows:
+        print("(registry empty — run `appregistry.py scan`)"); return
+    print(f"{'APP':22} {'KIND':10} {'STATUS':10} {'VER':8} {'README':7} {'REPO'}")
+    for r in rows:
+        print(f"{r['name'][:21]:22} {r['kind']:10} {r['status']:10} {r['version']:8} "
+              f"{'yes' if r['has_readme'] else 'NO':7} {r['repo_url'] or '(local only)'}")
+        deps = r["dependencies"]
+        print(f"{'':22} deps: {', '.join(deps) if deps else 'none'}"
+              + (f"  dev:{r['dev_url']}" if r.get('dev_url') else "")
+              + (f"  prod:{r['prod_url']}" if r.get('prod_url') else ""))
+
+
+def _main(a):
+    if not a or a[0] == "list":
+        _print_table(as_rows())
+    elif a[0] == "scan":
+        n = scan(); print(f"scanned {len(n)} apps"); _print_table(as_rows())
+    elif a[0] == "json":
+        print(json.dumps(as_rows(), default=str, indent=2))
+    elif a[0] == "publish":
+        print(publish(a[1]))
+    elif a[0] == "publish-all":
+        for name in a[1:]:
+            print(publish(name))
+    elif a[0] == "set-url":
+        set_url(a[1], a[2], a[3]); print("ok")
+    else:
+        sys.exit(f"unknown command: {a[0]}")
+
+
+if __name__ == "__main__":
+    _main(sys.argv[1:])

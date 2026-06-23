@@ -777,6 +777,11 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         log["result"] = "BLOCKED_AT_QA"   # the line refuses to ship red code
     audit.append(actor="factory:controller", action="ProductComplete", resource=product,
                  decision=log["result"], payload={"stages": len(log["stages"])})
+    try:                                              # record in the lifecycle registry (kind/version/deps/readme)
+        import appregistry
+        appregistry.register(product, repo)
+    except Exception:
+        pass
     # proactive push so you learn the outcome without watching anything
     try:
         import notify

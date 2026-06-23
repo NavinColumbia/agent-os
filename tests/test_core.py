@@ -63,6 +63,43 @@ def test_factory_resume_sweep_detects_interrupted_only():
             c.commit()
 
 
+# ── resilience: a sustained Anthropic outage fails over to the Codex engine ───
+def test_factory_codex_failover_on_anthropic_outage(monkeypatch):
+    """When Claude exhausts its retries on transient/overload errors (a provider outage), the SAME task
+    runs on Codex and that result is returned — the factory keeps moving instead of just escalating."""
+    import factory
+    factory._ctx.api_key = None                                  # platform run (BYO would NOT fail over)
+    monkeypatch.setattr(factory, "FALLBACK_ENGINE", "codex")
+    monkeypatch.setattr(factory.shutil, "which", lambda _: "/usr/bin/codex")  # pretend codex installed
+    monkeypatch.setattr(factory.time, "sleep", lambda *a, **k: None)          # no real backoff waits
+    # Claude always returns an overload error; Codex fallback succeeds.
+    monkeypatch.setattr(factory, "_run_once",
+                        lambda *a, **k: (1, "Error: overloaded_error (529)", 0.0, 0, 0, "claude-opus-4-8"))
+    monkeypatch.setattr(factory, "_run_once_codex",
+                        lambda *a, **k: (0, "implemented via codex", 0.0, 120, 40, "codex"))
+    r = factory.agent("builder", "/tmp", "build the thing", timeout=5, retries=1)
+    assert r["rc"] == 0 and r.get("engine") == "codex", f"expected codex failover, got {r}"
+
+
+def test_factory_byo_key_does_not_failover_to_codex(monkeypatch):
+    """A BYO-key tenant must NOT be silently failed over to platform-funded Codex — it escalates."""
+    import factory
+    factory._ctx.api_key = "sk-ant-tenant-key"
+    monkeypatch.setattr(factory, "FALLBACK_ENGINE", "codex")
+    monkeypatch.setattr(factory.shutil, "which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr(factory.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(factory, "_run_once",
+                        lambda *a, **k: (1, "Error: overloaded_error (529)", 0.0, 0, 0, "claude-opus-4-8"))
+    called = {"codex": False}
+    monkeypatch.setattr(factory, "_run_once_codex",
+                        lambda *a, **k: called.__setitem__("codex", True) or (0, "x", 0.0, 1, 1, "codex"))
+    try:
+        r = factory.agent("builder", "/tmp", "build the thing", timeout=5, retries=0)
+        assert r.get("failed") and not called["codex"], "BYO key must not trigger Codex failover"
+    finally:
+        factory._ctx.api_key = None
+
+
 # ── governance: the audit log is tamper-evident ──────────────────────────────
 def test_audit_chain_intact_after_append():
     import audit

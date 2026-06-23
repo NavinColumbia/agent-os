@@ -15,6 +15,7 @@ Run with the agent-os venv python. Needs the `claude` CLI authenticated; pytest 
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -99,6 +100,11 @@ FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-sonnet-4-6")
 # tools=[] (charters are already sanitized by sanitize.py; this is the second layer of that defense).
 AGENT_TOOLS = os.environ.get("AOS_AGENT_TOOLS", "WebSearch WebFetch").split()
 _TRANSIENT = ("overloaded", "rate limit", "rate_limit", "429", "529", "503", "timeout", "temporarily")
+# Cross-provider failover: when Claude/Anthropic is degraded or down (retries exhausted on transient
+# errors), the SAME task is retried once on OpenAI Codex so the factory keeps moving. Set to "none" to
+# disable. CODEX_MODEL is just the label recorded in the trace (Codex uses its own configured model).
+FALLBACK_ENGINE = os.environ.get("AOS_FALLBACK_ENGINE", "codex").lower()
+CODEX_MODEL = os.environ.get("AOS_CODEX_MODEL", "codex")
 
 
 def role_brief(role: str) -> str:
@@ -176,6 +182,34 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
     return p.returncode, out_text, cost, tin, tout, used
 
 
+def _run_once_codex(role, repo, prompt, timeout, env):
+    """Fallback engine: run the SAME task via OpenAI Codex (`codex exec`) when Claude is unavailable.
+    Returns the SAME tuple shape as _run_once. Codex reports tokens (not USD) in its `turn.completed`
+    JSONL events, so cost=0.0 and `used` records the Codex engine label — the trace then shows which
+    engine actually produced the stage. Uses the platform's Codex auth (workspace-write sandbox = it may
+    edit files in the repo, like the Claude path). Honest note: a BYO-key tenant is NOT failed over here
+    (the caller gates that) so we never silently spend platform OpenAI on a tenant's behalf."""
+    tmp = Path(tempfile.mkdtemp(prefix="codexrun-"))
+    out_file = tmp / "last.txt"
+    cmd = ["codex", "exec", "--skip-git-repo-check", "-s", "workspace-write", "--json",
+           "-o", str(out_file), prompt]
+    try:
+        p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
+        tin = tout = 0
+        for line in (p.stdout or "").splitlines():
+            try:
+                o = json.loads(line)
+                if o.get("type") == "turn.completed":
+                    u = o.get("usage", {})
+                    tin += int(u.get("input_tokens", 0)); tout += int(u.get("output_tokens", 0))
+            except Exception:
+                pass
+        out_text = out_file.read_text().strip() if out_file.exists() else (p.stdout or "")
+        return p.returncode, out_text, 0.0, tin, tout, CODEX_MODEL
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None,
           tools: list = None) -> dict:
     """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry from the CALLEE's
@@ -200,6 +234,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
         _trace("estimate", role, f"callee estimate for: {task[:120]}",
                f"~{est_min} min, {est_ret} retries -> timeout {timeout}s", 0)
     last = {"rc": -1, "out": ""}
+    saw_transient = False                            # did any attempt fail on overload/timeout (outage)?
     for attempt in range(retries + 1):
         t0 = time.time()
         try:
@@ -213,6 +248,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
             time.sleep(4 * (attempt + 1))
             timeout = min(900, int(timeout * 1.5))      # back off: give it more time next try
             last = {"rc": -1, "out": "timeout"}
+            saw_transient = True                        # a hung/overloaded provider counts as transient
             continue
         dt = round(time.time() - t0, 1)
         audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
@@ -225,7 +261,33 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                     "tokens_out": tout, "attempts": attempt + 1, "model": used}
         last = {"rc": rc, "out": out_text}
         transient = any(t in (out_text or "").lower() for t in _TRANSIENT)
+        saw_transient = saw_transient or transient
         time.sleep((8 if transient else 4) * (attempt + 1))   # longer backoff on rate-limit/overload
+    # PROVIDER FAILOVER — Claude exhausted its retries on transient/overload/timeout (Anthropic likely
+    # degraded or down): run the SAME task once on Codex before giving up. Skipped for BYO-key tenants
+    # (we don't silently spend platform OpenAI on their behalf) and when Codex isn't installed/enabled.
+    if FALLBACK_ENGINE == "codex" and saw_transient and not key and shutil.which("codex"):
+        print(f"[factory] Claude exhausted on transient errors — failing over to Codex for {role}", flush=True)
+        try:
+            with _AGENT_SEM:
+                rc, out_text, cost, tin, tout, used = _run_once_codex(role, repo, prompt, timeout, env)
+            _trace("agent", role, prompt, out_text, rc, 0.0, cost, tin, tout, used)
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="executed-failover", payload={"engine": "codex", "rc": rc, "model": used})
+            if rc == 0 and out_text.strip():
+                try:
+                    import notify
+                    notify.send(f"↪ failover: '{role}' ran on Codex (Anthropic degraded) for {Path(repo).name}",
+                                title="factory", tags="arrows_counterclockwise")
+                except Exception:
+                    pass
+                return {"rc": 0, "out": out_text[-1500:], "cost_usd": cost, "tokens_in": tin,
+                        "tokens_out": tout, "attempts": retries + 1, "model": used, "engine": "codex"}
+            last = {"rc": rc, "out": out_text}
+        except subprocess.TimeoutExpired:
+            last = {"rc": -1, "out": "codex fallback timeout"}
+        except Exception as e:
+            _trace("agent", role, prompt, f"codex fallback error: {e}", -1)
     try:                                                # exhausted -> escalate, don't die silently
         import notify
         notify.send(f"⚠ agent '{role}' failed after {retries + 1} attempts on {Path(repo).name}",

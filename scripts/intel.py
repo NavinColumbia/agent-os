@@ -30,8 +30,9 @@ def analyze(product):
         f"their key features and pricing if known; (3) a FEATURE-GAP table — features competitors have "
         f"that this product does NOT, and genuine differentiators this product has; (4) 3 concrete, "
         f"prioritized product recommendations (what to build/improve next and why). "
-        f"Be honest: if you lack live web data, say so explicitly and use well-known information. "
-        f"Do NOT fabricate competitors, prices, or metrics. Advisory only — do not ship, spend, or publish.")
+        f"Use WebSearch/WebFetch to ground competitors, pricing, and market size in LIVE data, and cite "
+        f"source URLs. Be honest: do NOT fabricate competitors, prices, or metrics — if a search yields "
+        f"nothing, say so. Advisory only — do not ship, spend, or publish.")
     r = factory.agent("research-growth", str(repo), task, timeout=320)
     audit.append(actor="intel", action="MarketAnalysis", resource=product,
                  decision="generated", payload={"rc": r["rc"]})

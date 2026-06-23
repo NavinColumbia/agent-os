@@ -92,6 +92,12 @@ _AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8"
 BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-opus-4-8")
 CHEAP_MODEL = os.environ.get("AOS_CHEAP_MODEL", "claude-haiku-4-5-20251001")
 FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-sonnet-4-6")
+# Tools every factory agent may use beyond auto-accepted file edits. Web is on by default so research/
+# intel/build agents can reach live data instead of guessing. Override per-deployment with AOS_AGENT_TOOLS
+# (space-separated), or per-call via agent(..., tools=[...]). SECURITY: web access turns an agent into a
+# potential exfiltration path under prompt-injection — for agents processing UNTRUSTED tenant input, pass
+# tools=[] (charters are already sanitized by sanitize.py; this is the second layer of that defense).
+AGENT_TOOLS = os.environ.get("AOS_AGENT_TOOLS", "WebSearch WebFetch").split()
 _TRANSIENT = ("overloaded", "rate limit", "rate_limit", "429", "529", "503", "timeout", "temporarily")
 
 
@@ -146,9 +152,15 @@ def _estimate_runtime(role, task, env):
     return mins, rets
 
 
-def _run_once(role, repo, prompt, timeout, env, model):
+def _run_once(role, repo, prompt, timeout, env, model, tools=None):
     cmd = ["claude", "-p", prompt, "--permission-mode", "acceptEdits", "--output-format", "json",
            "--model", model, "--fallback-model", FALLBACK_MODEL]   # pin + auto-fallback on overload
+    # Grant the agent the tools its job needs. File edits already flow via acceptEdits; non-edit tools
+    # (WebSearch/WebFetch and friends) must be allow-listed or the agent can't reach them. Additive —
+    # builders keep Edit/Write AND gain web. Configure the default set with AOS_AGENT_TOOLS.
+    grant = tools if tools is not None else AGENT_TOOLS
+    if grant:
+        cmd += ["--allowedTools", *grant]
     p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
     out_text, cost, tin, tout, used = (p.stdout or ""), 0.0, 0, 0, model
     try:
@@ -164,7 +176,8 @@ def _run_once(role, repo, prompt, timeout, env, model):
     return p.returncode, out_text, cost, tin, tout, used
 
 
-def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None) -> dict:
+def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None,
+          tools: list = None) -> dict:
     """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry from the CALLEE's
     own estimate (pre-flight handshake). Model is pinned (reproducible) with --fallback-model on overload;
     low-stakes stages pass a cheaper model. A timeout no longer kills the stage (retry w/ backoff),
@@ -191,7 +204,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
         t0 = time.time()
         try:
             with _AGENT_SEM:                          # global cap on concurrent agent subprocesses
-                rc, out_text, cost, tin, tout, used = _run_once(role, repo, prompt, timeout, env, model)
+                rc, out_text, cost, tin, tout, used = _run_once(role, repo, prompt, timeout, env, model, tools)
         except subprocess.TimeoutExpired:
             dt = round(time.time() - t0, 1)
             audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,

@@ -204,6 +204,11 @@ def _main(a):
         r3 = request_collaborator(dev, "astrophysicist", "model orbital decay", priority=5)
         ok = (r1["action"] == "routed_to_existing" and top["priority"] == 1
               and r2["action"] == "hire_requested_spawn" and r3["action"] in ("no_role", "no_exact_role_use_nearest"))
+        with psycopg.connect(DB) as c, c.cursor() as cur:   # self-clean so test data doesn't accumulate
+            cur.execute("DELETE FROM hire_requests WHERE requester=%s", (dev,))
+            cur.execute("DELETE FROM tasks WHERE assignee=%s OR requester=%s", (legal, dev))
+            cur.execute("DELETE FROM directory WHERE agent_id IN (%s,%s)", (legal, dev))
+            c.commit()
         print(f"A route-to-existing: {r1['action']}; priority pull: p{top['priority']} first; "
               f"B spawn-request: {r2['action']}; C uncovered: {r3['action']}")
         print("PASS: reuse-vs-spawn routing + priority queue + hire flow + uncovered-role ✅" if ok else "FAIL")

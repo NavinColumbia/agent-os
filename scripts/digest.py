@@ -92,6 +92,24 @@ def daily():
            if market else "  none yet — run intel.py analyze <app> on your top product"),
           "  read on pomodoro: a tier-a commodity (the feature is free everywhere); the only defensible",
           "  angles are trust, speed, privacy, offline — not feature breadth (per the intel report)", ""]
+    # awaiting your decision
+    try:
+        import osq
+        dq = osq.decisions()
+    except Exception:
+        dq = []
+    L += ["AWAITING YOUR DECISION"]
+    L += [f"  • {d['what']} ({d['why']})" for d in dq] if dq else ["  • nothing — you're clear"]
+    L += [""]
+    # risks
+    try:
+        import risk
+        rks = risk.risks()
+    except Exception:
+        rks = []
+    L += ["RISKS (what could hurt the business)"]
+    L += [f"  [{r['sev'].upper()}] {r['risk']} → {r['action']}" for r in rks[:5]]
+    L += [""]
     L += ["WHAT TO BUILD / NEXT STEPS"]
     for i, (title, why) in enumerate(recommendations(s), 1):
         L.append(f"  {i}. {title} — {why}")

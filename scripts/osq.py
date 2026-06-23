@@ -89,6 +89,23 @@ def alerts():
     return out
 
 
+def decisions():
+    """What's waiting on a human decision — the queue a CEO most needs surfaced."""
+    out = []
+    for p in appguard.paused_apps():
+        out.append({"what": f"Resume or retire '{p['app']}'", "why": f"auto-paused: {p['reason']}"})
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT need_role, count(*), max(requester) FROM hire_requests
+                           WHERE status='open' GROUP BY need_role ORDER BY count(*) DESC""")
+            for role, n, req in cur.fetchall():
+                out.append({"what": f"Approve spawning a '{role}'" + (f" (×{n})" if n > 1 else ""),
+                            "why": f"requested by {req}" + (" +others" if n > 1 else "")})
+    except Exception:
+        pass
+    return out
+
+
 def raise_alert(msg, level="warn"):
     ok = notify.send(f"{'■' if level == 'crit' else '▲'} {msg}", title="agent → you",
                      priority="urgent" if level == "crit" else "high", tags="robot")
@@ -108,6 +125,8 @@ def _main(a):
         print(json.dumps(portfolio.summary(), indent=2, default=str))
     elif a[0] == "alerts":
         print(json.dumps(alerts(), indent=2))
+    elif a[0] == "decisions":
+        print(json.dumps(decisions(), indent=2))
     elif a[0] == "raise":
         print(json.dumps(raise_alert(a[1], a[2] if len(a) > 2 else "warn"), indent=2))
     elif a[0] == "selftest":

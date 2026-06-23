@@ -43,11 +43,12 @@ def _trace(kind, role, prompt, output, rc, elapsed=None):
     if not run:
         return
     try:
+        import redact
         with psycopg.connect(_DB) as c, c.cursor() as cur:
             cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, prompt, output, rc, elapsed_s)
                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (run, getattr(_ctx, "product", None), getattr(_ctx, "stage", None), role, kind,
-                         (prompt or "")[:20000], (output or "")[:20000], rc, elapsed))
+                         redact.scrub((prompt or "")[:20000]), redact.scrub((output or "")[:20000]), rc, elapsed))
             c.commit()
     except Exception:
         pass

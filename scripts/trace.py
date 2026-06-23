@@ -57,10 +57,24 @@ def show(product, full=False):
             print("   ◂ output: " + o.replace("\n", "\n     "))
 
 
+def errors():
+    """Cross-run error search: every step that failed (rc<>0) — the first place a debugger looks."""
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""SELECT product, stage, role, kind, rc, ts FROM traces WHERE rc IS NOT NULL AND rc<>0
+                       ORDER BY ts DESC LIMIT 40""")
+        return [{"product": p, "stage": s, "role": r, "kind": k, "rc": rc, "ts": ts}
+                for p, s, r, k, rc, ts in cur.fetchall()]
+
+
 def _main(a):
     if not a or a[0] == "runs":
         for r in runs(int(a[1]) if len(a) > 1 else 15):
             print(f"  {r['product']:18} {r['steps']:>2} steps  {r['total_s']:>4}s  errs={r['errors']}  {r['end']:%H:%M:%S}")
+    elif a[0] == "errors":
+        es = errors()
+        for e in es:
+            print(f"  {e['ts']:%H:%M:%S} {e['product']:18} {e['stage']:7} {e['role']:18} rc={e['rc']}")
+        print(f"  ── {len(es)} failed step(s)" if es else "  no failed steps recorded")
     elif a[0] == "show":
         show(a[1], full="--full" in a)
     elif a[0] == "selftest":

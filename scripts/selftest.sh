@@ -65,6 +65,7 @@ ck "founder digest + next-steps"            "$PY scripts/digest.py selftest | gr
 ck "market-intel wiring"                    "$PY scripts/intel.py selftest | grep -q PASS"
 ck "app circuit-breaker (auto-pause)"       "$PY scripts/appguard.py selftest | grep -q PASS"
 ck "OS query plane (agent-queryable)"       "$PY scripts/osq.py selftest | grep -q PASS"
+ck "self-serve front door (signup loop)"    "curl -s http://127.0.0.1:8093/health | grep -q frontdoor && [ \$(curl -s -o /dev/null -w %{http_code} http://127.0.0.1:8093/api/builds) = 401 ]"
 ck "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ck "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"
 

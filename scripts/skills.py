@@ -159,6 +159,7 @@ CATALOG = [
     ("agent-directory", "governance", "Live presence/work registry: discover peers, direct brokered contact (no sockets), conflict detection", ["controller", "resource-allocator"], ["directory", "commfabric"], R, TO),
     ("agent-orchestration", "governance", "Reuse-vs-spawn routing, per-agent priority task queues, hire requests, uncovered-role escalation", ["controller", "resource-allocator"], ["orchestrate", "directory"], R, TO),
     ("os-query-plane", "governance", "Agent-queryable OS data plane: any agent can query app complexity/real-cost/status + raise alerts to the human", ["controller", "incident-commander", "analyst"], ["osq"], R, TO),
+    ("self-serve-frontdoor", "growth", "Public product loop: signup→BYO-key→describe→governed build→download, billed + quota-enforced", ["controller", "marketing-growth"], ["frontdoor", "billing", "factory", "vault"], R, TO),
     ("build-economics", "finance", "Real per-stage/per-app token cost + tokens + time (from claude usage), feeding portfolio P&L + circuit-breaker", ["finance-cost-controller", "controller"], ["factory", "trace", "portfolio"], R, TO),
 ]
 

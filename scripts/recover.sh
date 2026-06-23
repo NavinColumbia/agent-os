@@ -63,6 +63,15 @@ fi
 tailscale serve status 2>/dev/null | grep -q 9443 || tailscale serve --bg --https=9443 http://127.0.0.1:8092 >/dev/null 2>&1
 ok "dashboard private over Tailscale: https://nyaan.tail502e3f.ts.net:9443"
 
+hdr "4f. Self-serve front door (127.0.0.1:8093)"
+if pgrep -f "frontdoor.py serve" >/dev/null; then ok "front door already running"
+else
+  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/frontdoor.py serve 8093" >/tmp/frontdoor.log 2>&1 </dev/null & )
+  sleep 1; pgrep -f "frontdoor.py serve" >/dev/null && ok "front door started" || warn "front door failed"
+fi
+tailscale serve status 2>/dev/null | grep -q 8095 || tailscale serve --bg --https=8095 http://127.0.0.1:8093 >/dev/null 2>&1
+ok "front door private over Tailscale: https://nyaan.tail502e3f.ts.net:8095"
+
 hdr "4c. Scheduler ticker (drives recurring jobs incl. daily encrypted snapshot)"
 if [ -f /tmp/agentos-ticker.pid ] && kill -0 "$(cat /tmp/agentos-ticker.pid 2>/dev/null)" 2>/dev/null; then
   ok "ticker already running (pid $(cat /tmp/agentos-ticker.pid))"

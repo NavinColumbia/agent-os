@@ -64,7 +64,47 @@ def compose():
     return "\n".join(lines)
 
 
+def daily():
+    """A comprehensive daily founder brief: profitability, users, market, and what to build —
+    grounded in real data, honest about what's not yet measurable."""
+    import appguard
+    import osq
+    s = portfolio.summary()
+    t = s["totals"]
+    apps = osq.apps()
+    spend = round(sum(osq.app(a)["build_cost_usd"] for a in apps), 2)
+    paused = appguard.paused_apps()
+    top = sorted(((a, osq.app(a)["build_cost_usd"]) for a in apps), key=lambda x: -x[1])
+    top = [(a, c) for a, c in top if c > 0][:5]
+    market = [a for a in apps if (portfolio.PRODUCTS / a / "intel" / "MARKET.md").exists()]
+    L = ["=== agent-os daily digest ===", ""]
+    L += ["PROFITABILITY",
+          f"  apps: {t['products']} built · {t['shipped']} shipped · {t['with_launch_kit']} marketed",
+          f"  build spend (real $): ${spend}   product revenue: ${t['product_revenue']}   net: ${round(t['product_revenue']-spend,2)}",
+          f"  platform MRR: ${t['platform_mrr']} (demo tenants {s['tenants_by_plan']})   auto-paused apps: {len(paused)}",
+          ("  top build cost: " + ", ".join(f"{a} ${c}" for a, c in top)) if top else "  (no real-cost builds recorded yet)", ""]
+    L += ["USERS",
+          "  real paying users: 0 — no product is deployed/sold yet (so churn/CAC/LTV are N/A)",
+          "  usage telemetry: none until an app is live behind the self-serve front door",
+          f"  billing tenants on record: {sum(s['tenants_by_plan'].values())} (demo/test data, not real customers)", ""]
+    L += ["MARKET",
+          (f"  competitor analysis done for: {', '.join(market)} (products/<app>/intel/MARKET.md)"
+           if market else "  none yet — run intel.py analyze <app> on your top product"),
+          "  read on pomodoro: a tier-a commodity (the feature is free everywhere); the only defensible",
+          "  angles are trust, speed, privacy, offline — not feature breadth (per the intel report)", ""]
+    L += ["WHAT TO BUILD / NEXT STEPS"]
+    for i, (title, why) in enumerate(recommendations(s), 1):
+        L.append(f"  {i}. {title} — {why}")
+    return "\n".join(L)
+
+
 def _main(a):
+    if a and a[0] == "daily":
+        text = daily()
+        print(text)
+        if "send" in a:
+            notify.send(text[:1500], title="agent-os daily digest", tags="sunrise")
+        return
     text = compose()
     if a and a[0] == "send":
         ok = notify.send(text, title="agent-os digest", tags="bar_chart")

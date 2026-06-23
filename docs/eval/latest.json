@@ -1,0 +1,37 @@
+{
+  "n": 4,
+  "pass_at_1": "4/4",
+  "pass_with_fixloop": "4/4",
+  "blocked_or_error": "0/4",
+  "avg_elapsed_s": 272.4,
+  "rows": [
+    {
+      "product": "ev-csvstats",
+      "kind": "lib",
+      "result": "LAUNCHED",
+      "fix_attempts": 0,
+      "elapsed_s": 292.0
+    },
+    {
+      "product": "ev-tempconv",
+      "kind": "lib",
+      "result": "LAUNCHED",
+      "fix_attempts": 0,
+      "elapsed_s": 296.1
+    },
+    {
+      "product": "ev-notes",
+      "kind": "web",
+      "result": "LAUNCHED",
+      "fix_attempts": 0,
+      "elapsed_s": 241.3
+    },
+    {
+      "product": "ev-colorkit",
+      "kind": "web",
+      "result": "LAUNCHED",
+      "fix_attempts": 0,
+      "elapsed_s": 260.4
+    }
+  ]
+}

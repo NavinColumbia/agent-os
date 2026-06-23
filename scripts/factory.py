@@ -37,8 +37,8 @@ import threading
 _ctx = threading.local()   # per-build context (run/product/stage) so concurrent builds don't mix traces
 
 
-def _trace(kind, role, prompt, output, rc, elapsed=None, cost_usd=0.0, tokens_in=0, tokens_out=0):
-    """Persist a step's full I/O + real economics for later debugging/replay. Best-effort; bounded size."""
+def _trace(kind, role, prompt, output, rc, elapsed=None, cost_usd=0.0, tokens_in=0, tokens_out=0, model=None):
+    """Persist a step's full I/O + real economics + the model used, for debugging/replay/reproducibility."""
     run = getattr(_ctx, "run", None)
     if not run:
         return
@@ -46,11 +46,11 @@ def _trace(kind, role, prompt, output, rc, elapsed=None, cost_usd=0.0, tokens_in
         import redact
         with psycopg.connect(_DB) as c, c.cursor() as cur:
             cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, prompt, output, rc,
-                             elapsed_s, cost_usd, tokens_in, tokens_out)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                             elapsed_s, cost_usd, tokens_in, tokens_out, model)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (run, getattr(_ctx, "product", None), getattr(_ctx, "stage", None), role, kind,
                          redact.scrub((prompt or "")[:20000]), redact.scrub((output or "")[:20000]), rc,
-                         elapsed, cost_usd, tokens_in, tokens_out))
+                         elapsed, cost_usd, tokens_in, tokens_out, model))
             c.commit()
     except Exception:
         pass
@@ -73,6 +73,11 @@ ROLES = Path.home() / "projects" / "control-plane" / "roles"
 PRODUCTS = Path.home() / "projects" / "products"
 VENV_PY = str(Path.home() / "projects" / "agent-os" / ".venv" / "bin" / "python")
 MAX_FIX = 3  # bounded QA->BUILD re-flow attempts
+# Model policy (pinned for reproducibility; cheaper model for low-stakes stages; fallback on overload).
+BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-opus-4-8")
+CHEAP_MODEL = os.environ.get("AOS_CHEAP_MODEL", "claude-haiku-4-5-20251001")
+FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-sonnet-4-6")
+_TRANSIENT = ("overloaded", "rate limit", "rate_limit", "429", "529", "503", "timeout", "temporarily")
 
 
 def role_brief(role: str) -> str:
@@ -112,7 +117,8 @@ def _estimate_runtime(role, task, env):
          "\"retries\": <int 0-3, how many retries this is worth if it fails>}. Judge by the task's TRUE "
          "complexity — a deep/research/multi-file task may be 20-45+ min; a tiny one 1-2 min.\n\nTASK:\n" + task)
     try:
-        p = subprocess.run(["claude", "-p", q, "--output-format", "json"],
+        p = subprocess.run(["claude", "-p", q, "--output-format", "json", "--model", CHEAP_MODEL,
+                            "--fallback-model", FALLBACK_MODEL],   # estimation is low-stakes -> cheap model
                            cwd=str(PRODUCTS), capture_output=True, text=True, timeout=120, env=env)
         j = json.loads(p.stdout)
         est = _extract_json(j.get("result", ""))
@@ -125,10 +131,11 @@ def _estimate_runtime(role, task, env):
     return mins, rets
 
 
-def _run_once(role, repo, prompt, timeout, env):
-    p = subprocess.run(["claude", "-p", prompt, "--permission-mode", "acceptEdits", "--output-format", "json"],
-                       cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
-    out_text, cost, tin, tout = (p.stdout or ""), 0.0, 0, 0
+def _run_once(role, repo, prompt, timeout, env, model):
+    cmd = ["claude", "-p", prompt, "--permission-mode", "acceptEdits", "--output-format", "json",
+           "--model", model, "--fallback-model", FALLBACK_MODEL]   # pin + auto-fallback on overload
+    p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
+    out_text, cost, tin, tout, used = (p.stdout or ""), 0.0, 0, 0, model
     try:
         j = json.loads(p.stdout)
         out_text = j.get("result", "") or ""
@@ -136,17 +143,28 @@ def _run_once(role, repo, prompt, timeout, env):
         u = j.get("usage") or {}
         tin = int(u.get("input_tokens", 0)) + int(u.get("cache_read_input_tokens", 0)) + int(u.get("cache_creation_input_tokens", 0))
         tout = int(u.get("output_tokens", 0))
+        used = next(iter((j.get("modelUsage") or {}).keys()), model)   # which model ACTUALLY ran
     except Exception:
         pass
-    return p.returncode, out_text, cost, tin, tout
+    return p.returncode, out_text, cost, tin, tout, used
 
 
-def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None) -> dict:
-    """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry count come from
-    the CALLEE's own estimate (a pre-flight handshake), not a caller-side guess: the agent says how long
-    it'll take and how many retries it's worth, the caller honors that (× safety margin). A timeout no
-    longer kills the stage (retry w/ backoff), a bad BYO key fails fast, exhausted retries escalate."""
+def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None) -> dict:
+    """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry from the CALLEE's
+    own estimate (pre-flight handshake). Model is pinned (reproducible) with --fallback-model on overload;
+    low-stakes stages pass a cheaper model. A timeout no longer kills the stage (retry w/ backoff),
+    transient errors back off longer, a bad BYO key fails fast, exhausted retries escalate."""
+    model = model or BUILD_MODEL
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
+    try:                                             # context guard: don't blow the window on a big repo
+        import context as _ctxmod
+        b = _ctxmod.budget(repo)
+        if b["over"]:
+            prompt += (f"\n\nNOTE: this repo is large (~{b['tokens']} tokens, over the safe context budget). "
+                       f"Do NOT read every file. Use this map and read ONLY the files relevant to your task:\n"
+                       + _ctxmod.repo_map(repo)[:6000])
+    except Exception:
+        pass
     env = None
     key = getattr(_ctx, "api_key", None)
     if key:
@@ -163,27 +181,28 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     for attempt in range(retries + 1):
         t0 = time.time()
         try:
-            rc, out_text, cost, tin, tout = _run_once(role, repo, prompt, timeout, env)
+            rc, out_text, cost, tin, tout, used = _run_once(role, repo, prompt, timeout, env, model)
         except subprocess.TimeoutExpired:
             dt = round(time.time() - t0, 1)
             audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
                          decision="timeout", payload={"attempt": attempt + 1, "timeout_s": timeout})
-            _trace("agent", role, prompt, f"TIMEOUT after {timeout}s (attempt {attempt + 1}/{retries + 1})", -1, dt)
+            _trace("agent", role, prompt, f"TIMEOUT after {timeout}s (attempt {attempt + 1}/{retries + 1})", -1, dt, model=model)
             time.sleep(4 * (attempt + 1))
             timeout = min(900, int(timeout * 1.5))      # back off: give it more time next try
             last = {"rc": -1, "out": "timeout"}
             continue
         dt = round(time.time() - t0, 1)
         audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
-                     decision="executed", payload={"rc": rc, "attempt": attempt + 1, "cost_usd": cost})
-        _trace("agent", role, prompt, out_text, rc, dt, cost, tin, tout)
+                     decision="executed", payload={"rc": rc, "attempt": attempt + 1, "cost_usd": cost, "model": used})
+        _trace("agent", role, prompt, out_text, rc, dt, cost, tin, tout, used)
         if key and "Invalid API key" in out_text:       # bad BYO key — don't waste retries
             return {"rc": rc, "out": out_text[-1500:], "failed": True, "reason": "invalid BYO key"}
         if rc == 0 and out_text.strip():
             return {"rc": 0, "out": out_text[-1500:], "cost_usd": cost, "tokens_in": tin,
-                    "tokens_out": tout, "attempts": attempt + 1}
+                    "tokens_out": tout, "attempts": attempt + 1, "model": used}
         last = {"rc": rc, "out": out_text}
-        time.sleep(4 * (attempt + 1))                   # backoff before retry
+        transient = any(t in (out_text or "").lower() for t in _TRANSIENT)
+        time.sleep((8 if transient else 4) * (attempt + 1))   # longer backoff on rate-limit/overload
     try:                                                # exhausted -> escalate, don't die silently
         import notify
         notify.send(f"⚠ agent '{role}' failed after {retries + 1} attempts on {Path(repo).name}",
@@ -272,7 +291,19 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
     if not web:
         (repo / "src").mkdir(parents=True, exist_ok=True)
         (repo / "tests").mkdir(parents=True, exist_ok=True)
-    (repo / "docs" / "CHARTER.md").write_text(f"# {product} — charter ({kind})\n\n{charter}\n")
+    import sanitize
+    flags = sanitize.scan(charter)
+    if flags:                                        # possible prompt injection in untrusted user input
+        audit.append(actor="sanitize", action="InjectionDetected", resource=product,
+                     decision="flagged", payload={"patterns": flags[:3]})
+        try:
+            import notify
+            notify.send(f"⚠ possible prompt-injection in '{product}' charter — wrapped as untrusted, build continues",
+                        title="security", priority="high", tags="shield")
+        except Exception:
+            pass
+    (repo / "docs" / "CHARTER.md").write_text(
+        f"# {product} — charter ({kind})\n\n{sanitize.wrap_untrusted(charter)}\n")
     log = {"product": product, "kind": kind, "stages": []}
 
     cid = f"build-{product}"
@@ -369,13 +400,13 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
     stage("REVIEW", "reviewer", lambda: agent("reviewer", str(repo),
           f"Review the implementation against docs/SPEC.md. Write docs/REVIEW.md: what's correct, any "
           f"risks, and a clear APPROVE/REQUEST-CHANGES verdict. QA is currently "
-          f"{'GREEN' if qa_res.get('passed') else 'RED'}."))
+          f"{'GREEN' if qa_res.get('passed') else 'RED'}.", model=CHEAP_MODEL))
 
     # LAUNCH — only if QA is green (a real gate, not a placeholder)
     if qa_res.get("passed"):
         stage("LAUNCH", "tech-lead", lambda: agent("tech-lead", str(repo),
               "Write docs/LAUNCH-CHECKLIST.md (how to install, run, and the test command) and a short "
-              "README.md. This product passed QA and is cleared to ship."))
+              "README.md. This product passed QA and is cleared to ship.", model=CHEAP_MODEL))
         log["result"] = "LAUNCHED"
     else:
         log["result"] = "BLOCKED_AT_QA"   # the line refuses to ship red code

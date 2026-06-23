@@ -70,6 +70,8 @@ say "5. Seed the org (skills + roles)"
   '.venv/bin/python scripts/appguard.py guard' >/dev/null 2>&1 && ok "hourly app profit-guard job registered" || warn "profit-guard registration failed"
 "$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register founder-digest 604800 \
   '.venv/bin/python scripts/digest.py send' >/dev/null 2>&1 && ok "weekly founder-digest job registered" || warn "digest registration failed"
+"$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register eval-weekly 604800 \
+  '.venv/bin/python scripts/eval_factory.py run 2' >/dev/null 2>&1 && ok "weekly eval (quality-drift) job registered" || warn "eval registration failed"
 
 say "6. Prove the box (full self-test)"
 if bash "$ROOT/scripts/selftest.sh" >/tmp/rebuild-selftest.log 2>&1; then

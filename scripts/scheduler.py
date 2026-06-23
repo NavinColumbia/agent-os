@@ -26,10 +26,13 @@ DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
 
 
 def register(name, command, interval_s):
+    # first run is ONE INTERVAL out, not immediately — so registering e.g. a weekly eval doesn't fire
+    # a fleet of builds the instant it's set up.
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""INSERT INTO schedules (name, command, interval_s, next_run) VALUES (%s,%s,%s, now())
+        cur.execute("""INSERT INTO schedules (name, command, interval_s, next_run)
+                       VALUES (%s,%s,%s, now() + (%s||' seconds')::interval)
                        ON CONFLICT (name) DO UPDATE SET command=EXCLUDED.command, interval_s=EXCLUDED.interval_s""",
-                    (name, command, interval_s))
+                    (name, command, interval_s, interval_s))
         c.commit()
 
 
@@ -50,8 +53,10 @@ def tick():
 
 def _test():
     import time
-    register("selftest-job", "true", interval_s=3600)   # runs once, then due far in the future
-    n1 = tick()                                          # should run it now (next_run was now())
+    register("selftest-job", "true", interval_s=3600)
+    with psycopg.connect(DB) as c, c.cursor() as cur:   # force it due now (register defers first run)
+        cur.execute("UPDATE schedules SET next_run=now() WHERE name='selftest-job'"); c.commit()
+    n1 = tick()                                          # should run it now
     n2 = tick()                                          # immediately after -> not due
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("SELECT last_run IS NOT NULL, next_run > now() FROM schedules WHERE name='selftest-job'")

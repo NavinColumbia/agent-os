@@ -56,6 +56,8 @@ ck "auto-remediation routing"               "$PY scripts/responder.py selftest |
 ck "incident-commander context"             "$PY scripts/incident.py selftest | grep -q PASS"
 ck "SaaS billing (meter/plan/invoice)"      "$PY scripts/billing.py test | grep -q PASS"
 ck "agent directory + conflict detection"   "$PY scripts/directory.py selftest | grep -q PASS"
+ck "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
+ck "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"
 
 echo "=== integration: standing Controller ==="
 ck "controller full lifecycle -> LAUNCHED"  "rm -rf ~/projects/products/st-demo; dbexec \"DELETE FROM dbos.workflow_status\" >/dev/null 2>&1 || true; sg docker -c \"docker exec -e PGPASSWORD=$PW agentos-postgres psql -U agentos -d agentos_dbos_sys -c \\\"DELETE FROM dbos.workflow_status WHERE workflow_uuid='prod-st-demo'\\\"\" >/dev/null 2>&1; $PY scripts/controller.py run st-demo | grep -q LAUNCHED"

@@ -1,0 +1,35 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: agentos
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: agentos
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U agentos -d agentos"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: deps
+        run: python -m venv .venv && .venv/bin/pip install -q -r requirements.txt pytest
+      - name: config
+        run: echo "DATABASE_URL=postgresql://agentos:ci@127.0.0.1:5433/agentos" > .env.local
+      - name: migrations
+        run: |
+          for f in postgres/initdb/*.sql; do
+            PGPASSWORD=ci psql -h 127.0.0.1 -p 5433 -U agentos -d agentos -v ON_ERROR_STOP=1 -f "$f"
+          done
+      - name: security scan
+        run: .venv/bin/python scripts/security_scan.py
+      - name: unit tests
+        run: .venv/bin/python -m pytest tests/ -q

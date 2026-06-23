@@ -32,7 +32,8 @@ OUT = ROOT / "agent-os" / "PROVENANCE.json"
 INCLUDE = [
     ("agent-os", ["scripts/**/*.py", "scripts/*.sh", "postgres/initdb/*.sql", "*.md", "docs/*.md",
                   "*/docker-compose.yml", "cerbos/policies/*.yaml",
-                  "platform/*.py", "platform/*.sh", "platform/*.yaml", "platform/**/*.tf", "platform/**/*.md"]),
+                  "platform/*.py", "platform/*.sh", "platform/*.yaml", "platform/**/*.tf", "platform/**/*.md",
+                  "tests/**/*.py", ".github/workflows/*.yml"]),
     ("control-plane", ["docs/adr/*.md", "schemas/*.json", "protocols/*.md", "policies/*.md", "roles/*.yaml",
                        "hooks/*.py", "scripts/*.py", "constitution/*.md", "templates/*.md"]),
 ]

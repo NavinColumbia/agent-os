@@ -28,6 +28,22 @@ Each app went through the governed line — SPEC (PM) → BUILD (builder) → QA
 headless-browser smoke) → REVIEW (reviewer) → LAUNCH (tech-lead) — with role-grounded agents, a
 test-driven re-flow, untrusted code sandboxed, and every step in the tamper-evident audit log.
 
+## Hard tier — stateful, multi-module API services (the stress test)
+
+| Product | Kind | Result | Fix loops | Time | Re-verify |
+|---|---|---|---|---|---|
+| hv-todo-api | service | LAUNCHED | 0 | 444 s | 38 passed · 5 modules · SQLite |
+| hv-urls-api | service | LAUNCHED | 0 | 462 s | 47 passed · 5 modules · SQLite |
+
+**pass@1: 2/2.** Each is a real HTTP API service with a storage/handlers/http-adapter module split,
+SQLite persistence that survives a fresh repository instance, input validation + correct status codes,
+and a comprehensive pytest suite — built autonomously, no fix loops, sandboxed verification.
+Caveat (honest): 2 specs is a small sample; the frontier isn't *found* yet, only *not hit* at this tier.
+
+## Resilience (chaos)
+`scripts/chaos.py`: kills the dashboard and API daemons mid-run → watchdog+responder auto-recover.
+Result: **2/2 scenarios recovered autonomously**, no human action.
+
 ## Session total
 Across this session the factory has shipped **9 apps** end-to-end (splitbill, romanint, pwstrength,
 pomodoro, + the 4 above, + a SaaS demo), one of which (`pwstrength`) hit a genuine bug and the

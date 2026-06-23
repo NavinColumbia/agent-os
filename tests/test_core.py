@@ -133,6 +133,23 @@ def test_project_blocks_integration_when_a_component_fails(monkeypatch):
         shutil.rmtree(factory_products_dir() / prod, ignore_errors=True)
 
 
+def test_project_plan_resume_reuses_existing_plan(monkeypatch, tmp_path):
+    """A re-run must reuse an existing valid docs/PLAN.json instead of re-invoking the architect agent."""
+    import factory
+    import project
+    monkeypatch.setattr(factory, "PRODUCTS", tmp_path)
+    prod = "ut-resume"
+    docs = tmp_path / prod / "docs"
+    docs.mkdir(parents=True)
+    plan_obj = {"components": [{"id": "a", "name": "a", "description": "d", "deps": [], "interface": "a()"}],
+                "integration_tests": "x"}
+    (docs / "PLAN.json").write_text(__import__("json").dumps(plan_obj))
+    called = {"agent": False}
+    monkeypatch.setattr(factory, "agent", lambda *a, **k: called.__setitem__("agent", True) or {"rc": 0})
+    p = project.plan(prod, "any goal")
+    assert p["components"][0]["id"] == "a" and not called["agent"], "should reuse plan, not call architect"
+
+
 def factory_products_dir():
     import factory
     return factory.PRODUCTS

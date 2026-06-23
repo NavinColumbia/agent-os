@@ -85,6 +85,15 @@ def plan(product, goal, model=None):
     """ARCHITECT decomposes the goal into a dependency DAG with interface contracts -> docs/PLAN.json."""
     repo = factory.PRODUCTS / product
     (repo / "docs").mkdir(parents=True, exist_ok=True)
+    pj = repo / "docs" / "PLAN.json"
+    if pj.exists():                                   # RESUME: reuse the prior decomposition, don't re-plan
+        try:
+            p = _load_json(pj)
+            validate_dag(p["components"])
+            print(f"[project] resuming — reusing existing plan ({len(p['components'])} components)", flush=True)
+            return p
+        except Exception:
+            pass                                      # corrupt/partial -> fall through and re-plan
     factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = "PLAN"
     task = (
         f"You are the system ARCHITECT. Decompose this product goal into 4-8 INTERDEPENDENT components of "
@@ -115,6 +124,13 @@ def build_component(product, comp, dep_interfaces, api_key=None):
     cid = comp["id"]; pkg = cid.replace("-", "_")
     factory._ctx.api_key = api_key                    # thread-local: must be set inside this worker thread
     factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"BUILD:{cid}"
+    # RESUME: if this component was already built green in a prior (interrupted) run, skip it — so a
+    # killed complex build re-runs only the missing/failing components, not the whole thing.
+    if (repo / "src" / pkg).exists():
+        pre_ok, _ = factory.run_tests(str(repo), target=f"tests/{pkg}")
+        if pre_ok:
+            print(f"[project] component {cid}: already green — skipping (resume)", flush=True)
+            return {"id": cid, "passed": True, "resumed": True, "fix_attempts": 0}
     aid = f"builder@{product}:{cid}"
     try:
         import directory                              # live coordination: claim disjoint paths, detect overlap

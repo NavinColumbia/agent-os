@@ -63,6 +63,81 @@ def test_factory_resume_sweep_detects_interrupted_only():
             c.commit()
 
 
+# ── complex projects: dependency DAG layering + interdependent build orchestration ─
+def test_project_topo_layers_and_validation():
+    import project
+    comps = [{"id": "store", "deps": []}, {"id": "core", "deps": ["store"]},
+             {"id": "query", "deps": ["core"]}, {"id": "cli", "deps": ["core", "query"]}]
+    assert project.topo_layers(comps) == [["store"], ["core"], ["query"], ["cli"]]
+    # independent components occupy the same (parallel) layer
+    assert project.topo_layers([{"id": "a", "deps": []}, {"id": "b", "deps": []},
+                                {"id": "c", "deps": ["a", "b"]}]) == [["a", "b"], ["c"]]
+    for bad in ([{"id": "x", "deps": ["y"]}],                              # unknown dep
+                [{"id": "x", "deps": ["y"]}, {"id": "y", "deps": ["x"]}],  # cycle
+                [{"id": "x", "deps": []}, {"id": "x", "deps": []}]):       # duplicate id
+        with pytest.raises(ValueError):
+            project.validate_dag(bad)
+
+
+def test_project_build_complex_orchestration(monkeypatch):
+    """build_complex must build components in dependency order, hand each dependent its deps' interfaces,
+    then integrate — all without touching real agents."""
+    import shutil
+    import project
+    plan_obj = {"components": [
+        {"id": "store", "name": "s", "description": "d", "deps": [], "interface": "store.save()"},
+        {"id": "core", "name": "c", "description": "d", "deps": ["store"], "interface": "core.do()"},
+        {"id": "cli", "name": "l", "description": "d", "deps": ["core", "store"], "interface": "cli.main()"},
+    ], "integration_tests": "end to end"}
+    monkeypatch.setattr(project, "plan", lambda *a, **k: plan_obj)
+    seen = {}
+
+    def fake_build(product, comp, dep_ifaces, api_key=None):
+        seen[comp["id"]] = set(dep_ifaces)
+        return {"id": comp["id"], "passed": True, "fix_attempts": 0}
+    monkeypatch.setattr(project, "build_component", fake_build)
+    integrated = {"called": False}
+    monkeypatch.setattr(project, "integrate",
+                        lambda p, pl: (integrated.__setitem__("called", True), {"passed": True})[1])
+    prod = f"ut-complex-{_rid()}"
+    try:
+        log = project.build_complex(prod, "goal")
+        assert log["result"] == "INTEGRATED"
+        assert log["plan"]["layers"] == [["store"], ["core"], ["cli"]]      # dependency-ordered
+        assert seen["core"] == {"store"} and seen["cli"] == {"core", "store"}  # dependents got interfaces
+        assert integrated["called"]
+    finally:
+        shutil.rmtree(factory_products_dir() / prod, ignore_errors=True)
+
+
+def test_project_blocks_integration_when_a_component_fails(monkeypatch):
+    """If any component fails to build, the line must NOT integrate — it reports BLOCKED_AT_COMPONENTS."""
+    import shutil
+    import project
+    plan_obj = {"components": [{"id": "a", "name": "a", "description": "d", "deps": [], "interface": "a()"},
+                               {"id": "b", "name": "b", "description": "d", "deps": ["a"], "interface": "b()"}],
+                "integration_tests": "x"}
+    monkeypatch.setattr(project, "plan", lambda *a, **k: plan_obj)
+    monkeypatch.setattr(project, "build_component",
+                        lambda product, comp, dep_ifaces, api_key=None: {"id": comp["id"],
+                        "passed": comp["id"] != "b"})   # 'b' fails
+    integrated = {"called": False}
+    monkeypatch.setattr(project, "integrate",
+                        lambda p, pl: (integrated.__setitem__("called", True), {"passed": True})[1])
+    prod = f"ut-complex-{_rid()}"
+    try:
+        log = project.build_complex(prod, "goal")
+        assert log["result"] == "BLOCKED_AT_COMPONENTS" and "b" in log["failed_components"]
+        assert not integrated["called"], "must not integrate when a component failed"
+    finally:
+        shutil.rmtree(factory_products_dir() / prod, ignore_errors=True)
+
+
+def factory_products_dir():
+    import factory
+    return factory.PRODUCTS
+
+
 # ── pipeline-as-cycle: the reviewer's verdict is parsed correctly (it gates LAUNCH) ─
 def test_review_verdict_parsing(tmp_path):
     import factory

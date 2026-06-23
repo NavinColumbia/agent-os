@@ -63,6 +63,31 @@ def test_factory_resume_sweep_detects_interrupted_only():
             c.commit()
 
 
+# ── pipeline-as-cycle: the reviewer's verdict is parsed correctly (it gates LAUNCH) ─
+def test_review_verdict_parsing(tmp_path):
+    import factory
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    rv = docs / "REVIEW.md"
+
+    def verdict(body):
+        rv.write_text(body)
+        return factory._review_verdict(str(tmp_path))
+
+    # explicit VERDICT line wins
+    assert verdict("looks good\n\nVERDICT: APPROVE") == "APPROVE"
+    assert verdict("issues found\n\nVERDICT: REQUEST-CHANGES") == "REQUEST-CHANGES"
+    # the VERDICT line is authoritative even if risks are discussed above it
+    assert verdict("risk: a possible REQUEST-CHANGES situation if X\n\nVERDICT: APPROVE") == "APPROVE"
+    # whole-doc fallback when no explicit VERDICT line
+    assert verdict("Overall this REQUEST-CHANGES because of a bug") == "REQUEST-CHANGES"
+    # ambiguous / silent -> APPROVE (QA is the hard gate; never block a green build on a parse miss)
+    assert verdict("Looks fine to me, nice work.") == "APPROVE"
+    # missing file -> APPROVE
+    rv.unlink()
+    assert factory._review_verdict(str(tmp_path)) == "APPROVE"
+
+
 # ── resilience: a sustained Anthropic outage fails over to the Codex engine ───
 def test_factory_codex_failover_on_anthropic_outage(monkeypatch):
     """When Claude exhausts its retries on transient/overload errors (a provider outage), the SAME task

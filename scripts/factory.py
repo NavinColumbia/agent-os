@@ -86,6 +86,7 @@ ROLES = Path.home() / "projects" / "control-plane" / "roles"
 PRODUCTS = Path.home() / "projects" / "products"
 VENV_PY = str(Path.home() / "projects" / "agent-os" / ".venv" / "bin" / "python")
 MAX_FIX = 3  # bounded QA->BUILD re-flow attempts
+MAX_REVIEW = int(os.environ.get("AOS_MAX_REVIEW", "1"))  # bounded REVIEW->BUILD->re-QA->re-review cycles
 # Global backpressure: no matter how many builds run concurrently, total live agent subprocesses are
 # capped here (each ~430MB) so a big fleet can't exhaust RAM or hammer the API into rate-limits.
 _AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8")))
@@ -414,6 +415,17 @@ def run_ext_qa(repo: str):
     return ok, out
 
 
+def _review_verdict(repo) -> str:
+    """Parse the reviewer's verdict from docs/REVIEW.md — the explicit 'VERDICT:' line if present, else a
+    whole-doc scan. Defaults to APPROVE on ambiguity: QA is the OBJECTIVE ship gate, REVIEW is judgment,
+    so a parse miss must never block a QA-green build."""
+    f = Path(repo) / "docs" / "REVIEW.md"
+    txt = f.read_text() if f.exists() else ""
+    vlines = [l for l in txt.splitlines() if "VERDICT:" in l.upper()]
+    scope = vlines[-1] if vlines else txt
+    return "REQUEST-CHANGES" if ("REQUEST-CHANGES" in scope.upper() or "REQUEST CHANGES" in scope.upper()) else "APPROVE"
+
+
 def build_product(product: str, charter: str, kind: str = "lib", api_key: str = None) -> dict:
     """Drive one product end-to-end through the governed line with real agents + a real QA fix loop.
     kind='lib' -> Python library QA'd by pytest; kind='web' -> static web app QA'd by a real browser.
@@ -531,11 +543,13 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
             f"criterion, including edge cases. Use `from src...` imports. Make `python -m pytest -q` pass.")
     stage("BUILD", "builder", lambda: agent("builder", str(repo), build_task))
 
-    # QA — run REAL verification (browser smoke for web, pytest for lib); bounded fix loop on failure
+    # QA — run REAL verification (browser smoke for web, pytest for lib); bounded fix loop on failure.
+    # qa_run is hoisted so the REVIEW cycle can re-verify after a review-driven fix (no quality regress).
+    qa_run = ((lambda: run_ext_qa(str(repo))) if ext else
+              (lambda: run_web_qa(str(repo))) if web else (lambda: run_tests(str(repo))))
+
     def qa():
-        run = ((lambda: run_ext_qa(str(repo))) if ext else
-               (lambda: run_web_qa(str(repo))) if web else (lambda: run_tests(str(repo))))
-        ok, out = run()
+        ok, out = qa_run()
         label = "QA run (extension static)" if ext else "QA run (browser smoke)" if web else "QA run (pytest)"
         _trace("test", "qa-security", label, out, 0 if ok else 1)
         attempts = 0
@@ -555,22 +569,53 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
                    f"Fix the code under src/ (or a genuinely wrong test) so all tests pass. "
                    f"Do not delete tests to make them pass.")
             agent("builder", str(repo), fix)
-            ok, out = run()
+            ok, out = qa_run()
         return {"passed": ok, "fix_attempts": attempts, "tail": out[-400:]}
     qa_res = stage("QA", "qa-security", qa)
 
-    # REVIEW — an independent reviewer records a verdict (read-mostly)
-    stage("REVIEW", "reviewer", lambda: agent("reviewer", str(repo),
-          f"Review the implementation against docs/SPEC.md. Write docs/REVIEW.md: what's correct, any "
-          f"risks, and a clear APPROVE/REQUEST-CHANGES verdict. QA is currently "
-          f"{'GREEN' if qa_res.get('passed') else 'RED'}.", model=CHEAP_MODEL))
+    # REVIEW — an independent reviewer whose verdict is LOAD-BEARING. Development isn't purely linear:
+    # REQUEST-CHANGES drives a bounded review -> fix -> re-QA -> re-review CYCLE. After the cycle, an
+    # unresolved REQUEST-CHANGES is escalated to a human (not silently shipped); QA stays the hard gate.
+    qa_ok = [bool(qa_res.get("passed"))]      # mutable: the re-QA inside the cycle may change it
 
-    # LAUNCH — only if QA is green (a real gate, not a placeholder)
-    if qa_res.get("passed"):
+    def review():
+        def do_review():
+            agent("reviewer", str(repo),
+                  f"Review the implementation against docs/SPEC.md (and your previous docs/REVIEW.md if it "
+                  f"exists). Rewrite docs/REVIEW.md: what's correct, concrete risks, and END WITH A LINE "
+                  f"that is EXACTLY 'VERDICT: APPROVE' or 'VERDICT: REQUEST-CHANGES'. QA is currently "
+                  f"{'GREEN' if qa_ok[0] else 'RED'}.", model=CHEAP_MODEL)
+            return _review_verdict(repo)
+        verdict = do_review()
+        cycles = 0
+        while verdict == "REQUEST-CHANGES" and qa_ok[0] and cycles < MAX_REVIEW:
+            cycles += 1
+            print(f"[factory] REVIEW requested changes — fix cycle {cycles}/{MAX_REVIEW}", flush=True)
+            agent("builder", str(repo),
+                  "The independent reviewer REQUESTED CHANGES in docs/REVIEW.md. Address every risk/change "
+                  "it raised. Do NOT remove or weaken tests, and add NO network/external dependencies.")
+            ok, out = qa_run()                                  # re-verify: a review fix must not regress QA
+            _trace("test", "qa-security", f"re-QA after review cycle {cycles}", out, 0 if ok else 1)
+            qa_ok[0] = ok
+            verdict = do_review()
+        return {"passed": qa_ok[0], "verdict": verdict, "cycles": cycles}
+    review_res = stage("REVIEW", "reviewer", review)
+
+    # LAUNCH — QA is the hard gate. A review verdict still REQUEST-CHANGES after the cycle escalates.
+    if qa_ok[0] and review_res.get("verdict") != "REQUEST-CHANGES":
         stage("LAUNCH", "tech-lead", lambda: agent("tech-lead", str(repo),
               "Write docs/LAUNCH-CHECKLIST.md (how to install, run, and the test command) and a short "
-              "README.md. This product passed QA and is cleared to ship.", model=CHEAP_MODEL))
+              "README.md. This product passed QA and review and is cleared to ship.", model=CHEAP_MODEL))
         log["result"] = "LAUNCHED"
+    elif qa_ok[0]:                            # QA green but reviewer still wants changes after the cycle
+        log["result"] = "BLOCKED_AT_REVIEW"   # don't silently ship over an unresolved reviewer objection
+        try:
+            import notify
+            notify.send(f"⛔ {product} BLOCKED_AT_REVIEW — QA green but reviewer still REQUEST-CHANGES "
+                        f"after {review_res.get('cycles')} cycle(s); needs your call",
+                        title="app factory", priority="high", tags="warning")
+        except Exception:
+            pass
     else:
         log["result"] = "BLOCKED_AT_QA"   # the line refuses to ship red code
     audit.append(actor="factory:controller", action="ProductComplete", resource=product,

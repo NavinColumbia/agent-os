@@ -107,6 +107,21 @@ def take_snapshot():
     return {"action": "take snapshot", "ok": ok}
 
 
+def classify(issue):
+    """How should this issue be handled? 'auto' (responder has a safe fix), 'escalate' (a known
+    judgement/approval call — page a human), or 'unknown' (novel — hand to the reasoning incident agent)."""
+    sig, msg = issue.get("sig", ""), issue.get("msg", "").lower()
+    if sig.startswith("daemon:") and sig.split(":", 1)[1] in DAEMONS:
+        return "auto"
+    if "is down" in msg and any(s in msg for s in CONTAINERS):
+        return "auto"
+    if "disk" in msg or "backup" in msg or "snapshot" in msg:
+        return "auto"
+    if any(k in sig or k in msg for k in ("deadlock", "stall", "sla", "denial", "heartbeat")):
+        return "escalate"
+    return "unknown"
+
+
 def remediate(issue):
     """Map a detected issue to a safe auto-action. Returns a result dict if it acted, or None if the
     issue is NOT auto-remediable (caller should escalate/page a human)."""

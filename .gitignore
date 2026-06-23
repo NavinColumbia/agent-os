@@ -36,3 +36,6 @@ keys/
 backups/
 
 assets/voices/
+
+# Runtime-generated incident RCAs
+docs/incidents/

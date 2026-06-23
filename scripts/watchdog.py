@@ -25,6 +25,7 @@ import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
+import incident   # noqa: E402
 import notify     # noqa: E402
 import responder  # noqa: E402
 
@@ -136,8 +137,15 @@ def tick(auto_heal=True):
                 fresh = ls is None
                 cooled = ls is not None and (time.time() - ls.timestamp()) > COOLDOWN_S
                 if fresh or cooled:
+                    # novel critical failure the rules can't fix -> reasoning incident-commander writes an RCA
+                    rca_note = ""
+                    if fresh and i["level"] == "crit" and responder.classify(i) == "unknown":
+                        try:
+                            rca_note = " · RCA: " + incident.investigate(i)["summary"]
+                        except Exception:
+                            pass
                     extra = " (auto-fix gave up — flapping)" if fa >= 3 else ""
-                    notify.send(f"{'■' if i['level']=='crit' else '▲'} {i['msg']}{extra}",
+                    notify.send(f"{'■' if i['level']=='crit' else '▲'} {i['msg']}{extra}{rca_note}",
                                 title="agent-os watchdog", priority=PRIO[i["level"]], tags="rotating_light")
                     paged.append(i["msg"])
                     cur.execute("""INSERT INTO watchdog_alerts (signature, level, last_sent, fix_attempts)

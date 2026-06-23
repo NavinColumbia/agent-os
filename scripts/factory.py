@@ -115,14 +115,48 @@ def run_tests(repo: str, sandboxed: bool = True) -> tuple[bool, str]:
     return p.returncode == 0, out[-2500:]
 
 
-def build_product(product: str, charter: str) -> dict:
-    """Drive one product end-to-end through the governed line with real agents + a real QA fix loop."""
+def run_web_qa(repo: str) -> tuple[bool, str]:
+    """QA for the WEB line: serve the built app and load it in a real headless browser — assert it
+    renders, capture console/page errors, screenshot it. Real signal, not 'a file exists'."""
+    import functools
+    import http.server
+    import socket
+    import threading
+    root = repo
+    if (Path(repo) / "public" / "index.html").exists():
+        root = str(Path(repo) / "public")
+    elif not (Path(repo) / "index.html").exists():
+        idx = next(Path(repo).rglob("index.html"), None)
+        if not idx:
+            return False, "no index.html found in the build"
+        root = str(idx.parent)
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    httpd = http.server.HTTPServer(("127.0.0.1", port),
+                                   functools.partial(http.server.SimpleHTTPRequestHandler, directory=root))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        shot = f"/tmp/webqa-{Path(repo).name}.png"
+        env = {**os.environ, "NODE_PATH": str(Path.home() / "projects" / "products" / "noupload" / "node_modules")}
+        p = subprocess.run(["node", str(SCRIPTS / "web_smoke.cjs"), f"http://127.0.0.1:{port}", shot],
+                           capture_output=True, text=True, timeout=120, env=env)
+        audit.append(actor="factory:qa-security", action="WebSmoke", resource=Path(repo).name,
+                     decision="executed", payload={"rc": p.returncode})
+        return p.returncode == 0, (p.stdout or "") + (p.stderr or "") + f"\nscreenshot: {shot}"
+    finally:
+        httpd.shutdown()
+
+
+def build_product(product: str, charter: str, kind: str = "lib") -> dict:
+    """Drive one product end-to-end through the governed line with real agents + a real QA fix loop.
+    kind='lib' -> Python library QA'd by pytest; kind='web' -> static web app QA'd by a real browser."""
+    web = kind == "web"
     repo = PRODUCTS / product
     (repo / "docs").mkdir(parents=True, exist_ok=True)
-    (repo / "src").mkdir(parents=True, exist_ok=True)
-    (repo / "tests").mkdir(parents=True, exist_ok=True)
-    (repo / "docs" / "CHARTER.md").write_text(f"# {product} — charter\n\n{charter}\n")
-    log = {"product": product, "stages": []}
+    if not web:
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        (repo / "tests").mkdir(parents=True, exist_ok=True)
+    (repo / "docs" / "CHARTER.md").write_text(f"# {product} — charter ({kind})\n\n{charter}\n")
+    log = {"product": product, "kind": kind, "stages": []}
 
     cid = f"build-{product}"
 
@@ -141,32 +175,42 @@ def build_product(product: str, charter: str) -> dict:
           f"Read docs/CHARTER.md. Write docs/SPEC.md: scope, public API, and explicit acceptance "
           f"criteria as a bullet list of testable behaviours. Keep it tight and unambiguous."))
 
-    # BUILD — a builder implements the library + a real pytest suite from the spec
-    stage("BUILD", "builder", lambda: agent("builder", str(repo),
-          f"Read docs/SPEC.md. Implement the product as importable Python under src/ "
-          f"(package '{product.replace('-', '_')}') AND write a real pytest suite under tests/ that "
-          f"covers every acceptance criterion, including edge cases. Use `from src...` imports. "
-          f"Make `python -m pytest -q` pass from the repo root."))
+    # BUILD — a builder implements the product from the spec (library OR static web app)
+    build_task = (
+        f"Read docs/SPEC.md. Build a STATIC web app implementing it: index.html at the repo root plus "
+        f"CSS and vanilla JS. NO build step, NO external CDNs/network — it must work fully offline when "
+        f"opened over http. Clean, accessible, responsive UI. No console errors on load."
+        if web else
+        f"Read docs/SPEC.md. Implement the product as importable Python under src/ "
+        f"(package '{product.replace('-', '_')}') AND write a real pytest suite under tests/ that "
+        f"covers every acceptance criterion, including edge cases. Use `from src...` imports. "
+        f"Make `python -m pytest -q` pass from the repo root.")
+    stage("BUILD", "builder", lambda: agent("builder", str(repo), build_task))
 
-    # QA — run the REAL suite; on failure, a bounded test-driven fix loop (the re-flow)
+    # QA — run REAL verification (browser smoke for web, pytest for lib); bounded fix loop on failure
     def qa():
-        ok, out = run_tests(str(repo))
+        run = (lambda: run_web_qa(str(repo))) if web else (lambda: run_tests(str(repo)))
+        ok, out = run()
         attempts = 0
         while not ok and attempts < MAX_FIX:
             attempts += 1
             print(f"[factory] QA red — fix attempt {attempts}/{MAX_FIX}", flush=True)
-            agent("builder", str(repo),
-                  f"`python -m pytest -q` is FAILING. Here is the output:\n\n{out[-1800:]}\n\n"
-                  f"Fix the code under src/ (or a genuinely wrong test) so all tests pass. "
-                  f"Do not delete tests to make them pass.")
-            ok, out = run_tests(str(repo))
+            fix = (f"The web app FAILED QA (loaded in a headless browser). Output:\n\n{out[-1800:]}\n\n"
+                   f"Fix the HTML/CSS/JS so it loads with HTTP 200, renders visible content, and has NO "
+                   f"console/page errors."
+                   if web else
+                   f"`python -m pytest -q` is FAILING. Here is the output:\n\n{out[-1800:]}\n\n"
+                   f"Fix the code under src/ (or a genuinely wrong test) so all tests pass. "
+                   f"Do not delete tests to make them pass.")
+            agent("builder", str(repo), fix)
+            ok, out = run()
         return {"passed": ok, "fix_attempts": attempts, "tail": out[-400:]}
     qa_res = stage("QA", "qa-security", qa)
 
     # REVIEW — an independent reviewer records a verdict (read-mostly)
     stage("REVIEW", "reviewer", lambda: agent("reviewer", str(repo),
-          f"Review src/ against docs/SPEC.md. Write docs/REVIEW.md: what's correct, any risks, and a "
-          f"clear APPROVE/REQUEST-CHANGES verdict. Tests are currently "
+          f"Review the implementation against docs/SPEC.md. Write docs/REVIEW.md: what's correct, any "
+          f"risks, and a clear APPROVE/REQUEST-CHANGES verdict. QA is currently "
           f"{'GREEN' if qa_res.get('passed') else 'RED'}."))
 
     # LAUNCH — only if QA is green (a real gate, not a placeholder)
@@ -203,7 +247,8 @@ def dispatch_fleet(specs, max_workers=3):
     audit.append(actor="factory:controller", action="FleetStart", resource=f"{len(specs)} products",
                  decision="executed", payload={"workers": max_workers})
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(build_product, s["product"], s.get("charter", "")): s["product"] for s in specs}
+        futs = {ex.submit(build_product, s["product"], s.get("charter", ""), s.get("kind", "lib")): s["product"]
+                for s in specs}
         for f in as_completed(futs):
             name = futs[f]
             try:
@@ -228,7 +273,7 @@ def _main(a):
         print(agent(a[1], a[2], a[3]))
     elif a[0] == "build":
         charter = a[2] if len(a) > 2 else "Build a small, well-tested Python library."
-        build_product(a[1], charter)
+        build_product(a[1], charter, a[3] if len(a) > 3 else "lib")
     elif a[0] == "fleet":
         raw = Path(a[1]).read_text() if len(a) > 1 and Path(a[1]).exists() else (a[1] if len(a) > 1 else "[]")
         dispatch_fleet(json.loads(raw), int(a[2]) if len(a) > 2 else 3)

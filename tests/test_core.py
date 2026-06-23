@@ -168,6 +168,39 @@ def test_project_blocks_integration_when_a_component_fails(monkeypatch):
         shutil.rmtree(factory_products_dir() / prod, ignore_errors=True)
 
 
+def test_project_resume_sweep_detects_interrupted_only(tmp_path, monkeypatch):
+    """A complex build with no terminal ProjectComplete (an outage casualty) + a PLAN.json must be
+    detected for auto-resume; one with a ProjectComplete must be excluded (no infinite re-resume)."""
+    import psycopg
+    import factory
+    import project
+    import audit
+    monkeypatch.setattr(factory, "PRODUCTS", tmp_path)
+    sfx = _rid()
+    p_int, p_done = f"sweepproj-int-{sfx}", f"sweepproj-done-{sfx}"
+    for prod in (p_int, p_done):                              # both look resumable (have a PLAN.json)
+        (tmp_path / prod / "docs").mkdir(parents=True)
+        (tmp_path / prod / "docs" / "PLAN.json").write_text('{"components":[],"integration_tests":""}')
+    with psycopg.connect(factory._DB) as c, c.cursor() as cur:
+        for prod in (p_int, p_done):                          # aged 60m so the idle guard passes
+            cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,rc,ts)
+                           VALUES (%s,%s,'BUILD:x','builder','agent',0, now()-interval '60 minutes')""",
+                        (f"proj-{prod}", prod))
+        c.commit()
+    audit.append(actor="pytest", action="ProjectComplete", resource=p_done, decision="INTEGRATED")
+    try:
+        found = factory_find_projects(project, 20)
+        assert p_int in found and p_done not in found
+    finally:
+        with psycopg.connect(factory._DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM traces WHERE run_id IN (%s,%s)", (f"proj-{p_int}", f"proj-{p_done}"))
+            c.commit()
+
+
+def factory_find_projects(project_mod, age):
+    return project_mod.find_incomplete_projects(max_age_min=age)
+
+
 def test_project_plan_resume_reuses_existing_plan(monkeypatch, tmp_path):
     """A re-run must reuse an existing valid docs/PLAN.json instead of re-invoking the architect agent."""
     import factory

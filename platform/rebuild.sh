@@ -74,6 +74,8 @@ say "5. Seed the org (skills + roles)"
   '.venv/bin/python scripts/eval_factory.py run 2' >/dev/null 2>&1 && ok "weekly eval (quality-drift) job registered" || warn "eval registration failed"
 "$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register resume-sweep 600 \
   '.venv/bin/python scripts/factory.py resume-sweep' >/dev/null 2>&1 && ok "interrupted-build resume sweep registered" || warn "resume-sweep registration failed"
+"$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register resume-sweep-projects 600 \
+  '.venv/bin/python scripts/project.py resume-sweep' >/dev/null 2>&1 && ok "interrupted complex-build resume sweep registered" || warn "resume-sweep-projects registration failed"
 
 say "6. Prove the box (full self-test)"
 if bash "$ROOT/scripts/selftest.sh" >/tmp/rebuild-selftest.log 2>&1; then

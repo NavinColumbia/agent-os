@@ -23,10 +23,13 @@ Run with the agent-os venv python.
 """
 import json
 import os
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
@@ -240,6 +243,57 @@ def build_complex(product, goal, api_key=None):
     return log
 
 
+def find_incomplete_projects(max_age_min: int = 20):
+    """Complex builds INTERRUPTED, not finished: a proj-<product> with agent traces but NO terminal
+    'ProjectComplete' audit (written for INTEGRATED and every BLOCKED_* outcome, so a genuinely finished
+    or blocked project is never re-resumed), idle >= max_age_min, and with a docs/PLAN.json to resume
+    from. Mirrors factory.find_incomplete_builds, but for the proj- run-id space + ProjectComplete."""
+    out = []
+    with psycopg.connect(factory._DB) as c, c.cursor() as cur:
+        cur.execute("""
+            SELECT t.run_id
+              FROM traces t
+              LEFT JOIN audit_log a
+                     ON a.action='ProjectComplete' AND a.resource = substring(t.run_id from 6)
+             WHERE t.run_id LIKE 'proj-%%'
+             GROUP BY t.run_id
+            HAVING count(a.id) = 0                                        -- no terminal verdict
+               AND max(t.ts) < now() - (%s || ' minutes')::interval       -- and gone idle
+             ORDER BY max(t.ts)
+        """, (max_age_min,))
+        for (run_id,) in cur.fetchall():
+            product = run_id[len("proj-"):]
+            if (factory.PRODUCTS / product / "docs" / "PLAN.json").exists():   # resumable: has a plan
+                out.append(product)
+    return out
+
+
+def resume_incomplete_projects(max_age_min: int = 20, limit: int = 2) -> dict:
+    """Self-healing for interrupted COMPLEX builds (provider outage / kill mid-run). Re-launches each as
+    a DETACHED `project.py build <product> resume` — which reuses the existing plan and skips already-green
+    components (component-level resume), so it finishes only what's missing. Returns fast (detached
+    children), safe to call from the 120s-bounded scheduler."""
+    cands = find_incomplete_projects(max_age_min)[:limit]
+    resumed = []
+    for product in cands:
+        f = open(f"/tmp/resume-proj-{product}.log", "a")
+        # 'resume' goal arg is ignored: plan() reuses docs/PLAN.json when present.
+        subprocess.Popen([sys.executable, str(SCRIPTS / "project.py"), "build", product, "resume"],
+                         stdout=f, stderr=f, stdin=subprocess.DEVNULL,
+                         start_new_session=True, cwd=str(SCRIPTS.parent))
+        audit.append(actor="project:resume-sweep", action="ResumeProject", resource=product,
+                     decision="relaunched")
+        resumed.append(product)
+    if resumed:
+        try:
+            import notify
+            notify.send(f"♻ auto-resumed {len(resumed)} interrupted complex build(s): " + ", ".join(resumed),
+                        title="self-heal", tags="recycle")
+        except Exception:
+            pass
+    return {"found": len(cands), "resumed": resumed}
+
+
 def _selftest():
     """Offline proof of the graph engine (no agents): correct layering, cycle + bad-dep rejection."""
     comps = [{"id": "store", "deps": []},
@@ -267,6 +321,8 @@ def _main(a):
         sys.exit("usage: project.py build <product> '<goal>' | selftest")
     if a[0] == "build":
         print(build_complex(a[1], a[2] if len(a) > 2 else "Build a small multi-module Python product."))
+    elif a[0] == "resume-sweep":                       # self-heal interrupted complex builds (scheduler)
+        print(resume_incomplete_projects(max_age_min=int(a[1]) if len(a) > 1 else 20))
     elif a[0] == "selftest":
         _selftest()
     else:

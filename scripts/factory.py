@@ -160,12 +160,30 @@ def build_product(product: str, charter: str, kind: str = "lib") -> dict:
 
     cid = f"build-{product}"
 
+    def _claims(role):
+        f = ROLES / f"{role}.yaml"
+        if not f.exists():
+            return [f"{product}/**"]
+        import yaml
+        return yaml.safe_load(f.read_text()).get("allowed_paths", []) or [f"{product}/**"]
+
     def stage(name, role, fn):
         print(f"\n[factory] === {name} ===", flush=True)
+        aid = f"{role}@{product}"
+        try:                                          # publish presence to the live directory
+            import directory
+            directory.register(aid, role, product, name, _claims(role))
+        except Exception:
+            pass
         _log_comm(cid, "controller", role, "delegate", {"stage": name})        # hand-off out
         r = fn()
         ok = (r.get("passed", True) if isinstance(r, dict) else True)
         _log_comm(cid, role, "controller", "done" if ok else "blocked", {"stage": name})  # hand-back
+        try:
+            import directory
+            directory.release(aid)
+        except Exception:
+            pass
         log["stages"].append({name: r})
         print(f"[factory] {name}: {r}", flush=True)
         return r

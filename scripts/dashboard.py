@@ -143,6 +143,16 @@ def state():
         except Exception:
             pass
 
+    # live agent directory (presence + conflicts)
+    confs = []
+    try:
+        import directory
+        out["directory"] = directory.roster(active_only=True)[:12]
+        confs = directory.conflicts()
+        out["conflicts"] = confs
+    except Exception:
+        out["directory"], out["conflicts"] = [], []
+
     # derived alerts
     cycles = []
     try:
@@ -170,6 +180,8 @@ def state():
         alerts.append({"level": "warn", "msg": "a wait is past its SLA"})
     if out["throughput"]["denies_1h"] > 80:
         alerts.append({"level": "warn", "msg": f"{out['throughput']['denies_1h']} policy denials/hr"})
+    for cf in confs:
+        alerts.append({"level": "warn", "msg": f"conflict: {cf['agents'][0]} & {cf['agents'][1]} on {cf['resource']}"})
     out["alerts"] = alerts or [{"level": "ok", "msg": "all systems nominal"}]
     out["overall"] = ("crit" if any(a["level"] == "crit" for a in out["alerts"])
                       else "warn" if any(a["level"] == "warn" for a in out["alerts"]) else "ok")
@@ -272,6 +284,9 @@ font-weight:600;cursor:pointer}button:hover{filter:brightness(1.08)}
      </div>
      <div class=mut style="margin-top:6px;font-size:12px" id=sendnote>needs AOS_API_TOKEN (saved locally once)</div>
      <h2 style="margin-top:14px">What's blocked</h2><div id=waits class=feed style="max-height:120px"></div></div>
+
+  <div class="card col12"><h2>Agent directory <span class=mut>· live presence · who's working on what · direct-contact (no sockets, brokered mailboxes)</span></h2>
+     <div id=directory class=feed style="max-height:180px"></div></div>
 </div>
 <script>
 const $=s=>document.querySelector(s);
@@ -295,6 +310,8 @@ async function tick(){
  // recipients dropdown
  const to=$('#to');const cur=to.value;const names=[...new Set(s.graph.nodes.map(n=>n.id).filter(n=>!n.startsWith('human')))].sort();
  to.innerHTML=names.map(n=>`<option>${esc(n)}</option>`).join('');if(cur)to.value=cur;
+ const conf=new Set((s.conflicts||[]).flatMap(c=>c.agents));
+ $('#directory').innerHTML=(s.directory&&s.directory.length)?s.directory.map(d=>`<div class=row><span class="dot ${conf.has(d.agent_id)?'d-crit':'d-ok'}"></span><b>${esc(d.agent_id)}</b> <span class=tag>${esc(d.role)}</span><span class=grow></span><span class=mut>${esc(d.product||'-')} · ${esc(d.task||'-')} · ${esc((d.resources||[]).join(' '))}</span></div>`).join(''):'<div class=mut>no active agents right now</div>';
  drawGraph(s.graph,s.waits);
 }
 function drawGraph(g,waits){

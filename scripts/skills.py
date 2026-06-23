@@ -147,6 +147,7 @@ CATALOG = [
     ("resource-allocation", "governance", "Hire/route roles, manage the registry", ["resource-allocator"], ["allocator"], R, TO),
     ("ethics-safety-review", "governance", "Ethics/safety gate on plans + outputs", ["ethics-safety-reviewer", "audit-governance"], ["reasoning"], R, CL),
     ("web-research", "research", "Live web search + read + synthesize sources", ["research-growth", "analyst"], ["websearch", "webfetch"], R, CL),
+    ("agent-directory", "governance", "Live presence/work registry: discover peers, direct brokered contact (no sockets), conflict detection", ["controller", "resource-allocator"], ["directory", "commfabric"], R, TO),
 ]
 
 

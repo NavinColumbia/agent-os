@@ -117,7 +117,7 @@ def classify(issue):
         return "auto"
     if "disk" in msg or "backup" in msg or "snapshot" in msg:
         return "auto"
-    if any(k in sig or k in msg for k in ("deadlock", "stall", "sla", "denial", "heartbeat")):
+    if any(k in sig or k in msg for k in ("deadlock", "stall", "sla", "denial", "heartbeat", "conflict")):
         return "escalate"
     return "unknown"
 

@@ -35,7 +35,6 @@ def check():
     health = {
         "postgres": "accepting" in pg,
         "ntfy": _http_ok("http://127.0.0.1:8080/v1/health", "healthy"),
-        "nats": _http_ok("http://127.0.0.1:8222/healthz", "ok"),
         "cerbos": _http_ok("http://127.0.0.1:3592/_cerbos/health", "SERVING"),
     }
     return health

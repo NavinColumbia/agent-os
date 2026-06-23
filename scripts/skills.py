@@ -93,7 +93,6 @@ CATALOG = [
     ("bi-dashboards", "data", "Metrics models + BI dashboards + narratives", ["bi-analyst", "analytics-engineer"], ["sql"], R, CL),
     ("experiment-tracking", "data", "Log/compare/best ML experiments", ["data-scientist", "ml-engineer"], ["experiments"], R, TO),
     ("agent-eval", "data", "Evaluate agents/models", ["qa-security", "ml-engineer"], ["inspect-ai"], R, TO),
-    ("graph-memory", "data", "Knowledge-graph + vector memory", ["data-scientist", "librarian"], ["pgvector", "age"], R, TO),
     ("prompt-engineering", "ai", "Design/optimize prompts + agent workflows", ["ai-prompt-engineer", "ml-engineer"], ["reasoning"], R, CL),
     ("classic-ml-modeling", "ml", "Train classic ML (sklearn/xgboost) on CPU", ["ml-engineer", "data-scientist"], ["sklearn"], R, TO),
     ("deep-learning-train", "ml", "Train/fine-tune deep nets + recommenders", ["ml-engineer", "mlops-engineer"], ["gpu", "ml-frameworks"], SK, GPU),

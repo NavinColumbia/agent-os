@@ -8,7 +8,7 @@ deliberately NOT auto-remediated — it escalates to you. Every action is audite
 
 Auto-heals:
   * a dead daemon (dashboard/api/ticker/listener)   -> relaunch it
-  * a down infra container (postgres/nats/ntfy/cerbos) -> docker compose up -d
+  * a down infra container (postgres/ntfy/cerbos) -> docker compose up -d
   * disk pressure                                    -> prune snapshots + objstore GC + retention sweep
   * stale/missing backup                             -> take a snapshot now
 Escalates (pages you, no auto-action): deadlock, build stall, SLA breach, denial spike, watchdog itself.
@@ -36,7 +36,7 @@ DAEMONS = {
     "ticker":    (f"exec bash {ROOT}/scripts/ticker.sh", "ticker.sh"),
     "listener":  (f"bash {ROOT}/scripts/bridge.sh start", "reply_listener.py"),
 }
-CONTAINERS = {"postgres", "nats", "ntfy", "cerbos"}
+CONTAINERS = {"postgres", "ntfy", "cerbos"}
 
 
 def _spawn(cmd, log):

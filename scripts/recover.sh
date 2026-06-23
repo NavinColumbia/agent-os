@@ -30,7 +30,7 @@ tailscale status >/dev/null 2>&1 && ok "tailnet up ($(tailscale ip -4 2>/dev/nul
 tailscale serve status 2>/dev/null | grep -q ts.net && ok "serve (HTTPS) active" || warn "serve not active — run: tailscale serve --bg --https=443 http://127.0.0.1:8080"
 
 hdr "3. Containers (restart:unless-stopped should auto-start; ensure anyway)"
-for stack in ntfy postgres nats cerbos; do
+for stack in ntfy postgres cerbos; do
   DK "cd $ROOT/$stack && docker compose up -d" >/dev/null 2>&1 && ok "$stack up" || warn "$stack failed"
 done
 
@@ -105,7 +105,6 @@ fi
 hdr "5. Health checks"
 curl -s --max-time 5 http://127.0.0.1:8080/v1/health 2>/dev/null | grep -q healthy && ok "ntfy healthy (local)" || warn "ntfy not healthy"
 DK "docker exec agentos-postgres pg_isready -U agentos -d agentos" >/dev/null 2>&1 && ok "postgres ready" || warn "postgres not ready"
-curl -s --max-time 5 http://127.0.0.1:8222/healthz 2>/dev/null | grep -q ok && ok "nats healthy" || warn "nats not healthy"
 curl -s --max-time 8 https://nyaan.tail502e3f.ts.net/v1/health 2>/dev/null | grep -q healthy && ok "ntfy reachable over Tailscale HTTPS" || warn "tailnet ntfy not reachable (phone won't get pushes until fixed)"
 
 printf '\n\033[1mrecover.sh done.\033[0m If anything shows ! above, see SETUP_LOG.md.\n'

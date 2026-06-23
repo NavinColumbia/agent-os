@@ -22,17 +22,6 @@ components:
     migrate: "swap DATABASE_URL; pg_dump -Fc | pg_restore. DBOS/audit/vault/objstore all follow the URL."
     order: 1
 
-  - name: nats
-    kind: container
-    role: "Work queue / JetStream — distributed dispatch, deadlock-free."
-    local: "nats:2.10 @ 127.0.0.1:4222 (mon :8222)"
-    compose: nats/docker-compose.yml
-    config_keys: [NATS_URL]
-    in_snapshot: false           # transient transport; no durable user data
-    cloud_target: "Synadia Cloud / self-hosted NATS cluster (or Kafka/Redpanda at huge scale)"
-    migrate: "swap NATS_URL; JetStream config is portable."
-    order: 3
-
   - name: ntfy
     kind: container
     role: "Phone notification bridge + 2-way human approval."

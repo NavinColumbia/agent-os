@@ -57,7 +57,7 @@ def _health():
     try:
         h = monitor.check()
     except Exception:
-        h = {"postgres": False, "ntfy": False, "nats": False, "cerbos": False}
+        h = {"postgres": False, "ntfy": False, "cerbos": False}
     _hcache.update(ts=time.time(), data=h)
     return h
 

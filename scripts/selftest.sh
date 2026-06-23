@@ -9,7 +9,7 @@ ck(){ if eval "$2" >/tmp/st.$$ 2>&1; then printf "  ✅ %s\n" "$1"; pass=$((pass
 dbexec(){ sg docker -c "docker exec -e PGPASSWORD=$PW agentos-postgres psql -U agentos -d agentos -tAc \"$1\""; }
 
 echo "=== containers ==="
-for c in agentos-postgres agentos-nats agentos-ntfy agentos-cerbos; do
+for c in agentos-postgres agentos-ntfy agentos-cerbos; do
   sg docker -c "docker ps --filter name=$c --filter status=running -q" | grep -q . && echo "  ✅ $c up" && pass=$((pass+1)) || { echo "  ❌ $c down"; fail=$((fail+1)); }
 done
 
@@ -23,8 +23,7 @@ echo "=== communication fabric ==="
 ck "deadlock detector (cycle found)"        "$PY scripts/deadlock.py clear >/dev/null; $PY scripts/deadlock.py edge a b>/dev/null; $PY scripts/deadlock.py edge b a>/dev/null; ! $PY scripts/deadlock.py detect; $PY scripts/deadlock.py clear>/dev/null"
 ck "message envelope + deadlock-guard"      "$PY scripts/messaging.py | grep -q 'deadlock-guard works'"
 
-echo "=== memory / eval ==="
-ck "graph memory + reflection"              "$PY scripts/memory.py | grep -q PASS"
+echo "=== eval ==="
 ck "eval harness (Inspect AI runs)"         "timeout 90 $PY -m inspect_ai eval scripts/demo_eval.py --model mockllm/model --log-dir /tmp/st_logs 2>&1 | grep -q 'accuracy'"
 
 echo "=== governance ==="
@@ -39,7 +38,6 @@ ck "governed data connector (egress allowlist)" "$PY scripts/connectors.py test 
 ck "retention sweep (record expiry)"        "$PY scripts/retention.py test | grep -q PASS"
 ck "experiment tracking (log/compare/best)" "$PY scripts/experiments.py demo | grep -q PASS"
 ck "scheduler (recurring jobs)"             "$PY scripts/scheduler.py test | grep -q PASS"
-ck "distributed dispatch (NATS workers)"     "$PY scripts/dispatch.py demo | grep -q PASS"
 ck "budget governor (token caps)"          "$PY scripts/budget.py test | grep -q PASS"
 ck "feature flags + rollout"               "$PY scripts/flags.py test | grep -q PASS"
 ck "health monitor + alerting"             "$PY scripts/monitor.py test | grep -q PASS"
@@ -47,7 +45,7 @@ ck "HTTP API (health+auth)"                 "curl -s http://127.0.0.1:8090/healt
 ck "multi-tenant isolation"                 "$PY scripts/tenancy.py test | grep -q PASS"
 ck "skills/capability registry"            "$PY scripts/skills.py test | grep -q PASS"
 ck "portable encrypted snapshot"           "$PY platform/snapshot.py selftest | grep -q PASS"
-ck "platform inventory covers stack"       "for s in postgres nats ntfy cerbos; do grep -q \"name: \$s\" platform/inventory.yaml || exit 1; done"
+ck "platform inventory covers stack"       "for s in postgres ntfy cerbos; do grep -q \"name: \$s\" platform/inventory.yaml || exit 1; done"
 ck "autonomous factory (governed line)"     "$PY scripts/factory.py selftest | grep -q PASS"
 ck "fleet visibility view"                  "$PY scripts/fleet.py status | grep -q 'agent-os fleet'"
 ck "dashboard state (real data)"            "$PY scripts/dashboard.py state | grep -q '\"overall\"'"

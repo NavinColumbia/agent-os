@@ -366,18 +366,20 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         (repo / "src").mkdir(parents=True, exist_ok=True)
         (repo / "tests").mkdir(parents=True, exist_ok=True)
     import sanitize
-    flags = sanitize.scan(charter)
-    if flags:                                        # possible prompt injection in untrusted user input
-        audit.append(actor="sanitize", action="InjectionDetected", resource=product,
-                     decision="flagged", payload={"patterns": flags[:3]})
-        try:
-            import notify
-            notify.send(f"⚠ possible prompt-injection in '{product}' charter — wrapped as untrusted, build continues",
-                        title="security", priority="high", tags="shield")
-        except Exception:
-            pass
-    (repo / "docs" / "CHARTER.md").write_text(
-        f"# {product} — charter ({kind})\n\n{sanitize.wrap_untrusted(charter)}\n")
+    charter_md = repo / "docs" / "CHARTER.md"
+    if not charter_md.exists():                      # first run only — a RESUME must not clobber the
+        flags = sanitize.scan(charter)               # original charter (it was already scanned then)
+        if flags:                                    # possible prompt injection in untrusted user input
+            audit.append(actor="sanitize", action="InjectionDetected", resource=product,
+                         decision="flagged", payload={"patterns": flags[:3]})
+            try:
+                import notify
+                notify.send(f"⚠ possible prompt-injection in '{product}' charter — wrapped as untrusted, build continues",
+                            title="security", priority="high", tags="shield")
+            except Exception:
+                pass
+        charter_md.write_text(
+            f"# {product} — charter ({kind})\n\n{sanitize.wrap_untrusted(charter)}\n")
     log = {"product": product, "kind": kind, "stages": []}
 
     cid = f"build-{product}"
@@ -527,6 +529,75 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
     return log
 
 
+def _detect_kind(repo: Path) -> str:
+    """Recover a product's build kind for resume: from the CHARTER.md header `(kind)`, else disk shape."""
+    ch = repo / "docs" / "CHARTER.md"
+    if ch.exists():
+        first = (ch.read_text().splitlines() or [""])[0]
+        if first.endswith(")") and "(" in first:
+            k = first.rsplit("(", 1)[-1].rstrip(")").strip()
+            if k in ("lib", "web", "service", "extension"):
+                return k
+    if (repo / "manifest.json").exists():
+        return "extension"
+    if (repo / "index.html").exists():
+        return "web"
+    return "lib"
+
+
+def find_incomplete_builds(max_age_min: int = 20):
+    """Builds that were INTERRUPTED, not finished: BUILD checkpointed (rc=0) but the line never reached a
+    terminal verdict (no 'ProductComplete' audit — that row is written for BOTH launched AND blocked-at-QA,
+    so a genuinely-blocked build is NOT considered interrupted and won't be re-resumed forever), and idle
+    for >= max_age_min so we never grab one that's actively running. Returns [(product, kind), ...]."""
+    out = []
+    with psycopg.connect(_DB) as c, c.cursor() as cur:
+        cur.execute("""
+            SELECT t.run_id
+              FROM traces t
+              LEFT JOIN audit_log a
+                     ON a.action='ProductComplete' AND a.resource = substring(t.run_id from 7)
+             WHERE t.run_id LIKE 'build-%%'
+             GROUP BY t.run_id
+            HAVING bool_or(t.stage='BUILD' AND t.kind='agent' AND t.rc=0)   -- BUILD finished
+               AND count(a.id) = 0                                          -- but no terminal verdict
+               AND max(t.ts) < now() - (%s || ' minutes')::interval         -- and gone idle
+             ORDER BY max(t.ts)
+        """, (max_age_min,))
+        for (run_id,) in cur.fetchall():
+            product = run_id[len("build-"):]
+            out.append((product, _detect_kind(PRODUCTS / product)))
+    return out
+
+
+def resume_incomplete_builds(max_age_min: int = 20, limit: int = 3) -> dict:
+    """Self-healing for interrupted builds (e.g. a provider outage killed the line mid-run). Finds builds
+    that finished BUILD but never reached a terminal verdict and have gone idle, and RE-LAUNCHES each as a
+    DETACHED process that resumes from its checkpoint (SPEC/BUILD skipped, continues at QA). Each resume
+    runs independently so this sweep returns immediately — safe to call from the 120s-bounded scheduler."""
+    cands = find_incomplete_builds(max_age_min)[:limit]
+    resumed = []
+    for product, kind in cands:
+        f = open(f"/tmp/resume-{product}.log", "a")
+        # empty charter is intentional: on resume CHARTER.md already exists so it is preserved, and SPEC/
+        # BUILD are checkpoint-skipped — only QA/REVIEW/LAUNCH (which read SPEC.md) actually run.
+        subprocess.Popen([sys.executable, str(SCRIPTS / "factory.py"), "build", product, "", kind],
+                         stdout=f, stderr=f, stdin=subprocess.DEVNULL,
+                         start_new_session=True, cwd=str(SCRIPTS.parent))
+        audit.append(actor="factory:resume-sweep", action="ResumeBuild", resource=product,
+                     decision="relaunched", payload={"kind": kind})
+        resumed.append({"product": product, "kind": kind})
+    if resumed:
+        try:
+            import notify
+            notify.send(f"♻ auto-resumed {len(resumed)} interrupted build(s): " +
+                        ", ".join(r["product"] for r in resumed),
+                        title="self-heal", tags="recycle")
+        except Exception:
+            pass
+    return {"found": len(cands), "resumed": resumed}
+
+
 def dispatch_fleet(specs, max_workers=None):
     """Build several products CONCURRENTLY — the app factory at scale. Each runs its own governed line
     (own repo, own audit/comms rows), so they all show up together on the mission-control dashboard.
@@ -564,6 +635,9 @@ def _main(a):
     elif a[0] == "build":
         charter = a[2] if len(a) > 2 else "Build a small, well-tested Python library."
         build_product(a[1], charter, a[3] if len(a) > 3 else "lib")
+    elif a[0] == "resume-sweep":                       # self-heal interrupted builds (scheduler-driven)
+        age = int(a[1]) if len(a) > 1 else 20
+        print(resume_incomplete_builds(max_age_min=age))
     elif a[0] == "fleet":
         raw = Path(a[1]).read_text() if len(a) > 1 and Path(a[1]).exists() else (a[1] if len(a) > 1 else "[]")
         dispatch_fleet(json.loads(raw), int(a[2]) if len(a) > 2 else 3)

@@ -34,6 +34,35 @@ def test_factory_stage_resume_checkpoint():
             c.commit()
 
 
+# ── self-healing: the resume sweep detects INTERRUPTED builds, not finished ones ─
+def test_factory_resume_sweep_detects_interrupted_only():
+    """A build that finished BUILD but has no terminal ProductComplete (an outage casualty) must be
+    detected for resume; one with a ProductComplete (launched OR blocked) must be EXCLUDED so it is
+    never re-resumed in an infinite loop."""
+    import psycopg
+    import factory
+    import audit
+    sfx = _rid()
+    rid_int = f"build-sweep-int-{sfx}"      # interrupted: BUILD done, no terminal verdict
+    rid_done = f"build-sweep-done-{sfx}"    # terminal: BUILD done + ProductComplete
+    prod_int, prod_done = rid_int[len("build-"):], rid_done[len("build-"):]
+    with psycopg.connect(factory._DB) as c, c.cursor() as cur:
+        for rid in (rid_int, rid_done):     # aged 60m so the idle guard passes
+            cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,rc,ts)
+                           VALUES (%s,%s,'BUILD','builder','agent',0, now()-interval '60 minutes')""",
+                        (rid, rid[len("build-"):]))
+        c.commit()
+    audit.append(actor="pytest", action="ProductComplete", resource=prod_done, decision="LAUNCHED")
+    try:
+        found = dict(factory.find_incomplete_builds(max_age_min=20))
+        assert prod_int in found, "interrupted build should be detected for resume"
+        assert prod_done not in found, "terminal build must NOT be re-resumed"
+    finally:
+        with psycopg.connect(factory._DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM traces WHERE run_id IN (%s,%s)", (rid_int, rid_done))
+            c.commit()
+
+
 # ── governance: the audit log is tamper-evident ──────────────────────────────
 def test_audit_chain_intact_after_append():
     import audit

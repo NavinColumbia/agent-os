@@ -302,6 +302,56 @@ def run_web_qa(repo: str) -> tuple[bool, str]:
         httpd.shutdown()
 
 
+def run_ext_qa(repo: str):
+    """Static QA gate for a Manifest V3 Chrome extension: the manifest is valid MV3, every file it
+    references exists, and all JS is syntactically valid (node --check). This is a STRUCTURAL gate, not a
+    full browser load — it catches the failure modes that make an unpacked extension refuse to load
+    (bad/missing manifest, dangling file references, JS syntax errors). Honest limitation: it does not
+    exercise runtime behaviour in a live browser; that's a manual/e2e step before publish."""
+    root = Path(repo)
+    mf = root / "manifest.json"
+    if not mf.exists():
+        return False, "manifest.json missing at repo root"
+    try:
+        m = json.loads(mf.read_text())
+    except Exception as e:
+        return False, f"manifest.json is not valid JSON: {e}"
+    problems = []
+    if m.get("manifest_version") != 3:
+        problems.append(f"manifest_version must be 3 (got {m.get('manifest_version')!r})")
+    for k in ("name", "version"):
+        if not m.get(k):
+            problems.append(f"manifest missing required key '{k}'")
+    if not (m.get("action") or m.get("content_scripts") or m.get("background")):
+        problems.append("manifest has no entry point (need action/content_scripts/background)")
+    refs = []                                            # every file the manifest points at must exist
+    act = m.get("action") or {}
+    if act.get("default_popup"):
+        refs.append(act["default_popup"])
+    di = act.get("default_icon")
+    refs += ([di] if isinstance(di, str) else list(di.values()) if isinstance(di, dict) else [])
+    refs += list((m.get("icons") or {}).values())
+    if (m.get("background") or {}).get("service_worker"):
+        refs.append(m["background"]["service_worker"])
+    for cs in m.get("content_scripts") or []:
+        refs += cs.get("js", []) + cs.get("css", [])
+    for war in m.get("web_accessible_resources") or []:
+        refs += war.get("resources", []) if isinstance(war, dict) else []
+    for r in refs:
+        if not (root / r).exists():
+            problems.append(f"manifest references a missing file: {r}")
+    for jf in root.rglob("*.js"):                        # syntax-check every JS file (script mode)
+        p = subprocess.run(["node", "--check", str(jf)], capture_output=True, text=True)
+        if p.returncode != 0:
+            problems.append(f"JS syntax error in {jf.relative_to(root)}: {p.stderr.strip()[:160]}")
+    ok = not problems
+    out = "extension QA OK (valid MV3, all refs present, JS parses)" if ok else \
+          "EXTENSION QA FAILED:\n- " + "\n- ".join(problems)
+    audit.append(actor="factory:qa-security", action="ExtQA", resource=root.name,
+                 decision="executed", payload={"ok": ok, "problems": problems[:5]})
+    return ok, out
+
+
 def build_product(product: str, charter: str, kind: str = "lib", api_key: str = None) -> dict:
     """Drive one product end-to-end through the governed line with real agents + a real QA fix loop.
     kind='lib' -> Python library QA'd by pytest; kind='web' -> static web app QA'd by a real browser.
@@ -309,9 +359,10 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
     _ctx.api_key = api_key
     web = kind == "web"
     service = kind == "service"
+    ext = kind == "extension"
     repo = PRODUCTS / product
     (repo / "docs").mkdir(parents=True, exist_ok=True)
-    if not web:
+    if not web and not ext:
         (repo / "src").mkdir(parents=True, exist_ok=True)
         (repo / "tests").mkdir(parents=True, exist_ok=True)
     import sanitize
@@ -387,6 +438,18 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
             "Read docs/SPEC.md. Build a STATIC web app implementing it: index.html at the repo root plus "
             "CSS and vanilla JS. NO build step, NO external CDNs/network — it must work fully offline when "
             "opened over http. Clean, accessible, responsive UI. No console errors on load.")
+    elif ext:
+        build_task = (
+            "Read docs/SPEC.md. Build a complete, loadable UNPACKED Chrome extension (Manifest V3) that "
+            "implements it. At the repo ROOT put manifest.json with manifest_version 3, name, version, "
+            "description, and MINIMAL permissions (prefer just \"storage\"; add host_permissions ONLY if "
+            "strictly required by the spec). Implement the popup (popup.html/.css/.js) and/or content "
+            "scripts and a background service_worker as the feature needs. HARD CONSTRAINTS: 100% "
+            "client-side — NO backend, NO network/fetch calls, NO external CDNs/fonts/analytics; persist "
+            "ALL state with chrome.storage.local. Use plain script-mode vanilla JS (NO ES-module "
+            "import/export syntax) and NO build step. Do NOT include an \"icons\" or \"default_icon\" key "
+            "unless you actually create the PNG files — a dev extension loads fine without icons; NEVER "
+            "reference a file that doesn't exist. Every file named in manifest.json must exist in the repo.")
     elif service:
         build_task = (
             f"Read docs/SPEC.md. Build a small HTTP API SERVICE as a MULTI-MODULE Python package under "
@@ -406,14 +469,21 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
 
     # QA — run REAL verification (browser smoke for web, pytest for lib); bounded fix loop on failure
     def qa():
-        run = (lambda: run_web_qa(str(repo))) if web else (lambda: run_tests(str(repo)))
+        run = ((lambda: run_ext_qa(str(repo))) if ext else
+               (lambda: run_web_qa(str(repo))) if web else (lambda: run_tests(str(repo))))
         ok, out = run()
-        _trace("test", "qa-security", "QA run (browser smoke)" if web else "QA run (pytest)", out, 0 if ok else 1)
+        label = "QA run (extension static)" if ext else "QA run (browser smoke)" if web else "QA run (pytest)"
+        _trace("test", "qa-security", label, out, 0 if ok else 1)
         attempts = 0
         while not ok and attempts < MAX_FIX:
             attempts += 1
             print(f"[factory] QA red — fix attempt {attempts}/{MAX_FIX}", flush=True)
-            fix = (f"The web app FAILED QA (loaded in a headless browser). Output:\n\n{out[-1800:]}\n\n"
+            fix = (f"The Chrome extension FAILED static QA. Output:\n\n{out[-1800:]}\n\n"
+                   f"Fix manifest.json and its files so: it is valid Manifest V3, every file referenced in "
+                   f"the manifest exists, and all JS is syntactically valid script-mode JS (no ES-module "
+                   f"import/export). Add NO network calls or external resources."
+                   if ext else
+                   f"The web app FAILED QA (loaded in a headless browser). Output:\n\n{out[-1800:]}\n\n"
                    f"Fix the HTML/CSS/JS so it loads with HTTP 200, renders visible content, and has NO "
                    f"console/page errors."
                    if web else

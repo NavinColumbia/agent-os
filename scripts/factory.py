@@ -92,9 +92,37 @@ def role_brief(role: str) -> str:
             f"Do not touch .env, secrets, or anything outside this product repo.")
 
 
-def _estimate_timeout(task: str) -> int:
-    """Caller-side: give the agent more time for a more complex task (longer brief => more work)."""
-    return max(240, min(900, 240 + len(task) // 6))
+def _extract_json(text):
+    import re
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return {}
+
+
+def _estimate_runtime(role, task, env):
+    """Callee-driven handshake: ask the agent itself how long this task will take and how many retries
+    it warrants, BEFORE committing to it. The caller then honors that number (× a safety margin) instead
+    of guessing from prompt length. Sanity-bounded so a bad estimate can't hang forever."""
+    q = ("You are the " + role + ". You are about to do the TASK below, but FIRST only ESTIMATE it. "
+         "Reply with ONLY a JSON object: {\"minutes\": <int realistic wall-clock estimate>, "
+         "\"retries\": <int 0-3, how many retries this is worth if it fails>}. Judge by the task's TRUE "
+         "complexity — a deep/research/multi-file task may be 20-45+ min; a tiny one 1-2 min.\n\nTASK:\n" + task)
+    try:
+        p = subprocess.run(["claude", "-p", q, "--output-format", "json"],
+                           cwd=str(PRODUCTS), capture_output=True, text=True, timeout=120, env=env)
+        j = json.loads(p.stdout)
+        est = _extract_json(j.get("result", ""))
+        mins = int(est.get("minutes", 5))
+        rets = int(est.get("retries", 2))
+    except Exception:
+        mins, rets = 5, 2
+    mins = max(2, min(60, mins))      # never below 2m, never hang past 60m
+    rets = max(0, min(3, rets))
+    return mins, rets
 
 
 def _run_once(role, repo, prompt, timeout, env):
@@ -113,16 +141,24 @@ def _run_once(role, repo, prompt, timeout, env):
     return p.returncode, out_text, cost, tin, tout
 
 
-def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = 2) -> dict:
-    """Run one role-specialized agent (headless claude), RESILIENTLY: complexity-based timeout, retry
-    with backoff on stall/failure (a timeout no longer kills the stage), fail-fast on a bad BYO key,
-    and escalate to a human instead of dying silently. Every attempt is audited + traced."""
+def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None) -> dict:
+    """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry count come from
+    the CALLEE's own estimate (a pre-flight handshake), not a caller-side guess: the agent says how long
+    it'll take and how many retries it's worth, the caller honors that (× safety margin). A timeout no
+    longer kills the stage (retry w/ backoff), a bad BYO key fails fast, exhausted retries escalate."""
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
     env = None
     key = getattr(_ctx, "api_key", None)
     if key:
         env = {**os.environ, "ANTHROPIC_API_KEY": key}
-    timeout = timeout or _estimate_timeout(task)
+    if timeout is None or retries is None:
+        est_min, est_ret = _estimate_runtime(role, task, env)
+        if timeout is None:
+            timeout = int(est_min * 60 * 1.5)        # callee's estimate × 1.5 safety
+        if retries is None:
+            retries = est_ret
+        _trace("estimate", role, f"callee estimate for: {task[:120]}",
+               f"~{est_min} min, {est_ret} retries -> timeout {timeout}s", 0)
     last = {"rc": -1, "out": ""}
     for attempt in range(retries + 1):
         t0 = time.time()

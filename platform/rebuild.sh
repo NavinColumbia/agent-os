@@ -64,6 +64,8 @@ say "5. Seed the org (skills + roles)"
 [ -d "$CP" ] && python3 "$CP/scripts/validate_manifests.py" >/dev/null 2>&1 && ok "manifests valid" || true
 "$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register snapshot-backup 86400 \
   '.venv/bin/python platform/snapshot.py export' >/dev/null 2>&1 && ok "daily encrypted snapshot job registered" || warn "snapshot job registration failed"
+"$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register trace-retention 86400 \
+  '.venv/bin/python scripts/trace.py prune 30' >/dev/null 2>&1 && ok "daily trace-retention job registered" || warn "trace-retention registration failed"
 
 say "6. Prove the box (full self-test)"
 if bash "$ROOT/scripts/selftest.sh" >/tmp/rebuild-selftest.log 2>&1; then

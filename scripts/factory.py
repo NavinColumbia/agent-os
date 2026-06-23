@@ -92,18 +92,16 @@ def role_brief(role: str) -> str:
             f"Do not touch .env, secrets, or anything outside this product repo.")
 
 
-def agent(role: str, repo: str, task: str, timeout: int = 420) -> dict:
-    """Run one real, role-specialized agent (headless claude) inside the product repo. Audited."""
-    prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
-    env = None
-    key = getattr(_ctx, "api_key", None)
-    if key:                                          # BYO: run on the TENANT's key (they pay, not us)
-        env = {**os.environ, "ANTHROPIC_API_KEY": key}
-    t0 = time.time()
+def _estimate_timeout(task: str) -> int:
+    """Caller-side: give the agent more time for a more complex task (longer brief => more work)."""
+    return max(240, min(900, 240 + len(task) // 6))
+
+
+def _run_once(role, repo, prompt, timeout, env):
     p = subprocess.run(["claude", "-p", prompt, "--permission-mode", "acceptEdits", "--output-format", "json"],
                        cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
     out_text, cost, tin, tout = (p.stdout or ""), 0.0, 0, 0
-    try:                                            # real economics from the JSON envelope
+    try:
         j = json.loads(p.stdout)
         out_text = j.get("result", "") or ""
         cost = float(j.get("total_cost_usd") or 0)
@@ -112,11 +110,51 @@ def agent(role: str, repo: str, task: str, timeout: int = 420) -> dict:
         tout = int(u.get("output_tokens", 0))
     except Exception:
         pass
-    audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
-                 decision="executed", payload={"rc": p.returncode, "task": task[:80], "cost_usd": cost})
-    _trace("agent", role, prompt, out_text, p.returncode, round(time.time() - t0, 1), cost, tin, tout)
-    return {"rc": p.returncode, "out": out_text[-1500:], "err": (p.stderr or "")[-500:],
-            "cost_usd": cost, "tokens_in": tin, "tokens_out": tout}
+    return p.returncode, out_text, cost, tin, tout
+
+
+def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = 2) -> dict:
+    """Run one role-specialized agent (headless claude), RESILIENTLY: complexity-based timeout, retry
+    with backoff on stall/failure (a timeout no longer kills the stage), fail-fast on a bad BYO key,
+    and escalate to a human instead of dying silently. Every attempt is audited + traced."""
+    prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
+    env = None
+    key = getattr(_ctx, "api_key", None)
+    if key:
+        env = {**os.environ, "ANTHROPIC_API_KEY": key}
+    timeout = timeout or _estimate_timeout(task)
+    last = {"rc": -1, "out": ""}
+    for attempt in range(retries + 1):
+        t0 = time.time()
+        try:
+            rc, out_text, cost, tin, tout = _run_once(role, repo, prompt, timeout, env)
+        except subprocess.TimeoutExpired:
+            dt = round(time.time() - t0, 1)
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="timeout", payload={"attempt": attempt + 1, "timeout_s": timeout})
+            _trace("agent", role, prompt, f"TIMEOUT after {timeout}s (attempt {attempt + 1}/{retries + 1})", -1, dt)
+            time.sleep(4 * (attempt + 1))
+            timeout = min(900, int(timeout * 1.5))      # back off: give it more time next try
+            last = {"rc": -1, "out": "timeout"}
+            continue
+        dt = round(time.time() - t0, 1)
+        audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                     decision="executed", payload={"rc": rc, "attempt": attempt + 1, "cost_usd": cost})
+        _trace("agent", role, prompt, out_text, rc, dt, cost, tin, tout)
+        if key and "Invalid API key" in out_text:       # bad BYO key — don't waste retries
+            return {"rc": rc, "out": out_text[-1500:], "failed": True, "reason": "invalid BYO key"}
+        if rc == 0 and out_text.strip():
+            return {"rc": 0, "out": out_text[-1500:], "cost_usd": cost, "tokens_in": tin,
+                    "tokens_out": tout, "attempts": attempt + 1}
+        last = {"rc": rc, "out": out_text}
+        time.sleep(4 * (attempt + 1))                   # backoff before retry
+    try:                                                # exhausted -> escalate, don't die silently
+        import notify
+        notify.send(f"⚠ agent '{role}' failed after {retries + 1} attempts on {Path(repo).name}",
+                    title="factory", priority="high", tags="warning")
+    except Exception:
+        pass
+    return {"rc": last["rc"], "out": (last["out"] or "")[-1500:], "failed": True, "attempts": retries + 1}
 
 
 def _sandbox_config(repo: str) -> dict:

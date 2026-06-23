@@ -63,6 +63,24 @@ def test_factory_resume_sweep_detects_interrupted_only():
             c.commit()
 
 
+# ── QA depth: web/extension QA actually RUNS the builder's functional tests ───
+def test_run_js_tests_gates_on_functional_behaviour(tmp_path):
+    """The functional-test gate must FAIL when no behaviour tests exist (a smoke-load is not QA), PASS
+    when they exist and pass, and FAIL when any fails — this is the hole that let a web app 'pass' QA
+    while its real tests were never executed."""
+    import factory
+    ok, out = factory.run_js_tests(str(tmp_path))
+    assert not ok and "NO functional tests" in out, "absence of behaviour tests must FAIL"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "a.test.js").write_text(
+        "const assert=require('assert'); assert.equal(1+1,2); console.log('ok');")
+    ok2, _ = factory.run_js_tests(str(tmp_path))
+    assert ok2, "a passing behaviour test must PASS"
+    (tmp_path / "tests" / "b.test.js").write_text("const assert=require('assert'); assert.equal(1,2);")
+    ok3, out3 = factory.run_js_tests(str(tmp_path))
+    assert not ok3 and "FAIL" in out3, "a failing behaviour test must FAIL the gate"
+
+
 # ── runnable systems: the runtime gate boots a real server, runs E2E flows + load ─
 def test_run_e2e_qa_boots_real_server_runs_flows_and_load(tmp_path):
     """run_e2e_qa must actually launch a service, drive end-to-end HTTP flows against the LIVE server,

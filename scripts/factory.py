@@ -335,9 +335,34 @@ def run_tests(repo: str, sandboxed: bool = True, target: str = "") -> tuple[bool
     return p.returncode == 0, out[-2500:]
 
 
+def run_js_tests(repo: str) -> tuple[bool, str]:
+    """Run the builder's framework-free Node test files (tests/**/*.test.js|.cjs) — the FUNCTIONAL path
+    coverage for web/extension products (conversions, error paths, edge cases). Each file must exit 0.
+    ABSENCE of any test file is a FAIL: a QA stage that smoke-loads a page but never runs behaviour tests
+    is theatre (this is the gap that let a web app 'pass' while its 22 real tests were never executed)."""
+    root = Path(repo)
+    files = [p for p in sorted(root.rglob("*.test.js")) + sorted(root.rglob("*.test.cjs"))
+             if "node_modules" not in p.parts]
+    if not files:
+        return False, "NO functional tests found — expected tests/*.test.js exercising every operation, "\
+                      "error path, and edge case (a smoke-load is not QA)."
+    env = {**os.environ, "NODE_PATH": str(Path.home() / "projects" / "products" / "noupload" / "node_modules")}
+    outs, ok_all = [], True
+    for f in files:
+        p = subprocess.run(["node", str(f)], cwd=repo, capture_output=True, text=True, timeout=120, env=env)
+        ok_all = ok_all and (p.returncode == 0)
+        outs.append(f"{f.relative_to(root)}: {'PASS' if p.returncode == 0 else 'FAIL'}\n"
+                    f"{((p.stdout or '') + (p.stderr or ''))[-700:]}")
+    audit.append(actor="factory:qa-security", action="JsTests", resource=root.name,
+                 decision="executed", payload={"files": len(files), "ok": ok_all})
+    return ok_all, "\n".join(outs)
+
+
 def run_web_qa(repo: str) -> tuple[bool, str]:
-    """QA for the WEB line: serve the built app and load it in a real headless browser — assert it
-    renders, capture console/page errors, screenshot it. Real signal, not 'a file exists'."""
+    """QA for the WEB line: (1) run the builder's functional Node tests (every path/error/edge), THEN
+    (2) serve the app and load it in a real headless browser to assert it renders without console errors
+    + screenshot it. BOTH must pass — functional correctness AND it-actually-runs, not one or the other."""
+    js_ok, js_out = run_js_tests(repo)              # functional path coverage FIRST (was never run before)
     import functools
     import http.server
     import socket
@@ -361,7 +386,10 @@ def run_web_qa(repo: str) -> tuple[bool, str]:
                            capture_output=True, text=True, timeout=120, env=env)
         audit.append(actor="factory:qa-security", action="WebSmoke", resource=Path(repo).name,
                      decision="executed", payload={"rc": p.returncode})
-        return p.returncode == 0, (p.stdout or "") + (p.stderr or "") + f"\nscreenshot: {shot}"
+        smoke_ok = p.returncode == 0
+        out = (f"functional tests: {'PASS' if js_ok else 'FAIL'}\n{js_out}\n\n"
+               f"browser smoke: {'PASS' if smoke_ok else 'FAIL'}\n{(p.stdout or '') + (p.stderr or '')}\nscreenshot: {shot}")
+        return (js_ok and smoke_ok), out
     finally:
         httpd.shutdown()
 
@@ -408,12 +436,17 @@ def run_ext_qa(repo: str):
         p = subprocess.run(["node", "--check", str(jf)], capture_output=True, text=True)
         if p.returncode != 0:
             problems.append(f"JS syntax error in {jf.relative_to(root)}: {p.stderr.strip()[:160]}")
-    ok = not problems
-    out = "extension QA OK (valid MV3, all refs present, JS parses)" if ok else \
-          "EXTENSION QA FAILED:\n- " + "\n- ".join(problems)
+    static_ok = not problems
     audit.append(actor="factory:qa-security", action="ExtQA", resource=root.name,
-                 decision="executed", payload={"ok": ok, "problems": problems[:5]})
-    return ok, out
+                 decision="executed", payload={"ok": static_ok, "problems": problems[:5]})
+    if not static_ok:
+        return False, "EXTENSION QA FAILED (static):\n- " + "\n- ".join(problems)
+    # static is necessary but NOT sufficient — also run the builder's functional behaviour tests
+    # (add/edit/delete/search/export logic), so 'valid manifest' can't pass for a non-working extension.
+    js_ok, js_out = run_js_tests(repo)
+    out = (f"static: PASS (valid MV3, all refs present, JS parses)\n"
+           f"functional tests: {'PASS' if js_ok else 'FAIL'}\n{js_out}")
+    return js_ok, out
 
 
 def _free_port() -> int:
@@ -604,7 +637,15 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         build_task = (
             "Read docs/SPEC.md. Build a STATIC web app implementing it: index.html at the repo root plus "
             "CSS and vanilla JS. NO build step, NO external CDNs/network — it must work fully offline when "
-            "opened over http. Clean, accessible, responsive UI. No console errors on load.")
+            "opened over http. Clean, accessible, responsive UI. No console errors on load.\n"
+            "TESTABILITY (REQUIRED — QA runs these): put the core logic (parsing, conversion, validation, "
+            "computation) in functions that ALSO export under Node: end the logic file with "
+            "`if (typeof module !== 'undefined') module.exports = { ...the functions... };` so it works in "
+            "BOTH the browser and Node. Write framework-free Node tests at tests/<name>.test.js (use the "
+            "stdlib `assert`, `require('../yourfile.js')`, exit non-zero on failure) that exercise EVERY "
+            "operation, EVERY error path, and edge cases (empty input, malformed input, special characters, "
+            "boundary values). `node tests/<name>.test.js` must pass. The QA gate runs your tests AND a "
+            "headless-browser smoke — both must be green.")
     elif ext:
         build_task = (
             "Read docs/SPEC.md. Build a complete, loadable UNPACKED Chrome extension (Manifest V3) that "
@@ -616,7 +657,15 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
             "ALL state with chrome.storage.local. Use plain script-mode vanilla JS (NO ES-module "
             "import/export syntax) and NO build step. Do NOT include an \"icons\" or \"default_icon\" key "
             "unless you actually create the PNG files — a dev extension loads fine without icons; NEVER "
-            "reference a file that doesn't exist. Every file named in manifest.json must exist in the repo.")
+            "reference a file that doesn't exist. Every file named in manifest.json must exist in the repo.\n"
+            "TESTABILITY (REQUIRED — QA runs these): put the behaviour logic (add/edit/delete/search/"
+            "export/import, domain derivation) in a module that does NOT call chrome.* at import time — "
+            "take a storage object as a parameter (dependency injection) so it is testable without a "
+            "browser. Export it for Node: `if (typeof module !== 'undefined') module.exports = {...};`. "
+            "Write framework-free Node tests at tests/<name>.test.js using stdlib `assert` and an in-memory "
+            "fake storage, covering EVERY behaviour and edge case (empty, duplicate, search hit/miss, "
+            "export→import round-trip). `node tests/<name>.test.js` must pass — QA runs it after the static "
+            "manifest checks, so a valid manifest alone will NOT pass for a non-working extension.")
     elif service:
         build_task = (
             f"Read docs/SPEC.md. Build a REAL, RUNNABLE HTTP API SERVICE as a MULTI-MODULE Python package "
@@ -657,13 +706,15 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
             attempts += 1
             print(f"[factory] QA red — fix attempt {attempts}/{MAX_FIX}", flush=True)
             fix = (f"The Chrome extension FAILED static QA. Output:\n\n{out[-1800:]}\n\n"
-                   f"Fix manifest.json and its files so: it is valid Manifest V3, every file referenced in "
-                   f"the manifest exists, and all JS is syntactically valid script-mode JS (no ES-module "
-                   f"import/export). Add NO network calls or external resources."
+                   f"Fix manifest.json/files (valid MV3, no dangling refs, script-mode JS) AND the "
+                   f"FUNCTIONAL Node tests (tests/*.test.js exercising add/edit/delete/search/export). If "
+                   f"the failure says 'NO functional tests found', WRITE them with an injected fake storage. "
+                   f"`node tests/<name>.test.js` must pass. Add NO network/external resources."
                    if ext else
-                   f"The web app FAILED QA (loaded in a headless browser). Output:\n\n{out[-1800:]}\n\n"
-                   f"Fix the HTML/CSS/JS so it loads with HTTP 200, renders visible content, and has NO "
-                   f"console/page errors."
+                   f"The web app FAILED QA. Output:\n\n{out[-1800:]}\n\nQA = your FUNCTIONAL Node tests "
+                   f"(tests/*.test.js, every path/error/edge) AND a headless-browser smoke. If it says 'NO "
+                   f"functional tests found', WRITE them (export logic via module.exports, use stdlib assert). "
+                   f"Make `node tests/<name>.test.js` pass AND the page load with no console errors."
                    if web else
                    f"The SERVICE FAILED QA — this covers BOTH socket-free unit tests AND the runtime gate "
                    f"(server boots via `python -m src.{pkg}` on 127.0.0.1:$PORT, end-to-end HTTP flows in "

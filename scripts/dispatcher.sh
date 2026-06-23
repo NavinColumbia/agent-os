@@ -4,7 +4,7 @@
 set -u
 ROOT="$HOME/projects/agent-os"
 PIDFILE="/tmp/agentos-dispatcher.pid"
-INTERVAL="${DISPATCH_INTERVAL:-300}"   # default: poll every 5 min
+INTERVAL="${DISPATCH_INTERVAL:-120}"   # default: poll every 2 min
 
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
   echo "dispatcher already running (pid $(cat "$PIDFILE"))"; exit 0

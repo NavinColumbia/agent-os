@@ -85,6 +85,9 @@ ROLES = Path.home() / "projects" / "control-plane" / "roles"
 PRODUCTS = Path.home() / "projects" / "products"
 VENV_PY = str(Path.home() / "projects" / "agent-os" / ".venv" / "bin" / "python")
 MAX_FIX = 3  # bounded QA->BUILD re-flow attempts
+# Global backpressure: no matter how many builds run concurrently, total live agent subprocesses are
+# capped here (each ~430MB) so a big fleet can't exhaust RAM or hammer the API into rate-limits.
+_AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8")))
 # Model policy (pinned for reproducibility; cheaper model for low-stakes stages; fallback on overload).
 BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-opus-4-8")
 CHEAP_MODEL = os.environ.get("AOS_CHEAP_MODEL", "claude-haiku-4-5-20251001")
@@ -175,7 +178,8 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     if key:
         env = {**os.environ, "ANTHROPIC_API_KEY": key}
     if timeout is None or retries is None:
-        est_min, est_ret = _estimate_runtime(role, task, env)
+        with _AGENT_SEM:                             # the estimate is also a claude process — cap it too
+            est_min, est_ret = _estimate_runtime(role, task, env)
         if timeout is None:
             timeout = int(est_min * 60 * 1.5)        # callee's estimate × 1.5 safety
         if retries is None:
@@ -186,7 +190,8 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     for attempt in range(retries + 1):
         t0 = time.time()
         try:
-            rc, out_text, cost, tin, tout, used = _run_once(role, repo, prompt, timeout, env, model)
+            with _AGENT_SEM:                          # global cap on concurrent agent subprocesses
+                rc, out_text, cost, tin, tout, used = _run_once(role, repo, prompt, timeout, env, model)
         except subprocess.TimeoutExpired:
             dt = round(time.time() - t0, 1)
             audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
@@ -439,10 +444,12 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
     return log
 
 
-def dispatch_fleet(specs, max_workers=3):
+def dispatch_fleet(specs, max_workers=None):
     """Build several products CONCURRENTLY — the app factory at scale. Each runs its own governed line
     (own repo, own audit/comms rows), so they all show up together on the mission-control dashboard.
-    specs = [{"product": "...", "charter": "..."}, ...]. Bounded by max_workers parallel lines."""
+    specs = [{"product": "...", "charter": "..."}, ...]. Bounded by max_workers parallel lines AND the
+    global _AGENT_SEM cap on total live agent subprocesses (AOS_MAX_AGENTS)."""
+    max_workers = max_workers or int(os.environ.get("AOS_FLEET_WORKERS", "5"))
     results = {}
     audit.append(actor="factory:controller", action="FleetStart", resource=f"{len(specs)} products",
                  decision="executed", payload={"workers": max_workers})

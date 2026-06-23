@@ -29,9 +29,11 @@ BUILD_COST_PER_MIN = 0.10   # rough compute proxy until token-cost is instrument
 
 def summary():
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT product, count(*) steps, coalesce(sum(elapsed_s),0) secs, max(ts) last
+        cur.execute("""SELECT product, count(*) steps, coalesce(sum(elapsed_s),0) secs,
+                          coalesce(sum(cost_usd),0) cost, max(ts) last
                        FROM traces WHERE product IS NOT NULL GROUP BY product""")
-        traced = {p: {"steps": s, "secs": float(secs), "last": last} for p, s, secs, last in cur.fetchall()}
+        traced = {p: {"steps": s, "secs": float(secs), "cost": float(cost), "last": last}
+                  for p, s, secs, cost, last in cur.fetchall()}
         cur.execute("""SELECT DISTINCT resource FROM audit_log
                        WHERE action='ProductComplete' AND decision='LAUNCHED'""")
         launched = {r[0] for r in cur.fetchall()}
@@ -46,7 +48,7 @@ def summary():
             "shipped": prod in launched,
             "has_launch_kit": (PRODUCTS / prod / "launch").exists(),
             "build_min": build_min,
-            "build_cost": round(build_min * BUILD_COST_PER_MIN, 2),
+            "build_cost": round(t["cost"], 2),   # REAL $ from claude usage (time proxy retired)
             "owner": owner.get(prod),
             "revenue": 0.0,   # real once the product is sold to paying tenants
         })

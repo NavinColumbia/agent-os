@@ -37,18 +37,20 @@ import threading
 _ctx = threading.local()   # per-build context (run/product/stage) so concurrent builds don't mix traces
 
 
-def _trace(kind, role, prompt, output, rc, elapsed=None):
-    """Persist a step's full I/O for later debugging/replay. Best-effort; bounded size."""
+def _trace(kind, role, prompt, output, rc, elapsed=None, cost_usd=0.0, tokens_in=0, tokens_out=0):
+    """Persist a step's full I/O + real economics for later debugging/replay. Best-effort; bounded size."""
     run = getattr(_ctx, "run", None)
     if not run:
         return
     try:
         import redact
         with psycopg.connect(_DB) as c, c.cursor() as cur:
-            cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, prompt, output, rc, elapsed_s)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, prompt, output, rc,
+                             elapsed_s, cost_usd, tokens_in, tokens_out)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (run, getattr(_ctx, "product", None), getattr(_ctx, "stage", None), role, kind,
-                         redact.scrub((prompt or "")[:20000]), redact.scrub((output or "")[:20000]), rc, elapsed))
+                         redact.scrub((prompt or "")[:20000]), redact.scrub((output or "")[:20000]), rc,
+                         elapsed, cost_usd, tokens_in, tokens_out))
             c.commit()
     except Exception:
         pass
@@ -94,12 +96,23 @@ def agent(role: str, repo: str, task: str, timeout: int = 420) -> dict:
     """Run one real, role-specialized agent (headless claude) inside the product repo. Audited."""
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
     t0 = time.time()
-    p = subprocess.run(["claude", "-p", prompt, "--permission-mode", "acceptEdits"],
+    p = subprocess.run(["claude", "-p", prompt, "--permission-mode", "acceptEdits", "--output-format", "json"],
                        cwd=repo, capture_output=True, text=True, timeout=timeout)
+    out_text, cost, tin, tout = (p.stdout or ""), 0.0, 0, 0
+    try:                                            # real economics from the JSON envelope
+        j = json.loads(p.stdout)
+        out_text = j.get("result", "") or ""
+        cost = float(j.get("total_cost_usd") or 0)
+        u = j.get("usage") or {}
+        tin = int(u.get("input_tokens", 0)) + int(u.get("cache_read_input_tokens", 0)) + int(u.get("cache_creation_input_tokens", 0))
+        tout = int(u.get("output_tokens", 0))
+    except Exception:
+        pass
     audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
-                 decision="executed", payload={"rc": p.returncode, "task": task[:80]})
-    _trace("agent", role, prompt, p.stdout or "", p.returncode, round(time.time() - t0, 1))
-    return {"rc": p.returncode, "out": (p.stdout or "")[-1500:], "err": (p.stderr or "")[-500:]}
+                 decision="executed", payload={"rc": p.returncode, "task": task[:80], "cost_usd": cost})
+    _trace("agent", role, prompt, out_text, p.returncode, round(time.time() - t0, 1), cost, tin, tout)
+    return {"rc": p.returncode, "out": out_text[-1500:], "err": (p.stderr or "")[-500:],
+            "cost_usd": cost, "tokens_in": tin, "tokens_out": tout}
 
 
 def _sandbox_config(repo: str) -> dict:

@@ -63,13 +63,14 @@ def set_policy(app, cap=None, loss=None):
 
 
 def economics(app):
-    """Operating spend (from real token usage) and revenue (billing attribution)."""
+    """Operating spend (REAL $ from claude usage in traces) and revenue (billing attribution)."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT coalesce(sum(tokens_in+tokens_out),0) FROM org_metrics WHERE product=%s", (app,))
-        tokens = int(cur.fetchone()[0])
-    spend = round(tokens / 1000 * RATE_PER_1K, 2)
+        cur.execute("""SELECT coalesce(sum(cost_usd),0), coalesce(sum(tokens_in+tokens_out),0)
+                       FROM traces WHERE product=%s""", (app,))
+        spend, tokens = cur.fetchone()
+    spend = round(float(spend), 2)
     revenue = 0.0   # real once a product is sold to paying tenants (attribution wired, $0 today)
-    return {"tokens": tokens, "spend": spend, "revenue": revenue, "profit": round(revenue - spend, 2)}
+    return {"tokens": int(tokens), "spend": spend, "revenue": revenue, "profit": round(revenue - spend, 2)}
 
 
 def pause(app, reason):
@@ -154,21 +155,21 @@ def _main(a):
         print(json.dumps(resume(a[1]), indent=2))
     elif a[0] == "selftest":
         import os
-        import metrics
         app = f"guard-demo-{os.urandom(3).hex()}"
         set_policy(app, cap=100, loss=20)
-        # simulate operating spend with no revenue: 8M tokens ~ $24 (over the $20 loss limit)
-        metrics.record("state_change", product=app, task_id="t", tokens_in=8_000_000, tokens_out=0,
-                       model="m", outcome="success")
+        # real operating spend with no revenue: a $24 agent step (over the $20 loss limit)
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,cost_usd)
+                           VALUES (%s,%s,'X','r','agent',24)""", (f"g-{app}", app))
+            c.commit()
         before = _policy(app)["status"]
         r = evaluate(app)
         after = _policy(app)["status"]
         ok = before == "active" and after == "paused" and r["state"] == "paused"
-        # cleanup
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with psycopg.connect(DB) as c, c.cursor() as cur:   # cleanup
             cur.execute("DELETE FROM app_policies WHERE app=%s", (app,))
-            cur.execute("DELETE FROM org_metrics WHERE product=%s", (app,)); c.commit()
-        print(f"app spent ~$24 with $0 revenue -> auto-paused: {before}→{after} ({r.get('reason')})")
+            cur.execute("DELETE FROM traces WHERE product=%s", (app,)); c.commit()
+        print(f"app spent $24 with $0 revenue -> auto-paused: {before}→{after} ({r.get('reason')})")
         print("PASS: per-app circuit-breaker auto-pause ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 

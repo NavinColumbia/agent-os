@@ -155,16 +155,9 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     low-stakes stages pass a cheaper model. A timeout no longer kills the stage (retry w/ backoff),
     transient errors back off longer, a bad BYO key fails fast, exhausted retries escalate."""
     model = model or BUILD_MODEL
+    # NB: no home-grown context handling — the agent CLI (claude/codex) manages its own context window
+    # (agentic file search, on-demand reads, compaction) far better than a bolt-on retrieval layer would.
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
-    try:                                             # context guard: don't blow the window on a big repo
-        import context as _ctxmod
-        b = _ctxmod.budget(repo)
-        if b["over"]:
-            prompt += (f"\n\nNOTE: this repo is large (~{b['tokens']} tokens, over the safe context budget). "
-                       f"Do NOT read every file. Use this map and read ONLY the files relevant to your task:\n"
-                       + _ctxmod.repo_map(repo)[:6000])
-    except Exception:
-        pass
     env = None
     key = getattr(_ctx, "api_key", None)
     if key:

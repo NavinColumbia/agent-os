@@ -41,6 +41,21 @@ BENCH = [
 ]
 
 
+# Harder tier — multi-module, stateful API services with persistence (the real stress test).
+HARD_BENCH = [
+    {"product": "hv-todo-api", "kind": "service",
+     "charter": "A todo-list HTTP API service. Endpoints: POST /todos {title} -> 201 with id; GET /todos "
+                "-> list; POST /todos/{id}/complete -> mark done; DELETE /todos/{id} -> 204; 404 for unknown "
+                "id; 400 for missing/blank title. SQLite persistence (todos survive a fresh repository "
+                "instance pointed at the same db file). Multi-module: storage, handlers, http adapter."},
+    {"product": "hv-urls-api", "kind": "service",
+     "charter": "A URL-shortener HTTP API service. Endpoints: POST /shorten {url} -> 201 {code} (reject "
+                "non-http(s) urls with 400); GET /{code} -> 302 redirect to the long url (404 if unknown); "
+                "GET /stats/{code} -> hit count. Codes are short, unique, deterministic-on-collision. SQLite "
+                "persistence across repository instances. Multi-module: storage, handlers, http adapter."},
+]
+
+
 def _one(spec):
     t0 = time.time()
     try:
@@ -54,14 +69,15 @@ def _one(spec):
                 "result": f"ERROR: {e}", "fix_attempts": None, "elapsed_s": round(time.time() - t0, 1)}
 
 
-def run(workers=2):
+def run(workers=2, bench=None, tier="std"):
+    bench = bench or BENCH
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
-    for s in BENCH:
+    for s in bench:
         import shutil
         shutil.rmtree(factory.PRODUCTS / s["product"], ignore_errors=True)
     rows = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_one, s) for s in BENCH]
+        futs = [ex.submit(_one, s) for s in bench]
         for f in as_completed(futs):
             rows.append(f.result())
             print(f"[eval] {rows[-1]}", flush=True)
@@ -76,7 +92,9 @@ def run(workers=2):
         "avg_elapsed_s": round(sum(r["elapsed_s"] for r in rows) / n, 1) if n else 0,
         "rows": rows,
     }
+    score["tier"] = tier
     (EVAL_DIR / "latest.json").write_text(json.dumps(score, indent=2))
+    (EVAL_DIR / f"{tier}.json").write_text(json.dumps(score, indent=2))
     print("\n[eval] SCORECARD:", json.dumps({k: v for k, v in score.items() if k != "rows"}, indent=2), flush=True)
     return score
 
@@ -100,5 +118,7 @@ if __name__ == "__main__":
     a = sys.argv[1:]
     if a and a[0] == "report":
         report()
+    elif a and a[0] == "hard":
+        run(int(a[1]) if len(a) > 1 else 2, bench=HARD_BENCH, tier="hard")
     else:
         run(int(a[1]) if len(a) > 1 and a[0] == "run" else 2)

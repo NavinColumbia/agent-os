@@ -150,6 +150,7 @@ def build_product(product: str, charter: str, kind: str = "lib") -> dict:
     """Drive one product end-to-end through the governed line with real agents + a real QA fix loop.
     kind='lib' -> Python library QA'd by pytest; kind='web' -> static web app QA'd by a real browser."""
     web = kind == "web"
+    service = kind == "service"
     repo = PRODUCTS / product
     (repo / "docs").mkdir(parents=True, exist_ok=True)
     if not web:
@@ -170,6 +171,7 @@ def build_product(product: str, charter: str, kind: str = "lib") -> dict:
     def stage(name, role, fn):
         print(f"\n[factory] === {name} ===", flush=True)
         aid = f"{role}@{product}"
+        t0 = time.time()
         try:                                          # publish presence to the live directory
             import directory
             directory.register(aid, role, product, name, _claims(role))
@@ -177,6 +179,7 @@ def build_product(product: str, charter: str, kind: str = "lib") -> dict:
             pass
         _log_comm(cid, "controller", role, "delegate", {"stage": name})        # hand-off out
         r = fn()
+        dt = round(time.time() - t0, 1)
         ok = (r.get("passed", True) if isinstance(r, dict) else True)
         _log_comm(cid, role, "controller", "done" if ok else "blocked", {"stage": name})  # hand-back
         try:
@@ -184,8 +187,14 @@ def build_product(product: str, charter: str, kind: str = "lib") -> dict:
             directory.release(aid)
         except Exception:
             pass
-        log["stages"].append({name: r})
-        print(f"[factory] {name}: {r}", flush=True)
+        try:                                          # per-stage latency -> observability/cost
+            import metrics
+            metrics.record("stage_done", product=product, task_id=f"{product}:{name}",
+                           to_state=name.lower(), model=role, outcome="success" if ok else "blocked")
+        except Exception:
+            pass
+        log["stages"].append({name: r, "_elapsed_s": dt})
+        print(f"[factory] {name}: {r} ({dt}s)", flush=True)
         return r
 
     # SPEC — a PM turns the charter into a real spec + acceptance criteria
@@ -194,15 +203,27 @@ def build_product(product: str, charter: str, kind: str = "lib") -> dict:
           f"criteria as a bullet list of testable behaviours. Keep it tight and unambiguous."))
 
     # BUILD — a builder implements the product from the spec (library OR static web app)
-    build_task = (
-        f"Read docs/SPEC.md. Build a STATIC web app implementing it: index.html at the repo root plus "
-        f"CSS and vanilla JS. NO build step, NO external CDNs/network — it must work fully offline when "
-        f"opened over http. Clean, accessible, responsive UI. No console errors on load."
-        if web else
-        f"Read docs/SPEC.md. Implement the product as importable Python under src/ "
-        f"(package '{product.replace('-', '_')}') AND write a real pytest suite under tests/ that "
-        f"covers every acceptance criterion, including edge cases. Use `from src...` imports. "
-        f"Make `python -m pytest -q` pass from the repo root.")
+    pkg = product.replace('-', '_')
+    if web:
+        build_task = (
+            "Read docs/SPEC.md. Build a STATIC web app implementing it: index.html at the repo root plus "
+            "CSS and vanilla JS. NO build step, NO external CDNs/network — it must work fully offline when "
+            "opened over http. Clean, accessible, responsive UI. No console errors on load.")
+    elif service:
+        build_task = (
+            f"Read docs/SPEC.md. Build a small HTTP API SERVICE as a MULTI-MODULE Python package under "
+            f"src/{pkg}/: separate modules for (1) a SQLite-backed storage/repository layer, (2) the core "
+            f"handlers/routing with input validation and correct status codes, (3) a thin stdlib "
+            f"http.server adapter (NO external deps). CRITICAL for testability + sandboxed QA: the core "
+            f"(routing/handlers/storage) MUST be callable WITHOUT binding a socket — the pytest suite under "
+            f"tests/ exercises handler + storage functions directly (use a temp SQLite file per test), "
+            f"covering every endpoint, validation error, and a persistence round-trip. Use `from src...` "
+            f"imports. Make `python -m pytest -q` pass from the repo root. No network at test time.")
+    else:
+        build_task = (
+            f"Read docs/SPEC.md. Implement the product as importable Python under src/ "
+            f"(package '{pkg}') AND write a real pytest suite under tests/ that covers every acceptance "
+            f"criterion, including edge cases. Use `from src...` imports. Make `python -m pytest -q` pass.")
     stage("BUILD", "builder", lambda: agent("builder", str(repo), build_task))
 
     # QA — run REAL verification (browser smoke for web, pytest for lib); bounded fix loop on failure

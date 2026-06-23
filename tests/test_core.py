@@ -16,6 +16,24 @@ def _rid():
     return os.urandom(4).hex()
 
 
+# ── factory crash-resume: a completed stage is detected from persisted traces ────
+def test_factory_stage_resume_checkpoint():
+    import psycopg
+    import factory
+    rid = f"build-resumetest-{_rid()}"
+    with psycopg.connect(factory._DB) as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,rc)
+                       VALUES (%s,'rt','SPEC','r','agent',0)""", (rid,))
+        c.commit()
+    try:
+        assert factory._stage_done(rid, "SPEC") is True      # completed stage -> skip on resume
+        assert factory._stage_done(rid, "BUILD") is False     # not done -> will run
+    finally:
+        with psycopg.connect(factory._DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM traces WHERE run_id=%s", (rid,))
+            c.commit()
+
+
 # ── governance: the audit log is tamper-evident ──────────────────────────────
 def test_audit_chain_intact_after_append():
     import audit

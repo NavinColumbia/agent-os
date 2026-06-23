@@ -56,6 +56,18 @@ def _trace(kind, role, prompt, output, rc, elapsed=None, cost_usd=0.0, tokens_in
         pass
 
 
+def _stage_done(run, stage):
+    """Crash-resume checkpoint: a stage is already complete if its agent step is recorded done in the
+    traces we persist anyway. Re-running a crashed build skips finished stages — no DBOS needed for this."""
+    try:
+        with psycopg.connect(_DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT 1 FROM traces WHERE run_id=%s AND stage=%s AND kind='agent' AND rc=0
+                           LIMIT 1""", (run, stage))
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
 def _log_comm(cid, sender, recipient, intent, content):
     """Record a durable handoff in the conversation fabric so the dashboard's comms graph + message
     queue reflect REAL agent-to-agent communication (not just the audit stream). Best-effort."""
@@ -310,6 +322,12 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         return yaml.safe_load(f.read_text()).get("allowed_paths", []) or [f"{product}/**"]
 
     def stage(name, role, fn):
+        # crash-resume: skip a stage already completed in a prior (crashed) run of this product.
+        # QA always re-runs — it's the idempotent gate that re-derives the pass/fail the LAUNCH gate needs.
+        if name != "QA" and _stage_done(cid, name):
+            print(f"\n[factory] === {name} === (RESUMED — already complete, skipping)", flush=True)
+            log["stages"].append({name: {"resumed": True}})
+            return {"resumed": True, "passed": True, "rc": 0}
         print(f"\n[factory] === {name} ===", flush=True)
         _ctx.stage = name
         aid = f"{role}@{product}"

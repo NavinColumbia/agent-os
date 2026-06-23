@@ -18,6 +18,14 @@ import portfolio  # noqa: E402
 
 def recommendations(s):
     t, recs = s["totals"], []
+    try:
+        import appguard
+        paused = appguard.paused_apps()
+    except Exception:
+        paused = []
+    if paused:
+        recs.append(("Review auto-paused apps", f"{len(paused)} app(s) auto-paused for bleeding money "
+                     f"({', '.join(p['app'] for p in paused[:4])}) — approve a budget to resume, or retire them"))
     no_kit = [r["product"] for r in s["products"] if r["shipped"] and not r["has_launch_kit"]]
     if no_kit:
         recs.append(("Generate launch kits", f"{len(no_kit)} shipped app(s) have no marketing kit "
@@ -38,10 +46,16 @@ def recommendations(s):
 def compose():
     s = portfolio.summary()
     t = s["totals"]
+    try:
+        import appguard
+        npaused = len(appguard.paused_apps())
+    except Exception:
+        npaused = 0
     lines = [
         "agent-os digest",
         f"Products: {t['products']} built · {t['shipped']} shipped · {t['with_launch_kit']} with launch kit",
         f"Build cost: ${t['total_build_cost']} · Platform MRR: ${t['platform_mrr']} · Product revenue: ${t['product_revenue']}",
+        f"Money guard: {npaused} app(s) auto-paused for losses" if npaused else "Money guard: all apps within budget",
         "",
         "Next steps (prioritized):",
     ]

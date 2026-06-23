@@ -66,6 +66,10 @@ say "5. Seed the org (skills + roles)"
   '.venv/bin/python platform/snapshot.py export' >/dev/null 2>&1 && ok "daily encrypted snapshot job registered" || warn "snapshot job registration failed"
 "$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register trace-retention 86400 \
   '.venv/bin/python scripts/trace.py prune 30' >/dev/null 2>&1 && ok "daily trace-retention job registered" || warn "trace-retention registration failed"
+"$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register app-profit-guard 3600 \
+  '.venv/bin/python scripts/appguard.py guard' >/dev/null 2>&1 && ok "hourly app profit-guard job registered" || warn "profit-guard registration failed"
+"$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register founder-digest 604800 \
+  '.venv/bin/python scripts/digest.py send' >/dev/null 2>&1 && ok "weekly founder-digest job registered" || warn "digest registration failed"
 
 say "6. Prove the box (full self-test)"
 if bash "$ROOT/scripts/selftest.sh" >/tmp/rebuild-selftest.log 2>&1; then

@@ -63,6 +63,7 @@ ck "launch-kit (marketing-as-code)"         "$PY scripts/launch_kit.py selftest 
 ck "portfolio business view"                "$PY scripts/portfolio.py json | grep -q totals"
 ck "founder digest + next-steps"            "$PY scripts/digest.py selftest | grep -q PASS"
 ck "market-intel wiring"                    "$PY scripts/intel.py selftest | grep -q PASS"
+ck "app circuit-breaker (auto-pause)"       "$PY scripts/appguard.py selftest | grep -q PASS"
 ck "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ck "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"
 

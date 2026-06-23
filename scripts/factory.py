@@ -143,7 +143,7 @@ def _run_once(role, repo, prompt, timeout, env, model):
         u = j.get("usage") or {}
         tin = int(u.get("input_tokens", 0)) + int(u.get("cache_read_input_tokens", 0)) + int(u.get("cache_creation_input_tokens", 0))
         tout = int(u.get("output_tokens", 0))
-        used = next(iter((j.get("modelUsage") or {}).keys()), model)   # which model ACTUALLY ran
+        used = model   # record the PINNED model (reproducibility anchor); CLI may use cheaper models internally
     except Exception:
         pass
     return p.returncode, out_text, cost, tin, tout, used

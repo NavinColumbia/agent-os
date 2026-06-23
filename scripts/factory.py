@@ -416,6 +416,96 @@ def run_ext_qa(repo: str):
     return ok, out
 
 
+def _free_port() -> int:
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close()
+    return p
+
+
+def _wait_up(port: int, timeout: int = 20) -> bool:
+    import socket
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.3)
+    return False
+
+
+def _load_probe(port: int, path: str = "/health", n: int = 200, conc: int = 20) -> tuple[bool, str]:
+    """Fire n concurrent requests at a live endpoint; pass if ≥98% return 2xx. Reports throughput + p95.
+    This is a SMOKE-scale load check (does it survive concurrency without errors/locking), not a soak."""
+    import urllib.request
+    url = f"http://127.0.0.1:{port}{path}"
+
+    def one(_):
+        t = time.time()
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                r.read()
+                return (200 <= r.status < 300), time.time() - t
+        except Exception:
+            return False, time.time() - t
+    lat, ok = [], 0
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=conc) as ex:
+        for good, dt in ex.map(one, range(n)):
+            ok += 1 if good else 0
+            lat.append(dt)
+    lat.sort()
+    p95 = lat[min(len(lat) - 1, int(len(lat) * 0.95))] if lat else 0
+    rate, rps = ok / n, n / max(1e-6, time.time() - t0)
+    return rate >= 0.98, f"load: {ok}/{n} 2xx ({rate:.0%}), {rps:.0f} req/s, p95={p95 * 1000:.0f}ms @conc{conc}"
+
+
+def run_e2e_qa(repo: str, pkg: str, load_path: str = "/health") -> tuple[bool, str]:
+    """RUNTIME gate — what turns 'unit tests pass' into 'the system actually RUNS'. Boots the built
+    service (`python -m src.<pkg>`, which must bind 127.0.0.1:$PORT and serve GET /health), runs the
+    end-to-end HTTP flow tests under tests/e2e against the LIVE server, then a concurrency load probe.
+    SECURITY: the server is generated (untrusted) code and E2E needs loopback HTTP, so this runs OUTSIDE
+    the network-denied unit sandbox — mitigated by 127.0.0.1-only bind, an ephemeral port, a hard
+    timeout, and guaranteed teardown (terminate→kill). A real tradeoff, surfaced not hidden."""
+    port = _free_port()
+    env = {**os.environ, "PORT": str(port), "E2E_BASE": f"http://127.0.0.1:{port}", "PYTHONPATH": repo}
+    proc = subprocess.Popen([VENV_PY, "-m", f"src.{pkg}"], cwd=repo, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        if not _wait_up(port, 20):
+            try:
+                boot_log = proc.communicate(timeout=2)[0] or ""
+            except Exception:
+                boot_log = ""
+            return False, f"E2E: server did not come up on 127.0.0.1:{port}\n{boot_log[-1400:]}"
+        e2e = subprocess.run([VENV_PY, "-m", "pytest", "-q", "tests/e2e"], cwd=repo, env=env,
+                             capture_output=True, text=True, timeout=180)
+        e2e_ok = e2e.returncode == 0
+        load_ok, load_out = _load_probe(port, load_path)
+        ok = e2e_ok and load_ok
+        out = (f"E2E flows: {'PASS' if e2e_ok else 'FAIL'}\n{((e2e.stdout or '') + (e2e.stderr or ''))[-1600:]}\n"
+               f"load test: {'PASS' if load_ok else 'FAIL'} — {load_out}")
+        audit.append(actor="factory:qa-security", action="E2EQA", resource=Path(repo).name,
+                     decision="executed", payload={"e2e_ok": e2e_ok, "load_ok": load_ok})
+        return ok, out
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+
+def run_service_qa(repo: str, pkg: str) -> tuple[bool, str]:
+    """Full service gate: SANDBOXED unit tests (socket-free, in tests/unit) MUST pass first, then the
+    RUNTIME E2E + load gate proves the assembled service actually runs and serves real traffic."""
+    ok_u, out_u = run_tests(repo, target="tests/unit")
+    if not ok_u:
+        return False, "UNIT TESTS FAILED (fix before runtime):\n" + out_u
+    ok_e, out_e = run_e2e_qa(repo, pkg)
+    return ok_e, "unit: PASS\n" + out_e
+
+
 def _review_verdict(repo) -> str:
     """Parse the reviewer's verdict from docs/REVIEW.md — the explicit 'VERDICT:' line if present, else a
     whole-doc scan. Defaults to APPROVE on ambiguity: QA is the OBJECTIVE ship gate, REVIEW is judgment,
@@ -529,14 +619,21 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
             "reference a file that doesn't exist. Every file named in manifest.json must exist in the repo.")
     elif service:
         build_task = (
-            f"Read docs/SPEC.md. Build a small HTTP API SERVICE as a MULTI-MODULE Python package under "
-            f"src/{pkg}/: separate modules for (1) a SQLite-backed storage/repository layer, (2) the core "
-            f"handlers/routing with input validation and correct status codes, (3) a thin stdlib "
-            f"http.server adapter (NO external deps). CRITICAL for testability + sandboxed QA: the core "
-            f"(routing/handlers/storage) MUST be callable WITHOUT binding a socket — the pytest suite under "
-            f"tests/ exercises handler + storage functions directly (use a temp SQLite file per test), "
-            f"covering every endpoint, validation error, and a persistence round-trip. Use `from src...` "
-            f"imports. Make `python -m pytest -q` pass from the repo root. No network at test time.")
+            f"Read docs/SPEC.md. Build a REAL, RUNNABLE HTTP API SERVICE as a MULTI-MODULE Python package "
+            f"under src/{pkg}/ (stdlib only, NO external deps):\n"
+            f"(1) a SQLite-backed storage/repository layer (DB path from the SQLITE_PATH env, default a "
+            f"file under the repo); (2) core handlers/routing with input validation + correct status "
+            f"codes; (3) a thin stdlib http.server adapter; (4) src/{pkg}/__main__.py that starts the "
+            f"server on 127.0.0.1 at the port from the PORT env var (default 8080) and serves GET /health "
+            f"-> 200 JSON. So `python -m src.{pkg}` boots a live server.\n"
+            f"TESTS — TWO suites:\n"
+            f"  • tests/unit/ : exercise handler + storage functions DIRECTLY, WITHOUT binding a socket "
+            f"(use a temp SQLite file per test) — every endpoint, validation error, persistence round-trip.\n"
+            f"  • tests/e2e/ : real END-TO-END HTTP flows against a LIVE server — read the base URL from "
+            f"os.environ['E2E_BASE'] and use urllib to drive the full user journey across multiple "
+            f"endpoints (create -> read -> update/list), asserting status codes and JSON bodies.\n"
+            f"Use `from src...` imports. `python -m pytest -q tests/unit` must pass with NO network. "
+            f"GET /health must return 200 so the runtime gate can detect readiness.")
     else:
         build_task = (
             f"Read docs/SPEC.md. Implement the product as importable Python under src/ "
@@ -547,11 +644,13 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
     # QA — run REAL verification (browser smoke for web, pytest for lib); bounded fix loop on failure.
     # qa_run is hoisted so the REVIEW cycle can re-verify after a review-driven fix (no quality regress).
     qa_run = ((lambda: run_ext_qa(str(repo))) if ext else
-              (lambda: run_web_qa(str(repo))) if web else (lambda: run_tests(str(repo))))
+              (lambda: run_web_qa(str(repo))) if web else
+              (lambda: run_service_qa(str(repo), pkg)) if service else (lambda: run_tests(str(repo))))
 
     def qa():
         ok, out = qa_run()
-        label = "QA run (extension static)" if ext else "QA run (browser smoke)" if web else "QA run (pytest)"
+        label = ("QA run (extension static)" if ext else "QA run (browser smoke)" if web else
+                 "QA run (unit + runtime E2E + load)" if service else "QA run (pytest)")
         _trace("test", "qa-security", label, out, 0 if ok else 1)
         attempts = 0
         while not ok and attempts < MAX_FIX:
@@ -566,6 +665,12 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
                    f"Fix the HTML/CSS/JS so it loads with HTTP 200, renders visible content, and has NO "
                    f"console/page errors."
                    if web else
+                   f"The SERVICE FAILED QA — this covers BOTH socket-free unit tests AND the runtime gate "
+                   f"(server boots via `python -m src.{pkg}` on 127.0.0.1:$PORT, end-to-end HTTP flows in "
+                   f"tests/e2e against the live server, and a concurrency load probe on /health). "
+                   f"Output:\n\n{out[-1800:]}\n\nFix src/ (or a genuinely wrong test) so the server boots, "
+                   f"/health returns 200, the e2e flows pass, and it survives load. Do not delete tests."
+                   if service else
                    f"`python -m pytest -q` is FAILING. Here is the output:\n\n{out[-1800:]}\n\n"
                    f"Fix the code under src/ (or a genuinely wrong test) so all tests pass. "
                    f"Do not delete tests to make them pass.")

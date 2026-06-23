@@ -63,6 +63,41 @@ def test_factory_resume_sweep_detects_interrupted_only():
             c.commit()
 
 
+# ── runnable systems: the runtime gate boots a real server, runs E2E flows + load ─
+def test_run_e2e_qa_boots_real_server_runs_flows_and_load(tmp_path):
+    """run_e2e_qa must actually launch a service, drive end-to-end HTTP flows against the LIVE server,
+    and load-test it — the capability that turns 'units pass' into 'the system runs'. Uses a hand-written
+    trivial stdlib server (no agents) so it's deterministic."""
+    import factory
+    pkg = "fakesvc"
+    (tmp_path / "src" / pkg).mkdir(parents=True)
+    (tmp_path / "src" / "__init__.py").write_text("")
+    (tmp_path / "src" / pkg / "__init__.py").write_text("")
+    (tmp_path / "src" / pkg / "__main__.py").write_text(
+        "import os, json\n"
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
+        "class H(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        body = json.dumps({'ok': True, 'path': self.path}).encode()\n"
+        "        self.send_response(200); self.send_header('Content-Type', 'application/json')\n"
+        "        self.send_header('Content-Length', str(len(body))); self.end_headers()\n"
+        "        self.wfile.write(body)\n"
+        "    def log_message(self, *a):\n        pass\n"
+        "ThreadingHTTPServer(('127.0.0.1', int(os.environ.get('PORT', '8080'))), H).serve_forever()\n")
+    (tmp_path / "tests" / "e2e").mkdir(parents=True)
+    (tmp_path / "tests" / "e2e" / "test_flow.py").write_text(
+        "import os, json, urllib.request\n"
+        "def test_health_then_echo_flow():\n"
+        "    base = os.environ['E2E_BASE']\n"
+        "    with urllib.request.urlopen(base + '/health') as r:\n"
+        "        assert r.status == 200\n"
+        "    with urllib.request.urlopen(base + '/echo') as r:\n"
+        "        assert json.load(r)['ok'] is True\n")
+    ok, out = factory.run_e2e_qa(str(tmp_path), pkg)
+    assert ok, f"runtime gate should pass for a working server:\n{out}"
+    assert "load test: PASS" in out
+
+
 # ── complex projects: dependency DAG layering + interdependent build orchestration ─
 def test_project_topo_layers_and_validation():
     import project

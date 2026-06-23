@@ -60,6 +60,9 @@ ck "orchestration (route/spawn/priority)"   "$PY scripts/orchestrate.py selftest
 ck "debug trace store + replay"             "$PY scripts/trace.py selftest | grep -q PASS"
 ck "trace secret redaction"                 "$PY scripts/redact.py selftest | grep -q PASS"
 ck "launch-kit (marketing-as-code)"         "$PY scripts/launch_kit.py selftest | grep -q PASS"
+ck "portfolio business view"                "$PY scripts/portfolio.py json | grep -q totals"
+ck "founder digest + next-steps"            "$PY scripts/digest.py selftest | grep -q PASS"
+ck "market-intel wiring"                    "$PY scripts/intel.py selftest | grep -q PASS"
 ck "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ck "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"
 

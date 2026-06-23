@@ -101,6 +101,9 @@ CATALOG = [
     # ── growth / marketing / sales / success ──────────────────────────────────
     ("marketing-growth", "growth", "Campaigns, content, SEO, ads, analytics", ["marketing-growth"], ["web-research", "ffmpeg", "piper"], R, CL),
     ("launch-kit-generation", "growth", "Auto-generate a product's go-to-market kit (landing page + Show HN/Product Hunt/tweet/SEO copy); publish stays human-gated", ["marketing-growth", "controller"], ["launch_kit", "factory"], R, CL),
+    ("portfolio-analytics", "growth", "CEO portfolio view: per-product shipped/cost/revenue + platform MRR", ["finance-cost-controller", "controller"], ["portfolio", "billing"], R, TO),
+    ("founder-digest", "growth", "Weekly digest to phone: portfolio state + prioritized next steps", ["controller", "marketing-growth"], ["digest", "ntfy"], R, TO),
+    ("market-competitor-intel", "growth", "Competitor + feature-gap analysis + product recommendations (advisory)", ["research-growth", "marketing-growth"], ["intel", "web-research"], R, CL),
     ("seo-content", "growth", "SEO strategy, keyword + content optimization", ["seo-specialist", "content-marketer"], ["web-research"], R, CL),
     ("social-media", "growth", "Social content calendars + post drafting (publish gated)", ["social-media-manager", "community-manager"], ["reasoning"], R, CL),
     ("paid-ads", "growth", "Plan/draft paid campaigns (spend gated)", ["performance-ads", "marketing-growth"], ["reasoning"], R, CL),

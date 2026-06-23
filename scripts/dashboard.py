@@ -161,6 +161,13 @@ def state():
     except Exception:
         out["runs"] = []
 
+    # portfolio (business view)
+    try:
+        import portfolio
+        out["portfolio"] = portfolio.summary()["totals"]
+    except Exception:
+        out["portfolio"] = {}
+
     # derived alerts
     cycles = []
     try:
@@ -274,6 +281,9 @@ font-weight:600;cursor:pointer}button:hover{filter:brightness(1.08)}
      <div><b id=den>–</b><span>denials / hr</span></div></div>
      <h2 style="margin-top:14px">Products in flight</h2><div id=products class=feed style="max-height:150px"></div></div>
 
+  <div class="card col12"><h2>Portfolio <span class=mut>· business view · build cost · revenue (real once products are sold)</span></h2>
+     <div id=portfolio class=kpi style="padding:2px 0"></div></div>
+
   <div class="card col7"><h2>Agent communication graph <span class=mut>· msgs ▸ &nbsp; waits ▱ amber/red</span></h2>
      <svg id=graph viewBox="0 0 700 340"></svg></div>
   <div class="card col5"><h2>Message queue <span class=mut>· sender → recipient · latency</span></h2>
@@ -315,6 +325,8 @@ async function tick(){
  $('#backup').textContent=s.backup_age_h==null?'no snapshot yet':('last backup '+s.backup_age_h+'h ago');
  $('#procs').innerHTML=s.processes.map(p=>`<div class=row><span class="dot ${p.n?'d-ok':'d-off'}"></span>${p.label}<span class=grow></span><span class=mut>${p.beat!=null?('♥ '+p.beat+'s · '):''}${p.n?('×'+p.n):'idle'}</span></div>`).join('');
  $('#a10').textContent=s.throughput.actions_10m;$('#den').textContent=s.throughput.denies_1h;
+ const pf=s.portfolio||{};
+ $('#portfolio').innerHTML=`<div><b>${pf.products||0}</b><span>products built</span></div><div><b>${pf.shipped||0}</b><span>shipped</span></div><div><b>${pf.with_launch_kit||0}</b><span>launch kits</span></div><div><b>$${pf.total_build_cost||0}</b><span>build cost</span></div><div><b>$${pf.platform_mrr||0}</b><span>platform MRR</span></div><div><b>$${pf.product_revenue||0}</b><span>product revenue</span></div>`;
  $('#products').innerHTML=s.products.length?s.products.map(p=>`<div class=row><b>${esc(p.name)}</b><span class=grow></span><span class=tag>${p.steps} steps · ${esc(p.actor)}</span></div>`).join(''):'<div class=mut>none active</div>';
  $('#msgs').innerHTML=s.messages.map(m=>`<tr><td>${m.ts}</td><td>${esc(m.from)} → ${esc(m.to)}</td><td><span class=chip>${esc(m.intent)}</span></td><td class="${m.latency_s>5?'lat-hi':'lat-ok'}">${m.latency_s==null?'–':m.latency_s+'s'}</td></tr>`).join('')||'<tr><td class=mut colspan=4>no messages yet</td></tr>';
  $('#activity').innerHTML=s.activity.map(a=>`<div class=row><span class="dot ${color(a.decision)}"></span><span class=tag>${a.ts}</span> ${esc(a.actor)} <span class=mut>${esc(a.action)}</span> ${esc(a.resource)}</div>`).join('');

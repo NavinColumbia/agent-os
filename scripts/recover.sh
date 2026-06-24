@@ -102,6 +102,11 @@ else
     && ok "dispatcher started (every 5 min)" || warn "dispatcher failed"
 fi
 
+hdr "4b. Dev app servers (runnable apps on localhost)"
+"$ROOT/.venv/bin/python" "$ROOT/scripts/devserve.py" up-all >/dev/null 2>&1 \
+  && ok "dev app servers up ($("$ROOT/.venv/bin/python" "$ROOT/scripts/devserve.py" status 2>/dev/null | grep -c 'UP')) " \
+  || warn "devserve up-all failed"
+
 hdr "5. Health checks"
 curl -s --max-time 5 http://127.0.0.1:8080/v1/health 2>/dev/null | grep -q healthy && ok "ntfy healthy (local)" || warn "ntfy not healthy"
 DK "docker exec agentos-postgres pg_isready -U agentos -d agentos" >/dev/null 2>&1 && ok "postgres ready" || warn "postgres not ready"

@@ -38,14 +38,40 @@ def _load_json(path: Path):
     return json.loads(txt)
 
 
+def _json_from_text(txt):
+    """Pull the first {...} JSON object out of an agent's free-text reply."""
+    s = txt.find("{")
+    if s < 0:
+        raise ValueError("no json")
+    return json.loads(txt[s: txt.rfind("}") + 1])
+
+
 def decompose(repo: Path, question: str) -> list:
-    """LEAD agent splits the question into independent, researchable sub-questions -> PLAN.json."""
+    """LEAD agent splits the question into independent sub-questions. ROBUST: prefers the written PLAN.json,
+    falls back to parsing the agent's reply, and finally to a single-pass plan — so a live run never crashes
+    just because the model replied in chat instead of writing the file."""
     factory._ctx.product = repo.name; factory._ctx.run = f"research-{repo.name}"; factory._ctx.stage = "DECOMPOSE"
-    factory.agent("research-growth", str(repo),
-                  f"You are the research LEAD. Break this question into {MAX_SUBQ} INDEPENDENT, specific, "
-                  f"separately-researchable sub-questions. QUESTION:\n{question}\n\n"
-                  f'Write PLAN.json containing ONLY: {{"subquestions":["...", "..."]}} — no prose, no fences.')
-    p = _load_json(repo / "PLAN.json")
+    r = factory.agent("research-growth", str(repo),
+                      f"You are the research LEAD. Break this question into {MAX_SUBQ} INDEPENDENT, specific, "
+                      f"separately-researchable sub-questions. QUESTION:\n{question}\n\nDo TWO things: (1) WRITE "
+                      f'the file PLAN.json containing ONLY {{"subquestions":["...","..."]}} (no fences), and (2) '
+                      f"also output that same JSON as your reply.")
+    p = None
+    pj = repo / "PLAN.json"
+    if pj.exists():
+        try:
+            p = _load_json(pj)
+        except Exception:
+            p = None
+    if not (p and p.get("subquestions")):                # file missing/bad -> parse the agent's reply
+        try:
+            p = _json_from_text(r.get("out", ""))
+        except Exception:
+            p = None
+    if not (p and p.get("subquestions")):                # last resort -> single-pass research, never crash
+        print("[research] decompose fallback: single-pass (lead did not return sub-questions)", flush=True)
+        p = {"subquestions": [question]}
+    pj.write_text(json.dumps(p))                          # persist for resume regardless of how we got it
     return p["subquestions"][:MAX_SUBQ]
 
 
@@ -58,7 +84,10 @@ def research_one(repo: Path, idx: int, subq: str, api_key=None):
                       f"Research this sub-question using WebSearch/WebFetch. Be concrete and HONEST — cite "
                       f"source URLs, and if a search yields nothing solid say so (do not fabricate). "
                       f"SUB-QUESTION:\n{subq}\n\nWrite your findings to {out} (markdown, with a 'Sources:' list).")
-    return {"idx": idx, "subq": subq, "ok": r.get("rc") == 0, "file": out}
+    fp = repo / out
+    if not fp.exists() and r.get("out"):                 # robust: persist the reply if the agent didn't write the file
+        fp.write_text(f"# {subq}\n\n{r['out']}\n")
+    return {"idx": idx, "subq": subq, "ok": fp.exists(), "file": out}
 
 
 def synthesize(repo: Path, question: str, out_rel: str):

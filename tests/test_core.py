@@ -214,6 +214,40 @@ def test_project_blocks_integration_when_a_component_fails(monkeypatch):
         shutil.rmtree(factory_products_dir() / prod, ignore_errors=True)
 
 
+def test_project_explore_plan_picks_best(monkeypatch, tmp_path):
+    """Parallel design exploration: n>1 generates n candidate architectures and the judge's pick is built."""
+    import factory
+    import project
+    monkeypatch.setattr(factory, "PRODUCTS", tmp_path)
+    (tmp_path / "prodx" / "docs").mkdir(parents=True)
+    calls = {"n": 0}
+
+    def fake_arch(product, goal, model, ns, depth, variant, out_name):
+        calls["n"] += 1
+        return {"components": [{"id": f"c{calls['n']}", "name": "x", "description": "d", "deps": [], "interface": "i()"}],
+                "integration_tests": "t"}
+    monkeypatch.setattr(project, "_architect", fake_arch)
+    monkeypatch.setattr(project, "_judge_plans", lambda product, goal, cands: cands[max(cands)])  # pick last
+    p = project.explore_plan("prodx", "goal", n=3)
+    assert calls["n"] == 3                                  # three candidate architectures generated in parallel
+    assert p["components"][0]["id"] == "c3"                 # the judged-best one
+    assert (tmp_path / "prodx" / "docs" / "PLAN.json").exists()
+
+
+def test_project_component_role_specialization(monkeypatch, tmp_path):
+    """A component's `role` (infra/ml/data/…) is the agent that builds it — not always a generic builder."""
+    import factory
+    import project
+    monkeypatch.setattr(factory, "PRODUCTS", tmp_path)
+    (tmp_path / "prodr").mkdir()
+    seen = {"role": None}
+    monkeypatch.setattr(factory, "agent", lambda role, repo, task, **k: (seen.__setitem__("role", role), {"rc": 0})[1])
+    monkeypatch.setattr(factory, "run_tests", lambda *a, **k: (True, "ok"))
+    r = project.build_component("prodr", {"id": "trainer", "name": "x", "description": "d", "deps": [],
+                                          "interface": "i()", "role": "ml-engineer"}, {})
+    assert seen["role"] == "ml-engineer" and r["passed"]
+
+
 def test_project_recursive_decomposition(monkeypatch):
     """A component the architect marks `decompose` must trigger a RECURSIVE sub-build (its own plan +
     sub-components + facade integrate) — i.e. real multi-level hierarchy, not a flat 2-level build."""

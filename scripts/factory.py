@@ -325,12 +325,14 @@ def _sandbox_config(repo: str) -> dict:
             "network": {"allowedDomains": [], "deniedDomains": []}}
 
 
-def run_tests(repo: str, sandboxed: bool = True, target: str = "") -> tuple[bool, str]:
+def run_tests(repo: str, sandboxed: bool = True, target: str = "", python: str = "") -> tuple[bool, str]:
     """Run the product's pytest suite. Untrusted generated code runs inside the srt sandbox (write-
     limited to the repo, network denied). Falls back to direct exec ONLY if the sandbox infra itself
     is unavailable (never to mask a real test failure). `target` scopes pytest to a subpath (e.g. one
-    component's tests/<pkg>) — empty means the whole repo."""
-    inner = f"cd {repo} && {VENV_PY} -m pytest -q {target}".rstrip()
+    component's tests/<pkg>) — empty means the whole repo. `python` overrides the interpreter (e.g. a
+    per-product venv when the product assembles open-source deps) — defaults to the platform venv."""
+    py = python or VENV_PY
+    inner = f"cd {repo} && {py} -m pytest -q {target}".rstrip()
     if sandboxed:
         sf = tempfile.NamedTemporaryFile("w", suffix=".srt.json", delete=False)
         json.dump(_sandbox_config(repo), sf); sf.close()

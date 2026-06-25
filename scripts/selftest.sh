@@ -70,6 +70,7 @@ ck "complex-project graph engine"           "$PY scripts/project.py selftest | g
 ck "research fleet (decompose/parallel/synth)" "$PY scripts/research_fleet.py selftest | grep -q PASS"
 ck "scalable verification (tiered)"        "$PY scripts/verify.py selftest | grep -q PASS"
 ck "budget->capability scheduler"           "$PY scripts/scale.py selftest | grep -q PASS"
+ck "continuous improvement (safe-deploy)" "$PY scripts/improve.py selftest | grep -q PASS"
 ck "prompt-injection sanitize"              "$PY scripts/sanitize.py selftest | grep -q PASS"
 ck "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ck "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"

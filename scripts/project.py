@@ -50,6 +50,29 @@ def _pkg(ns, cid):
     return ns + cid.replace("-", "_")
 
 
+def _ensure_product_deps(repo, deps):
+    """OSS-ASSEMBLY: when a component declares `reuse` packages AND AOS_ALLOW_DEPS is set, maintain a
+    per-product venv with those deps installed (isolated from the platform venv) and record them in
+    requirements.txt. Returns that venv's python, or '' to use the platform venv (stdlib-only default).
+    Best-effort: any failure -> '' (the build proceeds stdlib-only rather than breaking)."""
+    if not (deps and os.environ.get("AOS_ALLOW_DEPS")):
+        return ""
+    repo = Path(repo)
+    req = repo / "requirements.txt"
+    have = {l.strip() for l in (req.read_text().splitlines() if req.exists() else []) if l.strip() and not l.startswith("#")}
+    have |= set(deps)
+    req.write_text("\n".join(sorted(have)) + "\n")
+    venv = repo / ".venv"; py = venv / "bin" / "python"
+    try:
+        if not py.exists():
+            subprocess.run(["python3", "-m", "venv", str(venv)], capture_output=True, timeout=120, check=True)
+            subprocess.run([str(py), "-m", "pip", "install", "-q", "pytest"], capture_output=True, timeout=300)
+        subprocess.run([str(py), "-m", "pip", "install", "-q", *deps], capture_output=True, timeout=600)
+        return str(py)
+    except Exception:
+        return ""
+
+
 # ───────────────────────── pure graph logic (unit-tested, no agents) ─────────────────────────
 def validate_dag(components):
     """Raise ValueError on duplicate ids, deps that reference unknown components, self-deps, or a cycle."""
@@ -94,50 +117,110 @@ def _load_json(path: Path):
 
 
 # ───────────────────────── agent-driven phases (compose factory primitives) ─────────────────
-def plan(product, goal, model=None, ns="", depth=0):
-    """ARCHITECT decomposes a goal into a dependency DAG with interface contracts. Each component is either
-    a LEAF (one builder writes it) or, if it is itself a large subsystem, marked `decompose:true` with a
-    `subgoal` — the recursive build then plans IT into a sub-DAG. Per-namespace plan file so resume works
-    at every level of the tree."""
+# Real specialized roles from the governed role library (~90 exist) — the architect assigns the best fit
+# per component, so infra/SRE/ML/data/security work is built by the right specialist, not a generic builder.
+_ROLES = ("builder | backend-engineer | frontend-engineer | fullstack-engineer | data-engineer | "
+          "ml-engineer | mlops-engineer | devops-sre | platform-infra | database-admin | security-appsec | "
+          "mobile-engineer | staff-engineer")
+
+
+def _architect(product, goal, model, ns, depth, variant, out_name):
+    """One architect pass -> a validated plan written to docs/<out_name>. Supports recursion (decompose),
+    role assignment per component, OSS reuse (when AOS_ALLOW_DEPS), and an optional design `variant`."""
     repo = factory.PRODUCTS / product
     (repo / "docs").mkdir(parents=True, exist_ok=True)
-    pj = repo / "docs" / (f"PLAN_{ns.rstrip('_')}.json" if ns else "PLAN.json")
-    if pj.exists():                                   # RESUME: reuse the prior decomposition, don't re-plan
-        try:
-            p = _load_json(pj)
-            validate_dag(p["components"])
-            print(f"[project] resuming — reusing plan {pj.name} ({len(p['components'])} components)", flush=True)
-            return p
-        except Exception:
-            pass                                      # corrupt/partial -> fall through and re-plan
     factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"PLAN:{ns or 'root'}"
     can_recurse = depth < MAX_DEPTH
-    decomp = (" A component that is ITSELF a large subsystem (many parts) may instead be marked "
-              '"decompose": true with a "subgoal" (a precise sub-goal) — it will be planned recursively into '
-              "its own sub-components. Mark decompose ONLY for genuinely large parts; keep simple parts as "
-              "leaves.") if can_recurse else " Every component here must be a LEAF (do NOT use decompose)."
+    decomp = (' A component that is ITSELF a large subsystem may be marked "decompose": true with a "subgoal" '
+              "— it is planned recursively into its own sub-components. Mark decompose ONLY for genuinely "
+              "large parts.") if can_recurse else ' Every component must be a LEAF (do NOT set decompose).'
+    reuse = (' A component MAY set "reuse":["pypi-package",...] to BUILD ON proven open-source packages '
+             'instead of reimplementing non-trivial wheels (they will be installed for that component).'
+             if os.environ.get("AOS_ALLOW_DEPS") else ' Do NOT set "reuse" — standard library only.')
+    var = f' DESIGN PHILOSOPHY for this plan: prioritise {variant}.' if variant else ""
     task = (
         f"You are the system ARCHITECT. Decompose this goal into 4-8 INTERDEPENDENT components of ONE Python "
         f"codebase. GOAL:\n{goal}\n\n"
-        f"Write {pj.name} (under docs/) containing ONLY this JSON (no prose, no fences):\n"
+        f"Write {out_name} (under docs/) containing ONLY this JSON (no prose, no fences):\n"
         f'{{"components":[{{"id":"kebab-id","name":"short name","description":"what it does",'
-        f'"deps":["other-id"],"interface":"the EXACT public functions/classes other components import and '
-        f'call — a contract","decompose":false,"subgoal":""}}],'
+        f'"deps":["other-id"],"interface":"the EXACT public functions/classes other components call — a '
+        f'contract","role":"builder","decompose":false,"subgoal":"","reuse":[]}}],'
         f'"integration_tests":"end-to-end behaviours that prove the components work TOGETHER"}}\n'
-        f"Rules: 'deps' MUST be acyclic and reference other component ids. Make 'interface' precise (names + "
-        f"signatures). Keep ids kebab-case and UNIQUE within this plan.{decomp}")
+        f"Rules: 'deps' acyclic, referencing other component ids; ids kebab-case + UNIQUE; 'interface' "
+        f"precise. Assign each component the best-fit 'role' from: {_ROLES}.{decomp}{reuse}{var}")
     r = factory.agent("staff-engineer", str(repo), task, model=model)
     if r.get("failed"):
         raise RuntimeError(f"architect failed to plan: {r.get('out','')[:200]}")
-    p = _load_json(repo / "docs" / pj.name)
-    if not can_recurse:                               # safety: strip any decompose flags past the depth bound
+    p = _load_json(repo / "docs" / out_name)
+    if not can_recurse:
         for c in p["components"]:
             c["decompose"] = False
     validate_dag(p["components"])
-    audit.append(actor="project:architect", action="Plan", resource=product, decision="executed",
-                 payload={"ns": ns or "root", "depth": depth,
-                          "components": [c["id"] for c in p["components"]]})
     return p
+
+
+def plan(product, goal, model=None, ns="", depth=0):
+    """Single-architect plan with RESUME (reuse an existing per-namespace plan file)."""
+    repo = factory.PRODUCTS / product
+    pj = repo / "docs" / (f"PLAN_{ns.rstrip('_')}.json" if ns else "PLAN.json")
+    if pj.exists():
+        try:
+            p = _load_json(pj); validate_dag(p["components"])
+            print(f"[project] resuming — reusing plan {pj.name} ({len(p['components'])} components)", flush=True)
+            return p
+        except Exception:
+            pass
+    p = _architect(product, goal, model, ns, depth, None, pj.name)
+    audit.append(actor="project:architect", action="Plan", resource=product, decision="executed",
+                 payload={"ns": ns or "root", "depth": depth, "components": [c["id"] for c in p["components"]]})
+    return p
+
+
+def _judge_plans(product, goal, cands):
+    """A judge agent picks the best candidate architecture. Returns the chosen plan dict."""
+    repo = factory.PRODUCTS / product
+    summary = "\n".join(
+        f"CANDIDATE {i}: components=" + ", ".join(f"{c['id']}({c.get('role','builder')})" for c in p["components"])
+        for i, p in cands.items())
+    factory._ctx.stage = "JUDGE"
+    factory.agent("reviewer", str(repo),
+                  f"Choose the BEST architecture for this goal:\n{goal}\n\nCandidates (component breakdowns):\n"
+                  f"{summary}\n\nWeigh clarity, cohesion, testability and right-sized decomposition. Write "
+                  f'docs/JUDGE.json containing ONLY {{"best": <candidate index>, "why": "one line"}}.')
+    try:
+        best = int(_load_json(repo / "docs" / "JUDGE.json").get("best"))
+    except Exception:
+        best = min(cands)
+    return cands.get(best, cands[min(cands)])
+
+
+def explore_plan(product, goal, model=None, ns="", depth=0, n=1):
+    """PARALLEL DESIGN EXPLORATION: generate n candidate architectures (different design philosophies) at
+    once, judge, and build the best. 'More budget -> better, not just more.' n<=1 (or resume) = single plan."""
+    repo = factory.PRODUCTS / product
+    pj = repo / "docs" / (f"PLAN_{ns.rstrip('_')}.json" if ns else "PLAN.json")
+    if pj.exists() or n <= 1:
+        return plan(product, goal, model, ns, depth)
+    variants = ["simplicity and the fewest moving parts", "clean modular boundaries and testability",
+                "robustness, validation and explicit error handling", "performance and scalability"]
+    base = ns.rstrip("_") or "root"
+    cands, workers = {}, int(os.environ.get("AOS_FLEET_WORKERS", "5"))
+    with ThreadPoolExecutor(max_workers=min(n, workers)) as ex:
+        futs = {ex.submit(_architect, product, goal, model, ns, depth, variants[i % len(variants)],
+                          f"cand_{base}_{i}.json"): i for i in range(n)}
+        for f in as_completed(futs):
+            i = futs[f]
+            try:
+                cands[i] = f.result()
+            except Exception:
+                pass
+    if not cands:
+        return plan(product, goal, model, ns, depth)
+    chosen = list(cands.values())[0] if len(cands) == 1 else _judge_plans(product, goal, cands)
+    (repo / "docs" / pj.name).write_text(json.dumps(chosen, indent=2))
+    audit.append(actor="project:architect", action="Plan", resource=product, decision="explored",
+                 payload={"ns": ns or "root", "candidates": len(cands), "components": [c["id"] for c in chosen["components"]]})
+    return chosen
 
 
 def build_component(product, comp, dep_interfaces, api_key=None, ns=""):
@@ -147,40 +230,44 @@ def build_component(product, comp, dep_interfaces, api_key=None, ns=""):
     collision-free. On failure returns a `blocker` reason that propagates up the tree for aggregation."""
     repo = factory.PRODUCTS / product
     cid = comp["id"]; pkg = _pkg(ns, cid)
+    role = comp.get("role") or "builder"              # ROLE SPECIALIZATION (infra/data/ml/staff/builder)
+    pybin = _ensure_product_deps(repo, comp.get("reuse"))  # OSS-ASSEMBLY: per-product venv if deps declared
     factory._ctx.api_key = api_key                    # thread-local: must be set inside this worker thread
     factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"BUILD:{pkg}"
-    # RESUME: if this component was already built green in a prior (interrupted) run, skip it — so a
-    # killed complex build re-runs only the missing/failing components, not the whole thing.
+    # RESUME: if this component was already built green in a prior (interrupted) run, skip it.
     if (repo / "src" / pkg).exists():
-        pre_ok, _ = factory.run_tests(str(repo), target=f"tests/{pkg}")
+        pre_ok, _ = factory.run_tests(str(repo), target=f"tests/{pkg}", python=pybin)
         if pre_ok:
             print(f"[project] component {cid}: already green — skipping (resume)", flush=True)
             return {"id": cid, "passed": True, "resumed": True, "fix_attempts": 0}
-    aid = f"builder@{product}:{cid}"
+    aid = f"{role}@{product}:{cid}"
     try:
         import directory                              # live coordination: claim disjoint paths, detect overlap
-        directory.register(aid, "builder", product, f"BUILD:{cid}", [f"src/{pkg}/**", f"tests/{pkg}/**"])
+        directory.register(aid, role, product, f"BUILD:{cid}", [f"src/{pkg}/**", f"tests/{pkg}/**"])
     except Exception:
         pass
     deps_block = "\n".join(f"- {d}: {i}" for d, i in dep_interfaces.items()) or "(no dependencies)"
+    reuse_block = (f"\nYou MAY (and should, where it saves real work) use these INSTALLED open-source "
+                   f"packages — import them directly, don't reimplement: {', '.join(comp['reuse'])}."
+                   if comp.get("reuse") and pybin else "")
     task = (
         f"Implement component '{cid}' of a LARGER system as a Python package under src/{pkg}/ "
         f"(create src/{pkg}/__init__.py; use `from src.{pkg}...` imports).\n"
         f"COMPONENT: {comp['name']} — {comp['description']}\n"
         f"THE PUBLIC INTERFACE YOU MUST EXPOSE (your dependents rely on this EXACT contract):\n{comp['interface']}\n"
-        f"INTERFACES OF YOUR DEPENDENCIES (import and call these — do NOT reimplement them):\n{deps_block}\n"
+        f"INTERFACES OF YOUR DEPENDENCIES (import and call these — do NOT reimplement them):\n{deps_block}{reuse_block}\n"
         f"Also write tests under tests/{pkg}/ covering this component. Touch ONLY src/{pkg}/** and "
         f"tests/{pkg}/**. Make `python -m pytest -q tests/{pkg}` pass.")
-    factory.agent("builder", str(repo), task)
-    ok, out = factory.run_tests(str(repo), target=f"tests/{pkg}")
+    factory.agent(role, str(repo), task)
+    ok, out = factory.run_tests(str(repo), target=f"tests/{pkg}", python=pybin)
     attempts = 0
     while not ok and attempts < MAX_COMPONENT_FIX:
         attempts += 1
         print(f"[project] component {cid}: test red — fix {attempts}/{MAX_COMPONENT_FIX}", flush=True)
-        factory.agent("builder", str(repo),
+        factory.agent(role, str(repo),
                       f"Component '{cid}' tests FAILING:\n\n{out[-1500:]}\n\nFix src/{pkg}/** (or a genuinely "
                       f"wrong test) so `python -m pytest -q tests/{pkg}` passes. Keep the public interface intact.")
-        ok, out = factory.run_tests(str(repo), target=f"tests/{pkg}")
+        ok, out = factory.run_tests(str(repo), target=f"tests/{pkg}", python=pybin)
     try:
         import directory
         directory.release(aid)
@@ -247,7 +334,8 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None):
     if top:
         audit.append(actor="project:controller", action="ProjectStart", resource=product, decision="executed")
 
-    p = plan(product, goal, model=os.environ.get("AOS_ARCHITECT_MODEL"), ns=ns, depth=depth)
+    p = explore_plan(product, goal, model=os.environ.get("AOS_ARCHITECT_MODEL"), ns=ns, depth=depth,
+                     n=int(os.environ.get("AOS_EXPLORATION", "1")))
     by_id = {c["id"]: c for c in p["components"]}
     layers = topo_layers(p["components"])
     log["plan"] = {"components": list(by_id), "layers": layers}

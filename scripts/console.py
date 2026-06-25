@@ -164,45 +164,97 @@ POSTS = {
 
 PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>agent-os · console</title><style>
-:root{--bg:#0a0d13;--panel:#111722;--line:#1e2733;--tx:#d7dee8;--mut:#7d8795;--accent:#4f8cff;--g:#3fb950;--r:#f85149;--y:#d29922}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+:root{--bg:#0b0d12;--bg2:#0f1117;--panel:#14171f;--panel2:#191d27;--hover:#1c212c;--line:#232834;--line2:#2e3542;
+--tx:#e7eaf0;--tx2:#a8b0be;--mut:#6b7280;--accent:#6e8bff;--accent2:#8aa1ff;--asoft:rgba(110,139,255,.14);--aring:rgba(110,139,255,.45);--atext:#aebcff;
+--g:#3ecf8e;--gsoft:rgba(62,207,142,.13);--gtext:#6fe3ad;--y:#e3b341;--ysoft:rgba(227,179,65,.13);--ytext:#f0cd6e;--r:#f06363;--rsoft:rgba(240,99,99,.13);--rtext:#ff8a8a;
+--mono:ui-monospace,"SF Mono",Menlo,monospace}
+*{box-sizing:border-box}*{scrollbar-width:thin;scrollbar-color:#2a3140 transparent}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#262c38;border-radius:6px;border:2px solid transparent;background-clip:content-box}
+::selection{background:rgba(110,139,255,.3)}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.55 "Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
 .app{display:flex;min-height:100vh}
-.side{width:210px;background:#0c111a;border-right:1px solid var(--line);padding:16px 10px;position:sticky;top:0;height:100vh;overflow:auto}
-.brand{font-weight:700;font-size:16px;padding:6px 10px 14px}
-.nav a{display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:8px;color:var(--mut);text-decoration:none;cursor:pointer;font-size:13px}
-.nav a:hover{background:#131c28;color:var(--tx)}.nav a.on{background:#16202c;color:var(--tx)}
-.nav a .b{margin-left:auto;background:var(--accent);color:#fff;border-radius:999px;font-size:10px;padding:0 6px}
-.main{flex:1;padding:22px 24px;max-width:1000px}
-h1{font-size:20px;margin:0 0 2px}.sub{color:var(--mut);margin:0 0 16px;font-size:13px}
-.kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
-.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;min-width:96px}
-.kpi b{display:block;font-size:19px}.kpi span{color:var(--mut);font-size:12px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
-.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut);margin:0 0 12px}
+.side{width:228px;background:var(--bg2);border-right:1px solid var(--line);padding:16px 12px;position:sticky;top:0;height:100vh;overflow:auto;display:flex;flex-direction:column}
+.brand{display:flex;align-items:center;gap:8px;font-weight:680;font-size:15px;letter-spacing:-.01em;padding:4px 10px 14px}.brand .mk{color:var(--accent)}
+.nsec{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);padding:14px 10px 6px}
+.nav a{display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;color:var(--tx2);text-decoration:none;cursor:pointer;font-size:13px;font-weight:500;transition:background .12s,color .12s}
+.nav a .ico{width:16px;text-align:center;opacity:.85;flex:none}
+.nav a:hover{background:var(--hover);color:var(--tx)}.nav a.on{background:var(--asoft);color:var(--atext);font-weight:600;box-shadow:inset 0 0 0 1px rgba(110,139,255,.18)}
+.nav a .b{margin-left:auto;background:var(--asoft);color:var(--atext);border-radius:999px;font-size:10px;font-weight:600;min-width:18px;height:18px;padding:0 6px;display:inline-flex;align-items:center;justify-content:center}
+.colmain{flex:1;display:flex;flex-direction:column;min-width:0}
+.topbar{display:flex;align-items:center;gap:12px;height:56px;padding:0 24px;background:rgba(15,17,23,.72);backdrop-filter:saturate(160%) blur(10px);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+.topbar .sp{flex:1}.topbar .chip{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--tx2);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:5px 12px;cursor:pointer}
+.topbar .chip .dot{width:8px;height:8px;border-radius:50%}.dot.ok{background:var(--g)}.dot.warn{background:var(--y)}.dot.bad{background:var(--r)}
+.tbtn{position:relative;background:transparent;border:none;color:var(--tx2);font-size:16px;cursor:pointer;padding:6px 8px;border-radius:8px}.tbtn:hover{background:var(--hover);color:var(--tx)}
+.tbtn .nb{position:absolute;top:0;right:0;background:var(--r);color:#fff;border-radius:999px;font-size:9px;font-weight:700;min-width:15px;height:15px;padding:0 4px;display:inline-flex;align-items:center;justify-content:center}
+.main{flex:1;padding:26px 30px;max-width:1080px;width:100%;margin:0 auto}
+h1{font-size:22px;font-weight:650;letter-spacing:-.02em;margin:0 0 3px}.sub{color:var(--mut);margin:0 0 20px;font-size:13px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:18px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 16px;box-shadow:0 1px 2px rgba(0,0,0,.25)}
+.kpi b{display:block;font-size:25px;font-weight:680;letter-spacing:-.02em;line-height:1.1}.kpi span{color:var(--mut);font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.25);animation:rise .22s cubic-bezier(.4,0,.2,1)}
+@keyframes rise{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.card h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--mut);margin:0 0 12px}
 .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.spread{justify-content:space-between}
-.item{border-top:1px solid var(--line);padding:10px 0}.item:first-child{border-top:none}
-.pill{font-size:11px;padding:2px 8px;border-radius:999px;background:#16202c;color:var(--mut)}
-.pill.ok{background:rgba(63,185,80,.15);color:var(--g)}.pill.bad{background:rgba(248,81,73,.15);color:var(--r)}.pill.warn{background:rgba(210,153,34,.15);color:var(--y)}
-.stages{display:flex;gap:4px;margin:8px 0;max-width:260px}.st{flex:1;height:6px;border-radius:3px;background:#1c2733}.st.ok{background:var(--g)}.st.bad{background:var(--r)}
-button{background:#16202c;border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:6px 12px;cursor:pointer;font-size:12px}
-button:hover{filter:brightness(1.25)}button.pri{background:var(--accent);border:none;color:#fff;font-weight:600}
-input,select,textarea{background:#0d131c;border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:8px;font-size:13px;width:100%;font-family:inherit}
-textarea{min-height:84px;resize:vertical}label{display:block;font-size:12px;color:var(--mut);margin:8px 0 3px}
-table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:5px 6px;border-top:1px solid var(--line);text-align:left;color:var(--mut)}th{color:var(--tx);border:none}
-.muted{color:var(--mut)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:820px){.grid{grid-template-columns:1fr}.side{width:64px}.side .lbl{display:none}}
-.tile{background:#0d131c;border:1px solid var(--line);border-radius:10px;padding:12px}
-code{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#9fb6d6}
-</style></head><body><div class=app>
-<div class=side><div class=brand>⬡ agent-os</div><div class=nav id=nav></div>
-  <div style="padding:12px 10px;font-size:11px" class=muted>token<br><input id=tok placeholder="tenant token" style="font-size:11px;padding:5px"><button onclick=saveTok() style="margin-top:6px;width:100%">use</button></div>
+.item{border-top:1px solid var(--line);padding:12px 0}.item:first-child{border-top:none;padding-top:0}
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;background:rgba(255,255,255,.05);color:var(--tx2)}
+.pill.ok{background:var(--gsoft);color:var(--gtext)}.pill.bad{background:var(--rsoft);color:var(--rtext)}.pill.warn{background:var(--ysoft);color:var(--ytext)}.pill.accent{background:var(--asoft);color:var(--atext)}
+.stages{display:flex;gap:4px;margin:8px 0;max-width:280px}.st{flex:1;height:6px;border-radius:3px;background:#1c2733}.st.ok{background:var(--g)}.st.bad{background:var(--r)}
+button{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--line2);color:var(--tx);border-radius:10px;padding:8px 14px;cursor:pointer;font-size:13px;font-weight:550;line-height:1;transition:background .15s,border-color .15s,transform .05s}
+button:hover{background:var(--hover);border-color:#3a4150}button:active{transform:translateY(.5px)}
+button.pri{background:var(--accent);border:1px solid var(--accent);color:#0b0d12;font-weight:600;box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}button.pri:hover{background:var(--accent2);border-color:var(--accent2)}
+input,select,textarea{width:100%;font-family:inherit;font-size:13.5px;color:var(--tx);background:var(--bg2);border:1px solid var(--line2);border-radius:10px;padding:9px 11px;transition:border-color .15s,box-shadow .15s}
+input::placeholder,textarea::placeholder{color:var(--mut)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);background:var(--panel);box-shadow:0 0 0 3px var(--asoft)}
+textarea{min-height:96px;resize:vertical}label{display:block;font-size:12px;font-weight:550;color:var(--tx2);margin:14px 0 5px}
+table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);padding:0 10px 10px;border-bottom:1px solid var(--line2)}
+td{padding:11px 10px;color:var(--tx2);border-bottom:1px solid var(--line)}td:first-child{color:var(--tx);font-weight:500}tbody tr{transition:background .12s}tbody tr:hover{background:var(--hover)}tbody tr:last-child td{border-bottom:none}
+.muted{color:var(--mut)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:820px){.grid{grid-template-columns:1fr}.side{width:64px}.side .lbl,.side .nsec{display:none}}
+.tile{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:14px}
+.chat{display:flex;flex-direction:column;gap:14px}.msg{display:flex;max-width:80%}.msg.me{align-self:flex-end;justify-content:flex-end}
+.bubble{padding:11px 15px;border-radius:18px;font-size:14px;line-height:1.5}
+.msg.ai .bubble{background:var(--panel2);border:1px solid var(--line);border-bottom-left-radius:6px}
+.msg.me .bubble{background:var(--accent);color:#0b0d12;font-weight:500;border-bottom-right-radius:6px;box-shadow:0 2px 8px -2px rgba(110,139,255,.4)}
+code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(--asoft);padding:1px 5px;border-radius:5px}
+:focus-visible{outline:none;box-shadow:0 0 0 3px var(--aring)}
+.skel{background:linear-gradient(90deg,#171b24 25%,#1d222d 50%,#171b24 75%);background-size:200% 100%;animation:shim 1.4s infinite;border-radius:6px;height:14px;margin:8px 0}@keyframes shim{to{background-position:-200% 0}}
+.menu{position:absolute;right:20px;top:52px;background:var(--panel2);border:1px solid var(--line2);border-radius:12px;box-shadow:0 12px 36px -10px rgba(0,0,0,.6);padding:8px;min-width:240px;z-index:30}
+.menu a{display:block;padding:8px 10px;border-radius:8px;color:var(--tx2);text-decoration:none;cursor:pointer;font-size:13px}.menu a:hover{background:var(--hover);color:var(--tx)}
+</style></head><body>
+<div id=signin style="display:none;max-width:420px;margin:14vh auto;padding:0 18px">
+  <div class=card><div class=brand style="padding-bottom:18px"><span class=mk>⬡</span> agent-os</div>
+  <h2 style="text-transform:none;font-size:15px;letter-spacing:0;color:var(--tx)">Sign in to your console</h2>
+  <label>Tenant token</label><input id=tok placeholder="aos_…  (from the front door)">
+  <div style="margin-top:12px"><button class=pri onclick=saveTok() style=width:100%>Open console</button></div>
+  <p class=muted style=margin-top:12px>No account yet? Open the front door to sign up, then paste your token here.</p></div>
 </div>
-<div class=main><div id=view><div class=card>Paste your tenant token (left) to open your console. No token? Use the front door to sign up.</div></div></div>
+<div class=app id=app style="display:none">
+<div class=side><div class=brand><span class=mk>⬡</span> agent-os</div><div class=nav id=nav style=flex:1></div>
+  <a class=nav-foot id=statusfoot onclick="go('status')" style="display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;color:var(--tx2);cursor:pointer;font-size:13px;border-top:1px solid var(--line);margin-top:8px"><span class="dot ok" id=statusdot></span><span class=lbl>Status</span></a>
+</div>
+<div class=colmain>
+  <div class=topbar><span class=title id=tbtitle>Cockpit</span><span class=sp></span>
+    <span class=chip id=spendchip onclick="go('billing')"><span class="dot ok" id=spenddot></span><span id=spendtxt>—</span></span>
+    <button class=tbtn onclick="go('notifications')" title=Notifications>◔<span class=nb id=bellbadge style=display:none></span></button>
+    <button class=tbtn onclick="go('help')" title=Help>?</button>
+    <button class=tbtn onclick="toggleAcct()" title=Account>☰</button>
+    <div class=menu id=acctmenu style=display:none><a onclick="go('settings')">Settings</a><a onclick="go('team')">Members</a><a onclick="go('billing')">Billing &amp; plan</a><a onclick="go('settings')">AI consent &amp; data</a><a onclick="go('status')">Status</a><a onclick=signOut()>Sign out</a></div>
+  </div>
+  <div class=main><div id=view></div></div>
+</div>
 </div>
 <script>
-const NAV=[['chat','💬 Direct (chat)'],['cockpit','◧ Cockpit'],['build','✦ New build'],['templates','▦ Templates'],['projects','▤ Projects'],['fleet','⚙ Fleet'],['observability','◴ Observability'],['approvals','✓ Approvals'],['integrations','⌁ Integrations'],['providers','🔌 Providers'],['billing','▣ Billing'],['notifications','◔ Notifications'],['team','◍ Team'],['settings','⚙ Settings'],['help','? Help'],['status','◉ Status']];
-const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';
+const NAV=[
+ ['Direct',[['chat','Chat','💬'],['build','New build','✦'],['templates','Templates','▦']]],
+ ['Operate',[['cockpit','Cockpit','◧'],['projects','Projects','▤'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
+ ['Business',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
+];
+const LABEL={chat:'Chat',build:'New build',templates:'Templates',cockpit:'Cockpit',projects:'Projects',approvals:'Approvals',activity:'Activity',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Team',settings:'Settings',status:'Status'};
+const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
-function saveTok(){TOK=$('#tok').value.trim();localStorage.setItem('aos_tenant',TOK);go('cockpit')}
+function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none'}
+function saveTok(){TOK=($('#tok').value||'').trim();if(!TOK)return;localStorage.setItem('aos_tenant',TOK);showApp(true);boot()}
+function signOut(){localStorage.removeItem('aos_tenant');TOK='';showApp(false)}
+function toggleAcct(){const m=$('#acctmenu');m.style.display=m.style.display==='none'?'block':'none'}
 async function get(p){
  if(!TOK){const e=new Error('Paste your tenant token to open the console.');e.kind='auth';throw e}
  let r;try{r=await fetch(p,{headers:H()})}catch(_){const e=new Error('Can\'t reach the server — is the console running?');e.kind='net';throw e}
@@ -219,8 +271,18 @@ function authCard(msg){return `<div class=card><h2>Sign in</h2><p class=muted>${
 function errCard(k,msg){return `<div class=card><h2>Something went wrong</h2><p class=muted>${esc(msg)}</p><div style=margin-top:8px><button class=pri onclick="go('${k}')">retry</button></div></div>`}
 function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function pill(txt,cls){return `<span class="pill ${cls||''}">${esc(txt)}</span>`}
-function renderNav(badges){$('#nav').innerHTML=NAV.map(([k,l])=>`<a class="${k==CUR?'on':''}" onclick="go('${k}')"><span class=lbl>${l}</span>${badges&&badges[k]?`<span class=b>${badges[k]}</span>`:''}</a>`).join('')}
-async function go(k){CUR=k;renderNav();$('#view').innerHTML='<div class=card><span class=muted>loading…</span></div>';
+function renderNav(){$('#nav').innerHTML=NAV.map(([sec,items])=>`<div class=nsec>${sec}</div>`+items.map(([k,l,ic])=>`<a class="${k==CUR?'on':''}" onclick="go('${k}')"><span class=ico>${ic}</span><span class=lbl>${l}</span>${BADGES[k]?`<span class=b>${BADGES[k]}</span>`:''}</a>`).join('')).join('')}
+async function refreshTopbar(){
+ try{const b=await get('/api/billing');const f=await get('/api/forecast').catch(()=>null);
+   const lvl=f?(f.level==='over'?'bad':(f.level==='warn'?'warn':'ok')):'ok';
+   $('#spenddot').className='dot '+lvl;$('#spendtxt').textContent='$'+((b.usage&&b.usage.tokens!=null)?(b.invoice&&b.invoice.total!=null?b.invoice.total:'') : '')+(f?(' · '+f.pct_of_quota_projected+'% quota'):'');
+   if(!$('#spendtxt').textContent.trim()||$('#spendtxt').textContent==='$')$('#spendtxt').textContent=(b.plan||'')+(f?(' · '+f.pct_of_quota_projected+'%'):'');
+ }catch(e){}
+ try{const n=await get('/api/notifications');const bb=$('#bellbadge');if(n.unread>0){bb.style.display='inline-flex';bb.textContent=n.unread}else bb.style.display='none'}catch(e){}
+ try{const ap=await get('/api/approvals');BADGES.approvals=ap.count||0;renderNav()}catch(e){}
+ try{const s=await get('/api/status');$('#statusdot').className='dot '+({operational:'ok',degraded:'warn',major_outage:'bad'}[s.verdict]||'ok')}catch(e){}
+}
+async function go(k){CUR=k;renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
  try{await VIEWS[k]()}catch(e){$('#view').innerHTML=(e.kind==='auth')?authCard(e.message):errCard(k,e.message)}}
 function kpis(arr){return '<div class=kpis>'+arr.map(a=>`<div class=kpi><b>${esc(a[1])}</b><span>${esc(a[0])}</span></div>`).join('')+'</div>'}
 function stages(ss){return '<div class=stages>'+ss.map(s=>`<div class="st ${s.done?(s.ok===false?'bad':'ok'):''}" title="${s.stage}"></div>`).join('')+'</div>'}
@@ -250,6 +312,13 @@ const VIEWS={
   <div class=card><label>Name</label><input id=bn placeholder=splitbill><label>Type</label><select id=bk onchange=showEst()><option value=lib>Python library</option><option value=web>Web app</option><option value=service>API service</option></select><label>What should it do?</label><textarea id=bc placeholder="Describe the API, behaviours, edge cases…"></textarea><div id=est class=muted style=margin-top:8px></div><div style=margin-top:10px><button class=pri onclick=doBuild()>Build it</button></div><div id=bnote class=muted style=margin-top:8px></div></div>`;showEst();},
  templates:async()=>{const d=await get('/api/templates');$('#view').innerHTML=`<h1>Templates</h1><p class=sub>Start from a curated, factory-ready blueprint.</p><div class=grid>`+(d.templates||[]).map(t=>`<div class=tile><div class="row spread"><b>${esc(t.name)}</b>${pill(t.kind)}</div><div class=muted style=margin:6px_0>${esc(t.blurb)}</div><button class=pri onclick="buildTpl('${t.slug}')">Build this</button></div>`).join('')+'</div>';},
  projects:async()=>{const d=await get('/api/projects');d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):'<div class=muted>no projects yet</div>')+'</div>';},
+ activity:async()=>{const o=await get('/api/observability');let fl={workers:[]};try{fl=await get('/api/fleet')}catch(e){}fl.workers=fl.workers||[];
+  let h='<h1>Activity</h1><p class=sub>Runs, errors, spend, and the live workers across your fleet.</p>';
+  h+=kpis([['Runs',o.runs||0],['Steps',o.steps||0],['Errors',o.errors||0],['Cost $',o.cost_usd||0],['Workers',fl.workers.length]]);
+  h+='<div class=card><h2>Live workers</h2><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th></tr>'+(fl.workers.length?fl.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td></tr>`).join(''):'<tr><td class=muted colspan=4>no live workers right now</td></tr>')+'</table></div>';
+  h+='<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(o.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div>';
+  h+='<div class=card><h2>Recent errors</h2>'+((o.recent_errors||[]).length?o.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean ✓</div>')+'</div>';
+  $('#view').innerHTML=h;},
  fleet:async()=>{const d=await get('/api/fleet');d.workers=d.workers||[];$('#view').innerHTML='<h1>Agent fleet</h1><p class=sub>Live workers across your products.</p>'+kpis([['Live workers',d.count||0],['Active products',d.products_active||0]])+'<div class=card><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th>task</th></tr>'+(d.workers.length?d.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td>${esc(w.task)}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';},
  observability:async()=>{const d=await get('/api/observability');$('#view').innerHTML='<h1>Observability</h1><p class=sub>Runs, errors, spend across your fleet.</p>'+kpis([['Runs',d.runs],['Steps',d.steps],['Errors',d.errors],['Cost $',d.cost_usd],['Tokens',d.tokens]])+'<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(d.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div><div class=card><h2>Recent errors</h2>'+((d.recent_errors||[]).length?d.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean</div>')+'</div>';},
  approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">deny</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):'<div class=muted>nothing awaiting you ✓</div>')+'</div>';},
@@ -303,7 +372,11 @@ async function saveKey(){await post('/api/byok',{key:$('#bk').value});go('settin
 async function acctExport(){$('#acctnote').textContent='preparing export…';const r=await post('/api/account/export',{});$('#acctnote').textContent=r.ok?('Export ready ('+r.products+' products) on the server: '+(r.path||'')):'export failed';}
 async function acctDelete(){const r=await post('/api/account/delete',{confirm:false});if(!confirm('Permanently delete your account and ALL data? This cannot be undone.'))return;const r2=await post('/api/account/delete',{confirm:true});if(r2.ok){localStorage.removeItem('aos_tenant');TOK='';$('#view').innerHTML='<div class=card>Your account and data were deleted. Goodbye.</div>';}}
 async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
-renderNav();if(TOK){$('#tok').value=TOK;go('chat');setInterval(()=>{if(['cockpit','fleet'].includes(CUR))go(CUR)},6000)}
+async function boot(){renderNav();refreshTopbar();let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
+ go((ob&&!ob.completed&&ob.step!=='done')?'chat':'cockpit');
+ setInterval(refreshTopbar,15000);setInterval(()=>{if(['cockpit','activity'].includes(CUR))go(CUR)},6000)}
+document.addEventListener('click',e=>{if(!e.target.closest('#acctmenu')&&!String(e.target.getAttribute&&e.target.getAttribute('onclick')||'').includes('toggleAcct'))$('#acctmenu').style.display='none'});
+if(TOK){$('#tok').value=TOK;showApp(true);boot()}else{showApp(false)}
 </script></body></html>"""
 
 

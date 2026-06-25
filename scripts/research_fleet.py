@@ -51,21 +51,23 @@ def decompose(repo: Path, question: str) -> list:
     falls back to parsing the agent's reply, and finally to a single-pass plan — so a live run never crashes
     just because the model replied in chat instead of writing the file."""
     factory._ctx.product = repo.name; factory._ctx.run = f"research-{repo.name}"; factory._ctx.stage = "DECOMPOSE"
+    # NO web tools here — decomposition is pure reasoning; with web tools the agent wanders into research
+    # and never returns the plan (which is why live runs degraded to single-pass). Force JSON-only.
     r = factory.agent("research-growth", str(repo),
-                      f"You are the research LEAD. Break this question into {MAX_SUBQ} INDEPENDENT, specific, "
-                      f"separately-researchable sub-questions. QUESTION:\n{question}\n\nDo TWO things: (1) WRITE "
-                      f'the file PLAN.json containing ONLY {{"subquestions":["...","..."]}} (no fences), and (2) '
-                      f"also output that same JSON as your reply.")
+                      f"Split this research question into exactly {MAX_SUBQ} INDEPENDENT, specific, "
+                      f"separately-researchable sub-questions that together fully cover it. Do NOT research "
+                      f"anything — just decompose. QUESTION:\n{question}\n\nReply with ONLY this JSON object "
+                      f'and NOTHING else (no preamble, no markdown fences): {{"subquestions":["q1","q2",...]}}',
+                      tools=[])
     p = None
+    try:                                                 # parse the reply first (no file needed)
+        p = _json_from_text(r.get("out", ""))
+    except Exception:
+        p = None
     pj = repo / "PLAN.json"
-    if pj.exists():
+    if not (p and p.get("subquestions")) and pj.exists():
         try:
             p = _load_json(pj)
-        except Exception:
-            p = None
-    if not (p and p.get("subquestions")):                # file missing/bad -> parse the agent's reply
-        try:
-            p = _json_from_text(r.get("out", ""))
         except Exception:
             p = None
     if not (p and p.get("subquestions")):                # last resort -> single-pass research, never crash
@@ -137,9 +139,9 @@ def _selftest():
     factory.PRODUCTS = workdir
     def fake_agent(role, repo, task, **k):
         repo = Path(repo)
-        if "PLAN.json" in task:
-            (repo / "PLAN.json").write_text('{"subquestions":["q1","q2","q3"]}')
-        elif "findings/" in task and "Write your findings" in task:
+        if "Split this research question" in task:                  # decompose -> JSON in the reply
+            return {"rc": 0, "out": '{"subquestions":["q1","q2","q3"]}'}
+        if "Write your findings" in task:
             f = task.split("Write your findings to ")[1].split(" ")[0]
             (repo / f).parent.mkdir(parents=True, exist_ok=True); (repo / f).write_text("finding\nSources: x")
             calls["research"] += 1

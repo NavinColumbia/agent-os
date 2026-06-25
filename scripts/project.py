@@ -290,6 +290,18 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None):
         log["failed_components"] = [cid for cid, b in built.items() if not b.get("passed")]
         log["blocker"] = " | ".join(blockers)[:600]   # aggregated, bubbles up to the parent level
 
+    if top and log["result"] == "INTEGRATED":         # SCALABLE VERIFICATION: assurance scales with budget
+        rigor = int(os.environ.get("AOS_RIGOR", "1"))
+        if rigor > 1:
+            try:
+                import verify
+                v = verify.verify(product, rigor=rigor, api_key=api_key)
+                log["verification"] = {"rigor": rigor, "passed": v.get("passed"),
+                                       "checks": [(c["check"], c["ok"]) for c in v.get("passes", [])]}
+                if not v.get("passed"):               # verification is a real gate at rigor>1
+                    log["result"], log["passed"] = "BLOCKED_AT_VERIFY", False
+            except Exception as e:
+                log["verification"] = {"error": str(e)[:160]}
     if top:
         audit.append(actor="project:controller", action="ProjectComplete", resource=product,
                      decision=log["result"], payload={"components": len(by_id), "layers": len(layers),

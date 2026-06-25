@@ -45,6 +45,9 @@ def _ensure():
             tenant_id TEXT NOT NULL, provider TEXT NOT NULL, has_key BOOLEAN NOT NULL DEFAULT false,
             priority INT NOT NULL DEFAULT 5, added_at TIMESTAMPTZ DEFAULT now(),
             PRIMARY KEY (tenant_id, provider))""")
+        # auth_mode: 'api_key' (BYO metered key) or 'subscription' (run on the host CLI's logged-in
+        # Claude/ChatGPT account — no per-token billing). Added idempotently for existing tables.
+        cur.execute("ALTER TABLE tenant_providers ADD COLUMN IF NOT EXISTS auth_mode TEXT DEFAULT 'api_key'")
         c.commit()
 
 
@@ -52,23 +55,35 @@ def _secret_name(provider):
     return f"byo_key_{provider}"
 
 
-def add_key(tid, provider, key):
+def connect(tid, provider, mode="api_key", key=None):
+    """Connect a provider either by BYO API key (mode='api_key', metered) or by SUBSCRIPTION login
+    (mode='subscription' — runs on the host CLI's logged-in Claude/ChatGPT account, no per-token billing).
+    Subscription mode needs no key. Returns connected status."""
     if provider not in _BY_SLUG:
         return {"error": f"unknown provider '{provider}'"}
+    if mode not in ("api_key", "subscription"):
+        return {"error": "mode must be 'api_key' or 'subscription'"}
+    if mode == "api_key" and not key:
+        return {"error": "an API key is required for api_key mode"}
     _ensure()
-    if key:
+    if mode == "api_key":
         vault.put_secret(_secret_name(provider), f"tenant:{tid}", "prod", ["builder", "factory"], key)
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("SELECT COALESCE(min(priority),5) FROM tenant_providers WHERE tenant_id=%s AND has_key", (tid,))
         top = cur.fetchone()[0]
-        cur.execute("""INSERT INTO tenant_providers (tenant_id, provider, has_key, priority)
-                       VALUES (%s,%s,true,%s)
-                       ON CONFLICT (tenant_id, provider) DO UPDATE SET has_key=true""",
-                    (tid, provider, max(1, top)))
+        cur.execute("""INSERT INTO tenant_providers (tenant_id, provider, has_key, priority, auth_mode)
+                       VALUES (%s,%s,true,%s,%s)
+                       ON CONFLICT (tenant_id, provider) DO UPDATE SET has_key=true, auth_mode=EXCLUDED.auth_mode""",
+                    (tid, provider, max(1, top), mode))
         c.commit()
     audit.append(actor="tenantproviders", action="ProviderConnected", resource=tid, decision="connected",
-                 payload={"provider": provider})
-    return {"ok": True, "provider": provider, "engine": _BY_SLUG[provider]["engine"]}
+                 payload={"provider": provider, "mode": mode})
+    return {"ok": True, "provider": provider, "engine": _BY_SLUG[provider]["engine"], "mode": mode}
+
+
+def add_key(tid, provider, key):
+    """Back-compat: connect via BYO API key."""
+    return connect(tid, provider, "api_key", key)
 
 
 def remove_key(tid, provider):
@@ -96,34 +111,38 @@ def set_priority(tid, ordered):
 def list_providers(tid):
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT provider, has_key, priority FROM tenant_providers WHERE tenant_id=%s", (tid,))
-        state = {p: (hk, pr) for p, hk, pr in cur.fetchall()}
+        cur.execute("SELECT provider, has_key, priority, auth_mode FROM tenant_providers WHERE tenant_id=%s", (tid,))
+        state = {p: (hk, pr, am) for p, hk, pr, am in cur.fetchall()}
     out = []
     for p in CATALOG:
-        hk, pr = state.get(p["slug"], (False, 5))
+        hk, pr, am = state.get(p["slug"], (False, 5, None))
         out.append({**{k: p[k] for k in ("slug", "name", "engine", "blurb", "key_hint")},
-                    "connected": bool(hk), "priority": pr})
+                    "connected": bool(hk), "priority": pr, "auth_mode": am,
+                    "modes": ["subscription", "api_key"]})   # both ways to connect
     out.sort(key=lambda x: (not x["connected"], x["priority"]))
     return out
 
 
 def resolve(tid):
-    """The engine + BYO key the build flow should use: highest-preference connected provider, else default."""
+    """The engine + key/auth the build flow should use: highest-preference connected provider, else default.
+    Subscription-mode providers carry no key (the CLI runs on its own logged-in account)."""
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT provider FROM tenant_providers WHERE tenant_id=%s AND has_key
+        cur.execute("""SELECT provider, auth_mode FROM tenant_providers WHERE tenant_id=%s AND has_key
                        ORDER BY priority, added_at LIMIT 1""", (tid,))
         row = cur.fetchone()
     if not row:
-        return {"engine": "claude", "provider": None, "key": None}
-    provider = row[0]; meta = _BY_SLUG.get(provider, _BY_SLUG["anthropic"])
+        return {"engine": "claude", "provider": None, "key": None, "auth_mode": None}
+    provider, auth_mode = row[0], row[1] or "api_key"
+    meta = _BY_SLUG.get(provider, _BY_SLUG["anthropic"])
     key = None
-    try:
-        v = vault.get_secret(_secret_name(provider), f"tenant:{tid}", "prod", "builder")
-        key = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
-    except Exception:
-        key = None
-    return {"engine": meta["engine"], "provider": provider, "key": key}
+    if auth_mode == "api_key":                            # subscription -> no key, run on the CLI login
+        try:
+            v = vault.get_secret(_secret_name(provider), f"tenant:{tid}", "prod", "builder")
+            key = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
+        except Exception:
+            key = None
+    return {"engine": meta["engine"], "provider": provider, "key": key, "auth_mode": auth_mode}
 
 
 def build_kwargs(tid):
@@ -139,16 +158,18 @@ def _selftest():
     tid = billing.signup("tprov-selftest", "free")["tenant_id"]
     try:
         d0 = resolve(tid); default_ok = d0["engine"] == "claude" and d0["provider"] is None
-        add_key(tid, "openai", "sk-codexkey-xyz")                      # "no claude, only codex" case
-        r1 = resolve(tid); codex_ok = r1["engine"] == "codex" and r1["provider"] == "openai" and r1["key"]
+        add_key(tid, "openai", "sk-codexkey-xyz")                      # "no claude, only codex" case (api key)
+        r1 = resolve(tid); codex_ok = r1["engine"] == "codex" and r1["provider"] == "openai" and r1["key"] and r1["auth_mode"] == "api_key"
         bk = build_kwargs(tid); bk_ok = bk["engine"] == "codex" and bk["provider_key"]
-        add_key(tid, "anthropic", "sk-ant-abc"); set_priority(tid, ["anthropic", "openai"])
-        r2 = resolve(tid); claude_ok = r2["engine"] == "claude" and r2["provider"] == "anthropic"
+        # SUBSCRIPTION mode: connect Claude via the logged-in account (no key) and prefer it
+        connect(tid, "anthropic", "subscription"); set_priority(tid, ["anthropic", "openai"])
+        r2 = resolve(tid); sub_ok = r2["engine"] == "claude" and r2["auth_mode"] == "subscription" and r2["key"] is None
+        bk2 = build_kwargs(tid); bk2_ok = bk2["engine"] == "claude" and not bk2["api_key"]   # runs on CLI login
         lst = list_providers(tid); both = sum(1 for p in lst if p["connected"]) == 2
-        ok = default_ok and codex_ok and bk_ok and claude_ok and both
-        print(f"default={d0['engine']} codex-only->{r1['engine']} bk={bk['engine']} "
-              f"prefer-claude->{r2['engine']} connected={sum(1 for p in lst if p['connected'])}")
-        print("PASS: multi-provider resolve (codex-only / claude / split preference) ✅" if ok else "FAIL")
+        ok = default_ok and codex_ok and bk_ok and sub_ok and bk2_ok and both
+        print(f"default={d0['engine']} codex-key->{r1['engine']} sub-claude->{r2['auth_mode']}(key={r2['key']}) "
+              f"bk-sub={bk2['engine']}/{bk2['api_key']} connected={sum(1 for p in lst if p['connected'])}")
+        print("PASS: multi-provider (codex key / claude SUBSCRIPTION login / split) ✅" if ok else "FAIL")
     finally:
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("DELETE FROM tenant_providers WHERE tenant_id=%s", (tid,))
@@ -163,6 +184,8 @@ def _main(a):
         _selftest()
     elif a[0] == "add" and len(a) > 3:
         print(json.dumps(add_key(a[1], a[2], a[3])))
+    elif a[0] == "connect" and len(a) > 3:
+        print(json.dumps(connect(a[1], a[2], a[3], a[4] if len(a) > 4 else None)))
     elif a[0] == "remove" and len(a) > 2:
         print(json.dumps(remove_key(a[1], a[2])))
     elif a[0] == "list" and len(a) > 1:

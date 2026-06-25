@@ -98,6 +98,7 @@ ck "product versioning + rollback"       "$PY scripts/versions.py selftest | gre
 ck "account export + GDPR delete"        "$PY scripts/account.py selftest | grep -q PASS"
 ck "in-app help assistant"               "$PY scripts/helpagent.py selftest | grep -q PASS"
 ck "tenant CONSOLE (all area routes)"    "$PY scripts/console.py selftest | grep -q PASS"
+ck "console click-through (real browser)" "bash scripts/console_e2e.sh | grep -qE 'PASS|SKIP'"
 ck "prompt-injection sanitize"              "$PY scripts/sanitize.py selftest | grep -q PASS"
 ck "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ck "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"

@@ -171,13 +171,13 @@ def test_project_build_complex_orchestration(monkeypatch):
     monkeypatch.setattr(project, "plan", lambda *a, **k: plan_obj)
     seen = {}
 
-    def fake_build(product, comp, dep_ifaces, api_key=None):
+    def fake_build(product, comp, dep_ifaces, api_key=None, ns=""):
         seen[comp["id"]] = set(dep_ifaces)
         return {"id": comp["id"], "passed": True, "fix_attempts": 0}
     monkeypatch.setattr(project, "build_component", fake_build)
     integrated = {"called": False}
     monkeypatch.setattr(project, "integrate",
-                        lambda p, pl: (integrated.__setitem__("called", True), {"passed": True})[1])
+                        lambda product, p, ns="", facade=None: (integrated.__setitem__("called", True), {"passed": True})[1])
     prod = f"ut-complex-{_rid()}"
     try:
         log = project.build_complex(prod, "goal")
@@ -190,7 +190,8 @@ def test_project_build_complex_orchestration(monkeypatch):
 
 
 def test_project_blocks_integration_when_a_component_fails(monkeypatch):
-    """If any component fails to build, the line must NOT integrate — it reports BLOCKED_AT_COMPONENTS."""
+    """If any component fails to build, the line must NOT integrate — it reports BLOCKED_AT_COMPONENTS
+    and surfaces the failing component's blocker."""
     import shutil
     import project
     plan_obj = {"components": [{"id": "a", "name": "a", "description": "d", "deps": [], "interface": "a()"},
@@ -198,16 +199,53 @@ def test_project_blocks_integration_when_a_component_fails(monkeypatch):
                 "integration_tests": "x"}
     monkeypatch.setattr(project, "plan", lambda *a, **k: plan_obj)
     monkeypatch.setattr(project, "build_component",
-                        lambda product, comp, dep_ifaces, api_key=None: {"id": comp["id"],
-                        "passed": comp["id"] != "b"})   # 'b' fails
+                        lambda product, comp, dep_ifaces, api_key=None, ns="": {"id": comp["id"],
+                        "passed": comp["id"] != "b", "blocker": None if comp["id"] != "b" else "b failed"})
     integrated = {"called": False}
     monkeypatch.setattr(project, "integrate",
-                        lambda p, pl: (integrated.__setitem__("called", True), {"passed": True})[1])
+                        lambda product, p, ns="", facade=None: (integrated.__setitem__("called", True), {"passed": True})[1])
     prod = f"ut-complex-{_rid()}"
     try:
         log = project.build_complex(prod, "goal")
         assert log["result"] == "BLOCKED_AT_COMPONENTS" and "b" in log["failed_components"]
+        assert "b failed" in (log.get("blocker") or "")        # blocker propagated up
         assert not integrated["called"], "must not integrate when a component failed"
+    finally:
+        shutil.rmtree(factory_products_dir() / prod, ignore_errors=True)
+
+
+def test_project_recursive_decomposition(monkeypatch):
+    """A component the architect marks `decompose` must trigger a RECURSIVE sub-build (its own plan +
+    sub-components + facade integrate) — i.e. real multi-level hierarchy, not a flat 2-level build."""
+    import shutil
+    import project
+    monkeypatch.setattr(project, "MAX_DEPTH", 2)
+    root = {"components": [
+        {"id": "engine", "name": "e", "description": "big subsystem", "deps": [], "interface": "engine.run()",
+         "decompose": True, "subgoal": "build the engine"},
+        {"id": "api", "name": "a", "description": "thin api", "deps": ["engine"], "interface": "api.serve()"},
+    ], "integration_tests": "root e2e"}
+    sub = {"components": [
+        {"id": "core", "name": "c", "description": "d", "deps": [], "interface": "core.x()"},
+        {"id": "io", "name": "i", "description": "d", "deps": ["core"], "interface": "io.y()"},
+    ], "integration_tests": "engine parts"}
+    plans_for = []
+    monkeypatch.setattr(project, "plan",
+                        lambda product, goal, model=None, ns="", depth=0: (plans_for.append(ns), root if ns == "" else sub)[1])
+    leaves = []
+    monkeypatch.setattr(project, "build_component",
+                        lambda product, comp, dep_ifaces, api_key=None, ns="": (leaves.append(ns + comp["id"]), {"id": comp["id"], "passed": True})[1])
+    integ_ns = []
+    monkeypatch.setattr(project, "integrate",
+                        lambda product, p, ns="", facade=None: (integ_ns.append(ns), {"passed": True})[1])
+    prod = f"ut-recur-{_rid()}"
+    try:
+        log = project.build_complex(prod, "goal")
+        assert log["result"] == "INTEGRATED"
+        assert "engine_" in plans_for, "the decomposed component must be planned recursively"   # sub-architect ran
+        assert {"engine_core", "engine_io"} <= set(leaves), "sub-components built under the namespace"
+        assert "api" in leaves and "engine_core" in leaves                                       # leaf + sub leaves
+        assert "engine_" in integ_ns and "" in integ_ns, "facade integrate + root integrate both ran"
     finally:
         shutil.rmtree(factory_products_dir() / prod, ignore_errors=True)
 

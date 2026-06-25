@@ -38,6 +38,16 @@ import factory   # noqa: E402
 
 MAX_COMPONENT_FIX = int(os.environ.get("AOS_MAX_COMPONENT_FIX", "3"))
 MAX_INTEGRATION_FIX = int(os.environ.get("AOS_MAX_INTEGRATION_FIX", "3"))
+# How many levels the architect tree may recurse: a component the architect marks "decompose" is itself
+# planned into a sub-DAG (sub-architect → sub-builders → sub-integrator) up to this depth. depth 0 is the
+# top, so AOS_MAX_DEPTH=2 allows 3 levels total. Total LIVE agents across the whole tree stay bounded by
+# factory._AGENT_SEM (AOS_MAX_AGENTS) no matter how deep/wide — recursion multiplies fan-out, not the cap.
+# (>~30 concurrent agents is RAM-bound on one box; 100s = the cloud worker-pool path, same Postgres queue.)
+MAX_DEPTH = int(os.environ.get("AOS_MAX_DEPTH", "2"))
+
+
+def _pkg(ns, cid):
+    return ns + cid.replace("-", "_")
 
 
 # ───────────────────────── pure graph logic (unit-tested, no agents) ─────────────────────────
@@ -84,49 +94,61 @@ def _load_json(path: Path):
 
 
 # ───────────────────────── agent-driven phases (compose factory primitives) ─────────────────
-def plan(product, goal, model=None):
-    """ARCHITECT decomposes the goal into a dependency DAG with interface contracts -> docs/PLAN.json."""
+def plan(product, goal, model=None, ns="", depth=0):
+    """ARCHITECT decomposes a goal into a dependency DAG with interface contracts. Each component is either
+    a LEAF (one builder writes it) or, if it is itself a large subsystem, marked `decompose:true` with a
+    `subgoal` — the recursive build then plans IT into a sub-DAG. Per-namespace plan file so resume works
+    at every level of the tree."""
     repo = factory.PRODUCTS / product
     (repo / "docs").mkdir(parents=True, exist_ok=True)
-    pj = repo / "docs" / "PLAN.json"
+    pj = repo / "docs" / (f"PLAN_{ns.rstrip('_')}.json" if ns else "PLAN.json")
     if pj.exists():                                   # RESUME: reuse the prior decomposition, don't re-plan
         try:
             p = _load_json(pj)
             validate_dag(p["components"])
-            print(f"[project] resuming — reusing existing plan ({len(p['components'])} components)", flush=True)
+            print(f"[project] resuming — reusing plan {pj.name} ({len(p['components'])} components)", flush=True)
             return p
         except Exception:
             pass                                      # corrupt/partial -> fall through and re-plan
-    factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = "PLAN"
+    factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"PLAN:{ns or 'root'}"
+    can_recurse = depth < MAX_DEPTH
+    decomp = (" A component that is ITSELF a large subsystem (many parts) may instead be marked "
+              '"decompose": true with a "subgoal" (a precise sub-goal) — it will be planned recursively into '
+              "its own sub-components. Mark decompose ONLY for genuinely large parts; keep simple parts as "
+              "leaves.") if can_recurse else " Every component here must be a LEAF (do NOT use decompose)."
     task = (
-        f"You are the system ARCHITECT. Decompose this product goal into 4-8 INTERDEPENDENT components of "
-        f"ONE Python codebase. GOAL:\n{goal}\n\n"
-        f"Write docs/PLAN.json containing ONLY this JSON (no prose, no fences):\n"
+        f"You are the system ARCHITECT. Decompose this goal into 4-8 INTERDEPENDENT components of ONE Python "
+        f"codebase. GOAL:\n{goal}\n\n"
+        f"Write {pj.name} (under docs/) containing ONLY this JSON (no prose, no fences):\n"
         f'{{"components":[{{"id":"kebab-id","name":"short name","description":"what it does",'
-        f'"deps":["other-id"],"interface":"the EXACT public functions/classes other components import '
-        f'and call — this is a contract"}}],'
+        f'"deps":["other-id"],"interface":"the EXACT public functions/classes other components import and '
+        f'call — a contract","decompose":false,"subgoal":""}}],'
         f'"integration_tests":"end-to-end behaviours that prove the components work TOGETHER"}}\n'
-        f"Rules: each component becomes a package src/<id_with_underscores>/. 'deps' MUST be acyclic and "
-        f"reference other component ids. Make the 'interface' precise (names + signatures) because your "
-        f"dependents will code against it without seeing your implementation. Keep ids kebab-case.")
+        f"Rules: 'deps' MUST be acyclic and reference other component ids. Make 'interface' precise (names + "
+        f"signatures). Keep ids kebab-case and UNIQUE within this plan.{decomp}")
     r = factory.agent("staff-engineer", str(repo), task, model=model)
     if r.get("failed"):
         raise RuntimeError(f"architect failed to plan: {r.get('out','')[:200]}")
-    p = _load_json(repo / "docs" / "PLAN.json")
+    p = _load_json(repo / "docs" / pj.name)
+    if not can_recurse:                               # safety: strip any decompose flags past the depth bound
+        for c in p["components"]:
+            c["decompose"] = False
     validate_dag(p["components"])
     audit.append(actor="project:architect", action="Plan", resource=product, decision="executed",
-                 payload={"components": [c["id"] for c in p["components"]]})
+                 payload={"ns": ns or "root", "depth": depth,
+                          "components": [c["id"] for c in p["components"]]})
     return p
 
 
-def build_component(product, comp, dep_interfaces, api_key=None):
-    """Build ONE component as src/<pkg>/ with its own tests, coding against its interface contract and its
-    dependencies' interfaces. Runs in a worker thread, so it sets its OWN thread-local _ctx. Bounded
-    per-component test loop. Disjoint paths (src/<pkg>, tests/<pkg>) make same-layer builds collision-free."""
+def build_component(product, comp, dep_interfaces, api_key=None, ns=""):
+    """Build ONE LEAF component as src/<ns><pkg>/ with its own tests, coding against its interface contract
+    and its dependencies' interfaces. Runs in a worker thread, so it sets its OWN thread-local _ctx. Bounded
+    per-component test loop. Disjoint namespaced paths make same-layer builds (and whole sub-trees)
+    collision-free. On failure returns a `blocker` reason that propagates up the tree for aggregation."""
     repo = factory.PRODUCTS / product
-    cid = comp["id"]; pkg = cid.replace("-", "_")
+    cid = comp["id"]; pkg = _pkg(ns, cid)
     factory._ctx.api_key = api_key                    # thread-local: must be set inside this worker thread
-    factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"BUILD:{cid}"
+    factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"BUILD:{pkg}"
     # RESUME: if this component was already built green in a prior (interrupted) run, skip it — so a
     # killed complex build re-runs only the missing/failing components, not the whole thing.
     if (repo / "src" / pkg).exists():
@@ -164,87 +186,126 @@ def build_component(product, comp, dep_interfaces, api_key=None):
         directory.release(aid)
     except Exception:
         pass
-    return {"id": cid, "passed": ok, "fix_attempts": attempts}
+    return {"id": cid, "pkg": pkg, "passed": ok, "fix_attempts": attempts,
+            "blocker": None if ok else f"leaf '{pkg}' tests still red after {attempts} fixes: {out[-240:]}"}
 
 
-def integrate(product, p):
-    """INTEGRATOR wires the built components into a coherent product via their interfaces and writes
-    end-to-end integration tests; bounded integration-fix loop drives the WHOLE suite green."""
+def integrate(product, p, ns="", facade=None):
+    """INTEGRATOR wires this level's built components into a coherent whole. At the ROOT (ns="") it builds
+    the product entrypoint + end-to-end tests and gates on the WHOLE suite. At a SUB level (ns set) it builds
+    a FACADE package src/<base> that composes the sub-components (src/<ns>*) and exposes the parent
+    component's exact interface — so a decomposed component looks identical to a leaf to its dependents.
+    Bounded integration-fix loop."""
     repo = factory.PRODUCTS / product
-    factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = "INTEGRATE"
-    comp_list = ", ".join(c["id"] for c in p["components"])
-    task = (
-        f"You are the INTEGRATOR. The components ({comp_list}) are built as packages under src/. Wire them "
-        f"into one coherent product: add the top-level entrypoint/orchestration under src/ that composes the "
-        f"components THROUGH their public interfaces (do not rewrite their internals), and write END-TO-END "
-        f"INTEGRATION TESTS under tests/integration/ that exercise: "
-        f"{p.get('integration_tests', 'the components working together')}. Use `from src...` imports. "
-        f"Make `python -m pytest -q` (the WHOLE suite) pass.")
+    factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"INTEGRATE:{ns or 'root'}"
+    comp_list = ", ".join(_pkg(ns, c["id"]) for c in p["components"])
+    if ns:
+        base = ns.rstrip("_")
+        target = f"tests/{base}"
+        task = (
+            f"You are the INTEGRATOR for subsystem '{facade.get('name', base) if facade else base}'. Its parts "
+            f"are built as packages ({comp_list}) under src/. Build the FACADE package src/{base}/ "
+            f"(src/{base}/__init__.py) that composes those parts THROUGH their interfaces (do NOT rewrite them) "
+            f"and exposes EXACTLY this public interface (your dependents rely on it):\n{facade.get('interface','') if facade else ''}\n"
+            f"Write tests under {target}/ proving the facade exposes that interface and the parts work together. "
+            f"Use `from src...` imports. Make `python -m pytest -q {target}` pass.")
+    else:
+        target = ""
+        task = (
+            f"You are the INTEGRATOR. The components ({comp_list}) are built as packages under src/. Wire them "
+            f"into one coherent product: add the top-level entrypoint/orchestration under src/ that composes the "
+            f"components THROUGH their public interfaces (do not rewrite internals), and write END-TO-END "
+            f"INTEGRATION TESTS under tests/integration/ that exercise: "
+            f"{p.get('integration_tests', 'the components working together')}. Use `from src...` imports. "
+            f"Make `python -m pytest -q` (the WHOLE suite) pass.")
     factory.agent("staff-engineer", str(repo), task)
-    ok, out = factory.run_tests(str(repo))            # full suite = components still green + integration green
+    ok, out = factory.run_tests(str(repo), target=target)
     attempts = 0
     while not ok and attempts < MAX_INTEGRATION_FIX:
         attempts += 1
-        print(f"[project] integration red — fix {attempts}/{MAX_INTEGRATION_FIX}", flush=True)
+        print(f"[project] integrate({ns or 'root'}) red — fix {attempts}/{MAX_INTEGRATION_FIX}", flush=True)
         factory.agent("staff-engineer", str(repo),
-                      f"Integration/tests FAILING:\n\n{out[-1800:]}\n\nFix the integration wiring or a genuinely "
-                      f"wrong integration test (do NOT weaken component tests). Make `python -m pytest -q` pass.")
-        ok, out = factory.run_tests(str(repo))
-    return {"passed": ok, "fix_attempts": attempts, "tail": out[-400:]}
+                      f"Integration/tests FAILING:\n\n{out[-1800:]}\n\nFix the wiring or a genuinely wrong "
+                      f"integration test (do NOT weaken component tests). Make `python -m pytest -q {target}` pass.")
+        ok, out = factory.run_tests(str(repo), target=target)
+    return {"passed": ok, "fix_attempts": attempts, "tail": out[-400:],
+            "blocker": None if ok else f"integration({ns or 'root'}) red after {attempts} fixes: {out[-240:]}"}
 
 
-def build_complex(product, goal, api_key=None):
-    """Drive ONE complex, interdependent product end-to-end: PLAN -> dependency-ordered parallel component
-    builds -> INTEGRATE. Returns a structured log; every phase is audited."""
+def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None):
+    """Drive ONE complex product end-to-end as a RECURSIVE tree: PLAN -> dependency-ordered parallel builds
+    (each component either a LEAF builder OR, if the architect marked it 'decompose', a recursive sub-build
+    with its own architect/builders/integrator) -> INTEGRATE this level. Blockers from any leaf or sub-tree
+    propagate UP and aggregate; results aggregate UP through each integrator. Total live agents across the
+    whole tree stay bounded by factory._AGENT_SEM regardless of depth/width. depth 0 = the root product."""
     repo = factory.PRODUCTS / product
     (repo / "src").mkdir(parents=True, exist_ok=True)
     (repo / "tests").mkdir(parents=True, exist_ok=True)
-    log = {"product": product, "phases": []}
-    audit.append(actor="project:controller", action="ProjectStart", resource=product, decision="executed")
+    top = depth == 0
+    indent = "  " * depth
+    log = {"product": product, "ns": ns or "root", "depth": depth, "phases": []}
+    if top:
+        audit.append(actor="project:controller", action="ProjectStart", resource=product, decision="executed")
 
-    p = plan(product, goal, model=os.environ.get("AOS_ARCHITECT_MODEL"))
+    p = plan(product, goal, model=os.environ.get("AOS_ARCHITECT_MODEL"), ns=ns, depth=depth)
     by_id = {c["id"]: c for c in p["components"]}
     layers = topo_layers(p["components"])
     log["plan"] = {"components": list(by_id), "layers": layers}
-    print(f"[project] plan: {len(by_id)} components in {len(layers)} dependency layers: {layers}", flush=True)
+    n_decomp = sum(1 for c in p["components"] if c.get("decompose") and depth < MAX_DEPTH)
+    print(f"{indent}[project] L{depth} {ns or 'root'}: {len(by_id)} components, {len(layers)} layers, "
+          f"{n_decomp} to decompose further", flush=True)
+
+    def build_one(comp):
+        cid = comp["id"]
+        if comp.get("decompose") and depth < MAX_DEPTH:       # RECURSE: this component is its own subsystem
+            sub = build_complex(product, comp.get("subgoal") or comp["description"], api_key,
+                                depth + 1, ns=f"{_pkg(ns, cid)}_", facade=comp)
+            return {"id": cid, "pkg": _pkg(ns, cid), "passed": sub["passed"],
+                    "blocker": sub.get("blocker"), "sub": {"result": sub["result"], "layers": sub.get("plan", {}).get("layers")}}
+        dep_ifaces = {d: by_id[d]["interface"] for d in comp.get("deps", [])}
+        return build_component(product, comp, dep_ifaces, api_key, ns)
 
     built, workers = {}, int(os.environ.get("AOS_FLEET_WORKERS", "5"))
     for li, layer in enumerate(layers):               # BARRIER between layers (layer N needs N-1's interfaces)
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(build_component, product, by_id[cid],
-                              {d: by_id[d]["interface"] for d in by_id[cid].get("deps", [])}, api_key): cid
-                    for cid in layer}
+            futs = {ex.submit(build_one, by_id[cid]): cid for cid in layer}
             for f in as_completed(futs):
                 cid = futs[f]
                 try:
                     built[cid] = f.result()
                 except Exception as e:
-                    built[cid] = {"id": cid, "passed": False, "error": str(e)}
+                    built[cid] = {"id": cid, "passed": False, "blocker": f"crashed: {e}"}
         log["phases"].append({f"layer{li}": {cid: built[cid].get("passed") for cid in layer}})
 
+    blockers = [b["blocker"] for b in built.values() if not b.get("passed") and b.get("blocker")]
     if all(b.get("passed") for b in built.values()):
-        integ = integrate(product, p)
+        integ = integrate(product, p, ns=ns, facade=facade)
         log["integration"] = integ
-        log["result"] = "INTEGRATED" if integ["passed"] else "BLOCKED_AT_INTEGRATION"
+        if integ["passed"]:
+            log["result"], log["passed"], log["blocker"] = "INTEGRATED", True, None
+        else:
+            log["result"], log["passed"], log["blocker"] = "BLOCKED_AT_INTEGRATION", False, integ.get("blocker")
     else:
-        failed = [cid for cid, b in built.items() if not b.get("passed")]
-        log["result"] = "BLOCKED_AT_COMPONENTS"
-        log["failed_components"] = failed
+        log["result"], log["passed"] = "BLOCKED_AT_COMPONENTS", False
+        log["failed_components"] = [cid for cid, b in built.items() if not b.get("passed")]
+        log["blocker"] = " | ".join(blockers)[:600]   # aggregated, bubbles up to the parent level
 
-    audit.append(actor="project:controller", action="ProjectComplete", resource=product,
-                 decision=log["result"], payload={"components": len(by_id), "layers": len(layers)})
-    try:
-        import appregistry
-        appregistry.register(product, repo)
-    except Exception:
-        pass
-    try:
-        import notify
-        notify.send(f"🧩 complex build '{product}': {log['result']} "
-                    f"({len(by_id)} components, {len(layers)} layers)", title="project", tags="jigsaw")
-    except Exception:
-        pass
-    print(f"\n[project] {product}: {log['result']}", flush=True)
+    if top:
+        audit.append(actor="project:controller", action="ProjectComplete", resource=product,
+                     decision=log["result"], payload={"components": len(by_id), "layers": len(layers),
+                                                       "max_depth_reached": depth})
+        try:
+            import appregistry
+            appregistry.register(product, repo)
+        except Exception:
+            pass
+        try:
+            import notify
+            notify.send(f"🧩 complex build '{product}': {log['result']} ({len(by_id)} top components)",
+                        title="project", tags="jigsaw")
+        except Exception:
+            pass
+    print(f"{indent}[project] L{depth} {ns or 'root'}: {log['result']}", flush=True)
     return log
 
 

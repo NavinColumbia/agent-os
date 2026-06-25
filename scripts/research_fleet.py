@@ -46,24 +46,75 @@ def _json_from_text(txt):
     return json.loads(txt[s: txt.rfind("}") + 1])
 
 
+def _parse_subqs(text: str) -> list:
+    """Pull sub-questions out of an agent's free-text reply, most-specific format first (unit-tested).
+    1) 'Q: ...' lines; 2) bulleted/numbered list items; 3) any line that is itself a question ('...?').
+    Strips leading bullets/numbers/bold so the same line parses under any of the three strategies."""
+    import re
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+
+    def _strip(l):  # drop leading "Q:", "- ", "1. ", "1) ", "**" decoration
+        l = re.sub(r"^\**\s*", "", l)
+        l = re.sub(r"^(?:[-*•]|\d+[.)])\s*", "", l).strip()
+        l = re.sub(r"^[Qq]\s*[:.)]\s*", "", l).strip()
+        return l.strip("* ").strip()
+
+    qs = [_strip(l) for l in lines if l.lower().startswith("q:") or l.lower().startswith("q.")]
+    if len(qs) < 2:
+        qs = [_strip(l) for l in lines if re.match(r"^(?:[-*•]|\d+[.)])\s+", l)]
+    if len(qs) < 2:
+        qs = [_strip(l) for l in lines if l.rstrip().endswith("?") and len(l) > 25]
+    seen, out = set(), []                                 # de-dupe, keep order, drop empties
+    for q in qs:
+        if q and q.lower() not in seen:
+            seen.add(q.lower()); out.append(q)
+    return out
+
+
 def decompose(repo: Path, question: str) -> list:
-    """LEAD agent splits the question into independent sub-questions. ROBUST: prefers the written PLAN.json,
-    falls back to parsing the agent's reply, and finally to a single-pass plan — so a live run never crashes
-    just because the model replied in chat instead of writing the file."""
+    """LEAD agent splits the question into independent sub-questions. ROBUST: parses Q:/bulleted/question-
+    shaped replies, logs the raw reply on a parse-miss (so degradation is never silent), and only then falls
+    back to single-pass — so a live run never crashes just because the model formatted its answer differently."""
     factory._ctx.product = repo.name; factory._ctx.run = f"research-{repo.name}"; factory._ctx.stage = "DECOMPOSE"
-    # NO web tools (decomposition is pure reasoning; web tools make the agent wander and never return).
-    # LINE-BASED output ("Q: ...") parses far more robustly than JSON — no brace/fence fragility, and we
-    # just pick the Q: lines out of whatever the model says.
+    before = {p for p in repo.rglob("*") if p.is_file()}   # snapshot, so we can find whatever the agent writes
+    # The research-growth role WRITES FILES by instinct (it has Write even with tools=[]) — so we ASK it to
+    # write the sub-questions to a known file and READ them back, rather than fighting it for stdout. We then
+    # parse, in priority order: the named file -> any other file it created -> its chat reply -> single-pass.
+    target = "SUBQUESTIONS.md"
     r = factory.agent("research-growth", str(repo),
                       f"Split this research question into {MAX_SUBQ} INDEPENDENT, specific, separately-"
                       f"researchable sub-questions that together fully cover it. Do NOT research anything — "
-                      f"just decompose. QUESTION:\n{question}\n\nOutput ONLY the sub-questions, ONE PER LINE, "
-                      f"each line starting with 'Q: '. No numbering, no preamble, no other text.", tools=[])
-    subqs = [l.split("Q:", 1)[1].strip() for l in (r.get("out", "") or "").splitlines()
-             if l.strip().lower().startswith("q:")]
-    if len(subqs) < 2:                                    # parse miss -> single-pass (never crash)
-        print("[research] decompose fallback: single-pass (no Q: lines parsed)", flush=True)
+                      f"just decompose. QUESTION:\n{question}\n\nWrite them to the file `{target}` in the repo "
+                      f"root, ONE PER LINE, each line starting with 'Q: ' — nothing else in the file.", tools=[])
+    # Selection PRIORITY (not max-count: a verbose report yields 100s of '?'-lines and would wrongly win).
+    # 1) the named target file; 2) any other small new file the agent wrote OUTSIDE findings/ (that dir is
+    # research output); 3) the chat reply. First source that yields a sane 2..MAX_SUBQ*2 wins.
+    def _sane(qs):                                         # a real decomposition, not a whole report body
+        return qs if 2 <= len(qs) <= MAX_SUBQ * 2 else []
+    subqs, src = [], "none"
+    tf = repo / target
+    if tf.exists():
+        subqs, src = _sane(_parse_subqs(tf.read_text())), target
+    if len(subqs) < 2:
+        for p in sorted((p for p in repo.rglob("*") if p.is_file() and p not in before),
+                        key=lambda p: -p.stat().st_mtime):  # newest first
+            if p != tf and "findings" not in p.parts and p.suffix.lower() in (".md", ".txt"):
+                cand = _sane(_parse_subqs(p.read_text()))
+                if len(cand) >= 2:
+                    subqs, src = cand, str(p.relative_to(repo)); break
+    if len(subqs) < 2:
+        subqs, src = _parse_subqs(r.get("out", "") or ""), "reply"
+    # the agent may have polluted findings/ during decompose (it sometimes researches anyway) — clear it so
+    # those stray files don't masquerade as fleet results downstream.
+    for stray in (repo / "findings").glob("*"):
+        try: stray.unlink()
+        except Exception: pass
+    if len(subqs) < 2:                                    # genuine miss -> log evidence, then single-pass
+        print(f"[research] decompose fallback: single-pass (best parse {len(subqs)} from {src}; "
+              f"rc={r.get('rc')}). REPLY HEAD:\n{(r.get('out') or '')[:400]!r}", flush=True)
         subqs = [question]
+    else:
+        print(f"[research] decomposed into {len(subqs)} sub-questions (from {src})", flush=True)
     (repo / "PLAN.json").write_text(json.dumps({"subquestions": subqs}))   # persist for resume
     return subqs[:MAX_SUBQ]
 
@@ -122,6 +173,18 @@ def _selftest():
     """Offline check of the decompose→parallel→synthesize wiring with mocked agents (no web, no spend)."""
     import types
     import tempfile
+    # _parse_subqs must survive the real reply shapes agents actually produce, not just clean "Q:" lines.
+    p_q = _parse_subqs("Q: alpha?\nQ: beta?\nQ: gamma?")                       # canonical
+    p_bullet = _parse_subqs("Here are the questions:\n- What is X?\n- What is Y?\n- What is Z?")
+    p_num = _parse_subqs("1. How does A work?\n2. How does B work?\n3. How does C scale?")
+    p_qmark = _parse_subqs("Sure!\nWhat are the steps to publish an app to the store?\n"
+                           "How do solo founders handle onboarding for new users?")
+    p_none = _parse_subqs("I cannot decompose this without more context.")     # -> single-pass upstream
+    parse_ok = (len(p_q) == 3 and len(p_bullet) == 3 and len(p_num) == 3
+                and len(p_qmark) == 2 and "Q:" not in p_q[0] and len(p_none) < 2)
+    print(f"parse: Q={len(p_q)} bullet={len(p_bullet)} num={len(p_num)} qmark={len(p_qmark)} none={len(p_none)}")
+    if not parse_ok:
+        print("FAIL: _parse_subqs"); sys.exit(1)
     workdir = Path(tempfile.mkdtemp())
     # fake the three agent phases via PLAN.json + findings + report files
     calls = {"research": 0, "synth": 0}

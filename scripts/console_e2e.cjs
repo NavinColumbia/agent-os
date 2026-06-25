@@ -19,8 +19,10 @@ const SCREENS = [
   try {
     const ctx = await b.newContext({ viewport: { width: 1380, height: 900 }, deviceScaleFactor: 1 });
     const p = await ctx.newPage();
-    // seed the token BEFORE the app script runs so it boots straight into the console
-    await ctx.addInitScript(tok => { try { localStorage.setItem('aos_tenant', tok); } catch (e) {} }, token);
+    // signup mode: token is 'signup' (or empty) -> exercise the REAL new-user signup flow in the browser.
+    // returning-user mode: a real token is seeded. Default to signup so a broken front door is CAUGHT.
+    const signupMode = !token || token === 'signup';
+    if (!signupMode) await ctx.addInitScript(tok => { try { localStorage.setItem('aos_tenant', tok); } catch (e) {} }, token);
 
     let current = 'boot';
     const errors = [];
@@ -28,8 +30,16 @@ const SCREENS = [
     p.on('pageerror', e => errors.push(`[${current}] PAGEERROR ${String(e)}`));
 
     await p.goto(base + '/', { waitUntil: 'networkidle', timeout: 20000 });
-    // the app shell should be visible (not the sign-in screen) because the token is seeded
-    await p.waitForSelector('#app', { state: 'visible', timeout: 8000 });
+    if (signupMode) {
+      // a brand-new visitor: the sign-in screen must be visible, and they must be able to CREATE AN ACCOUNT
+      current = 'signup';
+      await p.waitForSelector('#signin', { state: 'visible', timeout: 8000 });
+      if (shotDir) await p.screenshot({ path: `${shotDir}/console-00-signin.png` }).catch(() => {});
+      await p.fill('#su_name', 'E2E CEO');
+      await p.click('#su_signup button.pri');           // "Create account & open console"
+    }
+    // the app shell must become visible — via signup (new user) or seeded token (returning)
+    await p.waitForSelector('#app', { state: 'visible', timeout: 12000 });
 
     for (const screen of SCREENS) {
       current = screen;

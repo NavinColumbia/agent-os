@@ -240,12 +240,24 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
 .menu{position:absolute;right:20px;top:52px;background:var(--panel2);border:1px solid var(--line2);border-radius:12px;box-shadow:0 12px 36px -10px rgba(0,0,0,.6);padding:8px;min-width:240px;z-index:30}
 .menu a{display:block;padding:8px 10px;border-radius:8px;color:var(--tx2);text-decoration:none;cursor:pointer;font-size:13px}.menu a:hover{background:var(--hover);color:var(--tx)}
 </style></head><body>
-<div id=signin style="display:none;max-width:420px;margin:14vh auto;padding:0 18px">
-  <div class=card><div class=brand style="padding-bottom:18px"><span class=mk>⬡</span> agent-os</div>
-  <h2 style="text-transform:none;font-size:15px;letter-spacing:0;color:var(--tx)">Sign in to your console</h2>
-  <label>Tenant token</label><input id=tok placeholder="aos_…  (from the front door)">
-  <div style="margin-top:12px"><button class=pri onclick=saveTok() style=width:100%>Open console</button></div>
-  <p class=muted style=margin-top:12px>No account yet? Open the front door to sign up, then paste your token here.</p></div>
+<div id=signin style="display:none;max-width:440px;margin:11vh auto;padding:0 18px">
+  <div class=card><div class=brand style="padding-bottom:6px;font-size:20px"><span class=mk>⬡</span> agent-os</div>
+  <p class=muted style="margin:0 0 18px">Be the CEO of a company of AI agents that build &amp; ship your software.</p>
+  <div id=su_signup>
+    <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Create your account</h2>
+    <p class=muted style="margin:0 0 10px">Free to start — no card needed.</p>
+    <label>Your name or company</label><input id=su_name placeholder="Acme Co" onkeydown="if(event.key==='Enter')signUp()">
+    <label>Plan</label><select id=su_plan><option value=free>Free — 3 builds</option><option value=pro>Pro — $49 · 50 builds</option></select>
+    <div style="margin-top:14px"><button class=pri onclick=signUp() style=width:100%>Create account &amp; open console</button></div>
+    <div id=su_note class=muted style="margin-top:10px"></div>
+    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">Already have an account? <a onclick="document.getElementById('su_signup').style.display='none';document.getElementById('su_signin').style.display='block'" style="cursor:pointer;color:var(--atext)">Sign in with your token</a></p>
+  </div>
+  <div id=su_signin style=display:none>
+    <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Sign in</h2>
+    <label>Your access token</label><input id=tok placeholder="aos_…" onkeydown="if(event.key==='Enter')saveTok()">
+    <div style="margin-top:14px"><button class=pri onclick=saveTok() style=width:100%>Open console</button></div>
+    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px"><a onclick="document.getElementById('su_signin').style.display='none';document.getElementById('su_signup').style.display='block'" style="cursor:pointer;color:var(--atext)">← Back to create account</a></p>
+  </div></div>
 </div>
 <div class=app id=app style="display:none">
 <div class=side><div class=brand><span class=mk>⬡</span> agent-os</div><div class=nav id=nav style=flex:1></div>
@@ -273,6 +285,14 @@ const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')|
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none'}
 function saveTok(){TOK=($('#tok').value||'').trim();if(!TOK)return;localStorage.setItem('aos_tenant',TOK);showApp(true);boot()}
+async function signUp(){
+ const name=($('#su_name').value||'').trim()||'there';const note=$('#su_note');note.textContent='Creating your account…';
+ let r;try{r=await (await fetch('/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,plan:($('#su_plan')||{}).value||'free'})})).json()}catch(e){note.textContent='Could not reach the server — is the console running?';return}
+ if(r.error){note.textContent='✗ '+r.error;return}
+ TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);
+ note.innerHTML='✅ Account ready! Save your access token to sign in from another device:<br><code style="word-break:break-all">'+esc(TOK)+'</code><br>Opening your console…';
+ setTimeout(()=>{showApp(true);boot()},1400);
+}
 function signOut(){localStorage.removeItem('aos_tenant');TOK='';showApp(false)}
 function toggleAcct(){const m=$('#acctmenu');m.style.display=m.style.display==='none'?'block':'none'}
 async function get(p){
@@ -486,6 +506,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path); p = u.path
+        if p == "/api/signup":                            # UNAUTHENTICATED: create an account -> token
+            b = self._body()
+            try:
+                reg = billing.signup((b.get("name") or "there").strip()[:60], b.get("plan", "free"))
+                return self._json(200, reg)               # {tenant_id, api_token, plan}
+            except Exception as e:
+                return self._json(400, {"error": str(e)[:200]})
         fn = POSTS.get(p)
         if not fn:
             return self._json(404, {"error": "not found"})

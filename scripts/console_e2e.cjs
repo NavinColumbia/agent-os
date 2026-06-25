@@ -6,7 +6,7 @@
 const { chromium } = require('playwright');
 
 const SCREENS = [
-  'chat', 'build', 'templates',                 // Direct
+  'chat', 'build', 'agents', 'templates',        // Direct
   'cockpit', 'projects', 'approvals', 'activity', // Operate
   'billing', 'providers', 'integrations',        // Business
   'notifications', 'help', 'team', 'settings', 'status', // secondary surfaces

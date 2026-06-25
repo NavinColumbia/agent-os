@@ -124,8 +124,43 @@ def say(tid, thread_id, message, api_key=None):
     return {"reply": reply, "proposal": proposal}
 
 
+def post(tid, thread_id, content, meta=None):
+    """Post an assistant turn back into the thread (controller -> CEO). This is how the controller REPORTS
+    progress/results/next-steps so the chat is an ongoing dialogue, not a write-once intake form."""
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO chat_messages (thread_id, tenant_id, role, content, meta)
+                       VALUES (%s,%s,'assistant',%s,%s)""", (thread_id, tid, content, json.dumps(meta or {})))
+        c.commit()
+
+
+def _run_and_report(tid, thread_id, product, charter, kind):
+    """Run the governed build, then REPORT back into the chat thread like a manager would: a kickoff note,
+    the real outcome, and proposed next steps. (Runs in a daemon thread from confirm().)"""
+    post(tid, thread_id, f"On it — starting the build for **{product}**. I'll report back here when it's ready.")
+    try:
+        frontdoor._run_build(tid, product, charter, kind)
+    except Exception as e:
+        post(tid, thread_id, f"⚠️ I hit an error launching **{product}**: {str(e)[:200]}. Want me to retry?")
+        return
+    st = frontdoor._status(product)
+    if st.get("ready"):
+        post(tid, thread_id,
+             f"✅ **{product}** is built, tested and ready — download it from Projects. "
+             f"Want me to keep going? Common next steps:",
+             {"kind": "next_steps", "product": product,
+              "suggestions": ["Add user accounts / login", "Add a simple dashboard", "Write the launch copy"]})
+    elif st.get("failed"):
+        post(tid, thread_id,
+             f"⚠️ **{product}** didn't pass: {(st.get('error') or 'the build was blocked')[:200]}. "
+             f"I can retry, or adjust the spec — tell me what to change.", {"kind": "result"})
+    else:
+        post(tid, thread_id, f"**{product}** is still working — check the Cockpit for live progress.")
+
+
 def confirm(tid, thread_id, api_key=None):
-    """Commit the most recent proposed build — through the SAME governed gate as every other build."""
+    """Commit the most recent proposed build — through the SAME governed gate as every other build —
+    and report progress/results back into the thread (feedback-driven controller)."""
     msgs = [m for m in history(tid, thread_id) if m["role"] == "assistant" and m.get("meta", {}).get("proposal")]
     if not msgs:
         return {"error": "nothing to confirm — describe a product first"}
@@ -136,7 +171,7 @@ def confirm(tid, thread_id, api_key=None):
     if not q["within_quota"]:
         return {"error": f"quota reached ({q['builds']}) — upgrade your plan"}
     product = f"{tid.replace('t-', '')[:6]}-{p['name'].lower()}"
-    threading.Thread(target=frontdoor._run_build, args=(tid, product, p["charter"], p["kind"]), daemon=True).start()
+    threading.Thread(target=_run_and_report, args=(tid, thread_id, product, p["charter"], p["kind"]), daemon=True).start()
     audit.append(actor="orchestrator", action="BuildFromChat", resource=product, decision="started",
                  payload={"thread": thread_id, "kind": p["kind"]})
     return {"product": product, "status": "building", "charter": p["charter"]}
@@ -149,6 +184,8 @@ def _selftest():
     real = factory.agent
     real_build = frontdoor._run_build
     frontdoor._run_build = lambda *a, **k: None             # don't spawn a real build in selftest
+    real_rar = globals()["_run_and_report"]
+    globals()["_run_and_report"] = lambda *a, **k: None     # don't spawn the reporting thread work in selftest
     turns = {"n": 0}
 
     def fake_agent(role, repo, task, **k):
@@ -168,13 +205,14 @@ def _selftest():
         gate = confirm(tid, th).get("error") == "consent_required"   # confirm respects the consent gate
         consent.record(tid)
         built = confirm(tid, th).get("status") == "building"
-        hist = len(history(tid, th)) == 4                            # 2 user + 2 assistant
+        hist = len(history(tid, th)) >= 4                            # 2 user + 2 assistant (+ async reports)
         ok = clarified and proposed and gate and built and hist
-        print(f"clarify={clarified} propose={proposed} consent-gated={gate} build-on-confirm={built} history={hist}")
-        print("PASS: orchestrator chat (clarify -> propose -> governed build) ✅" if ok else "FAIL")
+        print(f"clarify={clarified} propose={proposed} consent-gated={gate} build-on-confirm={built} history>=4={hist}")
+        print("PASS: orchestrator chat (clarify -> propose -> governed build, reports back) ✅" if ok else "FAIL")
     finally:
         factory.agent = real
         frontdoor._run_build = real_build
+        globals()["_run_and_report"] = real_rar
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("DELETE FROM chat_messages WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM chat_threads WHERE tenant_id=%s", (tid,))

@@ -30,6 +30,7 @@ import billing           # noqa: E402
 import billingview       # noqa: E402
 import cockpit           # noqa: E402
 import consent           # noqa: E402
+import customagents      # noqa: E402
 import estimate          # noqa: E402
 import forecast          # noqa: E402
 import frontdoor         # noqa: E402  (reuse its governed build flow + zip)
@@ -127,6 +128,7 @@ GETS = {
     "/api/budgets": lambda tid, q: {"budgets": projbudget.list_budgets(tid)},
     "/api/versions": lambda tid, q: {"versions": versions.versions(tid, q.get("product", [""])[0])},
     "/api/help/topics": lambda tid, q: {"topics": helpagent.topics()},
+    "/api/agents": lambda tid, q: {"agents": customagents.list_agents(tid), "roles": list(customagents.ALLOWED_ROLES)},
     "/api/team": lambda tid, q: _team(tid),
     "/api/settings": lambda tid, q: settingsview.settings(tid),
     "/api/templates": lambda tid, q: {"templates": templatesview.gallery(), "categories": templatesview.categories()},
@@ -151,6 +153,10 @@ POSTS = {
     "/api/account/export": lambda tid, q, b: account.export(tid),
     "/api/account/delete": lambda tid, q, b: account.delete(tid, confirm=bool(b.get("confirm"))),
     "/api/help/ask": lambda tid, q, b: helpagent.ask(tid, b.get("question", "")),
+    "/api/agents/create": lambda tid, q, b: customagents.define(tid, b.get("name", ""), b.get("instructions", ""), b.get("role", "research-growth"), b.get("trigger", "manual"), int(b.get("interval_s") or 0) or None, b.get("output", "report"), b.get("product")),
+    "/api/agents/run": lambda tid, q, b: customagents.run_now(tid, int(b.get("id") or 0)),
+    "/api/agents/toggle": lambda tid, q, b: customagents.toggle(tid, int(b.get("id") or 0), bool(b.get("enabled"))),
+    "/api/agents/delete": lambda tid, q, b: customagents.delete(tid, int(b.get("id") or 0)),
     "/api/control": lambda tid, q, b: cockpit.control(tid, b.get("product", ""), b.get("action", "")),
     "/api/approvals/decide": lambda tid, q, b: approvals.decide(tid, b.get("kind"), b.get("ref"), b.get("verdict")),
     "/api/integrations/connect": lambda tid, q, b: integrationsview.connect(tid, b.get("slug", ""), b.get("secret")),
@@ -166,7 +172,7 @@ POSTS = {
 PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>agent-os · console</title><style>
 :root{--bg:#0b0d12;--bg2:#0f1117;--panel:#14171f;--panel2:#191d27;--hover:#1c212c;--line:#232834;--line2:#2e3542;
---tx:#e7eaf0;--tx2:#a8b0be;--mut:#6b7280;--accent:#6e8bff;--accent2:#8aa1ff;--asoft:rgba(110,139,255,.14);--aring:rgba(110,139,255,.45);--atext:#aebcff;
+--tx:#e7eaf0;--tx2:#b3bbc9;--mut:#8b93a3;--accent:#6e8bff;--accent2:#8aa1ff;--asoft:rgba(110,139,255,.14);--aring:rgba(110,139,255,.45);--atext:#aebcff;
 --g:#3ecf8e;--gsoft:rgba(62,207,142,.13);--gtext:#6fe3ad;--y:#e3b341;--ysoft:rgba(227,179,65,.13);--ytext:#f0cd6e;--r:#f06363;--rsoft:rgba(240,99,99,.13);--rtext:#ff8a8a;
 --mono:ui-monospace,"SF Mono",Menlo,monospace}
 *{box-sizing:border-box}*{scrollbar-width:thin;scrollbar-color:#2a3140 transparent}
@@ -189,12 +195,18 @@ body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.55 "Inter",-apple
 .tbtn .nb{position:absolute;top:0;right:0;background:var(--r);color:#fff;border-radius:999px;font-size:9px;font-weight:700;min-width:15px;height:15px;padding:0 4px;display:inline-flex;align-items:center;justify-content:center}
 .main{flex:1;padding:26px 30px;max-width:1080px;width:100%;margin:0 auto}
 h1{font-size:22px;font-weight:650;letter-spacing:-.02em;margin:0 0 3px}.sub{color:var(--mut);margin:0 0 20px;font-size:13px}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:18px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(122px,1fr));gap:10px;margin-bottom:18px}
 .kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 16px;box-shadow:0 1px 2px rgba(0,0,0,.25)}
 .kpi b{display:block;font-size:25px;font-weight:680;letter-spacing:-.02em;line-height:1.1}.kpi span{color:var(--mut);font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.25);animation:rise .22s cubic-bezier(.4,0,.2,1)}
-@keyframes rise{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-.card h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--mut);margin:0 0 12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.25)}
+#view{animation:rise .18s cubic-bezier(.4,0,.2,1)}
+@keyframes rise{from{transform:translateY(3px)}to{transform:none}}
+@media(prefers-reduced-motion:reduce){#view{animation:none}}
+.card h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;color:var(--tx2);margin:0 0 12px}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:52px 20px;color:var(--tx2)}
+.empty .ic{font-size:30px;opacity:.55;margin-bottom:10px}.empty h3{font-size:15px;font-weight:600;color:var(--tx);margin:0 0 4px}.empty p{color:var(--mut);margin:0 0 16px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}.chip-s{padding:7px 12px;border-radius:999px;background:var(--panel2);border:1px solid var(--line2);color:var(--tx2);cursor:pointer;font-size:12.5px}.chip-s:hover{border-color:var(--accent);color:var(--tx)}
+.pill.off{background:rgba(255,255,255,.04);color:var(--mut)}.int-ic{width:28px;height:28px;border-radius:7px;background:var(--panel2);border:1px solid var(--line2);display:inline-flex;align-items:center;justify-content:center;font-size:14px;flex:none}
 .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.spread{justify-content:space-between}
 .item{border-top:1px solid var(--line);padding:12px 0}.item:first-child{border-top:none;padding-top:0}
 .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;background:rgba(255,255,255,.05);color:var(--tx2)}
@@ -245,11 +257,11 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
 </div>
 <script>
 const NAV=[
- ['Direct',[['chat','Chat','💬'],['build','New build','✦'],['templates','Templates','▦']]],
+ ['Direct',[['chat','Chat','💬'],['build','New build','✦'],['agents','Agents','🤖'],['templates','Templates','▦']]],
  ['Operate',[['cockpit','Cockpit','◧'],['projects','Projects','▤'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
  ['Business',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
 ];
-const LABEL={chat:'Chat',build:'New build',templates:'Templates',cockpit:'Cockpit',projects:'Projects',approvals:'Approvals',activity:'Activity',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Team',settings:'Settings',status:'Status'};
+const LABEL={chat:'Chat',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',approvals:'Approvals',activity:'Activity',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Team',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none'}
@@ -272,6 +284,7 @@ function authCard(msg){return `<div class=card><h2>Sign in</h2><p class=muted>${
 function errCard(k,msg){return `<div class=card><h2>Something went wrong</h2><p class=muted>${esc(msg)}</p><div style=margin-top:8px><button class=pri onclick="go('${k}')">retry</button></div></div>`}
 function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function pill(txt,cls){return `<span class="pill ${cls||''}">${esc(txt)}</span>`}
+function emptyB(ic,t,m,cta){return '<div class=empty><div class=ic>'+ic+'</div><h3>'+esc(t)+'</h3><p>'+esc(m)+'</p>'+(cta||'')+'</div>'}
 function renderNav(){$('#nav').innerHTML=NAV.map(([sec,items])=>`<div class=nsec>${sec}</div>`+items.map(([k,l,ic])=>`<a class="${k==CUR?'on':''}" onclick="go('${k}')"><span class=ico>${ic}</span><span class=lbl>${l}</span>${BADGES[k]?`<span class=b>${BADGES[k]}</span>`:''}</a>`).join('')).join('')}
 async function refreshTopbar(){
  try{const b=await get('/api/billing');const f=await get('/api/forecast').catch(()=>null);
@@ -292,7 +305,9 @@ let THREAD=null;
 const VIEWS={
  chat:async()=>{
   if(!THREAD){const r=await post('/api/chat/new',{});THREAD=r.thread}
+  const CHIPS=['Track my gym members','An invoice generator','A URL shortener','A booking page for my salon','An internal tool for my team'];
   $('#view').innerHTML=`<h1>Direct your fleet</h1><p class=sub>Describe what you want in plain words. I'll ask questions, then build it — you approve.</p>
+   <div class=chips>`+CHIPS.map(c=>`<span class=chip-s onclick="chipFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div>
    <div class=card id=chatlog style="max-height:52vh;overflow:auto"></div>
    <div class=card><div class=row><input id=msg placeholder="e.g. I want an app to track my gym members…" onkeydown="if(event.key==='Enter')chatSend()"><button class=pri onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
   await chatRender();
@@ -303,7 +318,7 @@ const VIEWS={
   let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
   let h='<h1>Cockpit</h1><p class=sub>Your whole factory in one view.</p>';
   if(ob&&!ob.completed&&ob.step!=='done'){h+=`<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Get set up</b> — ${esc(ob.framing||'')} Next: <b>${esc(ob.step)}</b></span><span><button class=pri onclick="go('${ob.step==='provider'?'providers':(ob.step==='consent'?'settings':(ob.step==='first_build'?'chat':'chat'))}')">continue</button> <button onclick="post('/api/onboarding/skip',{}).then(()=>go('cockpit'))">skip</button></span></div></div>`;}
-  h+=kpis([['Products',s.products||0],['Launched',s.launched||0],['Building',s.building||0],['Failed',s.failed||0],['Workers',s.live_workers||0],['Spend $',s.spend_usd||0],['Plan',b.plan||'—']]);
+  h+=kpis([['Products',s.products||0],['Launched',s.launched||0],['Building',s.building||0],['Failed',s.failed||0],['Workers',s.live_workers||0],['Spend $',s.spend_usd||0]]);
   if(fc){const fcls=fc.level==='over'?'bad':(fc.level==='warn'?'warn':'ok');h+=`<div class=card><h2>Budget forecast</h2><div class="row spread"><span>${esc(fc.headline||'')}</span>${pill(fc.pct_of_quota_projected+'% projected',fcls)}</div><div class=meta>burn ~${fc.burn_tokens_per_day} tok/day · $${fc.burn_usd_per_day}/day${fc.eta_days_to_quota?(' · hits quota in ~'+fc.eta_days_to_quota+'d'):''}</div></div>`;}
   h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${ql[p.product]?pill('✓ '+ql[p.product].overall,(ql[p.product].overall=='verified'||ql[p.product].overall=='passed')?'ok':(ql[p.product].overall=='failed'?'bad':'')):''} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in New build</div>')+'</div>';
   h+='<div class=grid><div class=card><h2>Communications</h2><table>'+(d.communications.length?d.communications.map(m=>`<tr><td>${m.ts}</td><td>${esc(m.from)}</td><td>→ ${esc(m.to)}</td><td>${esc(m.intent)}</td></tr>`).join(''):'<tr><td class=muted>no recent agent messages</td></tr>')+'</table></div>';
@@ -311,8 +326,13 @@ const VIEWS={
   $('#view').innerHTML=h;},
  build:async()=>{$('#view').innerHTML=`<h1>New build</h1><p class=sub>Describe a product; the governed factory builds, tests and ships it.</p>
   <div class=card><label>Name</label><input id=bn placeholder=splitbill><label>Type</label><select id=bk onchange=showEst()><option value=lib>Python library</option><option value=web>Web app</option><option value=service>API service</option></select><label>What should it do?</label><textarea id=bc placeholder="Describe the API, behaviours, edge cases…"></textarea><div id=est class=muted style=margin-top:8px></div><div style=margin-top:10px><button class=pri onclick=doBuild()>Build it</button></div><div id=bnote class=muted style=margin-top:8px></div></div>`;showEst();},
+ agents:async()=>{const d=await get('/api/agents');d.agents=d.agents||[];const roles=(d.roles||['research-growth']);
+  let h='<h1>Your agents</h1><p class=sub>It\'s a factory — hire standing agents that work on a schedule and report back to you. E.g. a weekly market-watch.</p>';
+  h+='<div class=card><h2>Your standing agents</h2>'+(d.agents.length?d.agents.map(a=>`<div class=item><div class="row spread"><span><b>${esc(a.name)}</b> ${pill(a.role)} ${pill(a.trigger==='recurring'?('every '+Math.round((a.interval_s||0)/86400)+'d'):'manual',a.trigger==='recurring'?'accent':'')} ${a.enabled?pill('on','ok'):pill('off')}</span><span><button onclick="agentRun(${a.id})">run now</button> <button onclick="agentToggle(${a.id},${a.enabled?'false':'true'})">${a.enabled?'pause':'enable'}</button> <button class=danger onclick="agentDel(${a.id})">delete</button></span></div><div class=muted>last run: ${a.last_run?esc(a.last_run):'never'} ${a.last_status?('· '+esc(a.last_status)):''}</div></div>`).join(''):emptyB('🤖','No agents yet','Create a standing agent below — it runs on a schedule and reports into your feed.'))+'</div>';
+  h+='<div class=card><h2>Create an agent</h2><label>Name</label><input id=an placeholder="Market Watch"><div class=grid><div><label>Specialty</label><select id=ar>'+roles.map(r=>`<option value="${r}">${r}</option>`).join('')+'</select></div><div><label>Runs</label><select id=at><option value=manual>On demand</option><option value=recurring>Every week</option></select></div></div><label>What should it do?</label><textarea id=ai placeholder="Every week, scan my market for new competitors and pricing changes; give me 3 prioritized takeaways with sources."></textarea><div style=margin-top:10px><button class=pri onclick=agentCreate()>Create agent</button></div><div id=anote class=muted style=margin-top:8px></div></div>';
+  $('#view').innerHTML=h;},
  templates:async()=>{const d=await get('/api/templates');$('#view').innerHTML=`<h1>Templates</h1><p class=sub>Start from a curated, factory-ready blueprint.</p><div class=grid>`+(d.templates||[]).map(t=>`<div class=tile><div class="row spread"><b>${esc(t.name)}</b>${pill(t.kind)}</div><div class=muted style=margin:6px_0>${esc(t.blurb)}</div><button class=pri onclick="buildTpl('${t.slug}')">Build this</button></div>`).join('')+'</div>';},
- projects:async()=>{const d=await get('/api/projects');d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):'<div class=muted>no projects yet</div>')+'</div>';},
+ projects:async()=>{const d=await get('/api/projects');d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):emptyB('▤','No projects yet','Describe your first product and the factory builds, tests and ships it.','<button class=pri onclick="go(\'chat\')">Start your first build</button>'))+'</div>';},
  activity:async()=>{const o=await get('/api/observability');let fl={workers:[]};try{fl=await get('/api/fleet')}catch(e){}fl.workers=fl.workers||[];
   let h='<h1>Activity</h1><p class=sub>Runs, errors, spend, and the live workers across your fleet.</p>';
   h+=kpis([['Runs',o.runs||0],['Steps',o.steps||0],['Errors',o.errors||0],['Cost $',o.cost_usd||0],['Workers',fl.workers.length]]);
@@ -322,10 +342,10 @@ const VIEWS={
   $('#view').innerHTML=h;},
  fleet:async()=>{const d=await get('/api/fleet');d.workers=d.workers||[];$('#view').innerHTML='<h1>Agent fleet</h1><p class=sub>Live workers across your products.</p>'+kpis([['Live workers',d.count||0],['Active products',d.products_active||0]])+'<div class=card><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th>task</th></tr>'+(d.workers.length?d.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td>${esc(w.task)}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';},
  observability:async()=>{const d=await get('/api/observability');$('#view').innerHTML='<h1>Observability</h1><p class=sub>Runs, errors, spend across your fleet.</p>'+kpis([['Runs',d.runs],['Steps',d.steps],['Errors',d.errors],['Cost $',d.cost_usd],['Tokens',d.tokens]])+'<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(d.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div><div class=card><h2>Recent errors</h2>'+((d.recent_errors||[]).length?d.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean</div>')+'</div>';},
- approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">deny</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):'<div class=muted>nothing awaiting you ✓</div>')+'</div>';},
+ approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">deny</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):emptyB('✓','All clear','Nothing needs your decision right now. We\'ll bring anything important here.'))+'</div>';},
  integrations:async()=>{const d=await get('/api/integrations');$('#view').innerHTML='<h1>Integrations</h1><p class=sub>Connect the services your products need.</p><div class=grid>'+(d.integrations||[]).map(i=>`<div class=tile><div class="row spread"><b>${esc(i.name)}</b>${pill(i.status,i.status=='connected'?'ok':'')}</div><div class=muted style=margin:6px_0>${esc(i.blurb)} · ${esc(i.category)}</div>${i.status=='connected'?`<button onclick="integ('disconnect','${i.slug}')">disconnect</button>`:`<button class=pri onclick="integ('connect','${i.slug}')">connect</button>`}</div>`).join('')+'</div>';},
  billing:async()=>{const d=await get('/api/billing');$('#view').innerHTML=`<h1>Billing & plans</h1><p class=sub>Usage, quota and plan. Real payment is gated (BYO Stripe).</p>`+kpis([['Plan',d.plan],['Builds',(d.usage&&d.usage.builds)||0],['Tokens',(d.usage&&d.usage.tokens)||0]])+'<div class=card><h2>Plans</h2><table><tr><th>plan</th><th>price</th><th>builds</th><th>tokens</th><th></th></tr>'+(d.plans||[]).map(p=>`<tr><td>${esc(p.slug)} ${p.current?pill('current','ok'):''}</td><td>$${p.price}</td><td>${p.builds}</td><td>${p.tokens}</td><td>${p.current?'':`<button onclick="plan('${p.slug}')">switch</button>`}</td></tr>`).join('')+'</table></div>';},
- notifications:async()=>{const d=await get('/api/notifications');d.feed=d.feed||[];$('#view').innerHTML=`<h1>Notifications</h1><p class=sub>${d.unread||0} unread.</p><div class=card>`+(d.feed.length?d.feed.map(n=>`<div class=item><div class="row spread"><span>${pill(n.level,n.level=='urgent'?'bad':(n.level=='standard'?'':'warn'))} <b>${esc(n.title)}</b></span><span class=muted>${esc(n.category)} · ${n.created_at}</span></div><div class=muted>${esc(n.body||'')}</div></div>`).join(''):'<div class=muted>no notifications</div>')+'</div>';},
+ notifications:async()=>{const d=await get('/api/notifications');d.feed=d.feed||[];$('#view').innerHTML=`<h1>Notifications</h1><p class=sub>${d.unread||0} unread.</p><div class=card>`+(d.feed.length?d.feed.map(n=>`<div class=item><div class="row spread"><span>${pill(n.level,n.level=='urgent'?'bad':(n.level=='standard'?'':'warn'))} <b>${esc(n.title)}</b></span><span class=muted>${esc(n.category)} · ${n.created_at}</span></div><div class=muted>${esc(n.body||'')}</div></div>`).join(''):emptyB('◔','You\'re all caught up','Build updates, billing alerts and agent reports will appear here.'))+'</div>';},
  team:async()=>{const d=await get('/api/team');$('#view').innerHTML='<h1>Team</h1><p class=sub>'+esc(d.seats_note||'')+'</p><div class=card><table><tr><th>member</th><th>role</th><th>status</th></tr>'+(d.members||[]).map(m=>`<tr><td>${esc(m.id)}</td><td>${esc(m.role)}</td><td>${pill(m.status,'ok')}</td></tr>`).join('')+'</table></div>';},
  settings:async()=>{const d=await get('/api/settings');const c=d.ai_consent||{};const pr=d.profile||{};$('#view').innerHTML=`<h1>Settings</h1><p class=sub>Profile, AI consent, keys, notifications.</p>
   <div class=card><h2>Profile</h2><div class=row>plan <b>${esc(pr.plan||'—')}</b> ${pr.suspended?pill('suspended','bad'):pill('active','ok')}</div></div>
@@ -337,19 +357,26 @@ const VIEWS={
  help:async()=>{const d=await get('/api/help/topics');$('#view').innerHTML=`<h1>Help</h1><p class=sub>Ask me anything about using agent-os.</p>
   <div class=card><div class=row><input id=hq placeholder="e.g. how do I add my Codex key?" onkeydown="if(event.key==='Enter')helpAsk()"><button class=pri onclick=helpAsk()>Ask</button></div><div id=hans style=margin-top:10px></div></div>
   <div class=card><h2>Topics</h2>`+(d.topics||[]).map(t=>`<div class=item><b>${esc(t.area||t.key||'')}</b> <span class=muted>${esc(t.desc||t.description||'')}</span></div>`).join('')+'</div>';},
- status:async()=>{const d=await get('/api/status');const m={operational:'ok',degraded:'warn',major_outage:'bad',unknown:''}[d.verdict];$('#view').innerHTML='<h1>Status</h1><p class=sub>Live platform health.</p><div class=card><div class=row>'+pill(d.verdict,m)+'</div></div><div class=card><h2>Services</h2>'+Object.entries(d.components||{}).map(([k,v])=>`<div class="row spread item"><span>${esc(k)}</span>${pill(v,v===true||v=='ok'?'ok':'bad')}</div>`).join('')+`<div class="row spread item"><span>dead-letter depth</span>${pill(d.dead_letter_depth,d.dead_letter_depth?'bad':'ok')}</div></div>`;},
+ status:async()=>{const d=await get('/api/status');const m={operational:'ok',degraded:'warn',major_outage:'bad',unknown:''}[d.verdict];$('#view').innerHTML='<h1>Status</h1><p class=sub>Live platform health.</p><div class=card><div class=row>'+pill(d.verdict,m)+'</div></div><div class=card><h2>Services</h2>'+Object.entries(d.components||{}).map(([k,v])=>{const up=v===true||v=='ok'||v=='up';return `<div class="row spread item"><span>${esc(k)}</span>${pill(up?'Operational':'Down',up?'ok':'bad')}</div>`}).join('')+`<div class="row spread item"><span>dead-letter depth</span>${pill(d.dead_letter_depth,d.dead_letter_depth?'bad':'ok')}</div></div>`;},
 };
 let PREFS=[];
 let LAST_PROPOSAL=null;
+function md(s){return esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>')}
 async function chatRender(){
+ if(CUR!=='chat'){if(window.CHATPOLL){clearInterval(window.CHATPOLL);window.CHATPOLL=null}return}
  let d;try{d=await get('/api/chat/history?thread='+THREAD)}catch(e){return}
  const log=$('#chatlog');if(!log)return;
  log.innerHTML=(d.messages||[]).map(m=>{
-  const me=m.role==='user';const prop=(m.meta&&m.meta.proposal);
-  return `<div style="margin:8px 0;text-align:${me?'right':'left'}"><span style="display:inline-block;max-width:80%;padding:8px 12px;border-radius:12px;background:${me?'var(--accent)':'#16202c'};color:${me?'#fff':'var(--tx)'}">${esc(m.content)}</span>${prop?`<div class=tile style="margin:8px 0;text-align:left"><b>Proposed build:</b> ${esc(prop.name)} (${esc(prop.kind)})<div class=muted>${esc(prop.charter)}</div><button class=pri style=margin-top:6px onclick=chatConfirm()>Approve & build</button></div>`:''}</div>`;
- }).join('')||'<div class=muted>Say hello, or describe a product to build.</div>';
+  const me=m.role==='user';const meta=m.meta||{};const prop=meta.proposal;const ns=(meta.kind==='next_steps')&&meta.suggestions;
+  let extra='';
+  if(prop)extra=`<div class=tile style="margin:8px 0;text-align:left"><b>Proposed build:</b> ${esc(prop.name)} (${esc(prop.kind)})<div class=muted style=margin:4px_0>${esc(prop.charter)}</div><button class=pri style=margin-top:6px onclick=chatConfirm()>Approve &amp; build</button></div>`;
+  if(ns)extra=`<div class=chips style="margin:8px 0">`+meta.suggestions.map(s=>`<span class=chip-s onclick="chipFill('${s.replace(/'/g,"")}')">${esc(s)}</span>`).join('')+`</div>`;
+  return `<div class="msg ${me?'me':'ai'}" style="margin:8px 0"><div><span class=bubble>${md(m.content)}</span>${extra}</div></div>`;
+ }).join('')||'<div class=muted>Say hello, or describe a product — I\'ll ask a couple of questions, then build it.</div>';
  log.scrollTop=log.scrollHeight;
+ if(!window.CHATPOLL)window.CHATPOLL=setInterval(chatRender,5000);   // live updates as the controller reports back
 }
+function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus()}}
 async function chatSend(){
  const m=$('#msg').value.trim();if(!m)return;$('#msg').value='';$('#chatnote').textContent='thinking…';
  await post('/api/chat/say',{thread:THREAD,message:m});$('#chatnote').textContent='';await chatRender();
@@ -367,6 +394,10 @@ async function integ(act,slug){let secret=null;if(act=='connect')secret=prompt('
 async function plan(p){await post('/api/billing/plan',{plan:p});go('billing');}
 async function provAdd(slug,hint){const k=prompt('Paste your '+slug+' API key ('+hint+'):');if(k===null)return;await post('/api/providers/connect',{provider:slug,mode:'api_key',key:k});go('providers');}
 async function provSub(slug){await post('/api/providers/connect',{provider:slug,mode:'subscription'});go('providers');}
+async function agentCreate(){const t=$('#at').value;const r=await post('/api/agents/create',{name:$('#an').value,instructions:$('#ai').value,role:$('#ar').value,trigger:t,interval_s:t==='recurring'?604800:0,output:'report'});$('#anote').textContent=r.error?('✗ '+r.error):'agent created';if(!r.error)go('agents');}
+async function agentRun(id){await post('/api/agents/run',{id});$('#anote')&&($('#anote').textContent='running — it\'ll report into your notifications');}
+async function agentToggle(id,en){await post('/api/agents/toggle',{id,enabled:en});go('agents');}
+async function agentDel(id){if(!confirm('Delete this agent?'))return;await post('/api/agents/delete',{id});go('agents');}
 async function provRemove(slug){await post('/api/providers/remove',{provider:slug});go('providers');}
 async function helpAsk(){const q=$('#hq').value.trim();if(!q)return;$('#hans').innerHTML='<span class=muted>thinking…</span>';const r=await post('/api/help/ask',{question:q});$('#hans').innerHTML='<div class=tile>'+esc(r.answer||r.error||'(no answer)')+(r.suggested_area?` <button onclick="go('${r.suggested_area}')">go there</button>`:'')+'</div>';}
 async function setConsent(a){await post('/api/settings/consent',{accept:a});go('settings');}

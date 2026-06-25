@@ -72,10 +72,10 @@ fi
 tailscale serve status 2>/dev/null | grep -q 8095 || tailscale serve --bg --https=8095 http://127.0.0.1:8093 >/dev/null 2>&1
 ok "front door private over Tailscale: https://nyaan.tail502e3f.ts.net:8095"
 
-hdr "4g. Public status page (127.0.0.1:8096) + Prometheus metrics (127.0.0.1:9101)"
+hdr "4g. Public status page (127.0.0.1:8097) + Prometheus metrics (127.0.0.1:9101)"
 if pgrep -f "statuspage.py serve" >/dev/null; then ok "status page already running"
 else
-  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/statuspage.py serve 8096" >/tmp/statuspage.log 2>&1 </dev/null & )
+  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/statuspage.py serve 8097" >/tmp/statuspage.log 2>&1 </dev/null & )
   sleep 1; pgrep -f "statuspage.py serve" >/dev/null && ok "status page started" || warn "status page failed"
 fi
 if pgrep -f "metricsexport.py serve" >/dev/null; then ok "metrics exporter already running"

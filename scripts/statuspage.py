@@ -7,7 +7,7 @@ signals — service health (dashboard._health), active watchdog alerts, and dead
 renders a tiny HTML page + /status.json. Read-only, no secrets, binds 127.0.0.1 (front it with Tailscale
 serve / a reverse proxy to expose publicly, same as the other surfaces).
 
-    statuspage.py serve [port]    # default 8096
+    statuspage.py serve [port]    # default 8097
     statuspage.py json            # print the current status JSON
     statuspage.py selftest
 Run with the agent-os venv python.
@@ -144,7 +144,7 @@ def _main(a):
     elif a[0] == "json":
         print(json.dumps(status(), indent=2))
     elif a[0] == "serve":
-        port = int(a[1]) if len(a) > 1 else 8096
+        port = int(a[1]) if len(a) > 1 else 8097
         print(f"status page on http://127.0.0.1:{port}")
         ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
     else:

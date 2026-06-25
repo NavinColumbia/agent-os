@@ -11,7 +11,7 @@ This is the **specification**, produced from 4 parallel deep-research streams (h
 2. **[02 — Integrations, Onboarding, Deploy & Security](blueprint/02-integrations-onboarding-deploy-security.md)** — the integrations catalog, the "minimal-info / AI-assisted / confirm-and-go" onboarding & provisioning flows (Stripe, BYO-key, AWS deploy, GPU rental), deploy/infra automation, and the per-tenant security model. *(deep dive: [secrets & security](blueprint/research-secrets-security.md))*
 3. **[03 — Monetization, Finance, Legal & Personas](blueprint/03-monetization-finance-legal-personas.md)** — pricing/packaging, unit economics, legal/compliance/risk, and the persona × industry needs matrices. *(deep dive: [legal & compliance](blueprint/research-legal-compliance.md))*
 4. **[04 — Exhaustive Screen Inventory](blueprint/04-screens-inventory.md)** — ~240 screens across web + mobile + admin, 16 areas. The "list every view/page" deliverable.
-5. **[05 — Product Lifecycle (marketing/sales/pitch/feedback/IP/whitepaper + task board + external integrations)](blueprint/05-lifecycle.md)** — the part *after* "build", for our product and users'.
+5. **[05 — Product Lifecycle (marketing/sales/pitch/feedback/IP/whitepaper + task board + external integrations)](blueprint/05-lifecycle.md)** — the part *after* "build", for our product and users'. *(deep dive: [launch & lifecycle playbook](blueprint/RESEARCH-launch-onboarding.md) — store/Play/web publishing, onboarding, notification taxonomy, observability, resilience UX; 89 cited sources, produced by our own research fleet.)*
 
 ---
 
@@ -60,6 +60,9 @@ The factory engine is built. The platform shell around it is the work.
 - **Phase E — Hardening & scale:** microVM isolation, SOC 2 Type II, abuse/T&S + content moderation, admin back-office, mobile apps, marketing site.
 
 ---
+
+## ⚠️ Load-bearing constraint (from the launch-playbook research)
+**Neither store lets you publish your users' generated apps centrally.** Apple Guideline 4.2.6 rejects binaries from app-generation services, and Google Play reaches the same end via anti-spam/white-label rules — **each end user must publish under their *own* developer account.** This reshapes the "users publish their own apps" thesis: the product's job is to *generate the artifact + walk each user through publishing under their own account* (or steer them to **web/PWA**, where there's no gatekeeper), not to act as a central publisher. The AI-consent screen (Apple 5.1.2(i), eff. 2025-11-13; Google Play AI policy; EU AI Act Art. 50, applies 2026-08-02) is **mandatory and cross-platform** before any user data reaches a third-party model. Full detail + 89 sources: [RESEARCH-launch-onboarding.md](blueprint/RESEARCH-launch-onboarding.md).
 
 ## Honest reality check
 - This is a **funded-team, multi-quarter product**, not a weekend build. The blueprint exists so it can be built **incrementally and deliberately** — and agent-os can **dogfood itself** to build large parts of its own platform.

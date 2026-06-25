@@ -22,44 +22,83 @@ sys.path.insert(0, str(SCRIPTS))
 import audit      # noqa: E402
 import directory  # noqa: E402
 import factory    # noqa: E402
+import notify      # noqa: E402
 
 ENV = Path.home() / "projects" / "agent-os" / ".env.local"
 DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
            if l.strip().startswith("DATABASE_URL=")), None)
 INBOX_WORKSPACE = factory.PRODUCTS / "_inbox"
 MAX_PER_TICK = int(os.environ.get("DISPATCH_MAX_PER_TICK", "2"))   # cost guard
+BACKOFF_S = int(os.environ.get("AOS_TASK_BACKOFF_S", "120"))       # base retry backoff (×attempts)
 
 
 def _pull(limit):
-    """Atomically claim up to `limit` highest-priority pending tasks (concurrent-dispatcher-safe)."""
+    """Atomically claim up to `limit` runnable highest-priority tasks (concurrent-dispatcher-safe).
+    Runnable = pending AND past its backoff (`not_before`). Stamps `locked_at` so a crashed dispatcher's
+    task can be lease-reclaimed by tasksweep instead of being orphaned in 'active' forever."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT id, assignee, requester, title, priority FROM tasks WHERE status='pending'
+        cur.execute("""SELECT id, assignee, requester, title, priority,
+                              COALESCE(attempts,0), COALESCE(max_retry,3)
+                       FROM tasks WHERE status='pending' AND (not_before IS NULL OR not_before <= now())
                        ORDER BY priority, id FOR UPDATE SKIP LOCKED LIMIT %s""", (limit,))
         rows = cur.fetchall()
         if rows:
-            cur.execute("UPDATE tasks SET status='active' WHERE id = ANY(%s)", ([r[0] for r in rows],))
+            cur.execute("UPDATE tasks SET status='active', locked_at=now() WHERE id = ANY(%s)",
+                        ([r[0] for r in rows],))
         c.commit()
     return rows
 
 
 def _done(tid):
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("UPDATE tasks SET status='done' WHERE id=%s", (tid,))
+        cur.execute("UPDATE tasks SET status='done', locked_at=NULL WHERE id=%s", (tid,))
         c.commit()
 
 
+def _retry_or_dead(tid, attempts, max_retry, err):
+    """A failed task is NOT dropped: requeue with linear backoff until max_retry, then dead-letter it
+    (visible in the 'dead' state + paged) so a human can act. Returns 'retry' or 'dead'."""
+    attempts += 1
+    err = (err or "")[:500]
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        if attempts >= max_retry:
+            cur.execute("UPDATE tasks SET status='dead', attempts=%s, last_error=%s, locked_at=NULL WHERE id=%s",
+                        (attempts, err, tid))
+            c.commit()
+            audit.append(actor="dispatcher", action="TaskDeadLettered", resource=str(tid),
+                         decision="dead", payload={"attempts": attempts, "error": err[:160]})
+            notify.send(f"Task #{tid} dead-lettered after {attempts} attempts: {err[:120]}",
+                        title="agent-os queue", priority="high", tags="warning")
+            return "dead"
+        cur.execute("""UPDATE tasks SET status='pending', attempts=%s, last_error=%s, locked_at=NULL,
+                       not_before=now() + (%s || ' seconds')::interval WHERE id=%s""",
+                    (attempts, err, BACKOFF_S * attempts, tid))
+        c.commit()
+        audit.append(actor="dispatcher", action="TaskRetry", resource=str(tid), decision="requeued",
+                     payload={"attempts": attempts, "backoff_s": BACKOFF_S * attempts, "error": err[:160]})
+        return "retry"
+
+
 def process(task):
-    tid, assignee, requester, title, priority = task
+    tid, assignee, requester, title, priority, attempts, max_retry = task
     role = assignee.split("@", 1)[0]                  # agent_id 'legal-...@inst' -> role
     workspace = INBOX_WORKSPACE / assignee.replace("@", "_at_").replace("/", "_")
     workspace.mkdir(parents=True, exist_ok=True)
     audit.append(actor="dispatcher", action="WakeAgent", resource=assignee, decision="invoked",
-                 payload={"task_id": tid, "priority": priority})
-    r = factory.agent(role, str(workspace), title)    # INVOKE the idle agent to actually do the task
-    _done(tid)
-    if requester:                                     # close the loop: reply to whoever asked
-        directory.contact(assignee, requester, "reply", (r.get("out") or "")[:800])
-    return {"task_id": tid, "assignee": assignee, "ok": r.get("rc") == 0}
+                 payload={"task_id": tid, "priority": priority, "attempt": attempts + 1})
+    try:
+        r = factory.agent(role, str(workspace), title)   # INVOKE the idle agent to actually do the task
+    except Exception as e:                               # a crash is a failure, not a silent drop
+        r = {"rc": 1, "out": "", "blocker": f"agent raised: {e}"}
+    if r.get("rc") == 0:
+        _done(tid)
+        if requester:                                 # close the loop: reply to whoever asked
+            directory.contact(assignee, requester, "reply", (r.get("out") or "")[:800])
+        return {"task_id": tid, "assignee": assignee, "ok": True, "disposition": "done"}
+    disp = _retry_or_dead(tid, attempts, max_retry, r.get("blocker") or (r.get("out") or "")[:200])
+    if requester and disp == "dead":
+        directory.contact(assignee, requester, "reply", f"FAILED (dead-lettered): {title[:200]}")
+    return {"task_id": tid, "assignee": assignee, "ok": False, "disposition": disp}
 
 
 def tick():

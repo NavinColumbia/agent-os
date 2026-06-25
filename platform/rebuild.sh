@@ -82,6 +82,8 @@ say "5. Seed the org (skills + roles)"
   '.venv/bin/python scripts/reap.py run' >/dev/null 2>&1 && ok "orphan/stuck agent reaper registered" || warn "reap-orphans registration failed"
 "$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register tasksweep 600 \
   '.venv/bin/python scripts/tasksweep.py run' >/dev/null 2>&1 && ok "stuck-task lease reclaim registered" || warn "tasksweep registration failed"
+"$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register budget-forecast-sweep 3600 \
+  '.venv/bin/python scripts/forecast.py sweep' >/dev/null 2>&1 && ok "budget forecast/alert sweep registered" || warn "forecast sweep registration failed"
 
 say "6. Prove the box (full self-test)"
 if bash "$ROOT/scripts/selftest.sh" >/tmp/rebuild-selftest.log 2>&1; then

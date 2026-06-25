@@ -29,9 +29,11 @@ import billing           # noqa: E402
 import billingview       # noqa: E402
 import cockpit           # noqa: E402
 import consent           # noqa: E402
+import forecast          # noqa: E402
 import frontdoor         # noqa: E402  (reuse its governed build flow + zip)
 import integrationsview  # noqa: E402
 import notifications     # noqa: E402
+import orchestrator      # noqa: E402
 import projectsview      # noqa: E402
 import settingsview      # noqa: E402
 import statuspage        # noqa: E402
@@ -107,6 +109,8 @@ GETS = {
     "/api/approvals": lambda tid, q: approvals.inbox(tid),
     "/api/integrations": lambda tid, q: {"integrations": integrationsview.status(tid)},
     "/api/billing": lambda tid, q: billingview.billing_view(tid),
+    "/api/forecast": lambda tid, q: forecast.forecast(tid),
+    "/api/chat/history": lambda tid, q: {"messages": orchestrator.history(tid, int(q.get("thread", ["0"])[0] or 0))},
     "/api/team": lambda tid, q: _team(tid),
     "/api/settings": lambda tid, q: settingsview.settings(tid),
     "/api/templates": lambda tid, q: {"templates": templatesview.gallery(), "categories": templatesview.categories()},
@@ -116,6 +120,9 @@ GETS = {
 POSTS = {
     "/api/build": lambda tid, q, b: _build(tid, b),
     "/api/build_template": lambda tid, q, b: _build_template(tid, b),
+    "/api/chat/new": lambda tid, q, b: {"thread": orchestrator.start_thread(tid)},
+    "/api/chat/say": lambda tid, q, b: orchestrator.say(tid, int(b.get("thread") or 0), b.get("message", "")),
+    "/api/chat/confirm": lambda tid, q, b: orchestrator.confirm(tid, int(b.get("thread") or 0)),
     "/api/control": lambda tid, q, b: cockpit.control(tid, b.get("product", ""), b.get("action", "")),
     "/api/approvals/decide": lambda tid, q, b: approvals.decide(tid, b.get("kind"), b.get("ref"), b.get("verdict")),
     "/api/integrations/connect": lambda tid, q, b: integrationsview.connect(tid, b.get("slug", ""), b.get("secret")),
@@ -165,7 +172,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#9fb6d6}
 <div class=main><div id=view><div class=card>Paste your tenant token (left) to open your console. No token? Use the front door to sign up.</div></div></div>
 </div>
 <script>
-const NAV=[['cockpit','◧ Cockpit'],['build','✦ New build'],['templates','▦ Templates'],['projects','▤ Projects'],['fleet','⚙ Fleet'],['observability','◴ Observability'],['approvals','✓ Approvals'],['integrations','⌁ Integrations'],['billing','▣ Billing'],['notifications','◔ Notifications'],['team','◍ Team'],['settings','⚙ Settings'],['status','◉ Status']];
+const NAV=[['chat','💬 Direct (chat)'],['cockpit','◧ Cockpit'],['build','✦ New build'],['templates','▦ Templates'],['projects','▤ Projects'],['fleet','⚙ Fleet'],['observability','◴ Observability'],['approvals','✓ Approvals'],['integrations','⌁ Integrations'],['billing','▣ Billing'],['notifications','◔ Notifications'],['team','◍ Team'],['settings','⚙ Settings'],['status','◉ Status']];
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function saveTok(){TOK=$('#tok').value.trim();localStorage.setItem('aos_tenant',TOK);go('cockpit')}
@@ -191,10 +198,20 @@ async function go(k){CUR=k;renderNav();$('#view').innerHTML='<div class=card><sp
 function kpis(arr){return '<div class=kpis>'+arr.map(a=>`<div class=kpi><b>${esc(a[1])}</b><span>${esc(a[0])}</span></div>`).join('')+'</div>'}
 function stages(ss){return '<div class=stages>'+ss.map(s=>`<div class="st ${s.done?(s.ok===false?'bad':'ok'):''}" title="${s.stage}"></div>`).join('')+'</div>'}
 
+let THREAD=null;
 const VIEWS={
+ chat:async()=>{
+  if(!THREAD){const r=await post('/api/chat/new',{});THREAD=r.thread}
+  $('#view').innerHTML=`<h1>Direct your fleet</h1><p class=sub>Describe what you want in plain words. I'll ask questions, then build it — you approve.</p>
+   <div class=card id=chatlog style="max-height:52vh;overflow:auto"></div>
+   <div class=card><div class=row><input id=msg placeholder="e.g. I want an app to track my gym members…" onkeydown="if(event.key==='Enter')chatSend()"><button class=pri onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
+  await chatRender();
+ },
  cockpit:async()=>{const d=await get('/api/cockpit');const s=d.summary||{},b=d.budget||{};d.products=d.products||[];d.communications=d.communications||[];d.queue=d.queue||{};
+  let fc=null;try{fc=await get('/api/forecast')}catch(e){}
   let h='<h1>Cockpit</h1><p class=sub>Your whole factory in one view.</p>';
   h+=kpis([['Products',s.products||0],['Launched',s.launched||0],['Building',s.building||0],['Failed',s.failed||0],['Workers',s.live_workers||0],['Spend $',s.spend_usd||0],['Plan',b.plan||'—']]);
+  if(fc){const fcls=fc.level==='over'?'bad':(fc.level==='warn'?'warn':'ok');h+=`<div class=card><h2>Budget forecast</h2><div class="row spread"><span>${esc(fc.headline||'')}</span>${pill(fc.pct_of_quota_projected+'% projected',fcls)}</div><div class=meta>burn ~${fc.burn_tokens_per_day} tok/day · $${fc.burn_usd_per_day}/day${fc.eta_days_to_quota?(' · hits quota in ~'+fc.eta_days_to_quota+'d'):''}</div></div>`;}
   h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in New build</div>')+'</div>';
   h+='<div class=grid><div class=card><h2>Communications</h2><table>'+(d.communications.length?d.communications.map(m=>`<tr><td>${m.ts}</td><td>${esc(m.from)}</td><td>→ ${esc(m.to)}</td><td>${esc(m.intent)}</td></tr>`).join(''):'<tr><td class=muted>no recent agent messages</td></tr>')+'</table></div>';
   h+=`<div class=card><h2>Work queue</h2>${kpis([['pending',d.queue.pending],['active',d.queue.active],['dead',d.queue.dead]])}</div></div>`;
@@ -218,6 +235,24 @@ const VIEWS={
  status:async()=>{const d=await get('/api/status');const m={operational:'ok',degraded:'warn',major_outage:'bad',unknown:''}[d.verdict];$('#view').innerHTML='<h1>Status</h1><p class=sub>Live platform health.</p><div class=card><div class=row>'+pill(d.verdict,m)+'</div></div><div class=card><h2>Services</h2>'+Object.entries(d.components||{}).map(([k,v])=>`<div class="row spread item"><span>${esc(k)}</span>${pill(v,v===true||v=='ok'?'ok':'bad')}</div>`).join('')+`<div class="row spread item"><span>dead-letter depth</span>${pill(d.dead_letter_depth,d.dead_letter_depth?'bad':'ok')}</div></div>`;},
 };
 let PREFS=[];
+let LAST_PROPOSAL=null;
+async function chatRender(){
+ let d;try{d=await get('/api/chat/history?thread='+THREAD)}catch(e){return}
+ const log=$('#chatlog');if(!log)return;
+ log.innerHTML=(d.messages||[]).map(m=>{
+  const me=m.role==='user';const prop=(m.meta&&m.meta.proposal);
+  return `<div style="margin:8px 0;text-align:${me?'right':'left'}"><span style="display:inline-block;max-width:80%;padding:8px 12px;border-radius:12px;background:${me?'var(--accent)':'#16202c'};color:${me?'#fff':'var(--tx)'}">${esc(m.content)}</span>${prop?`<div class=tile style="margin:8px 0;text-align:left"><b>Proposed build:</b> ${esc(prop.name)} (${esc(prop.kind)})<div class=muted>${esc(prop.charter)}</div><button class=pri style=margin-top:6px onclick=chatConfirm()>Approve & build</button></div>`:''}</div>`;
+ }).join('')||'<div class=muted>Say hello, or describe a product to build.</div>';
+ log.scrollTop=log.scrollHeight;
+}
+async function chatSend(){
+ const m=$('#msg').value.trim();if(!m)return;$('#msg').value='';$('#chatnote').textContent='thinking…';
+ await post('/api/chat/say',{thread:THREAD,message:m});$('#chatnote').textContent='';await chatRender();
+}
+async function chatConfirm(){
+ $('#chatnote').textContent='starting build…';const r=await post('/api/chat/confirm',{thread:THREAD});
+ $('#chatnote').textContent=r.error?('✗ '+(r.error==='consent_required'?'accept AI consent in Settings first':r.error)):('building '+r.product+' — see Cockpit');
+}
 async function doBuild(){$('#bnote').textContent='submitting…';const r=await post('/api/build',{name:$('#bn').value,kind:$('#bk').value,charter:$('#bc').value});$('#bnote').textContent=r.error?('✗ '+(r.error==='consent_required'?'accept AI consent in Settings first':r.error)):('building '+r.product+' — see Cockpit');}
 async function buildTpl(slug){const r=await post('/api/build_template',{slug});go('cockpit');}
 async function ctl(p,a){await post('/api/control',{product:p,action:a});go('cockpit');}
@@ -227,7 +262,7 @@ async function plan(p){await post('/api/billing/plan',{plan:p});go('billing');}
 async function setConsent(a){await post('/api/settings/consent',{accept:a});go('settings');}
 async function saveKey(){await post('/api/byok',{key:$('#bk').value});go('settings');}
 async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
-renderNav();if(TOK){$('#tok').value=TOK;go('cockpit');setInterval(()=>{if(['cockpit','fleet'].includes(CUR))go(CUR)},6000)}
+renderNav();if(TOK){$('#tok').value=TOK;go('chat');setInterval(()=>{if(['cockpit','fleet'].includes(CUR))go(CUR)},6000)}
 </script></body></html>"""
 
 

@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""orgview.py — the tenant's AGENT ORG CHART: the CEO's "here is my staff and who reports to whom".
+
+The cockpit shows the factory floor (products, spend, queue). This is the org side: the reporting
+TREE of the AI-agent company. A static role hierarchy — a CONTROLLER at the top, with functional
+leads/specialists reporting to it — OVERLAID with the tenant's LIVE agents from the `directory`
+table (which roles are actually active on this tenant's products right now, their status + current
+task). So the owner sees both the intended org and who is really on the clock.
+
+  orgchart(tid) -> {"tree":[{role,title,reports_to,live,status,task,count}...]}  every static node,
+                   marked live with the count of that role's active instances + most recent task.
+  roster(tid)   -> the flat list of the tenant's currently-live agents.
+
+    orgview.py json <tenant_id>     # the org chart payload on the CLI
+    orgview.py selftest
+Run with the agent-os venv python. NO web server.
+"""
+import json
+import sys
+from pathlib import Path
+
+import psycopg
+
+SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS))
+import audit  # noqa: E402  (audit-trail the org reads, same convention as the other surfaces)
+
+ENV = Path.home() / "projects" / "agent-os" / ".env.local"
+DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
+           if l.strip().startswith("DATABASE_URL=")), None)
+ACTIVE_WINDOW = "15 minutes"
+
+# The static org chart of the AI-agent company: a controller at top, functional leads/specialists
+# reporting to it. (role, title, reports_to). Overlaid with the tenant's live `directory` agents.
+ORG = [
+    ("controller",       "Controller (chief of staff)",   None),
+    ("planner",          "Planner / Architect",           "controller"),
+    ("builder",          "Builder (backend/frontend)",    "controller"),
+    ("qa",               "QA",                            "controller"),
+    ("security",         "Security",                      "controller"),
+    ("reviewer",         "Reviewer",                      "controller"),
+    ("marketing-growth", "Marketing — Growth",            "controller"),
+    ("research-growth",  "Research — Growth",             "controller"),
+    ("devops",           "DevOps",                        "controller"),
+]
+
+
+def _products(cur, tid):
+    cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s", (tid,))
+    return [r[0] for r in cur.fetchall()]
+
+
+def _live_by_role(cur, products):
+    """Active directory agents on the tenant's products (15-min window), grouped by role:
+    {role: {"count":N, "status":..., "task":...}} with the MOST RECENT instance's status/task."""
+    if not products:
+        return {}
+    cur.execute(f"""SELECT role, status, task, updated_at FROM directory
+                    WHERE product = ANY(%s) AND status='active'
+                      AND updated_at > now() - interval '{ACTIVE_WINDOW}'
+                    ORDER BY updated_at DESC""", (products,))
+    by_role = {}
+    for role, status, task, _ in cur.fetchall():
+        r = by_role.setdefault(role, {"count": 0, "status": None, "task": None})
+        if r["count"] == 0:               # rows are newest-first, so first seen = most recent
+            r["status"], r["task"] = status, task
+        r["count"] += 1
+    return by_role
+
+
+def orgchart(tid):
+    """Every node of the static hierarchy, marked live + with the count of that role's active
+    instances on the tenant's products and the most recent task. Root reports_to=null."""
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        products = _products(cur, tid)
+        by_role = _live_by_role(cur, products)
+    tree = []
+    for role, title, reports_to in ORG:
+        live = by_role.get(role)
+        tree.append({
+            "role": role,
+            "title": title,
+            "reports_to": reports_to,
+            "live": live is not None,
+            "status": live["status"] if live else None,
+            "task": live["task"] if live else None,
+            "count": live["count"] if live else 0,
+        })
+    return {"tenant": tid, "tree": tree}
+
+
+def roster(tid):
+    """Flat list of the tenant's currently-live agents on their products."""
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        products = _products(cur, tid)
+        if not products:
+            return []
+        cur.execute(f"""SELECT agent_id, role, status, task, product FROM directory
+                        WHERE product = ANY(%s) AND status='active'
+                          AND updated_at > now() - interval '{ACTIVE_WINDOW}'
+                        ORDER BY updated_at DESC""", (products,))
+        return [{"agent_id": a, "role": r, "status": s, "task": t, "product": p}
+                for a, r, s, t, p in cur.fetchall()]
+
+
+def _selftest():
+    """Real tenant + product + a live directory agent; prove the org chart overlays live status."""
+    import billing  # noqa: E402
+    reg = billing.signup("orgview-selftest", "free")     # a REAL tenant (tenant_products FK -> tenants)
+    tid = reg["tenant_id"]
+    prod = tid.replace("t-", "")[:6] + "-org"
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (prod, tid))
+        cur.execute("""INSERT INTO directory (agent_id, role, status, product, task, updated_at)
+                       VALUES (%s,'builder','active',%s,'shipping the API', now())
+                       ON CONFLICT (agent_id) DO UPDATE SET role=EXCLUDED.role, status='active',
+                         product=EXCLUDED.product, task=EXCLUDED.task, updated_at=now()""", (f"builder@{prod}", prod))
+        c.commit()
+    try:
+        oc = orgchart(tid)
+        tree = oc["tree"]
+        root = next((n for n in tree if n["reports_to"] is None), None)
+        builder = next((n for n in tree if n["role"] == "builder"), None)
+        rs = roster(tid)
+        ok = (root is not None and root["role"] == "controller"
+              and len(tree) >= 6
+              and builder is not None and builder["live"] is True and builder["count"] >= 1
+              and any(x["agent_id"] == f"builder@{prod}" for x in rs))
+        print(f"root={root['role'] if root else None}(reports_to={root['reports_to'] if root else '?'}) "
+              f"nodes={len(tree)} builder.live={builder['live'] if builder else None} "
+              f"builder.count={builder['count'] if builder else 0} roster={len(rs)}")
+        print("PASS: org chart hierarchy overlaid with live directory agents ✅" if ok else "FAIL")
+    finally:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM directory WHERE product=%s", (prod,))
+            cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
+            c.commit()
+    sys.exit(0 if ok else 1)
+
+
+def _main(a):
+    if not a or a[0] == "selftest":
+        _selftest()
+    elif a[0] == "json" and len(a) > 1:
+        print(json.dumps({"orgchart": orgchart(a[1]), "roster": roster(a[1])}, indent=2))
+    else:
+        sys.exit("usage: orgview.py json <tenant_id> | selftest")
+
+
+if __name__ == "__main__":
+    _main(sys.argv[1:])

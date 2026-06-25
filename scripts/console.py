@@ -36,9 +36,11 @@ import forecast          # noqa: E402
 import frontdoor         # noqa: E402  (reuse its governed build flow + zip)
 import helpagent         # noqa: E402
 import integrationsview  # noqa: E402
+import livestatus        # noqa: E402
 import notifications     # noqa: E402
 import onboarding        # noqa: E402
 import orchestrator      # noqa: E402
+import orgview           # noqa: E402
 import projbudget        # noqa: E402
 import projectsview      # noqa: E402
 import qualityview       # noqa: E402
@@ -119,6 +121,11 @@ GETS = {
     "/api/integrations": lambda tid, q: {"integrations": integrationsview.status(tid)},
     "/api/billing": lambda tid, q: billingview.billing_view(tid),
     "/api/forecast": lambda tid, q: forecast.forecast(tid),
+    "/api/health": lambda tid, q: cockpit.health(tid),
+    "/api/company": lambda tid, q: cockpit.company_summary(tid),
+    "/api/comms_graph": lambda tid, q: cockpit.comms_graph(tid),
+    "/api/org": lambda tid, q: orgview.orgchart(tid),
+    "/api/livestatus": lambda tid, q: {"products": livestatus.live_status(tid)},
     "/api/chat/history": lambda tid, q: {"messages": orchestrator.history(tid, int(q.get("thread", ["0"])[0] or 0))},
     "/api/providers": lambda tid, q: {"providers": tenantproviders.list_providers(tid)},
     "/api/onboarding": lambda tid, q: onboarding.state(tid),
@@ -250,7 +257,7 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
     <button class=tbtn onclick="go('notifications')" title=Notifications>◔<span class=nb id=bellbadge style=display:none></span></button>
     <button class=tbtn onclick="go('help')" title=Help>?</button>
     <button class=tbtn onclick="toggleAcct()" title=Account>☰</button>
-    <div class=menu id=acctmenu style=display:none><a onclick="go('settings')">Settings</a><a onclick="go('team')">Members</a><a onclick="go('billing')">Billing &amp; plan</a><a onclick="go('settings')">AI consent &amp; data</a><a onclick="go('status')">Status</a><a onclick=signOut()>Sign out</a></div>
+    <div class=menu id=acctmenu style=display:none><a onclick="go('settings')">Settings</a><a onclick="go('team')">Org chart</a><a onclick="go('billing')">Billing &amp; plan</a><a onclick="go('settings')">AI consent &amp; data</a><a onclick="go('status')">Status</a><a onclick=signOut()>Sign out</a></div>
   </div>
   <div class=main><div id=view></div></div>
 </div>
@@ -261,7 +268,7 @@ const NAV=[
  ['Operate',[['cockpit','Cockpit','◧'],['projects','Projects','▤'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
  ['Business',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
 ];
-const LABEL={chat:'Chat',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',approvals:'Approvals',activity:'Activity',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Team',settings:'Settings',status:'Status'};
+const LABEL={chat:'Chat',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',approvals:'Approvals',activity:'Activity',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none'}
@@ -316,11 +323,22 @@ const VIEWS={
   let fc=null;try{fc=await get('/api/forecast')}catch(e){}
   let ql={};try{const q=await get('/api/quality');(q.products||[]).forEach(p=>ql[p.product]=p)}catch(e){}
   let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
-  let h='<h1>Cockpit</h1><p class=sub>Your whole factory in one view.</p>';
+  let co=null;try{co=await get('/api/company')}catch(e){}
+  let hl=null;try{hl=await get('/api/health')}catch(e){}
+  let ls={};try{const l=await get('/api/livestatus');(l.products||[]).forEach(p=>ls[p.product]=p)}catch(e){}
+  let h='<h1>Cockpit</h1><p class=sub>Your whole company at a glance.</p>';
+  if(co){const cm={healthy:'ok',attention:'warn',critical:'bad'}[co.verdict]||'ok';h+=`<div class=card><div class=row><span class="dot ${cm}" style="width:10px;height:10px;border-radius:50%"></span> <b>${esc(co.line||co.verdict)}</b></div></div>`;}
   if(ob&&!ob.completed&&ob.step!=='done'){h+=`<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Get set up</b> — ${esc(ob.framing||'')} Next: <b>${esc(ob.step)}</b></span><span><button class=pri onclick="go('${ob.step==='provider'?'providers':(ob.step==='consent'?'settings':(ob.step==='first_build'?'chat':'chat'))}')">continue</button> <button onclick="post('/api/onboarding/skip',{}).then(()=>go('cockpit'))">skip</button></span></div></div>`;}
   h+=kpis([['Products',s.products||0],['Launched',s.launched||0],['Building',s.building||0],['Failed',s.failed||0],['Workers',s.live_workers||0],['Spend $',s.spend_usd||0]]);
   if(fc){const fcls=fc.level==='over'?'bad':(fc.level==='warn'?'warn':'ok');h+=`<div class=card><h2>Budget forecast</h2><div class="row spread"><span>${esc(fc.headline||'')}</span>${pill(fc.pct_of_quota_projected+'% projected',fcls)}</div><div class=meta>burn ~${fc.burn_tokens_per_day} tok/day · $${fc.burn_usd_per_day}/day${fc.eta_days_to_quota?(' · hits quota in ~'+fc.eta_days_to_quota+'d'):''}</div></div>`;}
-  h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${ql[p.product]?pill('✓ '+ql[p.product].overall,(ql[p.product].overall=='verified'||ql[p.product].overall=='passed')?'ok':(ql[p.product].overall=='failed'?'bad':'')):''} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in New build</div>')+'</div>';
+  if(hl&&!hl.ok){let hi='';
+    (hl.blocked||[]).forEach(b=>hi+=`<div class=item>${pill('blocked','warn')} ${esc(b.agent||'')} waiting on ${esc(b.waiting_on||'')} ${b.minutes?('· '+b.minutes+'m'):''}</div>`);
+    (hl.deadlocks||[]).forEach(d2=>hi+=`<div class=item>${pill('deadlock','bad')} ${esc(JSON.stringify(d2).slice(0,80))}</div>`);
+    (hl.conflicts||[]).forEach(cf=>hi+=`<div class=item>${pill('conflict','warn')} ${esc(JSON.stringify(cf).slice(0,80))}</div>`);
+    if((hl.dead_letter||0))hi+=`<div class=item>${pill('stuck','bad')} ${hl.dead_letter} task(s) need a human decision — see Approvals</div>`;
+    if(hi)h+='<div class=card><h2>Needs attention · org health</h2>'+hi+'</div>';}
+  else if(hl&&hl.ok){h+='<div class=card><h2>Org health</h2><div class=row>'+pill('all clear','ok')+' <span class=muted>no blocked or stuck agents</span></div></div>';}
+  h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${ql[p.product]?pill('✓ '+ql[p.product].overall,(ql[p.product].overall=='verified'||ql[p.product].overall=='passed')?'ok':(ql[p.product].overall=='failed'?'bad':'')):''} ${ls[p.product]&&ls[p.product].url?'<a href="'+ls[p.product].url+'" target=_blank>'+(ls[p.product].reachable?'● live':'open ↗')+'</a>':''} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in New build</div>')+'</div>';
   h+='<div class=grid><div class=card><h2>Communications</h2><table>'+(d.communications.length?d.communications.map(m=>`<tr><td>${m.ts}</td><td>${esc(m.from)}</td><td>→ ${esc(m.to)}</td><td>${esc(m.intent)}</td></tr>`).join(''):'<tr><td class=muted>no recent agent messages</td></tr>')+'</table></div>';
   h+=`<div class=card><h2>Work queue</h2>${kpis([['pending',d.queue.pending],['active',d.queue.active],['dead',d.queue.dead]])}</div></div>`;
   $('#view').innerHTML=h;},
@@ -342,11 +360,18 @@ const VIEWS={
   $('#view').innerHTML=h;},
  fleet:async()=>{const d=await get('/api/fleet');d.workers=d.workers||[];$('#view').innerHTML='<h1>Agent fleet</h1><p class=sub>Live workers across your products.</p>'+kpis([['Live workers',d.count||0],['Active products',d.products_active||0]])+'<div class=card><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th>task</th></tr>'+(d.workers.length?d.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td>${esc(w.task)}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';},
  observability:async()=>{const d=await get('/api/observability');$('#view').innerHTML='<h1>Observability</h1><p class=sub>Runs, errors, spend across your fleet.</p>'+kpis([['Runs',d.runs],['Steps',d.steps],['Errors',d.errors],['Cost $',d.cost_usd],['Tokens',d.tokens]])+'<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(d.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div><div class=card><h2>Recent errors</h2>'+((d.recent_errors||[]).length?d.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean</div>')+'</div>';},
- approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">deny</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):emptyB('✓','All clear','Nothing needs your decision right now. We\'ll bring anything important here.'))+'</div>';},
- integrations:async()=>{const d=await get('/api/integrations');$('#view').innerHTML='<h1>Integrations</h1><p class=sub>Connect the services your products need.</p><div class=grid>'+(d.integrations||[]).map(i=>`<div class=tile><div class="row spread"><b>${esc(i.name)}</b>${pill(i.status,i.status=='connected'?'ok':'')}</div><div class=muted style=margin:6px_0>${esc(i.blurb)} · ${esc(i.category)}</div>${i.status=='connected'?`<button onclick="integ('disconnect','${i.slug}')">disconnect</button>`:`<button class=pri onclick="integ('connect','${i.slug}')">connect</button>`}</div>`).join('')+'</div>';},
+ approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'||i.kind=='blocked_build'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">${i.kind=='blocked_build'?'abandon':'deny'}</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):emptyB('✓','All clear','Nothing needs your decision right now. We\'ll bring anything important here.'))+'</div>';},
+ integrations:async()=>{const d=await get('/api/integrations');$('#view').innerHTML='<h1>Integrations</h1><p class=sub>Connect the services your products need.</p><div class=grid>'+(d.integrations||[]).map(i=>`<div class=tile><div class=row style=margin-bottom:6px><span class=int-ic>${esc((i.name||'?')[0])}</span><b>${esc(i.name)}</b><span style=flex:1></span>${pill(i.status=='connected'?'connected':'disconnected',i.status=='connected'?'ok':'off')}</div><div class=muted style=margin:0_0_8px>${esc(i.blurb)} · ${esc(i.category)}</div>${i.status=='connected'?`<button onclick="integ('disconnect','${i.slug}')">disconnect</button>`:`<button class=pri onclick="integ('connect','${i.slug}')">connect</button>`}</div>`).join('')+'</div>';},
  billing:async()=>{const d=await get('/api/billing');$('#view').innerHTML=`<h1>Billing & plans</h1><p class=sub>Usage, quota and plan. Real payment is gated (BYO Stripe).</p>`+kpis([['Plan',d.plan],['Builds',(d.usage&&d.usage.builds)||0],['Tokens',(d.usage&&d.usage.tokens)||0]])+'<div class=card><h2>Plans</h2><table><tr><th>plan</th><th>price</th><th>builds</th><th>tokens</th><th></th></tr>'+(d.plans||[]).map(p=>`<tr><td>${esc(p.slug)} ${p.current?pill('current','ok'):''}</td><td>$${p.price}</td><td>${p.builds}</td><td>${p.tokens}</td><td>${p.current?'':`<button onclick="plan('${p.slug}')">switch</button>`}</td></tr>`).join('')+'</table></div>';},
  notifications:async()=>{const d=await get('/api/notifications');d.feed=d.feed||[];$('#view').innerHTML=`<h1>Notifications</h1><p class=sub>${d.unread||0} unread.</p><div class=card>`+(d.feed.length?d.feed.map(n=>`<div class=item><div class="row spread"><span>${pill(n.level,n.level=='urgent'?'bad':(n.level=='standard'?'':'warn'))} <b>${esc(n.title)}</b></span><span class=muted>${esc(n.category)} · ${n.created_at}</span></div><div class=muted>${esc(n.body||'')}</div></div>`).join(''):emptyB('◔','You\'re all caught up','Build updates, billing alerts and agent reports will appear here.'))+'</div>';},
- team:async()=>{const d=await get('/api/team');$('#view').innerHTML='<h1>Team</h1><p class=sub>'+esc(d.seats_note||'')+'</p><div class=card><table><tr><th>member</th><th>role</th><th>status</th></tr>'+(d.members||[]).map(m=>`<tr><td>${esc(m.id)}</td><td>${esc(m.role)}</td><td>${pill(m.status,'ok')}</td></tr>`).join('')+'</table></div>';},
+ team:async()=>{let o=null;try{o=await get('/api/org')}catch(e){}
+  let h='<h1>Your org</h1><p class=sub>Your company of AI agents — who does what, and who\'s working right now.</p>';
+  if(o&&o.tree){const root=o.tree.find(n=>!n.reports_to)||o.tree[0];
+   const node=(n)=>`<div class=item><div class="row spread"><span><b>${esc(n.title||n.role)}</b> <span class=muted>${esc(n.role)}</span> ${n.live?pill('live · '+(n.count||1),'ok'):pill('idle')}</span><span class=muted>${esc(n.task||'')}</span></div></div>`;
+   h+='<div class=card><h2>Controller</h2>'+(root?node(root):'')+'</div>';
+   h+='<div class=card><h2>Reports</h2>'+o.tree.filter(n=>n.reports_to).map(node).join('')+'</div>';
+  } else { h+='<div class=card>'+emptyB('◍','Org unavailable','Your agent org chart will appear here.')+'</div>'; }
+  $('#view').innerHTML=h;},
  settings:async()=>{const d=await get('/api/settings');const c=d.ai_consent||{};const pr=d.profile||{};$('#view').innerHTML=`<h1>Settings</h1><p class=sub>Profile, AI consent, keys, notifications.</p>
   <div class=card><h2>Profile</h2><div class=row>plan <b>${esc(pr.plan||'—')}</b> ${pr.suspended?pill('suspended','bad'):pill('active','ok')}</div></div>
   <div class=card><h2>AI consent</h2><div class=row>${c.accepted?pill('accepted','ok'):pill('not accepted','bad')} <span class=muted>${esc(c.provider||'')} ${esc(c.version||'')}</span></div><div style=margin-top:8px>${c.accepted?'<button onclick="setConsent(false)">revoke</button>':'<button class=pri onclick="setConsent(true)">accept</button>'}</div></div>
@@ -369,7 +394,8 @@ async function chatRender(){
  log.innerHTML=(d.messages||[]).map(m=>{
   const me=m.role==='user';const meta=m.meta||{};const prop=meta.proposal;const ns=(meta.kind==='next_steps')&&meta.suggestions;
   let extra='';
-  if(prop)extra=`<div class=tile style="margin:8px 0;text-align:left"><b>Proposed build:</b> ${esc(prop.name)} (${esc(prop.kind)})<div class=muted style=margin:4px_0>${esc(prop.charter)}</div><button class=pri style=margin-top:6px onclick=chatConfirm()>Approve &amp; build</button></div>`;
+  if(prop){const planHtml=(prop.plan&&prop.plan.trim())?('<div style="margin:6px 0"><b>Plan</b>'+prop.plan.split('\n').filter(l=>l.trim()).map(l=>'<div class=muted style=margin-left:6px>'+esc(l.replace(/^[-*]\s*/,'• '))+'</div>').join('')+'</div>'):'';
+   extra=`<div class=tile style="margin:8px 0;text-align:left"><b>Proposed build:</b> ${esc(prop.name)} ${pill(prop.kind,prop.kind==='project'?'accent':'')}${planHtml}<div class=muted style=margin:4px_0>${esc(prop.charter)}</div><div class=row style=margin-top:6px><button class=pri onclick=chatConfirm()>Approve &amp; build</button><button onclick="chipFill('Actually, change: ')">Revise</button></div></div>`;}
   if(ns)extra=`<div class=chips style="margin:8px 0">`+meta.suggestions.map(s=>`<span class=chip-s onclick="chipFill('${s.replace(/'/g,"")}')">${esc(s)}</span>`).join('')+`</div>`;
   return `<div class="msg ${me?'me':'ai'}" style="margin:8px 0"><div><span class=bubble>${md(m.content)}</span>${extra}</div></div>`;
  }).join('')||'<div class=muted>Say hello, or describe a product — I\'ll ask a couple of questions, then build it.</div>';

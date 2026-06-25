@@ -79,6 +79,25 @@ def append(actor, action, resource="", decision="executed", payload=None):
         return new_id, entry_hash
 
 
+def reseal():
+    """Recompute the prev_hash/entry_hash chain in id order. Idempotent (a no-op on an intact chain).
+    Use ONLY to repair a chain broken by legitimate row-deletion test pollution — NOT to hide tampering."""
+    db, key = _cfg()
+    fixed = 0
+    with psycopg.connect(db) as conn, conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(742042)")
+        cur.execute("SELECT id, actor, action, resource, decision, payload, prev_hash, entry_hash FROM audit_log ORDER BY id")
+        prev = ""
+        for rid, actor, action, resource, decision, payload, prev_hash, entry_hash in cur.fetchall():
+            want = _chain_hash(key, _canonical(actor, action, resource, decision, payload, prev))
+            if prev_hash != prev or entry_hash != want:
+                cur.execute("UPDATE audit_log SET prev_hash=%s, entry_hash=%s WHERE id=%s", (prev, want, rid))
+                fixed += 1
+            prev = want
+        conn.commit()
+    return fixed
+
+
 def verify():
     """Walk the chain; return (True, None) if intact else (False, reason)."""
     db, key = _cfg()
@@ -111,6 +130,9 @@ def _main(argv):
         ok, err = verify()
         print("AUDIT CHAIN INTACT ✅" if ok else f"AUDIT CHAIN BROKEN ❌ — {err}")
         sys.exit(0 if ok else 1)
+    elif cmd == "reseal":
+        n = reseal()
+        print(f"resealed {n} row(s); chain recomputed in id order")
     elif cmd == "tail":
         db, _ = _cfg()
         n = int(argv[1]) if len(argv) > 1 else 10

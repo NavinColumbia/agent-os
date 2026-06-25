@@ -134,6 +134,175 @@ def control(tid, product, action):
     return {"error": "unknown action"}
 
 
+# ── tenant-scoped org-health, plain-language verdict, and comms graph ────────────────────────────
+# These PORT the operator-only dashboard.py logic (comms graph nodes+edges, "what's blocked" panel,
+# deadlock cycles, conflicts) but scope EVERYTHING to the caller's own agents — the agents on their
+# products, derived exactly the way cockpit() does (tenant_products -> directory -> agent_ids).
+
+def _tenant_agents(cur, tid):
+    """The agent_ids working on THIS tenant's products (same derivation cockpit() uses for comms)."""
+    cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s", (tid,))
+    prods = [r[0] for r in cur.fetchall()]
+    if not prods:
+        return [], []
+    cur.execute("SELECT DISTINCT agent_id FROM directory WHERE product = ANY(%s)", (prods,))
+    return prods, [r[0] for r in cur.fetchall()]
+
+
+def health(tid):
+    """Tenant org-health: blocked waits, deadlock cycles, conflicts, dead-letter + stuck tasks — all
+    scoped to the tenant's own agents. Every table read is guarded; never crashes (returns [] on error)."""
+    out = {"blocked": [], "deadlocks": [], "conflicts": [], "dead_letter": 0, "stuck": 0, "ok": True}
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        try:
+            prods, agents = _tenant_agents(cur, tid)
+        except Exception:
+            prods, agents = [], []
+        aset = set(agents)
+
+        # blocked: long/overdue waits whose waiter is one of THEIR agents (port of dashboard's waits panel)
+        try:
+            if agents:
+                cur.execute("""SELECT waiter, awaited, round(EXTRACT(EPOCH FROM now()-since)/60), reply_by
+                               FROM waits WHERE waiter = ANY(%s)""", (agents,))
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                for waiter, awaited, mins, rb in cur.fetchall():
+                    mins = int(mins or 0)
+                    overdue = bool(rb and rb < now)
+                    if overdue or mins >= 10:          # long (>=10 min) or past its SLA
+                        out["blocked"].append({"agent": waiter, "waiting_on": awaited, "minutes": mins})
+        except Exception:
+            out["blocked"] = []
+
+        # deadlocks: detect() cycles that intersect their agents (the whole-fleet graph, filtered)
+        try:
+            import contextlib
+            import io
+            import deadlock
+            with contextlib.redirect_stdout(io.StringIO()):    # detect() prints; keep this quiet
+                cycles = deadlock.detect() or []
+            out["deadlocks"] = [d for d in cycles if aset & set(d.get("cycle", []))]
+        except Exception:
+            out["deadlocks"] = []
+
+        # conflicts: overlapping resource claims, filtered to their products
+        try:
+            import directory
+            out["conflicts"] = [cf for cf in directory.conflicts() if cf.get("product") in set(prods)]
+        except Exception:
+            out["conflicts"] = []
+
+        # dead-letter + stuck tasks, scoped by assignee (the agent the task belongs to)
+        try:
+            if agents:
+                cur.execute("SELECT count(*) FROM tasks WHERE status='dead' AND assignee = ANY(%s)", (agents,))
+                out["dead_letter"] = int(cur.fetchone()[0] or 0)
+                cur.execute("""SELECT count(*) FROM tasks WHERE status='active' AND assignee = ANY(%s)
+                               AND locked_at IS NOT NULL AND locked_at < now() - interval '30 minutes'""", (agents,))
+                out["stuck"] = int(cur.fetchone()[0] or 0)
+        except Exception:
+            out["dead_letter"], out["stuck"] = 0, 0
+
+    out["ok"] = not (out["blocked"] or out["deadlocks"] or out["conflicts"] or out["dead_letter"] or out["stuck"])
+    return out
+
+
+def company_summary(tid):
+    """ONE plain-language verdict over the whole tenant, composed from signals already computed
+    (cockpit summary + forecast level + qualityview + health). healthy | attention | critical."""
+    try:
+        view = cockpit(tid)
+        s = view["summary"]
+    except Exception:
+        s = {"products": 0, "launched": 0, "building": 0, "failed": 0}
+    live = int(s.get("launched", 0)); building = int(s.get("building", 0)); failed = int(s.get("failed", 0))
+
+    try:
+        import forecast
+        f_level = forecast.forecast(tid).get("level", "ok")
+    except Exception:
+        f_level = "ok"
+
+    try:
+        import qualityview
+        quality = qualityview.summary(tid) or []
+    except Exception:
+        quality = []
+    quality_failed = sum(1 for q in quality if q.get("overall") == "failed")
+
+    h = health(tid)
+    has_deadlock = bool(h["deadlocks"])
+    over_budget = (f_level == "over")
+    failed_unaddressed = (failed > 0 or quality_failed > 0)
+
+    if has_deadlock or over_budget or failed_unaddressed:
+        verdict = "critical"
+    elif building or h["blocked"] or h["conflicts"] or h["dead_letter"] or h["stuck"] or f_level == "warn":
+        verdict = "attention"
+    else:
+        verdict = "healthy"
+
+    bud = {"ok": "on budget", "warn": "approaching budget", "over": "over budget"}[f_level]
+    pct = ""
+    try:
+        import forecast
+        pct = f" ({forecast.forecast(tid).get('pct_of_quota_projected', 0)}% projected)"
+    except Exception:
+        pct = ""
+    parts = [f"{live} product{'s' if live != 1 else ''} live"]
+    if building:
+        parts.append(f"{building} building")
+    if failed_unaddressed:
+        parts.append(f"{max(failed, quality_failed)} failed")
+    blockers = []
+    if has_deadlock:
+        blockers.append("DEADLOCK")
+    if h["blocked"]:
+        blockers.append(f"{len(h['blocked'])} blocked")
+    if h["conflicts"]:
+        blockers.append(f"{len(h['conflicts'])} conflict{'s' if len(h['conflicts']) != 1 else ''}")
+    if h["dead_letter"]:
+        blockers.append(f"{h['dead_letter']} dead-letter")
+    if h["stuck"]:
+        blockers.append(f"{h['stuck']} stuck")
+    tail = ", ".join(blockers) if blockers else "nothing blocked"
+    word = {"healthy": "Healthy", "attention": "Attention", "critical": "Critical"}[verdict]
+    line = f"{word} — {', '.join(parts)}, {bud}{pct}, {tail}."
+    return {"verdict": verdict, "line": line}
+
+
+def comms_graph(tid):
+    """Tenant-scoped agent communication graph: nodes + edges from the last 6h of conversations among
+    THIS tenant's agents (same aggregation dashboard.py uses, but scoped). Nodes capped ~20."""
+    nodes, edges = {}, []
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        try:
+            _, agents = _tenant_agents(cur, tid)
+        except Exception:
+            agents = []
+        if agents:
+            try:
+                cur.execute("""SELECT sender, recipient, count(*), (array_agg(intent ORDER BY turn DESC))[1]
+                               FROM conversations
+                               WHERE ts > now() - interval '6 hours'
+                                 AND (sender = ANY(%s) OR recipient = ANY(%s))
+                               GROUP BY sender, recipient
+                               ORDER BY count(*) DESC""", (agents, agents))
+                for s, r, n, intent in cur.fetchall():
+                    edges.append({"from": s, "to": r, "count": int(n), "intent": intent})
+                    for k in (s, r):
+                        if k not in nodes and len(nodes) < 20:
+                            role = "human" if str(k).startswith("human") else \
+                                   ("controller" if k == "controller" else "agent")
+                            nodes[k] = {"id": k, "role": role}
+                # drop edges whose endpoints we capped out (keep nodes/edges consistent)
+                edges = [e for e in edges if e["from"] in nodes and e["to"] in nodes]
+            except Exception:
+                nodes, edges = {}, []
+    return {"nodes": list(nodes.values()), "edges": edges}
+
+
 PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>agent-os · cockpit</title><style>
 :root{--bg:#0a0d13;--panel:#111722;--line:#1e2733;--tx:#d7dee8;--mut:#7d8795;--accent:#4f8cff;--g:#3fb950;--r:#f85149;--y:#d29922}
@@ -258,6 +427,7 @@ def _selftest():
               f"workers={v['summary']['live_workers']} stages={len(v['products'][0]['stages'])} "
               f"pause-control={ctl.get('halted')}")
         print("PASS: cockpit aggregates workers+comms+progress+budget+controls ✅" if ok else "FAIL")
+        ok = ok and _selftest_health()
     finally:
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("DELETE FROM traces WHERE product=%s", (prod,))
@@ -267,6 +437,47 @@ def _selftest():
             c.commit()
         killswitch.resume(prod)
     sys.exit(0 if ok else 1)
+
+
+def _selftest_health():
+    """Tenant-scoped health + company_summary + comms_graph over a real tenant with a directory agent
+    and a couple of conversation rows. Returns True on pass; cleans up everything in finally."""
+    tid = billing.signup("cockpit-health-selftest", "free")["tenant_id"]
+    prod = tid.replace("t-", "")[:6] + "-hp"
+    agent = f"builder@{prod}"; peer = f"reviewer@{prod}"
+    ok = False
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (prod, tid))
+            cur.execute("""INSERT INTO directory (agent_id, role, status, product, task, updated_at)
+                           VALUES (%s,'builder','active',%s,'building it', now())
+                           ON CONFLICT (agent_id) DO UPDATE SET updated_at=now(), product=EXCLUDED.product""", (agent, prod))
+            for i, (s, r, intent) in enumerate(((agent, peer, "ask"), (peer, agent, "answer"))):
+                cur.execute("""INSERT INTO conversations (conversation_id, message_id, intent, sender, recipient, content, turn)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                            (f"cv-{prod}", f"m-{prod}-{i}", intent, s, r, json.dumps({"text": "hi"}), i))
+            c.commit()
+
+        h = health(tid)
+        cs = company_summary(tid)
+        g = comms_graph(tid)
+        ok = (set(h) >= {"blocked", "deadlocks", "conflicts", "dead_letter", "stuck", "ok"}
+              and isinstance(h["blocked"], list) and isinstance(h["deadlocks"], list)
+              and isinstance(h["conflicts"], list) and isinstance(h["ok"], bool)
+              and cs.get("verdict") in ("healthy", "attention", "critical") and bool(cs.get("line"))
+              and isinstance(g.get("nodes"), list) and isinstance(g.get("edges"), list)
+              and any(n["id"] == agent for n in g["nodes"]) and len(g["edges"]) >= 1)
+        print(f"health.ok={h['ok']} keys={len(h)} verdict={cs.get('verdict')!r} "
+              f"graph_nodes={len(g['nodes'])} graph_edges={len(g['edges'])}")
+        print("PASS: cockpit org-health + company verdict + comms-graph (tenant-scoped) ✅" if ok else "FAIL")
+    finally:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM conversations WHERE conversation_id=%s", (f"cv-{prod}",))
+            cur.execute("DELETE FROM directory WHERE product=%s", (prod,))
+            cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
+            c.commit()
+    return ok
 
 
 def _main(a):

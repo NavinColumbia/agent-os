@@ -37,12 +37,19 @@ DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
 
 SYS = (
     "You are the ORCHESTRATOR for a non-technical CEO who directs a company of AI agents that build and "
-    "operate their software. Be warm, plain-spoken, and concise — no jargon. Each turn do ONE of:\n"
+    "operate their software. Be warm, plain-spoken, and concise — no jargon. Behave like a great human "
+    "manager. Each turn do ONE of:\n"
     "1) If the CEO's product idea is still vague, ask exactly ONE focused clarifying question.\n"
-    "2) If the CEO asks about their factory (status/cost/projects), answer from the FACTORY STATE provided.\n"
-    "3) When a product idea is concrete enough to build, end your reply with a build block EXACTLY:\n"
-    "[[BUILD]]\nname: <short-slug>\nkind: lib|web|service\ncharter: <2-4 sentence concrete spec>\n[[/BUILD]]\n"
-    "Only emit a build block when you have enough to write a good charter. Never emit more than one."
+    "2) SUGGEST: proactively offer advice when useful — 'most apps like this also want X', 'I'd recommend a "
+    "web app over an API so your staff get a screen' — phrased as a short suggestion the CEO can accept.\n"
+    "3) If the CEO asks about their factory (status/cost/projects), answer from the FACTORY STATE provided.\n"
+    "4) When the idea is concrete enough to build, end your reply with a build block EXACTLY:\n"
+    "[[BUILD]]\nname: <short-slug>\nkind: lib|web|service|project\n"
+    "plan: <a short bullet list (one per line, prefixed '- ') of the main components/features you'll build>\n"
+    "charter: <2-4 sentence concrete spec>\n[[/BUILD]]\n"
+    "Use kind 'project' for a BIG multi-component system (several modules/services); use lib/web/service for "
+    "a single focused artifact. Always include the plan so the CEO can see WHAT you'll build and say if it "
+    "looks right. Only emit a build block when you can write a good plan + charter. Never emit more than one."
 )
 
 
@@ -95,9 +102,9 @@ def _parse_build(text):
         fm = re.search(rf"{name}\s*:\s*(.+?)(?:\n[a-z]+\s*:|\Z)", body, re.S | re.I)
         return fm.group(1).strip() if fm else default
     kind = field("kind", "lib").lower()
-    kind = kind if kind in ("lib", "web", "service") else "lib"
+    kind = kind if kind in ("lib", "web", "service", "project") else "lib"
     proposal = {"name": (field("name", "app").split()[0][:24] or "app"), "kind": kind,
-                "charter": field("charter", "")}
+                "plan": field("plan", ""), "charter": field("charter", "")}
     reply = text[:m.start()].strip() or "Here's what I'll build — confirm to start."
     return (proposal if proposal["charter"] else None), reply
 
@@ -136,8 +143,11 @@ def post(tid, thread_id, content, meta=None):
 
 def _run_and_report(tid, thread_id, product, charter, kind):
     """Run the governed build, then REPORT back into the chat thread like a manager would: a kickoff note,
-    the real outcome, and proposed next steps. (Runs in a daemon thread from confirm().)"""
+    the real outcome, and proposed next steps. (Runs in a daemon thread from confirm().)
+    kind 'project' routes to the RECURSIVE multi-component engine (project.build_complex)."""
     post(tid, thread_id, f"On it — starting the build for **{product}**. I'll report back here when it's ready.")
+    if kind == "project":
+        return _run_project_and_report(tid, thread_id, product, charter)
     try:
         frontdoor._run_build(tid, product, charter, kind)
     except Exception as e:
@@ -156,6 +166,35 @@ def _run_and_report(tid, thread_id, product, charter, kind):
              f"I can retry, or adjust the spec — tell me what to change.", {"kind": "result"})
     else:
         post(tid, thread_id, f"**{product}** is still working — check the Cockpit for live progress.")
+
+
+def _run_project_and_report(tid, thread_id, product, goal):
+    """Run a COMPLEX multi-component build via the recursive engine, then report its real outcome."""
+    import project
+    frontdoor._own(product, tid)                          # tenant owns it (so it shows in their console)
+    bk = None
+    try:
+        import tenantproviders
+        bk = tenantproviders.build_kwargs(tid)
+    except Exception:
+        bk = {}
+    try:
+        log = project.build_complex(product, goal, api_key=bk.get("api_key"))
+    except Exception as e:
+        post(tid, thread_id, f"⚠️ **{product}** hit an error during the multi-component build: {str(e)[:200]}.")
+        return
+    result = (log or {}).get("result", "")
+    if result == "INTEGRATED" or (log or {}).get("passed"):
+        post(tid, thread_id,
+             f"✅ **{product}** — the full multi-component system is built and integrated. "
+             f"Download it from Projects. Want me to keep going?",
+             {"kind": "next_steps", "product": product,
+              "suggestions": ["Add a web UI on top", "Add user accounts", "Deploy it"]})
+    else:
+        post(tid, thread_id,
+             f"⚠️ **{product}** blocked at {result or 'a step'}: "
+             f"{(log or {}).get('blocker', 'needs a decision')[:200]}. It's in your Approvals — retry or tell me what to change.",
+             {"kind": "result"})
 
 
 def confirm(tid, thread_id, api_key=None):

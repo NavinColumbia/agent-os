@@ -51,30 +51,21 @@ def decompose(repo: Path, question: str) -> list:
     falls back to parsing the agent's reply, and finally to a single-pass plan — so a live run never crashes
     just because the model replied in chat instead of writing the file."""
     factory._ctx.product = repo.name; factory._ctx.run = f"research-{repo.name}"; factory._ctx.stage = "DECOMPOSE"
-    # NO web tools here — decomposition is pure reasoning; with web tools the agent wanders into research
-    # and never returns the plan (which is why live runs degraded to single-pass). Force JSON-only.
+    # NO web tools (decomposition is pure reasoning; web tools make the agent wander and never return).
+    # LINE-BASED output ("Q: ...") parses far more robustly than JSON — no brace/fence fragility, and we
+    # just pick the Q: lines out of whatever the model says.
     r = factory.agent("research-growth", str(repo),
-                      f"Split this research question into exactly {MAX_SUBQ} INDEPENDENT, specific, "
-                      f"separately-researchable sub-questions that together fully cover it. Do NOT research "
-                      f"anything — just decompose. QUESTION:\n{question}\n\nReply with ONLY this JSON object "
-                      f'and NOTHING else (no preamble, no markdown fences): {{"subquestions":["q1","q2",...]}}',
-                      tools=[])
-    p = None
-    try:                                                 # parse the reply first (no file needed)
-        p = _json_from_text(r.get("out", ""))
-    except Exception:
-        p = None
-    pj = repo / "PLAN.json"
-    if not (p and p.get("subquestions")) and pj.exists():
-        try:
-            p = _load_json(pj)
-        except Exception:
-            p = None
-    if not (p and p.get("subquestions")):                # last resort -> single-pass research, never crash
-        print("[research] decompose fallback: single-pass (lead did not return sub-questions)", flush=True)
-        p = {"subquestions": [question]}
-    pj.write_text(json.dumps(p))                          # persist for resume regardless of how we got it
-    return p["subquestions"][:MAX_SUBQ]
+                      f"Split this research question into {MAX_SUBQ} INDEPENDENT, specific, separately-"
+                      f"researchable sub-questions that together fully cover it. Do NOT research anything — "
+                      f"just decompose. QUESTION:\n{question}\n\nOutput ONLY the sub-questions, ONE PER LINE, "
+                      f"each line starting with 'Q: '. No numbering, no preamble, no other text.", tools=[])
+    subqs = [l.split("Q:", 1)[1].strip() for l in (r.get("out", "") or "").splitlines()
+             if l.strip().lower().startswith("q:")]
+    if len(subqs) < 2:                                    # parse miss -> single-pass (never crash)
+        print("[research] decompose fallback: single-pass (no Q: lines parsed)", flush=True)
+        subqs = [question]
+    (repo / "PLAN.json").write_text(json.dumps({"subquestions": subqs}))   # persist for resume
+    return subqs[:MAX_SUBQ]
 
 
 def research_one(repo: Path, idx: int, subq: str, api_key=None):
@@ -139,8 +130,8 @@ def _selftest():
     factory.PRODUCTS = workdir
     def fake_agent(role, repo, task, **k):
         repo = Path(repo)
-        if "Split this research question" in task:                  # decompose -> JSON in the reply
-            return {"rc": 0, "out": '{"subquestions":["q1","q2","q3"]}'}
+        if "Split this research question" in task:                  # decompose -> Q: lines in the reply
+            return {"rc": 0, "out": "here you go:\nQ: q1\nQ: q2\nQ: q3"}
         if "Write your findings" in task:
             f = task.split("Write your findings to ")[1].split(" ")[0]
             (repo / f).parent.mkdir(parents=True, exist_ok=True); (repo / f).write_text("finding\nSources: x")

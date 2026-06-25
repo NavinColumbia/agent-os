@@ -11,6 +11,7 @@ This is the **specification**, produced from 4 parallel deep-research streams (h
 2. **[02 — Integrations, Onboarding, Deploy & Security](blueprint/02-integrations-onboarding-deploy-security.md)** — the integrations catalog, the "minimal-info / AI-assisted / confirm-and-go" onboarding & provisioning flows (Stripe, BYO-key, AWS deploy, GPU rental), deploy/infra automation, and the per-tenant security model. *(deep dive: [secrets & security](blueprint/research-secrets-security.md))*
 3. **[03 — Monetization, Finance, Legal & Personas](blueprint/03-monetization-finance-legal-personas.md)** — pricing/packaging, unit economics, legal/compliance/risk, and the persona × industry needs matrices. *(deep dive: [legal & compliance](blueprint/research-legal-compliance.md))*
 4. **[04 — Exhaustive Screen Inventory](blueprint/04-screens-inventory.md)** — ~240 screens across web + mobile + admin, 16 areas. The "list every view/page" deliverable.
+5. **[05 — Product Lifecycle (marketing/sales/pitch/feedback/IP/whitepaper + task board + external integrations)](blueprint/05-lifecycle.md)** — the part *after* "build", for our product and users'.
 
 ---
 

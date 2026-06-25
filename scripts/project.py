@@ -144,10 +144,12 @@ def _architect(product, goal, model, ns, depth, variant, out_name):
         f"Write {out_name} (under docs/) containing ONLY this JSON (no prose, no fences):\n"
         f'{{"components":[{{"id":"kebab-id","name":"short name","description":"what it does",'
         f'"deps":["other-id"],"interface":"the EXACT public functions/classes other components call — a '
-        f'contract","role":"builder","decompose":false,"subgoal":"","reuse":[]}}],'
+        f'contract","role":"builder","decompose":false,"subgoal":"","reuse":[],"integrates":[]}}],'
         f'"integration_tests":"end-to-end behaviours that prove the components work TOGETHER"}}\n'
         f"Rules: 'deps' acyclic, referencing other component ids; ids kebab-case + UNIQUE; 'interface' "
-        f"precise. Assign each component the best-fit 'role' from: {_ROLES}.{decomp}{reuse}{var}")
+        f"precise. Assign each component the best-fit 'role' from: {_ROLES}. A component that must talk to a "
+        f"THIRD-PARTY system (e.g. Stripe, Twilio, Samsara) sets \"integrates\":[\"System name\"] — its docs "
+        f"get researched before building.{decomp}{reuse}{var}")
     r = factory.agent("staff-engineer", str(repo), task, model=model)
     if r.get("failed"):
         raise RuntimeError(f"architect failed to plan: {r.get('out','')[:200]}")
@@ -250,12 +252,25 @@ def build_component(product, comp, dep_interfaces, api_key=None, ns=""):
     reuse_block = (f"\nYou MAY (and should, where it saves real work) use these INSTALLED open-source "
                    f"packages — import them directly, don't reimplement: {', '.join(comp['reuse'])}."
                    if comp.get("reuse") and pybin else "")
+    integ_block = ""                                  # EXTERNAL-INTEGRATION RESEARCH: read the API docs first
+    if comp.get("integrates"):
+        nf = repo / "docs" / f"integration-{pkg}.md"
+        factory.agent("research-growth", str(repo),
+                      f"Research the external system(s) {comp['integrates']} that component '{cid}' must "
+                      f"integrate. Use WebSearch/WebFetch to read their official API docs. Write "
+                      f"docs/integration-{pkg}.md with: auth model, key endpoints, request/response shapes, "
+                      f"rate limits, the official SDK/package name, and gotchas — cite source URLs. Do NOT "
+                      f"use real credentials; this is reference for the builder.")
+        notes = nf.read_text()[:1400] if nf.exists() else ""
+        integ_block = (f"\nThis component INTEGRATES external system(s): {comp['integrates']}. Code against the "
+                       f"researched API notes in docs/integration-{pkg}.md (summary below). Use a config/env for "
+                       f"any credentials (never hardcode); real credential use is approval-gated.\n{notes}")
     task = (
         f"Implement component '{cid}' of a LARGER system as a Python package under src/{pkg}/ "
         f"(create src/{pkg}/__init__.py; use `from src.{pkg}...` imports).\n"
         f"COMPONENT: {comp['name']} — {comp['description']}\n"
         f"THE PUBLIC INTERFACE YOU MUST EXPOSE (your dependents rely on this EXACT contract):\n{comp['interface']}\n"
-        f"INTERFACES OF YOUR DEPENDENCIES (import and call these — do NOT reimplement them):\n{deps_block}{reuse_block}\n"
+        f"INTERFACES OF YOUR DEPENDENCIES (import and call these — do NOT reimplement them):\n{deps_block}{reuse_block}{integ_block}\n"
         f"Also write tests under tests/{pkg}/ covering this component. Touch ONLY src/{pkg}/** and "
         f"tests/{pkg}/**. Make `python -m pytest -q tests/{pkg}` pass.")
     factory.agent(role, str(repo), task)

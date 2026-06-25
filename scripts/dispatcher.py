@@ -117,13 +117,19 @@ def _main(a):
         import orchestrate
         suf = os.urandom(3).hex()
         ag = f"technical-writer@disp-{suf}"
-        orchestrate.enqueue(ag, f"selftest task {suf}", priority=5, requester=f"controller@{suf}")
-        claimed = _pull(5)
-        got = [r for r in claimed if r[1] == ag]
-        # release it back so we don't actually spend an agent call in selftest
+        # self-heal: purge any orphaned selftest rows left by a PRIOR interrupted run (they would
+        # otherwise age past the lease and get run as bogus real work). Unmistakable test-only pattern.
         with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("DELETE FROM tasks WHERE assignee=%s", (ag,)); c.commit()
-        ok = len(got) == 1 and got[0][3].startswith("selftest task")
+            cur.execute("DELETE FROM tasks WHERE assignee LIKE 'technical-writer@disp-%%' "
+                        "AND title LIKE 'selftest task %%'"); c.commit()
+        try:
+            orchestrate.enqueue(ag, f"selftest task {suf}", priority=5, requester=f"controller@{suf}")
+            claimed = _pull(5)
+            got = [r for r in claimed if r[1] == ag]
+            ok = len(got) == 1 and got[0][3].startswith("selftest task")
+        finally:                                          # ALWAYS release our own row, even on error
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("DELETE FROM tasks WHERE assignee=%s", (ag,)); c.commit()
         print(f"claimed pending task for idle agent: {ok} (assignee={ag})")
         print("PASS: dispatcher claims + would invoke idle agents ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)

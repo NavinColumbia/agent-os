@@ -80,6 +80,8 @@ say "5. Seed the org (skills + roles)"
   '.venv/bin/python scripts/devserve.py up-all' >/dev/null 2>&1 && ok "dev app-server keepalive registered" || warn "devserve-keepalive registration failed"
 "$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register reap-orphans 600 \
   '.venv/bin/python scripts/reap.py run' >/dev/null 2>&1 && ok "orphan/stuck agent reaper registered" || warn "reap-orphans registration failed"
+"$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register accountability-sweep 1800 \
+  '.venv/bin/python scripts/accountability.py sweep' >/dev/null 2>&1 && ok "accountability sweep registered" || warn "accountability registration failed"
 "$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register tasksweep 600 \
   '.venv/bin/python scripts/tasksweep.py run' >/dev/null 2>&1 && ok "stuck-task lease reclaim registered" || warn "tasksweep registration failed"
 "$ROOT/.venv/bin/python" "$ROOT/scripts/scheduler.py" register budget-forecast-sweep 3600 \

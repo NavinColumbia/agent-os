@@ -73,6 +73,7 @@ ck "budget->capability scheduler"           "$PY scripts/scale.py selftest | gre
 ck "continuous improvement (safe-deploy)" "$PY scripts/improve.py selftest | grep -q PASS"
 ck "task board (asked->status->done)"     "$PY scripts/taskboard.py selftest | grep -q PASS"
 ck "orphan/stuck agent reaper"          "$PY scripts/reap.py selftest | grep -q PASS"
+ck "accountability: dropped-handoff detection" "$PY scripts/accountability.py selftest | grep -q PASS"
 ck "queue: stuck-task lease reclaim"    "$PY scripts/tasksweep.py selftest | grep -q PASS"
 ck "runtime kill-switch (halt/resume)"  "$PY scripts/killswitch.py selftest | grep -q PASS"
 ck "AI-consent gate (block/allow/revoke)" "$PY scripts/consent.py selftest | grep -q PASS"

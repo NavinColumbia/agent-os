@@ -74,6 +74,7 @@ ck "continuous improvement (safe-deploy)" "$PY scripts/improve.py selftest | gre
 ck "task board (asked->status->done)"     "$PY scripts/taskboard.py selftest | grep -q PASS"
 ck "orphan/stuck agent reaper"          "$PY scripts/reap.py selftest | grep -q PASS"
 ck "queue: stuck-task lease reclaim"    "$PY scripts/tasksweep.py selftest | grep -q PASS"
+ck "runtime kill-switch (halt/resume)"  "$PY scripts/killswitch.py selftest | grep -q PASS"
 ck "AI-consent gate (block/allow/revoke)" "$PY scripts/consent.py selftest | grep -q PASS"
 ck "notification taxonomy (silent/std)" "$PY scripts/notifications.py selftest | grep -q PASS"
 ck "public status page (live verdict)"  "$PY scripts/statuspage.py selftest | grep -q PASS"

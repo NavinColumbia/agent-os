@@ -28,6 +28,7 @@ import psycopg
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
+import killswitch  # noqa: E402
 
 _ENV = Path.home() / "projects" / "agent-os" / ".env.local"
 _DB = next((l.split("=", 1)[1].strip() for l in _ENV.read_text().splitlines()
@@ -237,6 +238,10 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     if BUDGET_USD and spent_usd() >= BUDGET_USD:      # BUDGET cap: stop spawning new work, escalate
         return {"rc": -1, "failed": True, "out": "budget exhausted",
                 "blocker": f"factory budget ${BUDGET_USD:.2f} exhausted (${spent_usd():.2f} spent) — raise AOS_BUDGET_USD or split the work"}
+    _halt = killswitch.is_halted(getattr(_ctx, "product", None) or "global")  # runtime human-oversight stop
+    if _halt.get("halted"):                           # operator / EU-AI-Act kill-switch: refuse next spawn
+        return {"rc": -1, "failed": True, "out": "halted",
+                "blocker": f"fleet HALTED by operator (scope={_halt.get('scope')}): {_halt.get('reason')} — resume with killswitch.py resume"}
     # NB: no home-grown context handling — the agent CLI (claude/codex) manages its own context window
     # (agentic file search, on-demand reads, compaction) far better than a bolt-on retrieval layer would.
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."

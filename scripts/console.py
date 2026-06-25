@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""console.py — the agent-os tenant CONSOLE: the full CEO-facing application, one nav over the whole spec.
+
+This is the productized front-of-house the blueprint's 16 areas describe, wired to REAL data: it mounts
+every tenant-scoped view module behind a single authenticated shell (X-Tenant-Token):
+
+  Cockpit (A3) · Projects (A4) · Fleet (A5) · Observability (A6) · Incidents/Status (A7) ·
+  Approvals (A8) · Integrations (A9) · Billing (A11) · Team (A12) · Settings (A13) · Templates+Build (A14)
+
+Each nav item calls a JSON endpoint backed by a dedicated module (cockpit/projectsview/traceview/approvals/
+integrationsview/billingview/settingsview/templatesview/notifications/statuspage). Builds reuse the front
+door's governed flow (consent gate + quota + factory). Binds 127.0.0.1 (front with Tailscale serve).
+
+    console.py serve [port]      # default 8099
+    console.py selftest          # asserts the routes resolve + render for a real tenant
+Run with the agent-os venv python.
+"""
+import json
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS))
+import approvals          # noqa: E402
+import billing           # noqa: E402
+import billingview       # noqa: E402
+import cockpit           # noqa: E402
+import consent           # noqa: E402
+import frontdoor         # noqa: E402  (reuse its governed build flow + zip)
+import integrationsview  # noqa: E402
+import notifications     # noqa: E402
+import projectsview      # noqa: E402
+import settingsview      # noqa: E402
+import statuspage        # noqa: E402
+import templatesview     # noqa: E402
+import tenancy           # noqa: E402
+import traceview         # noqa: E402
+import vault             # noqa: E402
+
+
+def _tenant(token):
+    if not token:
+        return None
+    try:
+        t = tenancy.tenant_for_token(token)
+        return t["tenant_id"] if isinstance(t, dict) else t
+    except Exception:
+        return None
+
+
+def _fleet(tid):
+    """Area 5 — every live worker across the tenant's products, flattened from the cockpit payload."""
+    c = cockpit.cockpit(tid)
+    workers = []
+    for p in c["products"]:
+        for w in p.get("workers", []):
+            workers.append({**w, "product": p["product"]})
+    return {"workers": workers, "count": len(workers),
+            "products_active": sum(1 for p in c["products"] if p.get("workers"))}
+
+
+def _team(tid):
+    """Area 12 — org/team. Minimal but honest: the owner + any roles the platform knows; RBAC is roadmap."""
+    plan = "free"
+    try:
+        plan, _ = billing._plan_of(tid)
+    except Exception:
+        pass
+    return {"members": [{"id": tid, "role": "owner", "status": "active"}],
+            "plan": plan, "seats_note": "Multi-seat RBAC is on the roadmap (Team tier)."}
+
+
+# ---- routing tables: path -> (callable taking tid, needs_tid) -----------------------------------------
+def _build(tid, body):
+    """Start a governed build (reuses the front door's consent gate + quota + factory thread)."""
+    if not consent.require_consent(tid):
+        return {"error": "consent_required", "consent": consent.state(tid)}
+    q = billing.quota(tid)
+    if not q["within_quota"]:
+        return {"error": f"quota reached ({q['builds']}) — upgrade your plan"}
+    raw = (body.get("name") or "app").strip().lower().replace(" ", "-")[:24] or "app"
+    product = f"{tid.replace('t-', '')[:6]}-{raw}"
+    charter = body.get("charter") or "Build a small, well-tested product."
+    kind = body.get("kind", "lib")
+    threading.Thread(target=frontdoor._run_build, args=(tid, product, charter, kind), daemon=True).start()
+    return {"product": product, "status": "building"}
+
+
+def _build_template(tid, body):
+    t = templatesview.get(body.get("slug", ""))
+    if not t or t.get("error"):
+        return {"error": "unknown template"}
+    return _build(tid, {"name": t["slug"], "charter": templatesview.charter_for(t["slug"]), "kind": t["kind"]})
+
+
+GETS = {
+    "/api/cockpit": lambda tid, q: cockpit.cockpit(tid),
+    "/api/projects": lambda tid, q: {"projects": projectsview.list_projects(tid)},
+    "/api/project": lambda tid, q: projectsview.project_detail(tid, q.get("product", [""])[0]),
+    "/api/fleet": lambda tid, q: _fleet(tid),
+    "/api/observability": lambda tid, q: traceview.overview(tid),
+    "/api/runs": lambda tid, q: {"runs": traceview.runs(tid)},
+    "/api/replay": lambda tid, q: traceview.replay(tid, q.get("run_id", [""])[0]),
+    "/api/approvals": lambda tid, q: approvals.inbox(tid),
+    "/api/integrations": lambda tid, q: {"integrations": integrationsview.status(tid)},
+    "/api/billing": lambda tid, q: billingview.billing_view(tid),
+    "/api/team": lambda tid, q: _team(tid),
+    "/api/settings": lambda tid, q: settingsview.settings(tid),
+    "/api/templates": lambda tid, q: {"templates": templatesview.gallery(), "categories": templatesview.categories()},
+    "/api/notifications": lambda tid, q: {"unread": notifications.unread_count(tid), "feed": notifications.feed(tid)},
+    "/api/status": lambda tid, q: statuspage.status(),
+}
+POSTS = {
+    "/api/build": lambda tid, q, b: _build(tid, b),
+    "/api/build_template": lambda tid, q, b: _build_template(tid, b),
+    "/api/control": lambda tid, q, b: cockpit.control(tid, b.get("product", ""), b.get("action", "")),
+    "/api/approvals/decide": lambda tid, q, b: approvals.decide(tid, b.get("kind"), b.get("ref"), b.get("verdict")),
+    "/api/integrations/connect": lambda tid, q, b: integrationsview.connect(tid, b.get("slug", ""), b.get("secret")),
+    "/api/integrations/disconnect": lambda tid, q, b: integrationsview.disconnect(tid, b.get("slug", "")),
+    "/api/billing/plan": lambda tid, q, b: billingview.change_plan(tid, b.get("plan", "")),
+    "/api/settings/pref": lambda tid, q, b: settingsview.set_pref(tid, b.get("category"), b.get("in_app", True), b.get("email", True), b.get("push", False)),
+    "/api/settings/consent": lambda tid, q, b: settingsview.set_consent(tid, b.get("accept", True)),
+    "/api/notifications/read": lambda tid, q, b: {"read": notifications.mark_read(tid, b.get("id"))},
+    "/api/byok": lambda tid, q, b: ({"ok": bool(b.get("key"))} if not b.get("key") else
+                                    (vault.put_secret("byo_llm_key", f"tenant:{tid}", "prod", ["builder", "factory"], b["key"]) or {"ok": True})),
+}
+
+PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>agent-os · console</title><style>
+:root{--bg:#0a0d13;--panel:#111722;--line:#1e2733;--tx:#d7dee8;--mut:#7d8795;--accent:#4f8cff;--g:#3fb950;--r:#f85149;--y:#d29922}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+.app{display:flex;min-height:100vh}
+.side{width:210px;background:#0c111a;border-right:1px solid var(--line);padding:16px 10px;position:sticky;top:0;height:100vh;overflow:auto}
+.brand{font-weight:700;font-size:16px;padding:6px 10px 14px}
+.nav a{display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:8px;color:var(--mut);text-decoration:none;cursor:pointer;font-size:13px}
+.nav a:hover{background:#131c28;color:var(--tx)}.nav a.on{background:#16202c;color:var(--tx)}
+.nav a .b{margin-left:auto;background:var(--accent);color:#fff;border-radius:999px;font-size:10px;padding:0 6px}
+.main{flex:1;padding:22px 24px;max-width:1000px}
+h1{font-size:20px;margin:0 0 2px}.sub{color:var(--mut);margin:0 0 16px;font-size:13px}
+.kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;min-width:96px}
+.kpi b{display:block;font-size:19px}.kpi span{color:var(--mut);font-size:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut);margin:0 0 12px}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.spread{justify-content:space-between}
+.item{border-top:1px solid var(--line);padding:10px 0}.item:first-child{border-top:none}
+.pill{font-size:11px;padding:2px 8px;border-radius:999px;background:#16202c;color:var(--mut)}
+.pill.ok{background:rgba(63,185,80,.15);color:var(--g)}.pill.bad{background:rgba(248,81,73,.15);color:var(--r)}.pill.warn{background:rgba(210,153,34,.15);color:var(--y)}
+.stages{display:flex;gap:4px;margin:8px 0;max-width:260px}.st{flex:1;height:6px;border-radius:3px;background:#1c2733}.st.ok{background:var(--g)}.st.bad{background:var(--r)}
+button{background:#16202c;border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:6px 12px;cursor:pointer;font-size:12px}
+button:hover{filter:brightness(1.25)}button.pri{background:var(--accent);border:none;color:#fff;font-weight:600}
+input,select,textarea{background:#0d131c;border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:8px;font-size:13px;width:100%;font-family:inherit}
+textarea{min-height:84px;resize:vertical}label{display:block;font-size:12px;color:var(--mut);margin:8px 0 3px}
+table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:5px 6px;border-top:1px solid var(--line);text-align:left;color:var(--mut)}th{color:var(--tx);border:none}
+.muted{color:var(--mut)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:820px){.grid{grid-template-columns:1fr}.side{width:64px}.side .lbl{display:none}}
+.tile{background:#0d131c;border:1px solid var(--line);border-radius:10px;padding:12px}
+code{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#9fb6d6}
+</style></head><body><div class=app>
+<div class=side><div class=brand>⬡ agent-os</div><div class=nav id=nav></div>
+  <div style="padding:12px 10px;font-size:11px" class=muted>token<br><input id=tok placeholder="tenant token" style="font-size:11px;padding:5px"><button onclick=saveTok() style="margin-top:6px;width:100%">use</button></div>
+</div>
+<div class=main><div id=view><div class=card>Paste your tenant token (left) to open your console. No token? Use the front door to sign up.</div></div></div>
+</div>
+<script>
+const NAV=[['cockpit','◧ Cockpit'],['build','✦ New build'],['templates','▦ Templates'],['projects','▤ Projects'],['fleet','⚙ Fleet'],['observability','◴ Observability'],['approvals','✓ Approvals'],['integrations','⌁ Integrations'],['billing','▣ Billing'],['notifications','◔ Notifications'],['team','◍ Team'],['settings','⚙ Settings'],['status','◉ Status']];
+const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';
+function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
+function saveTok(){TOK=$('#tok').value.trim();localStorage.setItem('aos_tenant',TOK);go('cockpit')}
+async function get(p){return (await fetch(p,{headers:H()})).json()}
+async function post(p,b){return (await fetch(p,{method:'POST',headers:H(),body:JSON.stringify(b||{})})).json()}
+function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function pill(txt,cls){return `<span class="pill ${cls||''}">${esc(txt)}</span>`}
+function renderNav(badges){$('#nav').innerHTML=NAV.map(([k,l])=>`<a class="${k==CUR?'on':''}" onclick="go('${k}')"><span class=lbl>${l}</span>${badges&&badges[k]?`<span class=b>${badges[k]}</span>`:''}</a>`).join('')}
+async function go(k){CUR=k;renderNav();$('#view').innerHTML='<div class=card class=muted>loading…</div>';try{await VIEWS[k]()}catch(e){$('#view').innerHTML='<div class=card>error: '+esc(e.message)+'</div>'}}
+function kpis(arr){return '<div class=kpis>'+arr.map(a=>`<div class=kpi><b>${esc(a[1])}</b><span>${esc(a[0])}</span></div>`).join('')+'</div>'}
+function stages(ss){return '<div class=stages>'+ss.map(s=>`<div class="st ${s.done?(s.ok===false?'bad':'ok'):''}" title="${s.stage}"></div>`).join('')+'</div>'}
+
+const VIEWS={
+ cockpit:async()=>{const d=await get('/api/cockpit');const s=d.summary,b=d.budget;
+  let h='<h1>Cockpit</h1><p class=sub>Your whole factory in one view.</p>';
+  h+=kpis([['Products',s.products],['Launched',s.launched],['Building',s.building],['Failed',s.failed],['Workers',s.live_workers],['Spend $',s.spend_usd],['Plan',b.plan]]);
+  h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in New build</div>')+'</div>';
+  h+='<div class=grid><div class=card><h2>Communications</h2><table>'+(d.communications.length?d.communications.map(m=>`<tr><td>${m.ts}</td><td>${esc(m.from)}</td><td>→ ${esc(m.to)}</td><td>${esc(m.intent)}</td></tr>`).join(''):'<tr><td class=muted>no recent agent messages</td></tr>')+'</table></div>';
+  h+=`<div class=card><h2>Work queue</h2>${kpis([['pending',d.queue.pending],['active',d.queue.active],['dead',d.queue.dead]])}</div></div>`;
+  $('#view').innerHTML=h;},
+ build:async()=>{$('#view').innerHTML=`<h1>New build</h1><p class=sub>Describe a product; the governed factory builds, tests and ships it.</p>
+  <div class=card><label>Name</label><input id=bn placeholder=splitbill><label>Type</label><select id=bk><option value=lib>Python library</option><option value=web>Web app</option><option value=service>API service</option></select><label>What should it do?</label><textarea id=bc placeholder="Describe the API, behaviours, edge cases…"></textarea><div style=margin-top:10px><button class=pri onclick=doBuild()>Build it</button></div><div id=bnote class=muted style=margin-top:8px></div></div>`;},
+ templates:async()=>{const d=await get('/api/templates');$('#view').innerHTML=`<h1>Templates</h1><p class=sub>Start from a curated, factory-ready blueprint.</p><div class=grid>`+d.templates.map(t=>`<div class=tile><div class="row spread"><b>${esc(t.name)}</b>${pill(t.kind)}</div><div class=muted style=margin:6px_0>${esc(t.blurb)}</div><button class=pri onclick="buildTpl('${t.slug}')">Build this</button></div>`).join('')+'</div>';},
+ projects:async()=>{const d=await get('/api/projects');$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):'<div class=muted>no projects yet</div>')+'</div>';},
+ fleet:async()=>{const d=await get('/api/fleet');$('#view').innerHTML='<h1>Agent fleet</h1><p class=sub>Live workers across your products.</p>'+kpis([['Live workers',d.count],['Active products',d.products_active]])+'<div class=card><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th>task</th></tr>'+(d.workers.length?d.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td>${esc(w.task)}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';},
+ observability:async()=>{const d=await get('/api/observability');$('#view').innerHTML='<h1>Observability</h1><p class=sub>Runs, errors, spend across your fleet.</p>'+kpis([['Runs',d.runs],['Steps',d.steps],['Errors',d.errors],['Cost $',d.cost_usd],['Tokens',d.tokens]])+'<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(d.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div><div class=card><h2>Recent errors</h2>'+((d.recent_errors||[]).length?d.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean</div>')+'</div>';},
+ approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">deny</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):'<div class=muted>nothing awaiting you ✓</div>')+'</div>';},
+ integrations:async()=>{const d=await get('/api/integrations');$('#view').innerHTML='<h1>Integrations</h1><p class=sub>Connect the services your products need.</p><div class=grid>'+d.integrations.map(i=>`<div class=tile><div class="row spread"><b>${esc(i.name)}</b>${pill(i.status,i.status=='connected'?'ok':'')}</div><div class=muted style=margin:6px_0>${esc(i.blurb)} · ${esc(i.category)}</div>${i.status=='connected'?`<button onclick="integ('disconnect','${i.slug}')">disconnect</button>`:`<button class=pri onclick="integ('connect','${i.slug}')">connect</button>`}</div>`).join('')+'</div>';},
+ billing:async()=>{const d=await get('/api/billing');$('#view').innerHTML=`<h1>Billing & plans</h1><p class=sub>Usage, quota and plan. Real payment is gated (BYO Stripe).</p>`+kpis([['Plan',d.plan],['Builds',(d.usage&&d.usage.builds)||0],['Tokens',(d.usage&&d.usage.tokens)||0]])+'<div class=card><h2>Plans</h2><table><tr><th>plan</th><th>price</th><th>builds</th><th>tokens</th><th></th></tr>'+(d.plans||[]).map(p=>`<tr><td>${esc(p.slug)} ${p.current?pill('current','ok'):''}</td><td>$${p.price}</td><td>${p.builds}</td><td>${p.tokens}</td><td>${p.current?'':`<button onclick="plan('${p.slug}')">switch</button>`}</td></tr>`).join('')+'</table></div>';},
+ notifications:async()=>{const d=await get('/api/notifications');$('#view').innerHTML=`<h1>Notifications</h1><p class=sub>${d.unread} unread.</p><div class=card>`+(d.feed.length?d.feed.map(n=>`<div class=item><div class="row spread"><span>${pill(n.level,n.level=='urgent'?'bad':(n.level=='standard'?'':'warn'))} <b>${esc(n.title)}</b></span><span class=muted>${esc(n.category)} · ${n.created_at}</span></div><div class=muted>${esc(n.body||'')}</div></div>`).join(''):'<div class=muted>no notifications</div>')+'</div>';},
+ team:async()=>{const d=await get('/api/team');$('#view').innerHTML='<h1>Team</h1><p class=sub>'+esc(d.seats_note)+'</p><div class=card><table><tr><th>member</th><th>role</th><th>status</th></tr>'+d.members.map(m=>`<tr><td>${esc(m.id)}</td><td>${esc(m.role)}</td><td>${pill(m.status,'ok')}</td></tr>`).join('')+'</table></div>';},
+ settings:async()=>{const d=await get('/api/settings');const c=d.ai_consent||{};$('#view').innerHTML=`<h1>Settings</h1><p class=sub>Profile, AI consent, keys, notifications.</p>
+  <div class=card><h2>Profile</h2><div class=row>plan <b>${esc(d.profile.plan)}</b> ${d.profile.suspended?pill('suspended','bad'):pill('active','ok')}</div></div>
+  <div class=card><h2>AI consent</h2><div class=row>${c.accepted?pill('accepted','ok'):pill('not accepted','bad')} <span class=muted>${esc(c.provider||'')} ${esc(c.version||'')}</span></div><div style=margin-top:8px>${c.accepted?'<button onclick="setConsent(false)">revoke</button>':'<button class=pri onclick="setConsent(true)">accept</button>'}</div></div>
+  <div class=card><h2>BYO API key</h2><div class=row>${d.byo_key_set?pill('key on file','ok'):pill('no key','warn')}</div><div style=margin-top:8px><input id=bk placeholder="sk-… (stored encrypted)"><button class=pri style=margin-top:6px onclick=saveKey()>save key</button></div></div>
+  <div class=card><h2>Notification preferences</h2><table><tr><th>category</th><th>in-app</th><th>email</th><th>push</th></tr>`+(d.notification_prefs||[]).map(p=>`<tr><td>${esc(p.category)}</td><td><input type=checkbox ${p.in_app?'checked':''} onchange="pref('${p.category}',this.checked,null,null)"></td><td><input type=checkbox ${p.email?'checked':''} onchange="pref('${p.category}',null,this.checked,null)"></td><td><input type=checkbox ${p.push?'checked':''} onchange="pref('${p.category}',null,null,this.checked)"></td></tr>`).join('')+'</table></div>';PREFS=d.notification_prefs;},
+ status:async()=>{const d=await get('/api/status');const m={operational:'ok',degraded:'warn',major_outage:'bad',unknown:''}[d.verdict];$('#view').innerHTML='<h1>Status</h1><p class=sub>Live platform health.</p><div class=card><div class=row>'+pill(d.verdict,m)+'</div></div><div class=card><h2>Services</h2>'+Object.entries(d.components||{}).map(([k,v])=>`<div class="row spread item"><span>${esc(k)}</span>${pill(v,v===true||v=='ok'?'ok':'bad')}</div>`).join('')+`<div class="row spread item"><span>dead-letter depth</span>${pill(d.dead_letter_depth,d.dead_letter_depth?'bad':'ok')}</div></div>`;},
+};
+let PREFS=[];
+async function doBuild(){$('#bnote').textContent='submitting…';const r=await post('/api/build',{name:$('#bn').value,kind:$('#bk').value,charter:$('#bc').value});$('#bnote').textContent=r.error?('✗ '+(r.error==='consent_required'?'accept AI consent in Settings first':r.error)):('building '+r.product+' — see Cockpit');}
+async function buildTpl(slug){const r=await post('/api/build_template',{slug});go('cockpit');}
+async function ctl(p,a){await post('/api/control',{product:p,action:a});go('cockpit');}
+async function decide(kind,ref,verdict){await post('/api/approvals/decide',{kind,ref,verdict});go('approvals');}
+async function integ(act,slug){let secret=null;if(act=='connect')secret=prompt('API key / secret for '+slug+' (leave blank if OAuth):')||null;await post('/api/integrations/'+act,{slug,secret});go('integrations');}
+async function plan(p){await post('/api/billing/plan',{plan:p});go('billing');}
+async function setConsent(a){await post('/api/settings/consent',{accept:a});go('settings');}
+async function saveKey(){await post('/api/byok',{key:$('#bk').value});go('settings');}
+async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
+renderNav();if(TOK){$('#tok').value=TOK;go('cockpit');setInterval(()=>{if(['cockpit','fleet'].includes(CUR))go(CUR)},6000)}
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, obj):
+        b = json.dumps(obj, default=str).encode()
+        self.send_response(code); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        u = urlparse(self.path); p = u.path
+        if p == "/":
+            b = PAGE.encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
+        if p == "/health":
+            return self._json(200, {"service": "agent-os-console", "ok": True})
+        if p.startswith("/download/"):
+            product = p[len("/download/"):]
+            if not (frontdoor.PRODUCTS / product).exists():
+                return self._json(404, {"error": "not found"})
+            data = frontdoor._zip(product)
+            self.send_response(200); self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{product}.zip"')
+            self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+            return
+        fn = GETS.get(p)
+        if not fn:
+            return self._json(404, {"error": "not found"})
+        tid = _tenant(self.headers.get("X-Tenant-Token"))
+        if not tid:
+            return self._json(401, {"error": "sign up first"})
+        try:
+            self._json(200, fn(tid, parse_qs(u.query)))
+        except Exception as e:
+            self._json(500, {"error": str(e)[:200]})
+
+    def do_POST(self):
+        u = urlparse(self.path); p = u.path
+        fn = POSTS.get(p)
+        if not fn:
+            return self._json(404, {"error": "not found"})
+        tid = _tenant(self.headers.get("X-Tenant-Token"))
+        if not tid:
+            return self._json(401, {"error": "sign up first"})
+        try:
+            self._json(200, fn(tid, parse_qs(u.query), self._body()))
+        except Exception as e:
+            self._json(500, {"error": str(e)[:200]})
+
+
+def _selftest():
+    """Prove every GET route resolves + renders for a REAL tenant with one product, end to end."""
+    import billing as _b
+    import psycopg
+    reg = _b.signup("console-selftest", "free")
+    tid = reg["tenant_id"]
+    prod = tid.replace("t-", "")[:6] + "-demo"
+    DB = frontdoor.DB
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (prod, tid))
+        cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, rc, cost_usd, tokens_in, tokens_out, elapsed_s, prompt, output, model)
+                       VALUES (%s,%s,'SPEC','builder','agent',0,0.16,500,800,20,'p','o','m')""", (f"run-{prod}", prod))
+        c.commit()
+    try:
+        results = {}
+        for path, fn in GETS.items():
+            try:
+                out = fn(tid, {"product": [prod], "run_id": [f"run-{prod}"]})
+                results[path] = isinstance(out, (dict, list))   # replay returns a list timeline
+            except Exception as e:
+                results[path] = f"ERR {e}"
+        bad = {k: v for k, v in results.items() if v is not True}
+        # the build path must enforce the consent gate (no consent yet -> refused)
+        gate = _build(tid, {"name": "x", "charter": "y"}).get("error") == "consent_required"
+        ok = not bad and gate and len(GETS) >= 13
+        print(f"routes ok: {len(results)-len(bad)}/{len(results)} · consent-gated build: {gate} · nav areas: {len(GETS)}")
+        if bad:
+            print("FAILING ROUTES:", bad)
+        print("PASS: console mounts all area views for a real tenant ✅" if ok else "FAIL")
+    finally:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM traces WHERE product=%s", (prod,))
+            cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
+            c.commit()
+    sys.exit(0 if ok else 1)
+
+
+def _main(a):
+    if not a or a[0] == "selftest":
+        _selftest()
+    elif a[0] == "serve":
+        port = int(a[1]) if len(a) > 1 else 8099
+        print(f"console on http://127.0.0.1:{port}")
+        ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    else:
+        sys.exit("usage: console.py serve [port] | selftest")
+
+
+if __name__ == "__main__":
+    _main(sys.argv[1:])

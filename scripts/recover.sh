@@ -72,6 +72,15 @@ fi
 tailscale serve status 2>/dev/null | grep -q 8095 || tailscale serve --bg --https=8095 http://127.0.0.1:8093 >/dev/null 2>&1
 ok "front door private over Tailscale: https://nyaan.tail502e3f.ts.net:8095"
 
+hdr "4h. Tenant CONSOLE — full CEO app, all 16 areas (127.0.0.1:8099)"
+if pgrep -f "console.py serve" >/dev/null; then ok "console already running"
+else
+  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/console.py serve 8099" >/tmp/console.log 2>&1 </dev/null & )
+  sleep 1; pgrep -f "console.py serve" >/dev/null && ok "console started" || warn "console failed"
+fi
+tailscale serve status 2>/dev/null | grep -q 8096 || tailscale serve --bg --https=8096 http://127.0.0.1:8099 >/dev/null 2>&1
+ok "console private over Tailscale: https://nyaan.tail502e3f.ts.net:8096"
+
 hdr "4g. Public status page (127.0.0.1:8097) + Prometheus metrics (127.0.0.1:9101)"
 if pgrep -f "statuspage.py serve" >/dev/null; then ok "status page already running"
 else

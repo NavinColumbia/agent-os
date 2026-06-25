@@ -228,6 +228,31 @@ def _run_once_codex(role, repo, prompt, timeout, env):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _agent_codex(role, repo, prompt, codex_key, timeout=600):
+    """Run an agent on Codex as the PRIMARY engine (for tenants who only have an OpenAI/Codex key).
+    Bounded retries, the tenant's key in the env, same trace/spend/audit bookkeeping as the Claude path."""
+    cenv = {**os.environ}
+    if codex_key:
+        cenv["OPENAI_API_KEY"] = codex_key
+    last_out = ""
+    for attempt in range(2):
+        try:
+            with _AGENT_SEM:
+                rc, out_text, cost, tin, tout, used = _run_once_codex(role, repo, prompt, timeout, cenv)
+        except subprocess.TimeoutExpired:
+            timeout = min(900, int(timeout * 1.5)); last_out = "timeout"; continue
+        _add_spend(cost)
+        audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                     decision="executed", payload={"engine": "codex", "rc": rc, "attempt": attempt + 1})
+        _trace("agent", role, prompt, out_text, rc, 0.0, cost, tin, tout, used)
+        if rc == 0 and out_text.strip():
+            return {"rc": 0, "out": out_text[-1500:], "cost_usd": cost, "tokens_in": tin,
+                    "tokens_out": tout, "attempts": attempt + 1, "model": used}
+        last_out = out_text
+        time.sleep(4 * (attempt + 1))
+    return {"rc": 1, "out": (last_out or "")[-1500:], "failed": True, "reason": "codex exhausted"}
+
+
 def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None,
           tools: list = None) -> dict:
     """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry from the CALLEE's
@@ -245,6 +270,11 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     # NB: no home-grown context handling — the agent CLI (claude/codex) manages its own context window
     # (agentic file search, on-demand reads, compaction) far better than a bolt-on retrieval layer would.
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
+    # MULTI-PROVIDER: a tenant may have ONLY a Codex/OpenAI key (no Claude). Route them to Codex as the
+    # PRIMARY engine (not just failover), on their own key. Default stays Claude.
+    engine = (getattr(_ctx, "engine", None) or "claude").lower()
+    if engine == "codex" and shutil.which("codex"):
+        return _agent_codex(role, repo, prompt, getattr(_ctx, "codex_key", None))
     env = None
     key = getattr(_ctx, "api_key", None)
     if key:
@@ -577,11 +607,16 @@ def _review_verdict(repo) -> str:
     return "REQUEST-CHANGES" if ("REQUEST-CHANGES" in scope.upper() or "REQUEST CHANGES" in scope.upper()) else "APPROVE"
 
 
-def build_product(product: str, charter: str, kind: str = "lib", api_key: str = None) -> dict:
+def build_product(product: str, charter: str, kind: str = "lib", api_key: str = None,
+                  engine: str = None, provider_key: str = None) -> dict:
     """Drive one product end-to-end through the governed line with real agents + a real QA fix loop.
     kind='lib' -> Python library QA'd by pytest; kind='web' -> static web app QA'd by a real browser.
-    api_key (BYO): if set, every agent runs on the tenant's own key — they pay their own inference."""
+    api_key (BYO): if set, every agent runs on the tenant's own key — they pay their own inference.
+    engine ('claude'|'codex'): which provider to run on; provider_key = that provider's BYO key. A tenant
+    with only a Codex/OpenAI key builds on Codex; default is Claude."""
     _ctx.api_key = api_key
+    _ctx.engine = (engine or "claude").lower()
+    _ctx.codex_key = provider_key if (engine or "").lower() == "codex" else None
     web = kind == "web"
     service = kind == "service"
     ext = kind == "extension"

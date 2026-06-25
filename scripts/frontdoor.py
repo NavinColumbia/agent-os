@@ -73,14 +73,18 @@ def _status(product):
 
 def _run_build(tid, product, charter, kind):
     _own(product, tid)
-    key = None
-    try:                                             # BYO: build on the tenant's own key if they gave one
-        v = vault.get_secret("byo_llm_key", f"tenant:{tid}", "prod", "builder")
-        key = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
-    except Exception:
-        key = None
+    # MULTI-PROVIDER: route to whichever engine the tenant connected (Claude, or Codex if that's all they
+    # have). Falls back to the legacy single byo_llm_key, then to the platform default.
+    import tenantproviders
+    bk = tenantproviders.build_kwargs(tid)           # {engine, provider_key, api_key}
+    if bk["engine"] == "claude" and not bk["api_key"]:
+        try:
+            v = vault.get_secret("byo_llm_key", f"tenant:{tid}", "prod", "builder")
+            bk["api_key"] = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
+        except Exception:
+            pass
     try:
-        factory.build_product(product, charter, kind, api_key=key)
+        factory.build_product(product, charter, kind, **bk)
     except Exception as e:
         # DON'T swallow: record a terminal FAILED status so the user sees a real failure (+ retry CTA),
         # not an eternal "building" spinner. _status reads this ProductComplete row.

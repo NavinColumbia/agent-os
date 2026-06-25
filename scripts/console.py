@@ -24,23 +24,31 @@ from urllib.parse import urlparse, parse_qs
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
+import account           # noqa: E402
 import approvals          # noqa: E402
 import billing           # noqa: E402
 import billingview       # noqa: E402
 import cockpit           # noqa: E402
 import consent           # noqa: E402
+import estimate          # noqa: E402
 import forecast          # noqa: E402
 import frontdoor         # noqa: E402  (reuse its governed build flow + zip)
+import helpagent         # noqa: E402
 import integrationsview  # noqa: E402
 import notifications     # noqa: E402
+import onboarding        # noqa: E402
 import orchestrator      # noqa: E402
+import projbudget        # noqa: E402
 import projectsview      # noqa: E402
+import qualityview       # noqa: E402
 import settingsview      # noqa: E402
 import statuspage        # noqa: E402
 import templatesview     # noqa: E402
 import tenancy           # noqa: E402
+import tenantproviders   # noqa: E402
 import traceview         # noqa: E402
 import vault             # noqa: E402
+import versions          # noqa: E402
 
 
 def _tenant(token):
@@ -111,6 +119,14 @@ GETS = {
     "/api/billing": lambda tid, q: billingview.billing_view(tid),
     "/api/forecast": lambda tid, q: forecast.forecast(tid),
     "/api/chat/history": lambda tid, q: {"messages": orchestrator.history(tid, int(q.get("thread", ["0"])[0] or 0))},
+    "/api/providers": lambda tid, q: {"providers": tenantproviders.list_providers(tid)},
+    "/api/onboarding": lambda tid, q: onboarding.state(tid),
+    "/api/quality": lambda tid, q: {"products": qualityview.summary(tid)},
+    "/api/quality/product": lambda tid, q: qualityview.verdict(tid, q.get("product", [""])[0]),
+    "/api/estimate": lambda tid, q: estimate.estimate(q.get("kind", ["lib"])[0]),
+    "/api/budgets": lambda tid, q: {"budgets": projbudget.list_budgets(tid)},
+    "/api/versions": lambda tid, q: {"versions": versions.versions(tid, q.get("product", [""])[0])},
+    "/api/help/topics": lambda tid, q: {"topics": helpagent.topics()},
     "/api/team": lambda tid, q: _team(tid),
     "/api/settings": lambda tid, q: settingsview.settings(tid),
     "/api/templates": lambda tid, q: {"templates": templatesview.gallery(), "categories": templatesview.categories()},
@@ -123,6 +139,17 @@ POSTS = {
     "/api/chat/new": lambda tid, q, b: {"thread": orchestrator.start_thread(tid)},
     "/api/chat/say": lambda tid, q, b: orchestrator.say(tid, int(b.get("thread") or 0), b.get("message", "")),
     "/api/chat/confirm": lambda tid, q, b: orchestrator.confirm(tid, int(b.get("thread") or 0)),
+    "/api/providers/add": lambda tid, q, b: tenantproviders.add_key(tid, b.get("provider", ""), b.get("key", "")),
+    "/api/providers/remove": lambda tid, q, b: tenantproviders.remove_key(tid, b.get("provider", "")),
+    "/api/providers/priority": lambda tid, q, b: tenantproviders.set_priority(tid, b.get("order", [])),
+    "/api/onboarding/advance": lambda tid, q, b: onboarding.advance(tid, b.get("step", "")),
+    "/api/onboarding/skip": lambda tid, q, b: onboarding.skip(tid),
+    "/api/budget/set": lambda tid, q, b: projbudget.set_budget(tid, b.get("product", ""), float(b.get("cap_usd", 0) or 0)),
+    "/api/versions/snapshot": lambda tid, q, b: versions.snapshot(tid, b.get("product", ""), b.get("label", "")),
+    "/api/versions/rollback": lambda tid, q, b: versions.rollback(tid, b.get("product", ""), int(b.get("version") or 0)),
+    "/api/account/export": lambda tid, q, b: account.export(tid),
+    "/api/account/delete": lambda tid, q, b: account.delete(tid, confirm=bool(b.get("confirm"))),
+    "/api/help/ask": lambda tid, q, b: helpagent.ask(tid, b.get("question", "")),
     "/api/control": lambda tid, q, b: cockpit.control(tid, b.get("product", ""), b.get("action", "")),
     "/api/approvals/decide": lambda tid, q, b: approvals.decide(tid, b.get("kind"), b.get("ref"), b.get("verdict")),
     "/api/integrations/connect": lambda tid, q, b: integrationsview.connect(tid, b.get("slug", ""), b.get("secret")),
@@ -172,7 +199,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#9fb6d6}
 <div class=main><div id=view><div class=card>Paste your tenant token (left) to open your console. No token? Use the front door to sign up.</div></div></div>
 </div>
 <script>
-const NAV=[['chat','💬 Direct (chat)'],['cockpit','◧ Cockpit'],['build','✦ New build'],['templates','▦ Templates'],['projects','▤ Projects'],['fleet','⚙ Fleet'],['observability','◴ Observability'],['approvals','✓ Approvals'],['integrations','⌁ Integrations'],['billing','▣ Billing'],['notifications','◔ Notifications'],['team','◍ Team'],['settings','⚙ Settings'],['status','◉ Status']];
+const NAV=[['chat','💬 Direct (chat)'],['cockpit','◧ Cockpit'],['build','✦ New build'],['templates','▦ Templates'],['projects','▤ Projects'],['fleet','⚙ Fleet'],['observability','◴ Observability'],['approvals','✓ Approvals'],['integrations','⌁ Integrations'],['providers','🔌 Providers'],['billing','▣ Billing'],['notifications','◔ Notifications'],['team','◍ Team'],['settings','⚙ Settings'],['help','? Help'],['status','◉ Status']];
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function saveTok(){TOK=$('#tok').value.trim();localStorage.setItem('aos_tenant',TOK);go('cockpit')}
@@ -209,15 +236,18 @@ const VIEWS={
  },
  cockpit:async()=>{const d=await get('/api/cockpit');const s=d.summary||{},b=d.budget||{};d.products=d.products||[];d.communications=d.communications||[];d.queue=d.queue||{};
   let fc=null;try{fc=await get('/api/forecast')}catch(e){}
+  let ql={};try{const q=await get('/api/quality');(q.products||[]).forEach(p=>ql[p.product]=p)}catch(e){}
+  let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
   let h='<h1>Cockpit</h1><p class=sub>Your whole factory in one view.</p>';
+  if(ob&&!ob.completed&&ob.step!=='done'){h+=`<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Get set up</b> — ${esc(ob.framing||'')} Next: <b>${esc(ob.step)}</b></span><span><button class=pri onclick="go('${ob.step==='provider'?'providers':(ob.step==='consent'?'settings':(ob.step==='first_build'?'chat':'chat'))}')">continue</button> <button onclick="post('/api/onboarding/skip',{}).then(()=>go('cockpit'))">skip</button></span></div></div>`;}
   h+=kpis([['Products',s.products||0],['Launched',s.launched||0],['Building',s.building||0],['Failed',s.failed||0],['Workers',s.live_workers||0],['Spend $',s.spend_usd||0],['Plan',b.plan||'—']]);
   if(fc){const fcls=fc.level==='over'?'bad':(fc.level==='warn'?'warn':'ok');h+=`<div class=card><h2>Budget forecast</h2><div class="row spread"><span>${esc(fc.headline||'')}</span>${pill(fc.pct_of_quota_projected+'% projected',fcls)}</div><div class=meta>burn ~${fc.burn_tokens_per_day} tok/day · $${fc.burn_usd_per_day}/day${fc.eta_days_to_quota?(' · hits quota in ~'+fc.eta_days_to_quota+'d'):''}</div></div>`;}
-  h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in New build</div>')+'</div>';
+  h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${ql[p.product]?pill('✓ '+ql[p.product].overall,(ql[p.product].overall=='verified'||ql[p.product].overall=='passed')?'ok':(ql[p.product].overall=='failed'?'bad':'')):''} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in New build</div>')+'</div>';
   h+='<div class=grid><div class=card><h2>Communications</h2><table>'+(d.communications.length?d.communications.map(m=>`<tr><td>${m.ts}</td><td>${esc(m.from)}</td><td>→ ${esc(m.to)}</td><td>${esc(m.intent)}</td></tr>`).join(''):'<tr><td class=muted>no recent agent messages</td></tr>')+'</table></div>';
   h+=`<div class=card><h2>Work queue</h2>${kpis([['pending',d.queue.pending],['active',d.queue.active],['dead',d.queue.dead]])}</div></div>`;
   $('#view').innerHTML=h;},
  build:async()=>{$('#view').innerHTML=`<h1>New build</h1><p class=sub>Describe a product; the governed factory builds, tests and ships it.</p>
-  <div class=card><label>Name</label><input id=bn placeholder=splitbill><label>Type</label><select id=bk><option value=lib>Python library</option><option value=web>Web app</option><option value=service>API service</option></select><label>What should it do?</label><textarea id=bc placeholder="Describe the API, behaviours, edge cases…"></textarea><div style=margin-top:10px><button class=pri onclick=doBuild()>Build it</button></div><div id=bnote class=muted style=margin-top:8px></div></div>`;},
+  <div class=card><label>Name</label><input id=bn placeholder=splitbill><label>Type</label><select id=bk onchange=showEst()><option value=lib>Python library</option><option value=web>Web app</option><option value=service>API service</option></select><label>What should it do?</label><textarea id=bc placeholder="Describe the API, behaviours, edge cases…"></textarea><div id=est class=muted style=margin-top:8px></div><div style=margin-top:10px><button class=pri onclick=doBuild()>Build it</button></div><div id=bnote class=muted style=margin-top:8px></div></div>`;showEst();},
  templates:async()=>{const d=await get('/api/templates');$('#view').innerHTML=`<h1>Templates</h1><p class=sub>Start from a curated, factory-ready blueprint.</p><div class=grid>`+(d.templates||[]).map(t=>`<div class=tile><div class="row spread"><b>${esc(t.name)}</b>${pill(t.kind)}</div><div class=muted style=margin:6px_0>${esc(t.blurb)}</div><button class=pri onclick="buildTpl('${t.slug}')">Build this</button></div>`).join('')+'</div>';},
  projects:async()=>{const d=await get('/api/projects');d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):'<div class=muted>no projects yet</div>')+'</div>';},
  fleet:async()=>{const d=await get('/api/fleet');d.workers=d.workers||[];$('#view').innerHTML='<h1>Agent fleet</h1><p class=sub>Live workers across your products.</p>'+kpis([['Live workers',d.count||0],['Active products',d.products_active||0]])+'<div class=card><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th>task</th></tr>'+(d.workers.length?d.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td>${esc(w.task)}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';},
@@ -231,7 +261,12 @@ const VIEWS={
   <div class=card><h2>Profile</h2><div class=row>plan <b>${esc(pr.plan||'—')}</b> ${pr.suspended?pill('suspended','bad'):pill('active','ok')}</div></div>
   <div class=card><h2>AI consent</h2><div class=row>${c.accepted?pill('accepted','ok'):pill('not accepted','bad')} <span class=muted>${esc(c.provider||'')} ${esc(c.version||'')}</span></div><div style=margin-top:8px>${c.accepted?'<button onclick="setConsent(false)">revoke</button>':'<button class=pri onclick="setConsent(true)">accept</button>'}</div></div>
   <div class=card><h2>BYO API key</h2><div class=row>${d.byo_key_set?pill('key on file','ok'):pill('no key','warn')}</div><div style=margin-top:8px><input id=bk placeholder="sk-… (stored encrypted)"><button class=pri style=margin-top:6px onclick=saveKey()>save key</button></div></div>
-  <div class=card><h2>Notification preferences</h2><table><tr><th>category</th><th>in-app</th><th>email</th><th>push</th></tr>`+(d.notification_prefs||[]).map(p=>`<tr><td>${esc(p.category)}</td><td><input type=checkbox ${p.in_app?'checked':''} onchange="pref('${p.category}',this.checked,null,null)"></td><td><input type=checkbox ${p.email?'checked':''} onchange="pref('${p.category}',null,this.checked,null)"></td><td><input type=checkbox ${p.push?'checked':''} onchange="pref('${p.category}',null,null,this.checked)"></td></tr>`).join('')+'</table></div>';PREFS=d.notification_prefs;},
+  <div class=card><h2>Notification preferences</h2><table><tr><th>category</th><th>in-app</th><th>email</th><th>push</th></tr>`+(d.notification_prefs||[]).map(p=>`<tr><td>${esc(p.category)}</td><td><input type=checkbox ${p.in_app?'checked':''} onchange="pref('${p.category}',this.checked,null,null)"></td><td><input type=checkbox ${p.email?'checked':''} onchange="pref('${p.category}',null,this.checked,null)"></td><td><input type=checkbox ${p.push?'checked':''} onchange="pref('${p.category}',null,null,this.checked)"></td></tr>`).join('')+`</table></div>
+  <div class=card><h2>Your data</h2><div class=row><button onclick=acctExport()>Export my data</button><button onclick=acctDelete() style="border-color:var(--r);color:var(--r)">Delete my account</button></div><div id=acctnote class=muted style=margin-top:8px></div></div>`;PREFS=d.notification_prefs;},
+ providers:async()=>{const d=await get('/api/providers');$('#view').innerHTML='<h1>Model providers</h1><p class=sub>Bring your own keys. You can run on Claude, on Codex, or both — you only need one.</p><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${pill(p.connected?'connected':'not connected',p.connected?'ok':'')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)} · runs on <b>${esc(p.engine)}</b></div>${p.connected?`<button onclick="provRemove('${p.slug}')">disconnect</button>`:`<button class=pri onclick="provAdd('${p.slug}','${esc(p.key_hint)}')">connect</button>`}</div>`).join('')+'</div><p class=muted>The build uses your highest-priority connected provider. No key on file → platform default.</p>';},
+ help:async()=>{const d=await get('/api/help/topics');$('#view').innerHTML=`<h1>Help</h1><p class=sub>Ask me anything about using agent-os.</p>
+  <div class=card><div class=row><input id=hq placeholder="e.g. how do I add my Codex key?" onkeydown="if(event.key==='Enter')helpAsk()"><button class=pri onclick=helpAsk()>Ask</button></div><div id=hans style=margin-top:10px></div></div>
+  <div class=card><h2>Topics</h2>`+(d.topics||[]).map(t=>`<div class=item><b>${esc(t.area||t.key||'')}</b> <span class=muted>${esc(t.desc||t.description||'')}</span></div>`).join('')+'</div>';},
  status:async()=>{const d=await get('/api/status');const m={operational:'ok',degraded:'warn',major_outage:'bad',unknown:''}[d.verdict];$('#view').innerHTML='<h1>Status</h1><p class=sub>Live platform health.</p><div class=card><div class=row>'+pill(d.verdict,m)+'</div></div><div class=card><h2>Services</h2>'+Object.entries(d.components||{}).map(([k,v])=>`<div class="row spread item"><span>${esc(k)}</span>${pill(v,v===true||v=='ok'?'ok':'bad')}</div>`).join('')+`<div class="row spread item"><span>dead-letter depth</span>${pill(d.dead_letter_depth,d.dead_letter_depth?'bad':'ok')}</div></div>`;},
 };
 let PREFS=[];
@@ -253,14 +288,20 @@ async function chatConfirm(){
  $('#chatnote').textContent='starting build…';const r=await post('/api/chat/confirm',{thread:THREAD});
  $('#chatnote').textContent=r.error?('✗ '+(r.error==='consent_required'?'accept AI consent in Settings first':r.error)):('building '+r.product+' — see Cockpit');
 }
+async function showEst(){const k=($('#bk')||{}).value||'lib';let e;try{e=await get('/api/estimate?kind='+k)}catch(_){return}if($('#est'))$('#est').textContent='Estimate: '+(e.note||('~$'+e.cost_usd_estimate+', ~'+e.minutes_estimate+' min'));}
 async function doBuild(){$('#bnote').textContent='submitting…';const r=await post('/api/build',{name:$('#bn').value,kind:$('#bk').value,charter:$('#bc').value});$('#bnote').textContent=r.error?('✗ '+(r.error==='consent_required'?'accept AI consent in Settings first':r.error)):('building '+r.product+' — see Cockpit');}
 async function buildTpl(slug){const r=await post('/api/build_template',{slug});go('cockpit');}
 async function ctl(p,a){await post('/api/control',{product:p,action:a});go('cockpit');}
 async function decide(kind,ref,verdict){await post('/api/approvals/decide',{kind,ref,verdict});go('approvals');}
 async function integ(act,slug){let secret=null;if(act=='connect')secret=prompt('API key / secret for '+slug+' (leave blank if OAuth):')||null;await post('/api/integrations/'+act,{slug,secret});go('integrations');}
 async function plan(p){await post('/api/billing/plan',{plan:p});go('billing');}
+async function provAdd(slug,hint){const k=prompt('Paste your '+slug+' API key ('+hint+'):');if(k===null)return;await post('/api/providers/add',{provider:slug,key:k});go('providers');}
+async function provRemove(slug){await post('/api/providers/remove',{provider:slug});go('providers');}
+async function helpAsk(){const q=$('#hq').value.trim();if(!q)return;$('#hans').innerHTML='<span class=muted>thinking…</span>';const r=await post('/api/help/ask',{question:q});$('#hans').innerHTML='<div class=tile>'+esc(r.answer||r.error||'(no answer)')+(r.suggested_area?` <button onclick="go('${r.suggested_area}')">go there</button>`:'')+'</div>';}
 async function setConsent(a){await post('/api/settings/consent',{accept:a});go('settings');}
 async function saveKey(){await post('/api/byok',{key:$('#bk').value});go('settings');}
+async function acctExport(){$('#acctnote').textContent='preparing export…';const r=await post('/api/account/export',{});$('#acctnote').textContent=r.ok?('Export ready ('+r.products+' products) on the server: '+(r.path||'')):'export failed';}
+async function acctDelete(){const r=await post('/api/account/delete',{confirm:false});if(!confirm('Permanently delete your account and ALL data? This cannot be undone.'))return;const r2=await post('/api/account/delete',{confirm:true});if(r2.ok){localStorage.removeItem('aos_tenant');TOK='';$('#view').innerHTML='<div class=card>Your account and data were deleted. Goodbye.</div>';}}
 async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
 renderNav();if(TOK){$('#tok').value=TOK;go('chat');setInterval(()=>{if(['cockpit','fleet'].includes(CUR))go(CUR)},6000)}
 </script></body></html>"""

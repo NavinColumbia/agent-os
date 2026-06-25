@@ -106,6 +106,22 @@ _TRANSIENT = ("overloaded", "rate limit", "rate_limit", "429", "529", "503", "ti
 # disable. CODEX_MODEL is just the label recorded in the trace (Codex uses its own configured model).
 FALLBACK_ENGINE = os.environ.get("AOS_FALLBACK_ENGINE", "codex").lower()
 CODEX_MODEL = os.environ.get("AOS_CODEX_MODEL", "codex")
+# Per-factory BUDGET control (a tenant tunes these to their wallet). AOS_BUDGET_USD is a soft cap on total
+# spend for this process: once reached, agent() refuses to spawn new work and escalates instead of running
+# away. 0 = unlimited. (Agent COUNT is AOS_MAX_AGENTS; recursion depth is AOS_MAX_DEPTH.)
+BUDGET_USD = float(os.environ.get("AOS_BUDGET_USD", "0") or 0)
+_SPENT = [0.0]
+_SPENT_LOCK = threading.Lock()
+
+
+def spent_usd():
+    return _SPENT[0]
+
+
+def _add_spend(c):
+    if c:
+        with _SPENT_LOCK:
+            _SPENT[0] += float(c)
 
 
 def role_brief(role: str) -> str:
@@ -218,6 +234,9 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     low-stakes stages pass a cheaper model. A timeout no longer kills the stage (retry w/ backoff),
     transient errors back off longer, a bad BYO key fails fast, exhausted retries escalate."""
     model = model or BUILD_MODEL
+    if BUDGET_USD and spent_usd() >= BUDGET_USD:      # BUDGET cap: stop spawning new work, escalate
+        return {"rc": -1, "failed": True, "out": "budget exhausted",
+                "blocker": f"factory budget ${BUDGET_USD:.2f} exhausted (${spent_usd():.2f} spent) — raise AOS_BUDGET_USD or split the work"}
     # NB: no home-grown context handling — the agent CLI (claude/codex) manages its own context window
     # (agentic file search, on-demand reads, compaction) far better than a bolt-on retrieval layer would.
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
@@ -252,6 +271,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
             saw_transient = True                        # a hung/overloaded provider counts as transient
             continue
         dt = round(time.time() - t0, 1)
+        _add_spend(cost)                                # running total for the budget cap
         audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
                      decision="executed", payload={"rc": rc, "attempt": attempt + 1, "cost_usd": cost, "model": used})
         _trace("agent", role, prompt, out_text, rc, dt, cost, tin, tout, used)

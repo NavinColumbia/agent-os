@@ -330,6 +330,24 @@ def test_review_verdict_parsing(tmp_path):
     assert factory._review_verdict(str(tmp_path)) == "APPROVE"
 
 
+# ── budget control: a spend cap halts new agent spawning (per-factory tunable) ─
+def test_factory_budget_cap_halts_spawning(monkeypatch):
+    import factory
+    factory._ctx.api_key = None
+    monkeypatch.setattr(factory, "BUDGET_USD", 1.0)
+    monkeypatch.setattr(factory.time, "sleep", lambda *a, **k: None)
+    factory._SPENT[0] = 1.5                                   # already over budget
+    ran = {"v": False}
+    monkeypatch.setattr(factory, "_run_once",
+                        lambda *a, **k: (ran.__setitem__("v", True), (0, "x", 0.0, 0, 0, "m"))[1])
+    try:
+        r = factory.agent("builder", "/tmp", "do a thing", timeout=5, retries=0)
+        assert r.get("failed") and "budget" in (r.get("blocker") or "").lower()
+        assert not ran["v"], "must NOT spawn an agent once budget is exhausted"
+    finally:
+        factory._SPENT[0] = 0.0
+
+
 # ── resilience: a sustained Anthropic outage fails over to the Codex engine ───
 def test_factory_codex_failover_on_anthropic_outage(monkeypatch):
     """When Claude exhausts its retries on transient/overload errors (a provider outage), the SAME task

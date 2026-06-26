@@ -184,8 +184,14 @@ def say(tid, thread_id, msg, api_key=None):
         if _affirmative(msg) and (s["plan"]):
             _set(thread_id, awaiting=None); _to(thread_id, "PLAN_APPROVAL"); advance(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
-        sysp = ("Turn the chosen direction into a concrete plan. End with EXACTLY:\n[[PLAN]]\nname: <slug>\n"
-                "kind: lib|web|service|project\nplan: <bullets, one per line '- '>\ncharter: <2-4 sentences>\n[[/PLAN]]")
+        sysp = ("Turn the chosen direction into a concrete plan. Also cover THE CEO'S OWN SIDE: ask/decide what "
+                "the product looks like for (a) the CEO, (b) their staff/team to control & monitor, and (c) their "
+                "external users — these surfaces are BUILT INTO their product (we don't host them). Also ask if "
+                "they want any AGENTIC FEATURES embedded in their app — a button/endpoint that runs an agent, "
+                "e.g. a 'Migrate AWS→GCP' button, support-triage, in-app assistant, moderation, report-generator. "
+                "End with EXACTLY:\n[[PLAN]]\nname: <slug>\nkind: lib|web|service|project\n"
+                "plan: <bullets, one per line '- '>\nagentic: <comma-separated agentic-feature slugs the CEO wants, or none>\n"
+                "charter: <2-4 sentences incl. the team/external surfaces to build in>\n[[/PLAN]]")
         reply = _llm(tid, thread_id, sysp, s)
         pb = _parse_block(reply, "PLAN")
         clean = re.sub(r"\[\[PLAN\]\].*?\[\[/PLAN\]\]", "", reply, flags=re.S | re.I).strip()
@@ -307,9 +313,16 @@ def advance(thread_id, job_result=None):
         def _do_build():
             import frontdoor
             frontdoor._own(product, tid)
+            charter = plan.get("charter", "build it")
+            if plan.get("agentic"):                       # embed the chosen agentic features INTO the product
+                try:
+                    import agentfeatures
+                    charter += "\n\n" + agentfeatures.charter_for(plan["agentic"])
+                except Exception:
+                    pass
             if plan.get("kind") == "project":
                 import project
-                log = project.build_complex(product, plan.get("charter", "build it"))
+                log = project.build_complex(product, charter)
                 return {"product": product, "result": (log or {}).get("result")}
             import qualityloop
             return qualityloop.run(product, bar="high")
@@ -386,9 +399,11 @@ def _parse_plan(body):
         m = re.search(rf"{name}\s*:\s*(.+?)(?:\n[a-z]+\s*:|\Z)", body, re.S | re.I)
         return m.group(1).strip() if m else d
     kind = f("kind", "service").lower()
+    ag = f("agentic", "")
+    agentic = [s.strip() for s in re.split(r"[,\n]", ag) if s.strip() and s.strip().lower() not in ("none", "-")]
     return {"name": (f("name", "app").split()[0][:24] or "app"),
             "kind": kind if kind in ("lib", "web", "service", "project") else "service",
-            "plan": f("plan"), "charter": f("charter", "Build a small, well-tested product.")}
+            "plan": f("plan"), "agentic": agentic, "charter": f("charter", "Build a small, well-tested product.")}
 
 
 def _affirmative(msg):

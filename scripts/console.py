@@ -35,6 +35,7 @@ import estimate          # noqa: E402
 import forecast          # noqa: E402
 import frontdoor         # noqa: E402  (reuse its governed build flow + zip)
 import helpagent         # noqa: E402
+import agentfeatures     # noqa: E402
 import crossorg          # noqa: E402
 import crossorgview      # noqa: E402
 import designview        # noqa: E402
@@ -159,6 +160,7 @@ GETS = {
     "/api/portfolio/analytics": lambda tid, q: crossorgview.analytics(tid),
     "/api/portfolio/failures": lambda tid, q: crossorgview.failures(tid),
     "/api/design": lambda tid, q: {"gallery": designview.gallery(str(int(q.get("org", ["0"])[0] or 0))), "surfaces": designview.surfaces()},
+    "/api/agentfeatures": lambda tid, q: {"features": agentfeatures.catalog(), "categories": agentfeatures.categories()},
     "/api/controller/state": lambda tid, q: _controller_state(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/xorg": lambda tid, q: {"ops": crossorg.list_ops(tid)},
     "/api/team": lambda tid, q: _team(tid),
@@ -309,11 +311,11 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
 <script>
 const NAV=[
  ['Direct',[['controller','Controller','🧭'],['chat','Quick build','💬'],['agents','Agents','🤖'],['templates','Templates','▦']]],
- ['This org',[['cockpit','Cockpit','◧'],['projects','Projects','▤'],['design','Design','🎨'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
+ ['This org',[['cockpit','Cockpit','◧'],['projects','Projects','▤'],['design','Design','🎨'],['agentic','Agentic features','⚡'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
  ['All orgs',[['orgs','My orgs','🏢'],['portfolio','Portfolio','◎']]],
  ['Business',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
 ];
-const LABEL={controller:'Controller',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',approvals:'Approvals',activity:'Activity',orgs:'My orgs',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
+const LABEL={controller:'Controller',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My orgs',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
 let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];
 async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];if(!ORG&&ORGS.length)ORG=ORGS[0].org_id;const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=cur?cur.name:(ORGS.length?'pick an org':'no orgs');}catch(e){}}
@@ -387,6 +389,10 @@ const VIEWS={
   h+=kpis([['Orgs',t.orgs||0],['Products',t.products||0],['Live',t.live||0],['Building',t.building||0],['Failed',t.failed||0],['Spend $',t.spend_usd||0]]);
   h+='<div class=card><h2>Your orgs</h2><table><tr><th>org</th><th>stage</th><th>products</th><th>live</th><th>spend</th></tr>'+((p.orgs||[]).length?p.orgs.map(o=>`<tr><td>${esc(o.name)}</td><td>${esc(o.stage)}</td><td>${o.products}</td><td>${o.live||0}</td><td>$${o.spend_usd||0}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no orgs yet</td></tr>')+'</table></div>';
   const fails=(f.failures||f.items||[]);h+='<div class=card><h2>What needs attention (across orgs)</h2>'+(fails.length?fails.map(x=>`<div class=item>${pill('failed','bad')} ${esc(x.product||x.title||'')} <span class=muted>${esc(x.org||x.org_name||'')} ${esc(x.decision||'')}</span></div>`).join(''):'<div class=muted>nothing broken across your orgs ✓</div>')+'</div>';
+  $('#view').innerHTML=h;},
+ agentic:async()=>{const d=await get('/api/agentfeatures');
+  let h='<h1>Agentic features</h1><p class=sub>Embed your AI fleet INTO your product — a button or endpoint your users/staff trigger that runs an agent. We build these into your app (you host it); we don\'t run them for you. Tell your Controller which you want during design.</p>';
+  h+='<div class=grid>'+(d.features||[]).map(f=>`<div class=tile><div class="row spread"><b>${esc(f.name)}</b>${pill(f.audience,f.audience=='external'?'accent':'')}</div><div class=muted style=margin:6px_0>${esc(f.blurb)}</div><div class=muted>surface: ${esc(f.surface)} · ${esc(f.category)}</div></div>`).join('')+'</div>';
   $('#view').innerHTML=h;},
  design:async()=>{if(!ORG){$('#view').innerHTML='<div class=card>Pick an org first.</div>';return}const d=await get('/api/design?org='+ORG);
   let h='<h1>Design</h1><p class=sub>Prototype screens your fleet drafted — for your cockpit, your team, and your external users.</p>';

@@ -88,6 +88,7 @@ ck "data-driven recommendations" "$PY scripts/recommend.py selftest | grep -q PA
 ck "CLOSED-LOOP controller (discover->deliver)" "$PY scripts/loopcontroller.py selftest | grep -q PASS"
 ck "cross-org ops (merge/steal-feature)" "$PY scripts/crossorg.py selftest | grep -q PASS"
 ck "cross-org portfolio view" "$PY scripts/crossorgview.py selftest | grep -q PASS"
+ck "agentic features (embed agents in product)" "$PY scripts/agentfeatures.py selftest | grep -q PASS"
 ck "queue: stuck-task lease reclaim"    "$PY scripts/tasksweep.py selftest | grep -q PASS"
 ck "runtime kill-switch (halt/resume)"  "$PY scripts/killswitch.py selftest | grep -q PASS"
 ck "AI-consent gate (block/allow/revoke)" "$PY scripts/consent.py selftest | grep -q PASS"

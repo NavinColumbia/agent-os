@@ -115,6 +115,41 @@ def archive(tenant_id, org_id):
     return {"org_id": org_id, "status": "archived"}
 
 
+def record_artifact(org_id, kind, summary, product=None, path=None, ref=None):
+    """Record a context artifact (research_report|plan|design|product_repo|spec|qa_report) for an org —
+    the ONE place an org's full context is enumerable (enables context_brief + cross-org ops)."""
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS org_artifacts (
+            id BIGSERIAL PRIMARY KEY, org_id BIGINT NOT NULL, kind TEXT NOT NULL, product TEXT,
+            path TEXT, ref TEXT, summary TEXT, created_at TIMESTAMPTZ DEFAULT now())""")
+        cur.execute("""INSERT INTO org_artifacts (org_id, kind, product, path, ref, summary)
+                       VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""", (org_id, kind, product, path, ref, summary))
+        aid = cur.fetchone()[0]; c.commit()
+    return {"artifact_id": aid}
+
+
+def context_brief(tenant_id, org_id):
+    """Compact per-org context fed to the controller — this org's vision, stage, products, and the latest
+    research/plan/design artifacts. The per-org analogue of orchestrator's _state_brief."""
+    g = get(tenant_id, org_id)
+    if g.get("error"):
+        return g["error"]
+    arts = {}
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        try:
+            cur.execute("""SELECT DISTINCT ON (kind) kind, summary FROM org_artifacts
+                           WHERE org_id=%s ORDER BY kind, created_at DESC""", (org_id,))
+            arts = {k: (s or "")[:200] for k, s in cur.fetchall()}
+        except Exception:
+            pass
+        cur.execute("SELECT product FROM tenant_products WHERE org_id=%s", (org_id,))
+        prods = [r[0] for r in cur.fetchall()]
+    return (f"ORG: {g['name']} — vision: {g['vision'] or '(none yet)'} — stage: {g['stage']}. "
+            f"Products: {', '.join(prods) or 'none'}. "
+            f"Latest research: {arts.get('research_report','—')}. Latest plan: {arts.get('plan','—')}.")
+
+
 def _selftest():
     import billing
     tid = billing.signup("orgs-selftest", "free")["tenant_id"]

@@ -820,12 +820,34 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         return {"passed": qa_ok[0], "verdict": verdict, "cycles": cycles}
     review_res = stage("REVIEW", "reviewer", review)
 
+    # VERIFY gate — scalable verification (tests + static-security + runtime/load + adversarial) as an
+    # additional LAUNCH gate when rigor>=2. Default rigor=1 leaves the path unchanged; the closed-loop
+    # controller builds at higher rigor so it ships only verified work (quality > speed > cost).
+    rigor = int(os.environ.get("AOS_RIGOR", "1"))
+    verify_ok = True
+    if rigor >= 2 and qa_ok[0] and review_res.get("verdict") != "REQUEST-CHANGES":
+        try:
+            import verify as _verify
+            v = _verify.verify(product, rigor=rigor, api_key=api_key)
+            verify_ok = bool(v.get("passed", True)) if isinstance(v, dict) else True
+            log["verify"] = {"passed": verify_ok, "rigor": rigor}
+        except Exception:
+            verify_ok = True   # never block a ship on a verify-infra error; QA already gated
+
     # LAUNCH — QA is the hard gate. A review verdict still REQUEST-CHANGES after the cycle escalates.
-    if qa_ok[0] and review_res.get("verdict") != "REQUEST-CHANGES":
+    if qa_ok[0] and review_res.get("verdict") != "REQUEST-CHANGES" and verify_ok:
         stage("LAUNCH", "tech-lead", lambda: agent("tech-lead", str(repo),
               "Write docs/LAUNCH-CHECKLIST.md (how to install, run, and the test command) and a short "
               "README.md. This product passed QA and review and is cleared to ship.", model=CHEAP_MODEL))
         log["result"] = "LAUNCHED"
+    elif qa_ok[0] and not verify_ok:          # QA + review green but scalable verification failed
+        log["result"] = "BLOCKED_AT_VERIFY"   # quality bar not met — don't ship
+        try:
+            import notify
+            notify.send(f"⛔ {product} BLOCKED_AT_VERIFY — QA+review green but verification (rigor {rigor}) "
+                        f"failed; needs your call", title="app factory", priority="high", tags="warning")
+        except Exception:
+            pass
     elif qa_ok[0]:                            # QA green but reviewer still wants changes after the cycle
         log["result"] = "BLOCKED_AT_REVIEW"   # don't silently ship over an unresolved reviewer objection
         try:

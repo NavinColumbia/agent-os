@@ -35,11 +35,16 @@ import estimate          # noqa: E402
 import forecast          # noqa: E402
 import frontdoor         # noqa: E402  (reuse its governed build flow + zip)
 import helpagent         # noqa: E402
+import crossorg          # noqa: E402
+import crossorgview      # noqa: E402
+import designview        # noqa: E402
 import integrationsview  # noqa: E402
 import livestatus        # noqa: E402
+import loopcontroller    # noqa: E402
 import notifications     # noqa: E402
 import onboarding        # noqa: E402
 import orchestrator      # noqa: E402
+import orgs as orgsmod   # noqa: E402
 import orgview           # noqa: E402
 import projbudget        # noqa: E402
 import projectsview      # noqa: E402
@@ -73,6 +78,19 @@ def _fleet(tid):
             workers.append({**w, "product": p["product"]})
     return {"workers": workers, "count": len(workers),
             "products_active": sum(1 for p in c["products"] if p.get("workers"))}
+
+
+def _controller_state(tid, org_id):
+    """The per-org controller: its thread, phase/gate, and the conversation (for the closed-loop chat)."""
+    if not org_id:
+        orgs = orgsmod.list_orgs(tid)
+        if not orgs:
+            return {"error": "no org — create one first"}
+        org_id = orgs[0]["org_id"]
+    thread = loopcontroller.thread_for_org(tid, org_id)
+    st = loopcontroller.state(thread)
+    return {"org_id": org_id, "thread": thread, "phase": st.get("phase"), "awaiting": st.get("awaiting"),
+            "messages": orchestrator.history(tid, thread)}
 
 
 def _team(tid):
@@ -136,6 +154,13 @@ GETS = {
     "/api/versions": lambda tid, q: {"versions": versions.versions(tid, q.get("product", [""])[0])},
     "/api/help/topics": lambda tid, q: {"topics": helpagent.topics()},
     "/api/agents": lambda tid, q: {"agents": customagents.list_agents(tid), "roles": list(customagents.ALLOWED_ROLES)},
+    "/api/orgs": lambda tid, q: {"orgs": orgsmod.list_orgs(tid)},
+    "/api/portfolio": lambda tid, q: crossorgview.portfolio(tid),
+    "/api/portfolio/analytics": lambda tid, q: crossorgview.analytics(tid),
+    "/api/portfolio/failures": lambda tid, q: crossorgview.failures(tid),
+    "/api/design": lambda tid, q: {"gallery": designview.gallery(str(int(q.get("org", ["0"])[0] or 0))), "surfaces": designview.surfaces()},
+    "/api/controller/state": lambda tid, q: _controller_state(tid, int(q.get("org", ["0"])[0] or 0)),
+    "/api/xorg": lambda tid, q: {"ops": crossorg.list_ops(tid)},
     "/api/team": lambda tid, q: _team(tid),
     "/api/settings": lambda tid, q: settingsview.settings(tid),
     "/api/templates": lambda tid, q: {"templates": templatesview.gallery(), "categories": templatesview.categories()},
@@ -160,6 +185,11 @@ POSTS = {
     "/api/account/export": lambda tid, q, b: account.export(tid),
     "/api/account/delete": lambda tid, q, b: account.delete(tid, confirm=bool(b.get("confirm"))),
     "/api/help/ask": lambda tid, q, b: helpagent.ask(tid, b.get("question", "")),
+    "/api/orgs/new": lambda tid, q, b: orgsmod.create(tid, b.get("name", "New org"), b.get("vision", "")),
+    "/api/controller/say": lambda tid, q, b: loopcontroller.say(tid, loopcontroller.thread_for_org(tid, int(b.get("org") or 0)), b.get("message", "")),
+    "/api/controller/choose": lambda tid, q, b: loopcontroller.choose(tid, loopcontroller.thread_for_org(tid, int(b.get("org") or 0)), int(b.get("option_id") or 0)),
+    "/api/design/decide": lambda tid, q, b: designview.decide(str(int(b.get("org") or 0)), int(b.get("id") or 0), b.get("status", "approved")),
+    "/api/xorg/propose": lambda tid, q, b: crossorg.propose(tid, b.get("kind", "steal_feature"), int(b.get("source") or 0), int(b.get("target") or 0) or None, b.get("feature")),
     "/api/agents/create": lambda tid, q, b: customagents.define(tid, b.get("name", ""), b.get("instructions", ""), b.get("role", "research-growth"), b.get("trigger", "manual"), int(b.get("interval_s") or 0) or None, b.get("output", "report"), b.get("product")),
     "/api/agents/run": lambda tid, q, b: customagents.run_now(tid, int(b.get("id") or 0)),
     "/api/agents/toggle": lambda tid, q, b: customagents.toggle(tid, int(b.get("id") or 0), bool(b.get("enabled"))),
@@ -264,7 +294,9 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
   <a class=nav-foot id=statusfoot onclick="go('status')" style="display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;color:var(--tx2);cursor:pointer;font-size:13px;border-top:1px solid var(--line);margin-top:8px"><span class="dot ok" id=statusdot></span><span class=lbl>Status</span></a>
 </div>
 <div class=colmain>
-  <div class=topbar><span class=title id=tbtitle>Cockpit</span><span class=sp></span>
+  <div class=topbar><span class=title id=tbtitle>Cockpit</span>
+    <span class=chip id=orgchip onclick="go('orgs')" title="Switch org" style=cursor:pointer><span id=orgname>—</span> ▾</span>
+    <span class=sp></span>
     <span class=chip id=spendchip onclick="go('billing')"><span class="dot ok" id=spenddot></span><span id=spendtxt>—</span></span>
     <button class=tbtn onclick="go('notifications')" title=Notifications>◔<span class=nb id=bellbadge style=display:none></span></button>
     <button class=tbtn onclick="go('help')" title=Help>?</button>
@@ -276,12 +308,16 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
 </div>
 <script>
 const NAV=[
- ['Direct',[['chat','Chat','💬'],['build','New build','✦'],['agents','Agents','🤖'],['templates','Templates','▦']]],
- ['Operate',[['cockpit','Cockpit','◧'],['projects','Projects','▤'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
+ ['Direct',[['controller','Controller','🧭'],['chat','Quick build','💬'],['agents','Agents','🤖'],['templates','Templates','▦']]],
+ ['This org',[['cockpit','Cockpit','◧'],['projects','Projects','▤'],['design','Design','🎨'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
+ ['All orgs',[['orgs','My orgs','🏢'],['portfolio','Portfolio','◎']]],
  ['Business',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
 ];
-const LABEL={chat:'Chat',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',approvals:'Approvals',activity:'Activity',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
+const LABEL={controller:'Controller',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',approvals:'Approvals',activity:'Activity',orgs:'My orgs',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
+let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];
+async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];if(!ORG&&ORGS.length)ORG=ORGS[0].org_id;const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=cur?cur.name:(ORGS.length?'pick an org':'no orgs');}catch(e){}}
+function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);loadOrgs();go('controller');}
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none'}
 function saveTok(){TOK=($('#tok').value||'').trim();if(!TOK)return;localStorage.setItem('aos_tenant',TOK);showApp(true);boot()}
@@ -330,6 +366,32 @@ function stages(ss){return '<div class=stages>'+ss.map(s=>`<div class="st ${s.do
 
 let THREAD=null;
 const VIEWS={
+ controller:async()=>{
+  if(!ORG){await loadOrgs();if(!ORG){$('#view').innerHTML=emptyB('🏢','No org yet','Create your first organization — then your controller will help you build it.','<button class=pri onclick="go(\'orgs\')">Create an org</button>');return}}
+  let d;try{d=await get('/api/controller/state?org='+ORG)}catch(e){$('#view').innerHTML=errCard('controller',e.message);return}
+  if(d.error){$('#view').innerHTML='<div class=card>'+esc(d.error)+'</div>';return}
+  const phase=d.phase||'DISCOVER';const gate=d.awaiting?(' · waiting on '+esc(d.awaiting)):'';
+  $('#view').innerHTML=`<h1>Controller</h1><p class=sub>Tell your controller what to build. It researches, brings options, designs, and ships — asking you at each step. <b>${esc(phase)}</b>${gate}</p>
+   <div class=card id=clog style="max-height:54vh;overflow:auto"></div>
+   <div class=card><div class=row><input id=cmsg placeholder="e.g. build a competitor to YouTube" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
+  ctlRender(d.messages||[]);
+  if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}try{const s=await get('/api/controller/state?org='+ORG);ctlRender(s.messages||[])}catch(e){}},5000);
+ },
+ orgs:async()=>{const d=await get('/api/orgs');ORGS=d.orgs||[];
+  let h='<h1>My orgs</h1><p class=sub>Each org is its own company — its own controller, research, design, build and budget. You can run as many as you like.</p>';
+  h+='<div class=card><h2>Create an org</h2><div class=row><input id=onm placeholder="YouTube competitor"><input id=ovis placeholder="one-line vision (optional)"><button class=pri onclick=orgNew()>Create</button></div></div>';
+  h+='<div class=grid>'+(ORGS.length?ORGS.map(o=>`<div class=tile><div class="row spread"><b>${esc(o.name)}</b>${o.org_id==ORG?pill('active','ok'):''}</div><div class=muted style=margin:6px_0>${esc(o.vision||'—')} · ${esc(o.stage)} · ${o.products} product(s)</div><button class=pri onclick="switchOrg(${o.org_id})">Open</button></div>`).join(''):emptyB('🏢','No orgs yet','Create your first organization above.'))+'</div>';
+  $('#view').innerHTML=h;},
+ portfolio:async()=>{let p={},a={},f={};try{p=await get('/api/portfolio')}catch(e){}try{a=await get('/api/portfolio/analytics')}catch(e){}try{f=await get('/api/portfolio/failures')}catch(e){}
+  const t=p.totals||{};let h='<h1>Portfolio</h1><p class=sub>Everything across all your orgs.</p>';
+  h+=kpis([['Orgs',t.orgs||0],['Products',t.products||0],['Live',t.live||0],['Building',t.building||0],['Failed',t.failed||0],['Spend $',t.spend_usd||0]]);
+  h+='<div class=card><h2>Your orgs</h2><table><tr><th>org</th><th>stage</th><th>products</th><th>live</th><th>spend</th></tr>'+((p.orgs||[]).length?p.orgs.map(o=>`<tr><td>${esc(o.name)}</td><td>${esc(o.stage)}</td><td>${o.products}</td><td>${o.live||0}</td><td>$${o.spend_usd||0}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no orgs yet</td></tr>')+'</table></div>';
+  const fails=(f.failures||f.items||[]);h+='<div class=card><h2>What needs attention (across orgs)</h2>'+(fails.length?fails.map(x=>`<div class=item>${pill('failed','bad')} ${esc(x.product||x.title||'')} <span class=muted>${esc(x.org||x.org_name||'')} ${esc(x.decision||'')}</span></div>`).join(''):'<div class=muted>nothing broken across your orgs ✓</div>')+'</div>';
+  $('#view').innerHTML=h;},
+ design:async()=>{if(!ORG){$('#view').innerHTML='<div class=card>Pick an org first.</div>';return}const d=await get('/api/design?org='+ORG);
+  let h='<h1>Design</h1><p class=sub>Prototype screens your fleet drafted — for your cockpit, your team, and your external users.</p>';
+  const g=d.gallery||[];h+='<div class=grid>'+(g.length?g.map(s=>`<div class=tile><div class="row spread"><b>${esc(s.surface||'')}</b>${pill(s.status,s.status=='approved'?'ok':'')}</div><div class=muted style=margin:6px_0>${esc(s.title||'')}</div>${s.status!='approved'?`<button class=pri onclick="designOk(${s.id})">approve</button>`:''}</div>`).join(''):emptyB('🎨','No prototypes yet','When your controller reaches the design phase, screens appear here.'))+'</div>';
+  $('#view').innerHTML=h;},
  chat:async()=>{
   if(!THREAD){const r=await post('/api/chat/new',{});THREAD=r.thread}
   const CHIPS=['Track my gym members','An invoice generator','A URL shortener','A booking page for my salon','An internal tool for my team'];
@@ -423,6 +485,20 @@ async function chatRender(){
  if(!window.CHATPOLL)window.CHATPOLL=setInterval(chatRender,5000);   // live updates as the controller reports back
 }
 function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus()}}
+function ctlFill(t){const i=$('#cmsg');if(i){i.value=t;i.focus()}}
+function ctlRender(msgs){const log=$('#clog');if(!log)return;
+ log.innerHTML=(msgs||[]).map(m=>{const me=m.role==='user';const meta=m.meta||{};let extra='';
+  if(meta.kind==='options'&&meta.options)extra='<div class=chips style="margin:8px 0">'+meta.options.map(o=>`<span class=chip-s onclick="ctlChoose(${o.id})">${esc(o.title||('Option '+o.id))}${o.recommended?' ★':''}</span>`).join('')+'</div>';
+  else if(meta.kind==='plan'&&meta.plan)extra='<div class=tile style="margin:8px 0;text-align:left"><b>Plan: '+esc(meta.plan.name||'')+'</b> '+pill(meta.plan.kind||'')+'<div class=muted style=margin-top:4px>'+esc(meta.plan.charter||'')+'</div></div>';
+  else if(meta.kind==='next_steps'&&meta.suggestions)extra='<div class=chips style="margin:8px 0">'+meta.suggestions.map(s=>`<span class=chip-s onclick="ctlFill('${s.replace(/'/g,"")}')">${esc(s)}</span>`).join('')+'</div>';
+  return `<div class="msg ${me?'me':'ai'}" style="margin:8px 0"><div><span class=bubble>${md(m.content)}</span>${extra}</div></div>`;
+ }).join('')||'<div class=muted>Describe what you want to build — I\'ll ask a few questions, then research it and bring you options.</div>';
+ log.scrollTop=log.scrollHeight;
+}
+async function ctlSend(){const m=$('#cmsg').value.trim();if(!m)return;$('#cmsg').value='';$('#cnote').textContent='thinking…';await post('/api/controller/say',{org:ORG,message:m});$('#cnote').textContent='';go('controller');}
+async function ctlChoose(oid){await post('/api/controller/choose',{org:ORG,option_id:oid});go('controller');}
+async function orgNew(){const r=await post('/api/orgs/new',{name:($('#onm')||{}).value||'New org',vision:($('#ovis')||{}).value||''});if(r.org_id)switchOrg(r.org_id);}
+async function designOk(id){await post('/api/design/decide',{org:ORG,id,status:'approved'});go('design');}
 async function chatSend(){
  const m=$('#msg').value.trim();if(!m)return;$('#msg').value='';$('#chatnote').textContent='thinking…';
  await post('/api/chat/say',{thread:THREAD,message:m});$('#chatnote').textContent='';await chatRender();
@@ -451,8 +527,8 @@ async function saveKey(){await post('/api/byok',{key:$('#bk').value});go('settin
 async function acctExport(){$('#acctnote').textContent='preparing export…';const r=await post('/api/account/export',{});$('#acctnote').textContent=r.ok?('Export ready ('+r.products+' products) on the server: '+(r.path||'')):'export failed';}
 async function acctDelete(){const r=await post('/api/account/delete',{confirm:false});if(!confirm('Permanently delete your account and ALL data? This cannot be undone.'))return;const r2=await post('/api/account/delete',{confirm:true});if(r2.ok){localStorage.removeItem('aos_tenant');TOK='';$('#view').innerHTML='<div class=card>Your account and data were deleted. Goodbye.</div>';}}
 async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
-async function boot(){renderNav();refreshTopbar();let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
- go((ob&&!ob.completed&&ob.step!=='done')?'chat':'cockpit');
+async function boot(){renderNav();refreshTopbar();await loadOrgs();
+ go(ORG?'controller':'orgs');
  setInterval(refreshTopbar,15000);setInterval(()=>{if(['cockpit','activity'].includes(CUR))go(CUR)},6000)}
 document.addEventListener('click',e=>{if(!e.target.closest('#acctmenu')&&!String(e.target.getAttribute&&e.target.getAttribute('onclick')||'').includes('toggleAcct'))$('#acctmenu').style.display='none'});
 if(TOK){$('#tok').value=TOK;showApp(true);boot()}else{showApp(false)}

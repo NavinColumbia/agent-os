@@ -133,6 +133,18 @@ def start(tid, org_id):
     return {"thread_id": thread_id, "phase": "DISCOVER"}
 
 
+def thread_for_org(tid, org_id):
+    """The org's single controller thread — create it (start the loop) on first access."""
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("SELECT thread_id FROM controller_state WHERE tenant_id=%s AND org_id=%s ORDER BY thread_id LIMIT 1",
+                    (tid, org_id))
+        r = cur.fetchone()
+    if r:
+        return r[0]
+    return start(tid, org_id)["thread_id"]
+
+
 def _ctx_brief(s):
     try:
         import orgs
@@ -284,7 +296,7 @@ def advance(thread_id, job_result=None):
         _set(thread_id, product=product)
         def _do_proto():
             import design_fleet
-            return design_fleet.prototype(s["org_id"], product, plan)
+            return design_fleet.prototype(str(s["org_id"]), product, plan)
         _dispatch(thread_id, "design", _do_proto)
         return
 

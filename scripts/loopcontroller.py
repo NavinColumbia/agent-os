@@ -184,14 +184,19 @@ def say(tid, thread_id, msg, api_key=None):
         if _affirmative(msg) and (s["plan"]):
             _set(thread_id, awaiting=None); _to(thread_id, "PLAN_APPROVAL"); advance(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
-        sysp = ("Turn the chosen direction into a concrete plan. Also cover THE CEO'S OWN SIDE: ask/decide what "
-                "the product looks like for (a) the CEO, (b) their staff/team to control & monitor, and (c) their "
-                "external users — these surfaces are BUILT INTO their product (we don't host them). Also ask if "
-                "they want any AGENTIC FEATURES embedded in their app — a button/endpoint that runs an agent, "
-                "e.g. a 'Migrate AWS→GCP' button, support-triage, in-app assistant, moderation, report-generator. "
+        sysp = ("Turn the chosen direction into a concrete plan. Also cover THE CEO'S OWN SIDE: what the product "
+                "looks like for (a) the CEO, (b) their staff/team to control & monitor, and (c) their external "
+                "users — these surfaces are BUILT INTO their product (we don't host them).\n"
+                "If the CEO wants AI AGENTS to handle part of their product ('let agents take care of X'), don't "
+                "just pick a preset — ASK ONE follow-up about HOW the agent should be invoked, OR RECOMMEND an "
+                "architecture: a button (on-demand/sync), an event→agent pipeline handled ASYNC (form-submit / "
+                "inbound email / webhook — like Kafka but agent workers), or a schedule. Then describe that "
+                "custom agentic feature + its invocation in the agentic line (free text). If they don't want any, "
+                "put 'none'.\n"
                 "End with EXACTLY:\n[[PLAN]]\nname: <slug>\nkind: lib|web|service|project\n"
-                "plan: <bullets, one per line '- '>\nagentic: <comma-separated agentic-feature slugs the CEO wants, or none>\n"
-                "charter: <2-4 sentences incl. the team/external surfaces to build in>\n[[/PLAN]]")
+                "plan: <bullets, one per line '- '>\n"
+                "agentic: <free-text: the agentic feature(s) the CEO wants + how each is invoked (button/event-async/"
+                "schedule), or 'none'>\ncharter: <2-4 sentences incl. the team/external surfaces to build in>\n[[/PLAN]]")
         reply = _llm(tid, thread_id, sysp, s)
         pb = _parse_block(reply, "PLAN")
         clean = re.sub(r"\[\[PLAN\]\].*?\[\[/PLAN\]\]", "", reply, flags=re.S | re.I).strip()
@@ -314,12 +319,13 @@ def advance(thread_id, job_result=None):
             import frontdoor
             frontdoor._own(product, tid)
             charter = plan.get("charter", "build it")
-            if plan.get("agentic"):                       # embed the chosen agentic features INTO the product
-                try:
-                    import agentfeatures
-                    charter += "\n\n" + agentfeatures.charter_for(plan["agentic"])
-                except Exception:
-                    pass
+            try:                                          # embed the agentic feature(s) the CEO described
+                import agentfeatures
+                frag = agentfeatures.charter_for(plan.get("agentic", ""))
+                if frag:
+                    charter += "\n\n" + frag
+            except Exception:
+                pass
             if plan.get("kind") == "project":
                 import project
                 log = project.build_complex(product, charter)
@@ -399,11 +405,10 @@ def _parse_plan(body):
         m = re.search(rf"{name}\s*:\s*(.+?)(?:\n[a-z]+\s*:|\Z)", body, re.S | re.I)
         return m.group(1).strip() if m else d
     kind = f("kind", "service").lower()
-    ag = f("agentic", "")
-    agentic = [s.strip() for s in re.split(r"[,\n]", ag) if s.strip() and s.strip().lower() not in ("none", "-")]
     return {"name": (f("name", "app").split()[0][:24] or "app"),
             "kind": kind if kind in ("lib", "web", "service", "project") else "service",
-            "plan": f("plan"), "agentic": agentic, "charter": f("charter", "Build a small, well-tested product.")}
+            "plan": f("plan"), "agentic": f("agentic", "").strip(),   # free-text: feature(s) + invocation
+            "charter": f("charter", "Build a small, well-tested product.")}
 
 
 def _affirmative(msg):

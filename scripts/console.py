@@ -160,7 +160,8 @@ GETS = {
     "/api/portfolio/analytics": lambda tid, q: crossorgview.analytics(tid),
     "/api/portfolio/failures": lambda tid, q: crossorgview.failures(tid),
     "/api/design": lambda tid, q: {"gallery": designview.gallery(str(int(q.get("org", ["0"])[0] or 0))), "surfaces": designview.surfaces()},
-    "/api/agentfeatures": lambda tid, q: {"features": agentfeatures.catalog(), "categories": agentfeatures.categories()},
+    "/api/agentfeatures": lambda tid, q: {"features": agentfeatures.catalog(), "categories": agentfeatures.categories(), "triggers": agentfeatures.triggers()},
+    "/api/agentfeatures/recommend": lambda tid, q: agentfeatures.recommend(q.get("need", [""])[0]),
     "/api/controller/state": lambda tid, q: _controller_state(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/xorg": lambda tid, q: {"ops": crossorg.list_ops(tid)},
     "/api/team": lambda tid, q: _team(tid),
@@ -392,7 +393,7 @@ const VIEWS={
   $('#view').innerHTML=h;},
  agentic:async()=>{const d=await get('/api/agentfeatures');
   let h='<h1>Agentic features</h1><p class=sub>Embed your AI fleet INTO your product — a button or endpoint your users/staff trigger that runs an agent. We build these into your app (you host it); we don\'t run them for you. Tell your Controller which you want during design.</p>';
-  h+='<div class=grid>'+(d.features||[]).map(f=>`<div class=tile><div class="row spread"><b>${esc(f.name)}</b>${pill(f.audience,f.audience=='external'?'accent':'')}</div><div class=muted style=margin:6px_0>${esc(f.blurb)}</div><div class=muted>surface: ${esc(f.surface)} · ${esc(f.category)}</div></div>`).join('')+'</div>';
+  h+='<div class=grid>'+(d.features||[]).map(f=>`<div class=tile><div class="row spread"><b>${esc(f.name)}</b>${pill(f.audience,f.audience=='external'?'accent':'')}</div><div class=muted style=margin:6px_0>${esc(f.blurb)}</div><div class=muted>${pill('trigger: '+(f.trigger||f.surface),f.trigger=='event'?'warn':'')} ${esc(f.surface)} · ${esc(f.category)}</div></div>`).join('')+'</div>';
   $('#view').innerHTML=h;},
  design:async()=>{if(!ORG){$('#view').innerHTML='<div class=card>Pick an org first.</div>';return}const d=await get('/api/design?org='+ORG);
   let h='<h1>Design</h1><p class=sub>Prototype screens your fleet drafted — for your cockpit, your team, and your external users.</p>';

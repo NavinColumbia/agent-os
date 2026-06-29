@@ -32,13 +32,49 @@ import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
-import directory  # noqa: E402
+import directory   # noqa: E402
+import governance  # noqa: E402  (the read side of the governance manifest: may()/enforce())
 
 ENV = Path.home() / "projects" / "agent-os" / ".env.local"
 DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
            if l.strip().startswith("DATABASE_URL=")), None)
 ROLES_DIR = Path.home() / "projects" / "control-plane" / "roles"
 OVERLOAD = 3   # an agent with this many pending tasks is considered overloaded
+
+# A gated-action phrase (detected in a collaborator request title) -> the capability the REQUESTER
+# must ITSELF hold to be allowed to delegate it. You cannot route around a capability you lack by
+# asking a collaborator to perform it for you — the anti-circumvention rule governance.py exists for.
+# These are the governance capabilities that have no direct in-tree action site yet, so this is where
+# their flag is genuinely READ on the live request-routing path (not merely defined in the manifest).
+_DELEGATION_CAPS = {
+    "deploy": "deploy",
+    "merge to main": "merge_main",
+    "merge main": "merge_main",
+    "publish public": "post_publicly",
+    "post public": "post_publicly",
+    "post publicly": "post_publicly",
+    "modify registry": "modify_registry",
+    "registry change": "modify_registry",
+    "open bounded meeting": "open_bounded_meeting",
+    "bounded meeting": "open_bounded_meeting",
+}
+
+
+def _role_of(agent_id):
+    """The role portion of an agent_id ('builder@app-7f3' -> 'builder'); the manifest lookup key."""
+    return str(agent_id).split("@", 1)[0]
+
+
+def _delegation_block(role, title):
+    """If a request asks a collaborator to perform a GATED action the requester itself may not perform,
+    return that capability (so the caller refuses to route it). Genuinely consults governance.may() for
+    every no-direct-action-site capability (deploy/merge_main/post_publicly/modify_registry/
+    open_bounded_meeting) on the live collaborator path."""
+    t = (title or "").lower()
+    for phrase, cap in _DELEGATION_CAPS.items():
+        if phrase in t and not governance.may(role, cap):
+            return cap
+    return None
 
 
 def _ensure():
@@ -131,6 +167,12 @@ def request_collaborator(requester, need_role, title, priority=5):
     """The core decision: reuse an existing agent, ask the controller to spawn one, or flag an
     uncovered role. Returns a dict describing what happened."""
     _ensure()
+    role = _role_of(requester)
+    # anti-circumvention: never route a gated action the requester itself may not perform.
+    blocked = _delegation_block(role, title)
+    if blocked:
+        return {"action": "delegation_denied", "capability": blocked,
+                "note": f"role '{role}' may not '{blocked}' (manifest), so it cannot delegate it"}
     active = directory.find(role=need_role)          # active instances of the needed role
     if active:
         # reuse: pick the least-loaded instance; spawn-more only if all are overloaded
@@ -140,9 +182,16 @@ def request_collaborator(requester, need_role, title, priority=5):
             tid = enqueue(chosen["agent_id"], title, priority, requester, need_role)
             directory.contact(requester, chosen["agent_id"], "task", title)   # direct brokered message
             return {"action": "routed_to_existing", "assignee": chosen["agent_id"], "task_id": tid}
+        # scaling out is a HIRE — gate it on can_request_hire (real action site for request_hire).
+        if not governance.may(role, "request_hire"):
+            return {"action": "hire_denied", "capability": "request_hire",
+                    "note": f"role '{role}' may not request_hire (manifest)"}
         hid = file_hire(requester, need_role, f"all {need_role} instances overloaded")
         return {"action": "hire_requested_overloaded", "hire_id": hid}
     if need_role in known_roles():
+        if not governance.may(role, "request_hire"):
+            return {"action": "hire_denied", "capability": "request_hire",
+                    "note": f"role '{role}' may not request_hire (manifest)"}
         hid = file_hire(requester, need_role, f"no active {need_role} — needs spawn")
         return {"action": "hire_requested_spawn", "hire_id": hid}
     near = nearest_role(need_role)
@@ -154,6 +203,7 @@ def request_collaborator(requester, need_role, title, priority=5):
 def fulfill(hire_id, agent_id):
     """Controller-only: spawn (register a fresh instance in the directory) + route its queued task."""
     _ensure()
+    governance.enforce("controller", "spawn")   # only the controller may spawn (manifest invariant)
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("SELECT requester, need_role, reason FROM hire_requests WHERE id=%s AND status='open'", (hire_id,))
         row = cur.fetchone()

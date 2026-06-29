@@ -28,6 +28,7 @@ import psycopg
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
+import governance  # noqa: E402  — central spawn/write/action enforcement (reads the role manifests)
 import killswitch  # noqa: E402
 
 _ENV = Path.home() / "projects" / "agent-os" / ".env.local"
@@ -198,6 +199,74 @@ def _estimate_runtime(role, task, env):
     return mins, rets
 
 
+CONTROL_PLANE = Path.home() / "projects" / "control-plane"
+
+
+def _changed_paths(repo):
+    """The files a just-run agent created/modified in `repo`, as absolute paths — the input to the
+    governance write backstop. Uses `git status --porcelain` (modified + untracked). Returns [] when the
+    repo isn't a git checkout (nothing reliable to diff against) so the backstop simply no-ops there."""
+    try:
+        p = subprocess.run(["git", "-C", repo, "status", "--porcelain", "--untracked-files=all"],
+                           capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            return []
+        out = []
+        for line in (p.stdout or "").splitlines():
+            if not line.strip():
+                continue
+            path = line[3:]
+            if " -> " in path:                     # rename/copy: the destination is the written path
+                path = path.split(" -> ", 1)[1]
+            out.append(str(Path(repo) / path.strip().strip('"')))
+        return out
+    except Exception:
+        return []
+
+
+def _govern_writes(role, repo):
+    """Post-run WRITE backstop (secondary to the PreToolUse hook; PRIMARY for the Codex engine, which
+    does not honor claude hooks). governance.validate_writes flags every changed path that is either a
+    denied_path (.env/secrets/registry/.github/...) or outside the role's allowed_paths — and audits all
+    of them. We HARD-REVERT the denied_path writes (genuinely forbidden, never legitimate), but only
+    audit-WARN the outside_allowed_paths ones: a role's allowed_paths can be legitimately narrower than
+    its real output (a web/extension builder writes index.html / manifest.json at the repo root), so we
+    must NOT destroy core build output over a too-narrow allowlist."""
+    changed = _changed_paths(repo)
+    if not changed:
+        return
+    try:
+        violations = governance.validate_writes(role, repo, changed)
+    except Exception:
+        return
+    reverted = []
+    for v in violations:
+        if v.get("reason") != "denied_path":       # outside_allowed_paths -> audit-warn only (already audited)
+            continue
+        rel = v["path"]
+        target = Path(repo) / rel
+        try:
+            tracked = subprocess.run(["git", "-C", repo, "ls-files", "--error-unmatch", rel],
+                                     capture_output=True, text=True, timeout=15).returncode == 0
+            if tracked:                            # forbidden EDIT to a tracked file -> restore committed
+                subprocess.run(["git", "-C", repo, "checkout", "HEAD", "--", rel],
+                               capture_output=True, text=True, timeout=15)
+            elif target.exists():                  # forbidden NEW file -> remove it
+                target.unlink()
+            reverted.append(rel)
+        except Exception:
+            pass
+    if reverted:
+        audit.append(actor=f"factory:{role}", action="GovernanceWriteReverted", resource=Path(repo).name,
+                     decision="reverted", payload={"paths": reverted[:10], "count": len(reverted)})
+        try:
+            import notify
+            notify.send(f"⛔ reverted {len(reverted)} forbidden write(s) by '{role}' in {Path(repo).name}: "
+                        + ", ".join(reverted[:5]), title="governance", priority="high", tags="shield")
+        except Exception:
+            pass
+
+
 def _run_once(role, repo, prompt, timeout, env, model, tools=None):
     cmd = ["claude", "-p", prompt, "--permission-mode", "acceptEdits", "--output-format", "json",
            "--model", model, "--fallback-model", FALLBACK_MODEL]   # pin + auto-fallback on overload
@@ -207,7 +276,20 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
     grant = tools if tools is not None else AGENT_TOOLS
     if grant:
         cmd += ["--allowedTools", *grant]
-    p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
+    # GOVERNANCE (spawn restrictions — deny beats allow). Disallow the tools the role's manifest forbids
+    # (denied_tools + capability-gated tools: posting/deploy tools, Edit/Write when read-only, Task when
+    # it may not spawn), and deny READS of secret/denied paths as Read(<glob>) permission rules.
+    restr = governance.spawn_restrictions(role)
+    disallow = list(restr["disallowed_tools"]) + [f"Read({g})" for g in restr["deny_read"]]
+    if disallow:
+        cmd += ["--disallowedTools", *disallow]
+    # The deterministic PreToolUse block (enforce_manifest.py) keys on THIS role's manifest — point it
+    # there so a repo that wires the hook enforces the same deny_read/denied_paths at the source.
+    mpath = ROLES / f"{role}.yaml"
+    genv = ({**(env or os.environ), "CP_MANIFEST": str(mpath), "CP": str(CONTROL_PLANE)}
+            if mpath.exists() else env)
+    p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=genv)
+    _govern_writes(role, repo)                      # post-run write backstop: revert/audit out-of-scope writes
     out_text, cost, tin, tout, used = (p.stdout or ""), 0.0, 0, 0, model
     try:
         j = json.loads(p.stdout)
@@ -235,6 +317,7 @@ def _run_once_codex(role, repo, prompt, timeout, env):
            "-o", str(out_file), prompt]
     try:
         p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
+        _govern_writes(role, repo)                  # Codex ignores claude hooks -> this backstop is PRIMARY here
         tin = tout = 0
         for line in (p.stdout or "").splitlines():
             try:
@@ -282,6 +365,10 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     low-stakes stages pass a cheaper model. A timeout no longer kills the stage (retry w/ backoff),
     transient errors back off longer, a bad BYO key fails fast, exhausted retries escalate."""
     model = model or BUILD_MODEL
+    # GOVERNANCE (can_spawn gate): the factory spawns this sub-agent ON BEHALF of the orchestrating role
+    # (the controller drives the line). Only a role whose manifest grants can_spawn may cause a sub-agent
+    # to be spawned — enforce raises PermissionError + audits 'GovernanceDenied' otherwise.
+    governance.enforce(getattr(_ctx, "spawner", None) or "controller", "spawn")
     if BUDGET_USD and spent_usd() >= BUDGET_USD:      # BUDGET cap: stop spawning new work, escalate
         return {"rc": -1, "failed": True, "out": "budget exhausted",
                 "blocker": f"factory budget ${BUDGET_USD:.2f} exhausted (${spent_usd():.2f} spent) — raise AOS_BUDGET_USD or split the work"}

@@ -30,6 +30,7 @@ import cockpit     # noqa: E402
 import consent     # noqa: E402
 import factory     # noqa: E402
 import frontdoor   # noqa: E402
+import governance  # noqa: E402  (read side of the role manifest: enforce()/may())
 
 ENV = Path.home() / "projects" / "agent-os" / ".env.local"
 DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
@@ -209,6 +210,9 @@ def confirm(tid, thread_id, api_key=None):
     q = billing.quota(tid)
     if not q["within_quota"]:
         return {"error": f"quota reached ({q['builds']}) — upgrade your plan"}
+    # Launching a build makes the controller spawn worker agents — enforce the spawn capability on
+    # the live build-launch path (only the controller may spawn; manifest invariant, read here).
+    governance.enforce("controller", "spawn")
     product = f"{tid.replace('t-', '')[:6]}-{p['name'].lower()}"
     threading.Thread(target=_run_and_report, args=(tid, thread_id, product, p["charter"], p["kind"]), daemon=True).start()
     audit.append(actor="orchestrator", action="BuildFromChat", resource=product, decision="started",

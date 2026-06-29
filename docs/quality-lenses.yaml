@@ -1,0 +1,95 @@
+# Quality-lens registry — the machine-enforced version of the audit's core rule.
+#
+# THE META-RULE: a quality lens is only "in the pipeline" (status: enforced) when it has all THREE legs:
+#   1. STANDARD  — a written doc that says what "good" means (docs/STANDARDS-*.md), OR an executable
+#                  spec (a scanner/test) when a prose doc adds nothing.
+#   2. ROLE      — a gating role whose responsibilities/must_never name the lens, so an agent is
+#                  accountable for it (control-plane/roles/<file>.yaml).
+#   3. GUARD     — an automated check WIRED INTO selftest.sh (by its exact ck/ckp label) that FAILS
+#                  CLOSED, so the lens can't be skimmed.
+#
+# scripts/test_quality_lenses_wired.py asserts every `enforced` lens still has all three legs. This is the
+# structural fix for our recurring failure ("the fleet missed a whole CLASS because nothing enforced it"):
+#   - a lens can't silently decay from enforced -> aspirational (remove its guard -> selftest goes red),
+#   - promoting a `building`/`backlog` lens to `enforced` REQUIRES wiring all three legs (no hand-waving),
+#   - `backlog` lenses are tracked in the open, so missing coverage is visible instead of discovered by a
+#     user hitting the bug.
+#
+# status: enforced | building | backlog
+#   enforced = all three legs present and asserted (the guard fails if any leg goes missing).
+#   building = standard/role landing now; guard not yet wired (reported, not failed).
+#   backlog  = recognized as needed; not yet in the pipeline (the honest "we don't cover this YET" list).
+
+lenses:
+  - id: functional-correctness
+    status: enforced
+    standard: null                       # per-module selftests + pytest are the executable spec
+    role: { file: qa-security, keyword: test }
+    guard: "unit test suite (pytest)"
+
+  - id: user-journey
+    status: enforced
+    standard: docs/STANDARDS-qa.md
+    role: { file: qa-security, keyword: journey }
+    guard: "console click-through (real browser)"
+
+  - id: timing-idle-disruption
+    status: enforced
+    standard: docs/STANDARDS-qa.md
+    role: { file: qa-security, keyword: dwell }
+    guard: "console click-through (real browser)"   # idle-dwell + timer-leak assertions live in console_e2e
+
+  - id: impact-analysis-planning
+    status: enforced
+    standard: docs/STANDARDS-planning.md
+    role: { file: software-architect, keyword: impact }
+    guard: "callsite signature wiring"
+
+  - id: governance-enforcement
+    status: enforced
+    standard: null
+    role: { file: qa-security, keyword: security }
+    guard: "enforcement-layer consistency (gov==hook)"
+
+  - id: governance-wiring
+    status: enforced
+    standard: null
+    role: { file: qa-security, keyword: security }
+    guard: "governance controls wired"              # test_governance_wired.py — newly wired by this fix
+
+  - id: security
+    status: enforced
+    standard: null                                  # security_scan.py is the executable spec
+    role: { file: qa-security, keyword: security }
+    guard: "security scan (invariants)"
+
+  # --- being promoted now (the product-craft class the user hit) ---
+  - id: product-craft-ux
+    status: building
+    standard: docs/STANDARDS-product-quality.md
+    role: { file: reviewer, keyword: craft }
+    guard: null                                     # forms/a11y assertions being wired into console_e2e
+
+  - id: accessibility
+    status: building
+    standard: docs/STANDARDS-product-quality.md
+    role: { file: reviewer, keyword: accessib }
+    guard: null                                     # target: @axe-core/playwright in console_e2e (fails closed)
+
+  # --- backlog: recognized, not yet in the pipeline (honest coverage gaps) ---
+  - id: responsive-mobile
+    status: backlog
+  - id: empty-loading-error-states
+    status: backlog
+  - id: content-microcopy
+    status: backlog
+  - id: performance-load
+    status: backlog
+  - id: data-integrity-migrations
+    status: backlog
+  - id: i18n-readiness
+    status: backlog
+  - id: observability-telemetry
+    status: backlog
+  - id: docs-onboarding
+    status: backlog

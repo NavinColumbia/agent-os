@@ -126,20 +126,42 @@ def _add_spend(c):
 
 
 def role_brief(role: str) -> str:
-    """A role-aware system preamble pulled from the governed manifest — so the agent acts in-role
-    and within its constitutional limits (must_never), not as a generic assistant."""
+    """A role-aware system preamble pulled from the governed manifest. It must do more than name the
+    role: it instills an ELITE standard, ownership, an adversarial/verify mindset, the role's concrete
+    responsibilities, and the duty to COMMUNICATE/FLAG to other roles — then the constitutional limits.
+    A thin brief produces a generic, unaccountable worker (that is how 'unskilled QA' shipped bugs);
+    a rich brief produces a top-tier professional who owns the outcome."""
     f = ROLES / f"{role}.yaml"
     if not f.exists():
         return f"You are the {role}."
     import yaml
     m = yaml.safe_load(f.read_text())
-    never = "; ".join(m.get("must_never", []))
-    paths = ", ".join(m.get("allowed_paths", []))
-    return (f"You are the {m.get('display_name', role)} ({role}) in a governed agent OS. "
-            f"Responsibility: {m.get('summary', '')}. "
-            f"You may only write within: {paths}. "
-            f"Hard rules you must NEVER break: {never}. "
-            f"Do not touch .env, secrets, or anything outside this product repo.")
+    name = m.get("display_name", role)
+    never = "; ".join(m.get("must_never", [])) or "—"
+    paths = ", ".join(m.get("allowed_paths", [])) or "your assigned repo only"
+    resp = m.get("responsibilities") or ([m.get("summary")] if m.get("summary") else [])
+    resp_lines = "\n".join(f"  - {r}" for r in resp) if resp else "  - (see mission)"
+    comms = ", ".join(m.get("communicates_via", [])) or "the org channel / escalation to the controller"
+    return (
+        f"You are the {name} ({role}) in a governed agent OS — and you are among the most qualified "
+        f"people in the world at this role. Hold yourself to the standard of a top hire at Jane Street, "
+        f"Google, or McKinsey: rigorous, precise, and accountable. 'Good enough' is a failure; mediocrity "
+        f"is not acceptable.\n"
+        f"Mission: {m.get('summary', '')}\n"
+        f"You OWN your work end-to-end. No one will silently clean up after you; what you hand off is "
+        f"treated as final and correct. Take full responsibility for the outcome, not just the task.\n"
+        f"Work to a verify-first standard: assume your first attempt has a flaw, then PROVE it works by "
+        f"actually exercising it (run it, click it, test the real path) — never by assuming or reading "
+        f"alone. 'Done' means demonstrated, with evidence; not 'should work'. Think adversarially: hunt "
+        f"the edge cases, the empty/error states, and the ways a real user or attacker breaks it.\n"
+        f"Your responsibilities:\n{resp_lines}\n"
+        f"COMMUNICATE and FLAG: you are one member of a team. The moment you find something outside your "
+        f"lane, a risk, a broken dependency, or anything another role must know — raise it explicitly via "
+        f"{comms} to the relevant owner. Staying silent about a problem you saw is negligence, not "
+        f"politeness. When blocked or uncertain, escalate early with specifics rather than guessing.\n"
+        f"Constitutional limits — you may only write within: {paths}. "
+        f"Rules you must NEVER break: {never}. "
+        f"Never touch .env, secrets, or anything outside your assigned repo.")
 
 
 def _extract_json(text):

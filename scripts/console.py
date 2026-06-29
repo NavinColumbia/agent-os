@@ -70,6 +70,23 @@ def _tenant(token):
         return None
 
 
+def _owns(tid, org_id):
+    """Authoritative ownership check for org-scoped routes (IDOR guard). A falsy org id is allowed
+    (server picks the tenant's own default); a truthy id must belong to this tenant."""
+    if not org_id:
+        return True
+    try:
+        r = orgsmod.get(tid, int(org_id))
+        return isinstance(r, dict) and not r.get("error")
+    except Exception:
+        return False
+
+
+# Routes that carry a client-supplied org id — gated through _owns() before they ever touch a module.
+ORG_SCOPED_GET = {"/api/controller/state", "/api/design"}
+ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/design/decide"}
+
+
 def _fleet(tid):
     """Area 5 — every live worker across the tenant's products, flattened from the cockpit payload."""
     c = cockpit.cockpit(tid)
@@ -159,7 +176,7 @@ GETS = {
     "/api/portfolio": lambda tid, q: crossorgview.portfolio(tid),
     "/api/portfolio/analytics": lambda tid, q: crossorgview.analytics(tid),
     "/api/portfolio/failures": lambda tid, q: crossorgview.failures(tid),
-    "/api/design": lambda tid, q: {"gallery": designview.gallery(str(int(q.get("org", ["0"])[0] or 0))), "surfaces": designview.surfaces()},
+    "/api/design": lambda tid, q: {"gallery": designview.gallery(tid, str(int(q.get("org", ["0"])[0] or 0))), "surfaces": designview.surfaces()},
     "/api/agentfeatures": lambda tid, q: {"features": agentfeatures.catalog(), "categories": agentfeatures.categories(), "triggers": agentfeatures.triggers()},
     "/api/agentfeatures/recommend": lambda tid, q: agentfeatures.recommend(q.get("need", [""])[0]),
     "/api/controller/state": lambda tid, q: _controller_state(tid, int(q.get("org", ["0"])[0] or 0)),
@@ -191,7 +208,7 @@ POSTS = {
     "/api/orgs/new": lambda tid, q, b: orgsmod.create(tid, b.get("name", "New org"), b.get("vision", "")),
     "/api/controller/say": lambda tid, q, b: loopcontroller.say(tid, loopcontroller.thread_for_org(tid, int(b.get("org") or 0)), b.get("message", "")),
     "/api/controller/choose": lambda tid, q, b: loopcontroller.choose(tid, loopcontroller.thread_for_org(tid, int(b.get("org") or 0)), int(b.get("option_id") or 0)),
-    "/api/design/decide": lambda tid, q, b: designview.decide(str(int(b.get("org") or 0)), int(b.get("id") or 0), b.get("status", "approved")),
+    "/api/design/decide": lambda tid, q, b: designview.decide(tid, str(int(b.get("org") or 0)), int(b.get("id") or 0), b.get("status", "approved")),
     "/api/xorg/propose": lambda tid, q, b: crossorg.propose(tid, b.get("kind", "steal_feature"), int(b.get("source") or 0), int(b.get("target") or 0) or None, b.get("feature")),
     "/api/agents/create": lambda tid, q, b: customagents.define(tid, b.get("name", ""), b.get("instructions", ""), b.get("role", "research-growth"), b.get("trigger", "manual"), int(b.get("interval_s") or 0) or None, b.get("output", "report"), b.get("product")),
     "/api/agents/run": lambda tid, q, b: customagents.run_now(tid, int(b.get("id") or 0)),
@@ -261,7 +278,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 textarea{min-height:96px;resize:vertical}label{display:block;font-size:12px;font-weight:550;color:var(--tx2);margin:14px 0 5px}
 table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);padding:0 10px 10px;border-bottom:1px solid var(--line2)}
 td{padding:11px 10px;color:var(--tx2);border-bottom:1px solid var(--line)}td:first-child{color:var(--tx);font-weight:500}tbody tr{transition:background .12s}tbody tr:hover{background:var(--hover)}tbody tr:last-child td{border-bottom:none}
-.muted{color:var(--mut)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:820px){.grid{grid-template-columns:1fr}.side{width:64px}.side .lbl,.side .nsec{display:none}}
+.muted{color:var(--mut)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:820px){html,body,.app{max-width:100%;overflow-x:hidden}.grid{grid-template-columns:1fr}.side{width:64px}.side .lbl,.side .nsec{display:none}.side .brand{font-size:0;justify-content:center;padding:4px 0 14px}.side .brand .mk{font-size:18px}.topbar{padding:0 12px;gap:8px;flex-wrap:wrap;height:auto;min-height:56px}.topbar .chip{padding:5px 9px;max-width:42vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.main{padding:18px 14px}}
 .tile{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:14px}
 .chat{display:flex;flex-direction:column;gap:14px}.msg{display:flex;max-width:80%}.msg.me{align-self:flex-end;justify-content:flex-end}
 .chat{display:flex;flex-direction:column;gap:12px}
@@ -324,15 +341,19 @@ const NAV=[
 const LABEL={controller:'Controller',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My orgs',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
 let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];
-async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];if(!ORG&&ORGS.length)ORG=ORGS[0].org_id;const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=cur?cur.name:(ORGS.length?'pick an org':'no orgs');}catch(e){}}
+async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];
+  if(ORG && !ORGS.some(o=>o.org_id==ORG)){ORG=0;localStorage.removeItem('aos_org');}
+  if(!ORG&&ORGS.length){ORG=ORGS[0].org_id;localStorage.setItem('aos_org',ORG);}
+  const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=cur?cur.name:(ORGS.length?'pick an org':'no orgs');}catch(e){}}
 function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);loadOrgs();go('controller');}
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none'}
-function saveTok(){TOK=($('#tok')||{}).value||'';TOK=TOK.trim();if(!TOK)return;localStorage.setItem('aos_tenant',TOK);showApp(true);boot()}
+function resetSession(){localStorage.removeItem('aos_org');localStorage.removeItem('aos_email');ORG=0;ORGS=[];THREAD=null;CUR='cockpit'}
 function suTab(t){$('#su_signup').style.display=t==='up'?'block':'none';$('#su_signin').style.display=t==='in'?'block':'none'}
 async function signUp(){
  const note=$('#su_note');const email=($('#su_email').value||'').trim();const pw=$('#su_pw').value||'';const name=($('#su_name').value||'').trim();
- if(!email){note.textContent='Enter your email';return} if(pw.length<8){note.textContent='Password must be at least 8 characters';return}
+ if(!email){note.textContent='Enter your email';return} if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){note.textContent='Enter a valid email';return} if(pw.length<8){note.textContent='Password must be at least 8 characters';return}
+ resetSession();
  note.textContent='Creating your account…';
  let r;try{r=await (await fetch('/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,email,password:pw})})).json()}catch(e){note.textContent='Could not reach the server — is the console running?';return}
  if(r.error){note.textContent='✗ '+r.error;return}
@@ -342,19 +363,20 @@ async function signUp(){
 async function signIn(){
  const note=$('#si_note');const email=($('#si_email').value||'').trim();const pw=$('#si_pw').value||'';
  if(!email||!pw){note.textContent='Enter your email and password';return}
+ resetSession();
  note.textContent='Signing in…';
  let r;try{r=await (await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})})).json()}catch(e){note.textContent='Could not reach the server';return}
  if(r.error){note.textContent='✗ '+r.error;return}
  TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||email);
  showApp(true);boot();
 }
-function signOut(){localStorage.removeItem('aos_tenant');TOK='';showApp(false)}
+function signOut(){localStorage.removeItem('aos_tenant');TOK='';resetSession();suTab('in');showApp(false)}
 function toggleAcct(){const m=$('#acctmenu');m.style.display=m.style.display==='none'?'block':'none'}
 async function get(p){
- if(!TOK){const e=new Error('Paste your tenant token to open the console.');e.kind='auth';throw e}
+ if(!TOK){const e=new Error('Your session expired — sign in again with your email and password.');e.kind='auth';throw e}
  let r;try{r=await fetch(p,{headers:H()})}catch(_){const e=new Error('Can\'t reach the server — is the console running?');e.kind='net';throw e}
  let d={};try{d=await r.json()}catch(_){}
- if(r.status===401){const e=new Error(d.error||'Your session is invalid — re-enter your token.');e.kind='auth';throw e}
+ if(r.status===401){const e=new Error(d.error||'Your session expired — sign in again with your email and password.');e.kind='auth';throw e}
  if(!r.ok||(d&&d.error)){const e=new Error((d&&d.error)||('Request failed ('+r.status+')'));e.kind='error';throw e}
  return d||{};
 }
@@ -362,7 +384,7 @@ async function post(p,b){
  try{const r=await fetch(p,{method:'POST',headers:H(),body:JSON.stringify(b||{})});let d={};try{d=await r.json()}catch(_){}; return d||{}}
  catch(_){return {error:'request failed'}}
 }
-function authCard(msg){return `<div class=card><h2>Sign in</h2><p class=muted>${esc(msg||'Paste your tenant token in the left panel.')}</p><p class=muted>No account yet? Open the front door to sign up, then paste your token here.</p></div>`}
+function authCard(msg){return `<div class=card><h2>Sign in</h2><p class=muted>${esc(msg||'Your session expired — sign in again with your email and password.')}</p></div>`}
 function errCard(k,msg){return `<div class=card><h2>Something went wrong</h2><p class=muted>${esc(msg)}</p><div style=margin-top:8px><button class=pri onclick="go('${k}')">retry</button></div></div>`}
 function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function pill(txt,cls){return `<span class="pill ${cls||''}">${esc(txt)}</span>`}
@@ -375,26 +397,27 @@ async function refreshTopbar(){
    if(!$('#spendtxt').textContent.trim()||$('#spendtxt').textContent==='$')$('#spendtxt').textContent=(b.plan||'')+(f?(' · '+f.pct_of_quota_projected+'%'):'');
  }catch(e){}
  try{const n=await get('/api/notifications');const bb=$('#bellbadge');if(n.unread>0){bb.style.display='inline-flex';bb.textContent=n.unread}else bb.style.display='none'}catch(e){}
- try{const ap=await get('/api/approvals');BADGES.approvals=ap.count||0;renderNav()}catch(e){}
+ try{const ap=await get('/api/approvals');BADGES.approvals=(ap.items||[]).filter(i=>i.kind!=='consent').length;renderNav()}catch(e){}
  try{const s=await get('/api/status');$('#statusdot').className='dot '+({operational:'ok',degraded:'warn',major_outage:'bad'}[s.verdict]||'ok')}catch(e){}
 }
 async function go(k){CUR=k;renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
- try{await VIEWS[k]()}catch(e){$('#view').innerHTML=(e.kind==='auth')?authCard(e.message):errCard(k,e.message)}}
+ try{await VIEWS[k]()}catch(e){if(e.kind==='auth'){signOut();return}$('#view').innerHTML=errCard(k,e.message)}}
 function kpis(arr){return '<div class=kpis>'+arr.map(a=>`<div class=kpi><b>${esc(a[1])}</b><span>${esc(a[0])}</span></div>`).join('')+'</div>'}
 function stages(ss){return '<div class=stages>'+ss.map(s=>`<div class="st ${s.done?(s.ok===false?'bad':'ok'):''}" title="${s.stage}"></div>`).join('')+'</div>'}
 
-let THREAD=null;
+let THREAD=null;let CTLBUSY=false;let CHATBUSY=false;
 const VIEWS={
  controller:async()=>{
   if(!ORG){await loadOrgs();if(!ORG){$('#view').innerHTML=emptyB('🏢','No org yet','Create your first organization — then your controller will help you build it.','<button class=pri onclick="go(\'orgs\')">Create an org</button>');return}}
   let d;try{d=await get('/api/controller/state?org='+ORG)}catch(e){$('#view').innerHTML=errCard('controller',e.message);return}
   if(d.error){$('#view').innerHTML='<div class=card>'+esc(d.error)+'</div>';return}
-  const phase=d.phase||'DISCOVER';const gate=d.awaiting?(' · waiting on '+esc(d.awaiting)):'';
+  const GATE={user_feedback:'your reply',user_approval:'your go-ahead',credentials:'a connected provider',fleet:'your agents to finish'};
+  const rawPhase=d.phase||'DISCOVER';const phase=rawPhase.charAt(0)+rawPhase.slice(1).toLowerCase();const gate=d.awaiting?(' · waiting on '+esc(GATE[d.awaiting]||d.awaiting)):'';
   $('#view').innerHTML=`<h1>Controller</h1><p class=sub>Tell your controller what to build. It researches, brings options, designs, and ships — asking you at each step. <b>${esc(phase)}</b>${gate}</p>
    <div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>
-   <div class=card><div class=row><input id=cmsg placeholder="e.g. build a competitor to YouTube" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
+   <div class=card><div class=row><input id=cmsg placeholder="e.g. build a competitor to YouTube" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
   ctlRender(d.messages||[]);
-  if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}try{const s=await get('/api/controller/state?org='+ORG);ctlRender(s.messages||[])}catch(e){}},5000);
+  if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}if(CTLBUSY)return;try{const s=await get('/api/controller/state?org='+ORG);ctlRender(s.messages||[])}catch(e){}},5000);
  },
  orgs:async()=>{const d=await get('/api/orgs');ORGS=d.orgs||[];
   let h='<h1>My orgs</h1><p class=sub>Each org is its own company — its own controller, research, design, build and budget. You can run as many as you like.</p>';
@@ -421,7 +444,7 @@ const VIEWS={
   $('#view').innerHTML=`<h1>Direct your fleet</h1><p class=sub>Describe what you want in plain words. I'll ask questions, then build it — you approve.</p>
    <div class=chips>`+CHIPS.map(c=>`<span class=chip-s onclick="chipFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div>
    <div class=card id=chatlog style="max-height:52vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>
-   <div class=card><div class=row><input id=msg placeholder="e.g. I want an app to track my gym members…" onkeydown="if(event.key==='Enter')chatSend()"><button class=pri onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
+   <div class=card><div class=row><input id=msg placeholder="e.g. I want an app to track my gym members…" onkeydown="if(event.key==='Enter')chatSend()"><button class=pri id=chatsend onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
   await chatRender();
  },
  cockpit:async()=>{const d=await get('/api/cockpit');const s=d.summary||{},b=d.budget||{};d.products=d.products||[];d.communications=d.communications||[];d.queue=d.queue||{};
@@ -433,7 +456,7 @@ const VIEWS={
   let ls={};try{const l=await get('/api/livestatus');(l.products||[]).forEach(p=>ls[p.product]=p)}catch(e){}
   let h='<h1>Cockpit</h1><p class=sub>Your whole company at a glance.</p>';
   if(co){const cm={healthy:'ok',attention:'warn',critical:'bad'}[co.verdict]||'ok';h+=`<div class=card><div class=row><span class="dot ${cm}" style="width:10px;height:10px;border-radius:50%"></span> <b>${esc(co.line||co.verdict)}</b></div></div>`;}
-  if(ob&&!ob.completed&&ob.step!=='done'){h+=`<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Get set up</b> — ${esc(ob.framing||'')} Next: <b>${esc(ob.step)}</b></span><span><button class=pri onclick="go('${ob.step==='provider'?'providers':(ob.step==='consent'?'settings':(ob.step==='first_build'?'chat':'chat'))}')">continue</button> <button onclick="post('/api/onboarding/skip',{}).then(()=>go('cockpit'))">skip</button></span></div></div>`;}
+  if(ob&&!ob.completed&&ob.step!=='done'){h+=`<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Get set up</b> — ${esc(ob.framing||'')} Next: <b>${esc(ob.step)}</b></span><span><button class=pri onclick="obContinue('${esc(ob.step)}')">continue</button> <button onclick="post('/api/onboarding/skip',{}).then(()=>go('cockpit'))">skip</button></span></div></div>`;}
   h+=kpis([['Products',s.products||0],['Launched',s.launched||0],['Building',s.building||0],['Failed',s.failed||0],['Workers',s.live_workers||0],['Spend $',s.spend_usd||0]]);
   if(fc){const fcls=fc.level==='over'?'bad':(fc.level==='warn'?'warn':'ok');h+=`<div class=card><h2>Budget forecast</h2><div class="row spread"><span>${esc(fc.headline||'')}</span>${pill(fc.pct_of_quota_projected+'% projected',fcls)}</div><div class=meta>burn ~${fc.burn_tokens_per_day} tok/day · $${fc.burn_usd_per_day}/day${fc.eta_days_to_quota?(' · hits quota in ~'+fc.eta_days_to_quota+'d'):''}</div></div>`;}
   if(hl&&!hl.ok){let hi='';
@@ -465,7 +488,7 @@ const VIEWS={
   $('#view').innerHTML=h;},
  fleet:async()=>{const d=await get('/api/fleet');d.workers=d.workers||[];$('#view').innerHTML='<h1>Agent fleet</h1><p class=sub>Live workers across your products.</p>'+kpis([['Live workers',d.count||0],['Active products',d.products_active||0]])+'<div class=card><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th>task</th></tr>'+(d.workers.length?d.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td>${esc(w.task)}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';},
  observability:async()=>{const d=await get('/api/observability');$('#view').innerHTML='<h1>Observability</h1><p class=sub>Runs, errors, spend across your fleet.</p>'+kpis([['Runs',d.runs],['Steps',d.steps],['Errors',d.errors],['Cost $',d.cost_usd],['Tokens',d.tokens]])+'<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(d.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div><div class=card><h2>Recent errors</h2>'+((d.recent_errors||[]).length?d.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean</div>')+'</div>';},
- approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'||i.kind=='blocked_build'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">${i.kind=='blocked_build'?'abandon':'deny'}</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):emptyB('✓','All clear','Nothing needs your decision right now. We\'ll bring anything important here.'))+'</div>';},
+ approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>i.kind=='consent'?`<div class=item><div class="row spread"><span>${pill('setup','accent')} <b>Approve AI processing</b></span><span><button class=pri onclick="decide('consent','${esc(i.ref)}','approve')">Approve AI processing</button></span></div><div class=muted>Nothing's broken — this is a one-time, revocable OK to let your AI provider process your prompts so your agents can build. Approving it unlocks your first build.</div></div>`:`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'||i.kind=='blocked_build'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">${i.kind=='blocked_build'?'abandon':'deny'}</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):emptyB('✓','All clear','Nothing needs your decision right now. We\'ll bring anything important here.'))+'</div>';},
  integrations:async()=>{const d=await get('/api/integrations');$('#view').innerHTML='<h1>Integrations</h1><p class=sub>Connect the services your products need.</p><div class=grid>'+(d.integrations||[]).map(i=>`<div class=tile><div class=row style=margin-bottom:6px><span class=int-ic>${esc((i.name||'?')[0])}</span><b>${esc(i.name)}</b><span style=flex:1></span>${pill(i.status=='connected'?'connected':'disconnected',i.status=='connected'?'ok':'off')}</div><div class=muted style=margin:0_0_8px>${esc(i.blurb)} · ${esc(i.category)}</div>${i.status=='connected'?`<button onclick="integ('disconnect','${i.slug}')">disconnect</button>`:`<button class=pri onclick="integ('connect','${i.slug}')">connect</button>`}</div>`).join('')+'</div>';},
  billing:async()=>{const d=await get('/api/billing');$('#view').innerHTML=`<h1>Billing & plans</h1><p class=sub>Usage, quota and plan. Real payment is gated (BYO Stripe).</p>`+kpis([['Plan',d.plan],['Builds',(d.usage&&d.usage.builds)||0],['Tokens',(d.usage&&d.usage.tokens)||0]])+'<div class=card><h2>Plans</h2><table><tr><th>plan</th><th>price</th><th>builds</th><th>tokens</th><th></th></tr>'+(d.plans||[]).map(p=>`<tr><td>${esc(p.slug)} ${p.current?pill('current','ok'):''}</td><td>$${p.price}</td><td>${p.builds}</td><td>${p.tokens}</td><td>${p.current?'':`<button onclick="plan('${p.slug}')">switch</button>`}</td></tr>`).join('')+'</table></div>';},
  notifications:async()=>{const d=await get('/api/notifications');d.feed=d.feed||[];$('#view').innerHTML=`<h1>Notifications</h1><p class=sub>${d.unread||0} unread.</p><div class=card>`+(d.feed.length?d.feed.map(n=>`<div class=item><div class="row spread"><span>${pill(n.level,n.level=='urgent'?'bad':(n.level=='standard'?'':'warn'))} <b>${esc(n.title)}</b></span><span class=muted>${esc(n.category)} · ${n.created_at}</span></div><div class=muted>${esc(n.body||'')}</div></div>`).join(''):emptyB('◔','You\'re all caught up','Build updates, billing alerts and agent reports will appear here.'))+'</div>';},
@@ -494,6 +517,7 @@ let LAST_PROPOSAL=null;
 function md(s){return esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>')}
 async function chatRender(){
  if(CUR!=='chat'){if(window.CHATPOLL){clearInterval(window.CHATPOLL);window.CHATPOLL=null}return}
+ if(CHATBUSY)return;
  let d;try{d=await get('/api/chat/history?thread='+THREAD)}catch(e){return}
  const log=$('#chatlog');if(!log)return;
  log.innerHTML=(d.messages||[]).map(m=>{
@@ -518,13 +542,26 @@ function ctlRender(msgs){const log=$('#clog');if(!log)return;
  }).join('')||'<div class=muted>Describe what you want to build — I\'ll ask a few questions, then research it and bring you options.</div>';
  log.scrollTop=log.scrollHeight;
 }
-async function ctlSend(){const m=$('#cmsg').value.trim();if(!m)return;$('#cmsg').value='';$('#cnote').textContent='thinking…';await post('/api/controller/say',{org:ORG,message:m});$('#cnote').textContent='';go('controller');}
+async function ctlSend(){
+ if(CTLBUSY)return;const i=$('#cmsg');const m=(i?i.value:'').trim();if(!m)return;CTLBUSY=true;
+ const btn=$('#ctlsend');if(btn)btn.disabled=true;if(i){i.value='';i.disabled=true}
+ const log=$('#clog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=ctltyping style="margin:8px 0"><div><span class=bubble><span class=muted>… thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
+ $('#cnote').textContent='thinking…';
+ try{await post('/api/controller/say',{org:ORG,message:m});}
+ finally{CTLBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false;i.focus()}}
+ const t=$('#ctltyping');if(t)t.remove();$('#cnote').textContent='';go('controller');
+}
 async function ctlChoose(oid){await post('/api/controller/choose',{org:ORG,option_id:oid});go('controller');}
 async function orgNew(){const r=await post('/api/orgs/new',{name:($('#onm')||{}).value||'New org',vision:($('#ovis')||{}).value||''});if(r.org_id)switchOrg(r.org_id);}
 async function designOk(id){await post('/api/design/decide',{org:ORG,id,status:'approved'});go('design');}
 async function chatSend(){
- const m=$('#msg').value.trim();if(!m)return;$('#msg').value='';$('#chatnote').textContent='thinking…';
- await post('/api/chat/say',{thread:THREAD,message:m});$('#chatnote').textContent='';await chatRender();
+ if(CHATBUSY)return;const i=$('#msg');const m=(i?i.value:'').trim();if(!m)return;CHATBUSY=true;
+ const btn=$('#chatsend');if(btn)btn.disabled=true;if(i){i.value='';i.disabled=true}
+ const log=$('#chatlog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=chattyping style="margin:8px 0"><div><span class=bubble><span class=muted>… thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
+ $('#chatnote').textContent='thinking…';
+ try{await post('/api/chat/say',{thread:THREAD,message:m});}
+ finally{CHATBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false;i.focus()}}
+ $('#chatnote').textContent='';await chatRender();
 }
 async function chatConfirm(){
  $('#chatnote').textContent='starting build…';const r=await post('/api/chat/confirm',{thread:THREAD});
@@ -532,7 +569,18 @@ async function chatConfirm(){
 }
 async function showEst(){const k=($('#bk')||{}).value||'lib';let e;try{e=await get('/api/estimate?kind='+k)}catch(_){return}if($('#est'))$('#est').textContent='Estimate: '+(e.note||('~$'+e.cost_usd_estimate+', ~'+e.minutes_estimate+' min'));}
 async function doBuild(){$('#bnote').textContent='submitting…';const r=await post('/api/build',{name:$('#bn').value,kind:$('#bk').value,charter:$('#bc').value});$('#bnote').textContent=r.error?('✗ '+(r.error==='consent_required'?'accept AI consent in Settings first':r.error)):('building '+r.product+' — see Cockpit');}
-async function buildTpl(slug){const r=await post('/api/build_template',{slug});go('cockpit');}
+async function obContinue(step){
+ const SCREEN={welcome:'providers',provider:'providers',consent:'settings',first_build:'chat'};
+ const NEXT={welcome:'provider',provider:'consent',consent:'first_build',first_build:'done'};
+ await post('/api/onboarding/advance',{step:NEXT[step]||'done'});   // record progress past the current step
+ go(SCREEN[step]||'chat');
+}
+async function buildTpl(slug){
+ const r=await post('/api/build_template',{slug});
+ if(r.error==='consent_required'){go('settings');return}
+ if(r.error){alert('Could not build: '+r.error);return}
+ go('cockpit');
+}
 async function ctl(p,a){await post('/api/control',{product:p,action:a});go('cockpit');}
 async function decide(kind,ref,verdict){await post('/api/approvals/decide',{kind,ref,verdict});go('approvals');}
 async function integ(act,slug){let secret=null;if(act=='connect')secret=prompt('API key / secret for '+slug+' (leave blank if OAuth):')||null;await post('/api/integrations/'+act,{slug,secret});go('integrations');}
@@ -551,7 +599,9 @@ async function acctExport(){$('#acctnote').textContent='preparing export…';con
 async function acctDelete(){const r=await post('/api/account/delete',{confirm:false});if(!confirm('Permanently delete your account and ALL data? This cannot be undone.'))return;const r2=await post('/api/account/delete',{confirm:true});if(r2.ok){localStorage.removeItem('aos_tenant');TOK='';$('#view').innerHTML='<div class=card>Your account and data were deleted. Goodbye.</div>';}}
 async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
 async function boot(){renderNav();refreshTopbar();await loadOrgs();
- go(ORG?'controller':'orgs');
+ let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
+ if(ob&&!ob.completed&&ob.step!=='done')go('cockpit');   // first-run: Cockpit renders the guided onboarding banner
+ else go(ORG?'controller':'orgs');
  setInterval(refreshTopbar,15000);setInterval(()=>{if(['cockpit','activity'].includes(CUR))go(CUR)},6000)}
 document.addEventListener('click',e=>{if(!e.target.closest('#acctmenu')&&!String(e.target.getAttribute&&e.target.getAttribute('onclick')||'').includes('toggleAcct'))$('#acctmenu').style.display='none'});
 if(TOK){showApp(true);boot()}else{showApp(false)}
@@ -598,8 +648,11 @@ class Handler(BaseHTTPRequestHandler):
         tid = _tenant(self.headers.get("X-Tenant-Token"))
         if not tid:
             return self._json(401, {"error": "sign up first"})
+        q = parse_qs(u.query)
+        if p in ORG_SCOPED_GET and not _owns(tid, int((q.get("org", ["0"])[0]) or 0)):
+            return self._json(403, {"error": "not your org"})
         try:
-            self._json(200, fn(tid, parse_qs(u.query)))
+            self._json(200, fn(tid, q))
         except Exception as e:
             self._json(500, {"error": str(e)[:200]})
 
@@ -623,8 +676,15 @@ class Handler(BaseHTTPRequestHandler):
         tid = _tenant(self.headers.get("X-Tenant-Token"))
         if not tid:
             return self._json(401, {"error": "sign up first"})
+        body = self._body()
+        if p in ORG_SCOPED_POST and not _owns(tid, int(body.get("org") or 0)):
+            return self._json(403, {"error": "not your org"})
+        if p == "/api/xorg/propose":
+            for k in ("source", "target"):
+                if not _owns(tid, int(body.get(k) or 0)):
+                    return self._json(403, {"error": "not your org"})
         try:
-            self._json(200, fn(tid, parse_qs(u.query), self._body()))
+            self._json(200, fn(tid, parse_qs(u.query), body))
         except Exception as e:
             self._json(500, {"error": str(e)[:200]})
 

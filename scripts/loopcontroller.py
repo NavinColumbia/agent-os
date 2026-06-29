@@ -209,6 +209,17 @@ def say(tid, thread_id, msg, api_key=None):
             _report(tid, thread_id, reply)
         return {"phase": phase}
 
+    if phase == "OPTIONS":
+        # Options only move via choose() (a chip tap). If the CEO TYPES instead of tapping,
+        # don't run the generic affirmative branch — it would clear the gate and call advance(),
+        # which is a no-op at OPTIONS, stalling the thread. Try to map a typed ordinal to a chip;
+        # otherwise nudge them to tap. Never clear `awaiting`.
+        oid = _option_ordinal(msg, s.get("options") or [])
+        if oid is not None:
+            return choose(tid, thread_id, oid)
+        _report(tid, thread_id, "Tap one of the options above to pick a direction.")
+        return {"phase": phase}
+
     if s["awaiting"] in ("user_feedback", "user_approval"):
         if _affirmative(msg):
             _set(thread_id, awaiting=None); advance(thread_id)
@@ -414,6 +425,27 @@ def _parse_plan(body):
 def _affirmative(msg):
     return bool(re.search(r"\b(looks good|approve|approved|go ahead|yes|ship it|do it|ready|lgtm|perfect|good)\b",
                           (msg or "").lower()))
+
+
+def _option_ordinal(msg, options):
+    """Map a TYPED option choice ('option 2', 'the first one', '#3') to that option's id.
+    Returns the option id, or None if the message isn't an unambiguous ordinal pick."""
+    m = (msg or "").lower()
+    words = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+             "one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+    idx = None
+    num = re.search(r"\b(?:option|number|num|#|no\.?)\s*#?\s*(\d+)\b", m) or re.search(r"#\s*(\d+)\b", m)
+    if num:
+        idx = int(num.group(1))
+    else:
+        for word, n in words.items():
+            if re.search(rf"\b{word}\b", m):
+                idx = n
+                break
+    if idx is None or idx < 1 or idx > len(options):
+        return None
+    opt = options[idx - 1]
+    return opt.get("id", idx) if isinstance(opt, dict) else idx
 
 
 def state(thread_id):

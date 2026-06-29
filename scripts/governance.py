@@ -32,6 +32,15 @@ from pathlib import Path
 
 ROLES = Path.home() / "projects" / "control-plane" / "roles"
 
+# THE single canonical role-permission decision, shared verbatim with the PreToolUse hook
+# (control-plane/hooks/enforce_manifest.py). Both layers derive their allow/deny from this module
+# so they CANNOT diverge. It is stdlib-only (no pyyaml/agent-os imports). We add the control-plane
+# hooks dir to sys.path (governance.py already locates control-plane/roles the same way).
+_HOOKS = Path.home() / "projects" / "control-plane" / "hooks"
+if str(_HOOKS) not in sys.path:
+    sys.path.insert(0, str(_HOOKS))
+import manifest_policy
+
 # capability name (as used by may/enforce) -> the manifest flag that grants it.
 _CAP_FLAG = {
     "deploy": "can_deploy",
@@ -252,60 +261,22 @@ def spawn_restrictions(role: str) -> dict:
                          allowed_paths has no deterministic pre-write enforcement layer; treat the
                          post-run validator as its sole (best-effort) backstop.
     """
-    f = _read_flags(load_manifest(role))
+    m = load_manifest(role)
+    _read_flags(m)   # genuinely READ every governance flag (the wiring guard keys on these reads)
 
-    disallowed = list(f["denied_tools"])
-    if not f["can_post_publicly"]:
-        disallowed += _CAP_TOOLS["post_publicly"]
-    if not f["can_deploy"]:
-        disallowed += _CAP_TOOLS["deploy"]
-    # can_modify_code:false forbids authoring CODE — but docs/specs/tests written WITHIN a role's
-    # declared BOUNDED write scope are NOT code, so the edit-tool deny is graduated rather than
-    # all-or-nothing:
-    #   * MultiEdit/NotebookEdit are ALWAYS denied for a read-only role — no doc/test author needs
-    #     them (Edit/Write suffice), so they must never leak into --disallowedTools just because the
-    #     role has a write scope. (This closes the post-77793f0 regression where a non-empty
-    #     allowed_paths skipped the WHOLE _EDIT_TOOLS block, omitting MultiEdit/NotebookEdit — and,
-    #     for ['**'] roles with empty denied_tools, Edit/Write too — from the deny layer.)
-    #   * Edit/Write are denied too UNLESS the role has a BOUNDED scope (non-empty allowed_paths that
-    #     is not the unbounded ['**'] wildcard). product-manager (docs/**, tasks/**) and qa-security
-    #     (tests/**) keep them to author the SPEC/test stages; a FULLY read-only role (empty
-    #     allowed_paths) OR an unbounded ['**'] auditor scope (security-appsec/reviewer/
-    #     audit-governance — they mutate via flock'd scripts, not freehand edits) loses them too.
-    # This makes the --disallowedTools layer match the PreToolUse hook's tools-allowlist (defense in
-    # depth) instead of relying on each read-only role's (often incomplete) denied_tools list.
-    if not f["can_modify_code"]:
-        disallowed += _EDIT_TOOLS_ALWAYS
-        bounded_scope = f["allowed_paths"] and "**" not in f["allowed_paths"]
-        if not bounded_scope:
-            disallowed += _EDIT_TOOLS_SCOPED
-    if not f["can_spawn"]:
-        disallowed += _SPAWN_TOOLS
-    # de-dup, preserve order
-    seen, disallowed_tools = set(), []
-    for t in disallowed:
-        if t not in seen:
-            seen.add(t)
-            disallowed_tools.append(t)
-
-    deny_read = []
-    if not f["can_read_secrets"]:
-        deny_read += _SECRET_GLOBS
-    # Propagate ONLY the read-sensitive (secret/credential/registry) denied_paths globs — NOT code/
-    # docs/tests trees. A write-deny of src/** must not become a read-deny of src/**, which would brick
-    # read-only auditing roles (qa-security/product-manager) from reading the source they exist to test
-    # and spec. The write side of every denied_paths glob is still enforced by the hook + validate_writes.
-    deny_read += [g for g in f["denied_paths"] if _is_read_sensitive(g)]
-    seen, deny_read_dedup = set(), []
-    for g in deny_read:
-        if g not in seen:
-            seen.add(g)
-            deny_read_dedup.append(g)
-
+    # ALL THREE outputs now derive from the canonical manifest_policy so this spawn-time layer and
+    # the PreToolUse hook cannot disagree:
+    #   * disallowed_tools : every tool in the canonical universe that tool_denied() rejects
+    #                        (denied_tools + write-tool family + capability gates + the positive
+    #                        `tools` allowlist). Passed to `claude --disallowedTools`.
+    #   * deny_read        : secret/credential/registry material denied unless can_read_secrets —
+    #                        NOT source/docs/tests trees (read-only auditors must keep reading code).
+    #   * write_scope      : allowed_paths, enforced via the validate_writes backstop, which itself
+    #                        now calls manifest_policy.write_decision (denied_paths ALWAYS win).
     return {
-        "disallowed_tools": disallowed_tools,
-        "deny_read": deny_read_dedup,
-        "write_scope": list(f["allowed_paths"]),   # allowed_paths is a real WRITE restriction
+        "disallowed_tools": manifest_policy.disallowed_tools(m),
+        "deny_read": manifest_policy.read_denied_globs(m),
+        "write_scope": list(m.get("allowed_paths") or []),
     }
 
 
@@ -322,8 +293,8 @@ def validate_writes(role: str, repo: str, changed_paths) -> list:
     every allowed_paths glob (allowlist semantics). Records each as a 'GovernanceWriteViolation' audit
     entry and returns the list of violations: [{"path","reason","matched"}]. The caller reverts/flags
     them. allowed_paths empty => no allowlist restriction (only the denylist applies)."""
-    f = _read_flags(load_manifest(role))
-    allowed, denied = f["allowed_paths"], f["denied_paths"]
+    m = load_manifest(role)
+    _read_flags(m)                                       # wiring guard: READ the declared controls
     repo_p = Path(repo)
     violations = []
     for raw in changed_paths:
@@ -332,11 +303,12 @@ def validate_writes(role: str, repo: str, changed_paths) -> list:
             rel = str(Path(p).resolve().relative_to(repo_p.resolve()))
         except Exception:
             rel = p[len(str(repo_p)):].lstrip("/") if p.startswith(str(repo_p)) else p
-        hit = next((d for d in denied if _match(rel, d)), None)
-        if hit:
-            violations.append({"path": rel, "reason": "denied_path", "matched": hit})
-        elif allowed and not any(_match(rel, a) for a in allowed):
-            violations.append({"path": rel, "reason": "outside_allowed_paths", "matched": None})
+        decision, why = manifest_policy.write_decision(m, rel)   # THE canonical write decision
+        if decision == "deny":
+            # classify so factory._govern_writes can HARD-REVERT genuinely forbidden writes
+            # (denied_path) but only audit-WARN a too-narrow-scope miss (outside_allowed_paths).
+            kind = "denied_path" if manifest_policy.is_denied_path(m, rel) else "outside_allowed_paths"
+            violations.append({"path": rel, "reason": kind, "matched": why})
     if violations:
         _audit("GovernanceWriteViolation", role, "flag",
                {"repo": repo_p.name, "violations": violations[:10], "count": len(violations)})
@@ -369,10 +341,11 @@ def _selftest() -> int:
     if not may("devops-sre", "deploy"):
         problems.append("may('devops-sre','deploy') should be True (can_deploy:true)")
 
-    # 3) allowed_paths drives write_scope (builder: src/**, tests/**, docs/**).
+    # 3) allowed_paths drives write_scope. A code builder writes anywhere not denied (allowed_paths
+    #    ['**']) so legitimate root build output (index.html/package.json) is never bricked.
     b = spawn_restrictions("builder")
-    if b["write_scope"] != ["src/**", "tests/**", "docs/**"]:
-        problems.append(f"write_scope should be builder allowed_paths, got {b['write_scope']}")
+    if b["write_scope"] != ["**"]:
+        problems.append(f"builder write_scope should be ['**'] (write anywhere not denied), got {b['write_scope']}")
 
     # 4) can_read_secrets:false adds secret read-denies (builder).
     if not any(".env" in g or "secrets" in g for g in b["deny_read"]):
@@ -430,17 +403,26 @@ def _selftest() -> int:
     if "Task" in spawn_restrictions("controller")["disallowed_tools"]:
         problems.append("controller (can_spawn:true) must NOT have Task disallowed")
 
-    # 7) validate_writes flags an out-of-scope / denied write but passes an in-scope one.
+    # 7) validate_writes: a code builder (['**']) passes legitimate output (src/app.py, index.html)
+    #    but denied_paths STILL hard-deny secrets/registry/.github/workflows (reason=denied_path so
+    #    factory hard-reverts them). A bounded role's out-of-scope write -> outside_allowed_paths.
     repo = "/tmp/repo"
-    v = validate_writes("builder", repo, [f"{repo}/src/app.py", f"{repo}/registry/leases.yaml",
-                                          f"{repo}/infra/deploy.sh"])
+    v = validate_writes("builder", repo, [f"{repo}/src/app.py", f"{repo}/index.html",
+                                          f"{repo}/registry/leases.yaml",
+                                          f"{repo}/.github/workflows/ci.yml"])
     paths = {x["path"]: x["reason"] for x in v}
     if "src/app.py" in paths:
         problems.append("validate_writes wrongly flagged an in-scope write src/app.py")
+    if "index.html" in paths:
+        problems.append("validate_writes wrongly flagged legitimate root build output index.html")
     if paths.get("registry/leases.yaml") != "denied_path":
         problems.append("validate_writes must flag registry/ as denied_path")
-    if paths.get("infra/deploy.sh") != "outside_allowed_paths":
-        problems.append("validate_writes must flag infra/deploy.sh as outside allowed_paths")
+    if paths.get(".github/workflows/ci.yml") != "denied_path":
+        problems.append("validate_writes must flag .github/workflows as denied_path (hard-deny)")
+    # a BOUNDED role (product-manager: docs/**, tasks/**) writing outside scope -> outside_allowed_paths
+    vp = validate_writes("product-manager", repo, [f"{repo}/config.yaml"])
+    if not vp or vp[0]["reason"] != "outside_allowed_paths":
+        problems.append("validate_writes must flag a bounded role's out-of-scope write as outside_allowed_paths")
 
     # 8) approval_required_for is read straight from the manifest.
     if "deploy" not in approval_required_for("controller"):

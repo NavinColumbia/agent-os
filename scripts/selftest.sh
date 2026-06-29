@@ -120,6 +120,7 @@ ck "tenant CONSOLE (all area routes)"    "$PY scripts/console.py selftest | grep
 ck "console click-through (real browser)" "bash scripts/console_e2e.sh gate | grep -q PASS"
 ck "prompt-injection sanitize"              "$PY scripts/sanitize.py selftest | grep -q PASS"
 ck "callsite signature wiring"              "$PY scripts/test_callsites_wired.py | grep -q PASS"
+ck "enforcement-layer consistency (gov==hook)" "$PY scripts/test_enforcement_consistency.py | grep -q PASS"
 ck "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ck "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"
 

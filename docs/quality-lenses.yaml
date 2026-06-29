@@ -104,6 +104,11 @@ lenses:
     standard: null                                  # platform/snapshot.py round-trips the DB; migrate.sh is idempotent
     role: { file: database-admin, keyword: migrat }
     guard: "portable encrypted snapshot"
+  - id: resilience-supervision
+    status: enforced
+    standard: null                                  # watchdog(detect)+responder(auto-restart) are the executable spec
+    role: { file: devops-sre, keyword: heal }
+    guard: "daemon supervision wired"               # every critical serving daemon is detected-down + auto-restarted
 
   # --- deferred WITH REASON (a decision, not a silent gap) — revisit triggers stated ---
   - id: performance-load

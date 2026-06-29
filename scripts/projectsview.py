@@ -68,12 +68,37 @@ def _repo_scan(product):
     return info
 
 
-def list_projects(tid):
-    """All of a tenant's products, newest first: result + readiness + progress + spend."""
+def _default_org(cur, tid):
+    """The tenant's default org — its oldest org. Legacy products (org_id NULL) belong here."""
+    try:
+        cur.execute("SELECT min(id) FROM orgs WHERE tenant_id=%s", (tid,))
+        r = cur.fetchone()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def _scoped_products(cur, tid, org_id=0):
+    """A tenant's products, optionally scoped to ONE org (the active org in the 'This org' nav).
+    org_id falsy → the whole tenant. When an org is selected, filter tenant_products by org_id;
+    legacy NULL org_id rows count as the tenant's default org."""
+    if not org_id:
+        cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s ORDER BY created_at DESC", (tid,))
+    elif int(org_id) == (_default_org(cur, tid) or -1):
+        cur.execute("""SELECT product FROM tenant_products WHERE tenant_id=%s
+                       AND (org_id=%s OR org_id IS NULL) ORDER BY created_at DESC""", (tid, int(org_id)))
+    else:
+        cur.execute("""SELECT product FROM tenant_products WHERE tenant_id=%s AND org_id=%s
+                       ORDER BY created_at DESC""", (tid, int(org_id)))
+    return [r[0] for r in cur.fetchall()]
+
+
+def list_projects(tid, org_id=0):
+    """A tenant's products, newest first: result + readiness + progress + spend. When org_id is set,
+    scoped to the active org ('This org' nav); 0 = the whole tenant."""
     out = []
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s ORDER BY created_at DESC", (tid,))
-        prods = [r[0] for r in cur.fetchall()]
+        prods = _scoped_products(cur, tid, org_id)
         for product in prods:
             cur.execute("""SELECT count(DISTINCT stage), sum(COALESCE(cost_usd,0)),
                                   sum(COALESCE(tokens_in,0)+COALESCE(tokens_out,0)), max(ts)
@@ -182,7 +207,7 @@ def _main(a):
     if not a or a[0] == "selftest":
         _selftest()
     elif a[0] == "json" and len(a) > 1:
-        print(json.dumps(list_projects(a[1]), indent=2))
+        print(json.dumps(list_projects(a[1], int(a[2]) if len(a) > 2 else 0), indent=2))
     elif a[0] == "detail" and len(a) > 2:
         print(json.dumps(project_detail(a[1], a[2]), indent=2))
     else:

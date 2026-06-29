@@ -83,13 +83,16 @@ def _owns(tid, org_id):
 
 
 # Routes that carry a client-supplied org id — gated through _owns() before they ever touch a module.
-ORG_SCOPED_GET = {"/api/controller/state", "/api/design"}
+ORG_SCOPED_GET = {"/api/controller/state", "/api/design",
+                  "/api/cockpit", "/api/projects", "/api/fleet",
+                  "/api/health", "/api/company", "/api/comms_graph"}
 ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/design/decide"}
 
 
-def _fleet(tid):
-    """Area 5 — every live worker across the tenant's products, flattened from the cockpit payload."""
-    c = cockpit.cockpit(tid)
+def _fleet(tid, org_id=0):
+    """Area 5 — every live worker across the active org's products (or the whole tenant when
+    org_id=0), flattened from the cockpit payload."""
+    c = cockpit.cockpit(tid, org_id)
     workers = []
     for p in c["products"]:
         for w in p.get("workers", []):
@@ -146,10 +149,10 @@ def _build_template(tid, body):
 
 
 GETS = {
-    "/api/cockpit": lambda tid, q: cockpit.cockpit(tid),
-    "/api/projects": lambda tid, q: {"projects": projectsview.list_projects(tid)},
+    "/api/cockpit": lambda tid, q: cockpit.cockpit(tid, int(q.get("org", ["0"])[0] or 0)),
+    "/api/projects": lambda tid, q: {"projects": projectsview.list_projects(tid, int(q.get("org", ["0"])[0] or 0))},
     "/api/project": lambda tid, q: projectsview.project_detail(tid, q.get("product", [""])[0]),
-    "/api/fleet": lambda tid, q: _fleet(tid),
+    "/api/fleet": lambda tid, q: _fleet(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/observability": lambda tid, q: traceview.overview(tid),
     "/api/runs": lambda tid, q: {"runs": traceview.runs(tid)},
     "/api/replay": lambda tid, q: traceview.replay(tid, q.get("run_id", [""])[0]),
@@ -157,9 +160,9 @@ GETS = {
     "/api/integrations": lambda tid, q: {"integrations": integrationsview.status(tid)},
     "/api/billing": lambda tid, q: billingview.billing_view(tid),
     "/api/forecast": lambda tid, q: forecast.forecast(tid),
-    "/api/health": lambda tid, q: cockpit.health(tid),
-    "/api/company": lambda tid, q: cockpit.company_summary(tid),
-    "/api/comms_graph": lambda tid, q: cockpit.comms_graph(tid),
+    "/api/health": lambda tid, q: cockpit.health(tid, int(q.get("org", ["0"])[0] or 0)),
+    "/api/company": lambda tid, q: cockpit.company_summary(tid, int(q.get("org", ["0"])[0] or 0)),
+    "/api/comms_graph": lambda tid, q: cockpit.comms_graph(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/org": lambda tid, q: orgview.orgchart(tid),
     "/api/livestatus": lambda tid, q: {"products": livestatus.live_status(tid)},
     "/api/chat/history": lambda tid, q: {"messages": orchestrator.history(tid, int(q.get("thread", ["0"])[0] or 0))},
@@ -380,9 +383,11 @@ async function get(p){
  if(!r.ok||(d&&d.error)){const e=new Error((d&&d.error)||('Request failed ('+r.status+')'));e.kind='error';throw e}
  return d||{};
 }
-async function post(p,b){
- try{const r=await fetch(p,{method:'POST',headers:H(),body:JSON.stringify(b||{})});let d={};try{d=await r.json()}catch(_){}; return d||{}}
- catch(_){return {error:'request failed'}}
+async function post(p,b,timeoutMs){
+ const ctl=timeoutMs?new AbortController():null;const tid=ctl?setTimeout(()=>ctl.abort(),timeoutMs):null;
+ try{const r=await fetch(p,{method:'POST',headers:H(),body:JSON.stringify(b||{}),signal:ctl?ctl.signal:undefined});let d={};try{d=await r.json()}catch(_){}; return d||{}}
+ catch(e){return {error:(e&&e.name==='AbortError')?'timeout':'request failed'}}
+ finally{if(tid)clearTimeout(tid)}
 }
 function authCard(msg){return `<div class=card><h2>Sign in</h2><p class=muted>${esc(msg||'Your session expired — sign in again with your email and password.')}</p></div>`}
 function errCard(k,msg){return `<div class=card><h2>Something went wrong</h2><p class=muted>${esc(msg)}</p><div style=margin-top:8px><button class=pri onclick="go('${k}')">retry</button></div></div>`}
@@ -447,12 +452,12 @@ const VIEWS={
    <div class=card><div class=row><input id=msg placeholder="e.g. I want an app to track my gym members…" onkeydown="if(event.key==='Enter')chatSend()"><button class=pri id=chatsend onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
   await chatRender();
  },
- cockpit:async()=>{const d=await get('/api/cockpit');const s=d.summary||{},b=d.budget||{};d.products=d.products||[];d.communications=d.communications||[];d.queue=d.queue||{};
+ cockpit:async()=>{const d=await get('/api/cockpit?org='+ORG);const s=d.summary||{},b=d.budget||{};d.products=d.products||[];d.communications=d.communications||[];d.queue=d.queue||{};
   let fc=null;try{fc=await get('/api/forecast')}catch(e){}
   let ql={};try{const q=await get('/api/quality');(q.products||[]).forEach(p=>ql[p.product]=p)}catch(e){}
   let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
-  let co=null;try{co=await get('/api/company')}catch(e){}
-  let hl=null;try{hl=await get('/api/health')}catch(e){}
+  let co=null;try{co=await get('/api/company?org='+ORG)}catch(e){}
+  let hl=null;try{hl=await get('/api/health?org='+ORG)}catch(e){}
   let ls={};try{const l=await get('/api/livestatus');(l.products||[]).forEach(p=>ls[p.product]=p)}catch(e){}
   let h='<h1>Cockpit</h1><p class=sub>Your whole company at a glance.</p>';
   if(co){const cm={healthy:'ok',attention:'warn',critical:'bad'}[co.verdict]||'ok';h+=`<div class=card><div class=row><span class="dot ${cm}" style="width:10px;height:10px;border-radius:50%"></span> <b>${esc(co.line||co.verdict)}</b></div></div>`;}
@@ -478,15 +483,15 @@ const VIEWS={
   h+='<div class=card><h2>Create an agent</h2><label>Name</label><input id=an placeholder="Market Watch"><div class=grid><div><label>Specialty</label><select id=ar>'+roles.map(r=>`<option value="${r}">${r}</option>`).join('')+'</select></div><div><label>Runs</label><select id=at><option value=manual>On demand</option><option value=recurring>Every week</option></select></div></div><label>What should it do?</label><textarea id=ai placeholder="Every week, scan my market for new competitors and pricing changes; give me 3 prioritized takeaways with sources."></textarea><div style=margin-top:10px><button class=pri onclick=agentCreate()>Create agent</button></div><div id=anote class=muted style=margin-top:8px></div></div>';
   $('#view').innerHTML=h;},
  templates:async()=>{const d=await get('/api/templates');$('#view').innerHTML=`<h1>Templates</h1><p class=sub>Start from a curated, factory-ready blueprint.</p><div class=grid>`+(d.templates||[]).map(t=>`<div class=tile><div class="row spread"><b>${esc(t.name)}</b>${pill(t.kind)}</div><div class=muted style=margin:6px_0>${esc(t.blurb)}</div><button class=pri onclick="buildTpl('${t.slug}')">Build this</button></div>`).join('')+'</div>';},
- projects:async()=>{const d=await get('/api/projects');d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):emptyB('▤','No projects yet','Describe your first product and the factory builds, tests and ships it.','<button class=pri onclick="go(\'chat\')">Start your first build</button>'))+'</div>';},
- activity:async()=>{const o=await get('/api/observability');let fl={workers:[]};try{fl=await get('/api/fleet')}catch(e){}fl.workers=fl.workers||[];
+ projects:async()=>{const d=await get('/api/projects?org='+ORG);d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):emptyB('▤','No projects yet','Describe your first product and the factory builds, tests and ships it.','<button class=pri onclick="go(\'chat\')">Start your first build</button>'))+'</div>';},
+ activity:async()=>{const o=await get('/api/observability');let fl={workers:[]};try{fl=await get('/api/fleet?org='+ORG)}catch(e){}fl.workers=fl.workers||[];
   let h='<h1>Activity</h1><p class=sub>Runs, errors, spend, and the live workers across your fleet.</p>';
   h+=kpis([['Runs',o.runs||0],['Steps',o.steps||0],['Errors',o.errors||0],['Cost $',o.cost_usd||0],['Workers',fl.workers.length]]);
   h+='<div class=card><h2>Live workers</h2><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th></tr>'+(fl.workers.length?fl.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td></tr>`).join(''):'<tr><td class=muted colspan=4>no live workers right now</td></tr>')+'</table></div>';
   h+='<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(o.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div>';
   h+='<div class=card><h2>Recent errors</h2>'+((o.recent_errors||[]).length?o.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean ✓</div>')+'</div>';
   $('#view').innerHTML=h;},
- fleet:async()=>{const d=await get('/api/fleet');d.workers=d.workers||[];$('#view').innerHTML='<h1>Agent fleet</h1><p class=sub>Live workers across your products.</p>'+kpis([['Live workers',d.count||0],['Active products',d.products_active||0]])+'<div class=card><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th>task</th></tr>'+(d.workers.length?d.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td>${esc(w.task)}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';},
+ fleet:async()=>{const d=await get('/api/fleet?org='+ORG);d.workers=d.workers||[];$('#view').innerHTML='<h1>Agent fleet</h1><p class=sub>Live workers across your products.</p>'+kpis([['Live workers',d.count||0],['Active products',d.products_active||0]])+'<div class=card><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th>task</th></tr>'+(d.workers.length?d.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td>${esc(w.task)}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';},
  observability:async()=>{const d=await get('/api/observability');$('#view').innerHTML='<h1>Observability</h1><p class=sub>Runs, errors, spend across your fleet.</p>'+kpis([['Runs',d.runs],['Steps',d.steps],['Errors',d.errors],['Cost $',d.cost_usd],['Tokens',d.tokens]])+'<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(d.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div><div class=card><h2>Recent errors</h2>'+((d.recent_errors||[]).length?d.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean</div>')+'</div>';},
  approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>i.kind=='consent'?`<div class=item><div class="row spread"><span>${pill('setup','accent')} <b>Approve AI processing</b></span><span><button class=pri onclick="decide('consent','${esc(i.ref)}','approve')">Approve AI processing</button></span></div><div class=muted>Nothing's broken — this is a one-time, revocable OK to let your AI provider process your prompts so your agents can build. Approving it unlocks your first build.</div></div>`:`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'||i.kind=='blocked_build'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">${i.kind=='blocked_build'?'abandon':'deny'}</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):emptyB('✓','All clear','Nothing needs your decision right now. We\'ll bring anything important here.'))+'</div>';},
  integrations:async()=>{const d=await get('/api/integrations');$('#view').innerHTML='<h1>Integrations</h1><p class=sub>Connect the services your products need.</p><div class=grid>'+(d.integrations||[]).map(i=>`<div class=tile><div class=row style=margin-bottom:6px><span class=int-ic>${esc((i.name||'?')[0])}</span><b>${esc(i.name)}</b><span style=flex:1></span>${pill(i.status=='connected'?'connected':'disconnected',i.status=='connected'?'ok':'off')}</div><div class=muted style=margin:0_0_8px>${esc(i.blurb)} · ${esc(i.category)}</div>${i.status=='connected'?`<button onclick="integ('disconnect','${i.slug}')">disconnect</button>`:`<button class=pri onclick="integ('connect','${i.slug}')">connect</button>`}</div>`).join('')+'</div>';},
@@ -503,7 +508,7 @@ const VIEWS={
  settings:async()=>{const d=await get('/api/settings');const c=d.ai_consent||{};const pr=d.profile||{};$('#view').innerHTML=`<h1>Settings</h1><p class=sub>Profile, AI consent, keys, notifications.</p>
   <div class=card><h2>Profile</h2><div class=row>plan <b>${esc(pr.plan||'—')}</b> ${pr.suspended?pill('suspended','bad'):pill('active','ok')}</div></div>
   <div class=card><h2>AI consent</h2><div class=row>${c.accepted?pill('accepted','ok'):pill('not accepted','bad')} <span class=muted>${esc(c.provider||'')} ${esc(c.version||'')}</span></div><div style=margin-top:8px>${c.accepted?'<button onclick="setConsent(false)">revoke</button>':'<button class=pri onclick="setConsent(true)">accept</button>'}</div></div>
-  <div class=card><h2>BYO API key</h2><div class=row>${d.byo_key_set?pill('key on file','ok'):pill('no key','warn')}</div><div style=margin-top:8px><input id=bk placeholder="sk-… (stored encrypted)"><button class=pri style=margin-top:6px onclick=saveKey()>save key</button></div></div>
+  <div class=card><h2>BYO API key</h2><div class=row>${d.byo_key_set?pill('key on file','ok'):pill('no key','warn')}</div><div style=margin-top:8px><input id=bk placeholder="sk-… (stored encrypted)"><button class=pri style=margin-top:6px onclick=saveKey()>save key</button></div><div id=bknote class=muted style=margin-top:8px></div></div>
   <div class=card><h2>Notification preferences</h2><table><tr><th>category</th><th>in-app</th><th>email</th><th>push</th></tr>`+(d.notification_prefs||[]).map(p=>`<tr><td>${esc(p.category)}</td><td><input type=checkbox ${p.in_app?'checked':''} onchange="pref('${p.category}',this.checked,null,null)"></td><td><input type=checkbox ${p.email?'checked':''} onchange="pref('${p.category}',null,this.checked,null)"></td><td><input type=checkbox ${p.push?'checked':''} onchange="pref('${p.category}',null,null,this.checked)"></td></tr>`).join('')+`</table></div>
   <div class=card><h2>Your data</h2><div class=row><button onclick=acctExport()>Export my data</button><button onclick=acctDelete() style="border-color:var(--r);color:var(--r)">Delete my account</button></div><div id=acctnote class=muted style=margin-top:8px></div></div>`;PREFS=d.notification_prefs;},
  providers:async()=>{const d=await get('/api/providers');$('#view').innerHTML='<h1>Model providers</h1><p class=sub>Run on Claude, on Codex, or both — you only need one. Use your subscription login (no per-token billing) OR bring an API key.</p><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill(p.auth_mode==='subscription'?'subscription login':'api key','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)} · runs on <b>${esc(p.engine)}</b></div>${p.connected?`<button onclick="provRemove('${p.slug}')">disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Use subscription login</button><button onclick="provAdd('${p.slug}','${esc(p.key_hint)}')">Use API key</button></div>`}</div>`).join('')+'</div><p class=muted>The build uses your highest-priority connected provider. Subscription login uses the Claude/ChatGPT account signed in on this machine; no key → platform default.</p>';},
@@ -559,8 +564,18 @@ async function chatSend(){
  const btn=$('#chatsend');if(btn)btn.disabled=true;if(i){i.value='';i.disabled=true}
  const log=$('#chatlog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=chattyping style="margin:8px 0"><div><span class=bubble><span class=muted>… thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
  $('#chatnote').textContent='thinking…';
- try{await post('/api/chat/say',{thread:THREAD,message:m});}
- finally{CHATBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false;i.focus()}}
+ let r;
+ try{r=await post('/api/chat/say',{thread:THREAD,message:m},90000);}
+ finally{CHATBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false}}
+ if(r&&r.error){   // never leave a silent spinner: surface a clear, retryable failure
+  const t=$('#chattyping');if(t)t.remove();
+  const em=r.error==='timeout'?'The assistant is taking too long to respond. Your message is still in the box — press Send to try again.':('✗ '+r.error+' — your message is still in the box, press Send to retry.');
+  $('#chatnote').textContent=em;
+  if(i){i.value=m;i.focus()}
+  if(log){log.insertAdjacentHTML('beforeend','<div class="msg ai" style="margin:8px 0"><div><span class=bubble><span class=muted>'+esc(em)+'</span></span></div></div>');log.scrollTop=log.scrollHeight}
+  return;
+ }
+ if(i)i.focus();
  $('#chatnote').textContent='';await chatRender();
 }
 async function chatConfirm(){
@@ -585,8 +600,8 @@ async function ctl(p,a){await post('/api/control',{product:p,action:a});go('cock
 async function decide(kind,ref,verdict){await post('/api/approvals/decide',{kind,ref,verdict});go('approvals');}
 async function integ(act,slug){let secret=null;if(act=='connect')secret=prompt('API key / secret for '+slug+' (leave blank if OAuth):')||null;await post('/api/integrations/'+act,{slug,secret});go('integrations');}
 async function plan(p){await post('/api/billing/plan',{plan:p});go('billing');}
-async function provAdd(slug,hint){const k=prompt('Paste your '+slug+' API key ('+hint+'):');if(k===null)return;await post('/api/providers/connect',{provider:slug,mode:'api_key',key:k});go('providers');}
-async function provSub(slug){await post('/api/providers/connect',{provider:slug,mode:'subscription'});go('providers');}
+async function provAdd(slug,hint){const k=prompt('Paste your '+slug+' API key ('+hint+'):');if(k===null)return;const r=await post('/api/providers/connect',{provider:slug,mode:'api_key',key:k});if(r&&r.error){alert('Could not connect '+slug+': '+r.error);return}go('providers');}
+async function provSub(slug){const r=await post('/api/providers/connect',{provider:slug,mode:'subscription'});if(r&&r.error){alert('Could not connect '+slug+': '+r.error);return}go('providers');}
 async function agentCreate(){const t=$('#at').value;const r=await post('/api/agents/create',{name:$('#an').value,instructions:$('#ai').value,role:$('#ar').value,trigger:t,interval_s:t==='recurring'?604800:0,output:'report'});$('#anote').textContent=r.error?('✗ '+r.error):'agent created';if(!r.error)go('agents');}
 async function agentRun(id){await post('/api/agents/run',{id});$('#anote')&&($('#anote').textContent='running — it\'ll report into your notifications');}
 async function agentToggle(id,en){await post('/api/agents/toggle',{id,enabled:en});go('agents');}
@@ -594,13 +609,14 @@ async function agentDel(id){if(!confirm('Delete this agent?'))return;await post(
 async function provRemove(slug){await post('/api/providers/remove',{provider:slug});go('providers');}
 async function helpAsk(){const q=$('#hq').value.trim();if(!q)return;$('#hans').innerHTML='<span class=muted>thinking…</span>';const r=await post('/api/help/ask',{question:q});$('#hans').innerHTML='<div class=tile>'+esc(r.answer||r.error||'(no answer)')+(r.suggested_area?` <button onclick="go('${r.suggested_area}')">go there</button>`:'')+'</div>';}
 async function setConsent(a){await post('/api/settings/consent',{accept:a});go('settings');}
-async function saveKey(){await post('/api/byok',{key:$('#bk').value});go('settings');}
+async function saveKey(){const v=($('#bk')||{}).value||'';const note=$('#bknote');if(note)note.textContent='saving…';const r=await post('/api/byok',{key:v});if(r&&r.error){if(note)note.textContent='✗ '+r.error;else alert('Could not save key: '+r.error);return}go('settings');}
 async function acctExport(){$('#acctnote').textContent='preparing export…';const r=await post('/api/account/export',{});$('#acctnote').textContent=r.ok?('Export ready ('+r.products+' products) on the server: '+(r.path||'')):'export failed';}
 async function acctDelete(){const r=await post('/api/account/delete',{confirm:false});if(!confirm('Permanently delete your account and ALL data? This cannot be undone.'))return;const r2=await post('/api/account/delete',{confirm:true});if(r2.ok){localStorage.removeItem('aos_tenant');TOK='';$('#view').innerHTML='<div class=card>Your account and data were deleted. Goodbye.</div>';}}
 async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
 async function boot(){renderNav();refreshTopbar();await loadOrgs();
  let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
- if(ob&&!ob.completed&&ob.step!=='done')go('cockpit');   // first-run: Cockpit renders the guided onboarding banner
+ if(!ORGS.length)go('orgs');                              // brand-new CEO (0 orgs): orgs are first-class — guide them to create their first org before anything else
+ else if(ob&&!ob.completed&&ob.step!=='done')go('cockpit');   // first-run: Cockpit renders the guided onboarding banner
  else go(ORG?'controller':'orgs');
  setInterval(refreshTopbar,15000);setInterval(()=>{if(['cockpit','activity'].includes(CUR))go(CUR)},6000)}
 document.addEventListener('click',e=>{if(!e.target.closest('#acctmenu')&&!String(e.target.getAttribute&&e.target.getAttribute('onclick')||'').includes('toggleAcct'))$('#acctmenu').style.display='none'});

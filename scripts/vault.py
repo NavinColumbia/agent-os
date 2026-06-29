@@ -53,6 +53,20 @@ def _tenant_of(product):
 
 _SCHEMA_READY = False
 
+# The PK every put_secret ON CONFLICT (name, product, environment, tenant_id) requires.
+_EXPECTED_PK = {"name", "product", "environment", "tenant_id"}
+
+
+def _read_pk(cur):
+    """The set of column names making up the live `secrets` PRIMARY KEY, read fresh from the
+    catalog on THIS connection (so it reflects DDL applied in the current transaction)."""
+    cur.execute(
+        """SELECT a.attname FROM pg_index i
+             JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum = ANY(i.indkey)
+            WHERE i.indrelid='secrets'::regclass AND i.indisprimary"""
+    )
+    return {r[0] for r in cur.fetchall()}
+
 
 def _ensure_schema():
     """Idempotently make the live `secrets` table tenant-scoped (#52).
@@ -60,8 +74,14 @@ def _ensure_schema():
     The original PK was (name, product, environment) with no tenant column, so a secret was
     addressable by anyone who could name its product — and `get_secret` never bound the *requester's*
     tenant. We add `tenant_id` and fold it into the PK so tenant isolation is enforced in storage,
-    not just by convention. ADD COLUMN IF NOT EXISTS is a no-op once applied; the PK is only
-    rebuilt when tenant_id is not yet part of it."""
+    not just by convention. ADD COLUMN IF NOT EXISTS is a no-op once applied.
+
+    Self-healing cache: we only set `_SCHEMA_READY` after RE-READING the live PK and confirming it
+    EXACTLY equals (name, product, environment, tenant_id) — the spec put_secret's ON CONFLICT
+    targets. A long-running process that booted against stale schema/DB state therefore can't latch a
+    broken `_SCHEMA_READY=True` for its whole lifetime: if the PK still doesn't match after we try to
+    rebuild it, we leave the cache False and raise, so the next call retries instead of failing every
+    put_secret with 'no unique or exclusion constraint matching the ON CONFLICT specification'."""
     global _SCHEMA_READY
     if _SCHEMA_READY:
         return
@@ -70,16 +90,18 @@ def _ensure_schema():
         # Backfill tenant_id for any rows written before this column existed.
         cur.execute("UPDATE secrets SET tenant_id=split_part(product,':',2) "
                     "WHERE tenant_id='' AND product LIKE 'tenant:%'")
-        cur.execute(
-            """SELECT a.attname FROM pg_index i
-                 JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum = ANY(i.indkey)
-                WHERE i.indrelid='secrets'::regclass AND i.indisprimary"""
-        )
-        pk = {r[0] for r in cur.fetchall()}
-        if "tenant_id" not in pk:
+        # Rebuild the PK unless it ALREADY exactly matches the expected 4 columns (not merely
+        # "contains tenant_id" — a wrong/partial PK must be corrected too).
+        if _read_pk(cur) != _EXPECTED_PK:
             cur.execute("ALTER TABLE secrets DROP CONSTRAINT IF EXISTS secrets_pkey")
             cur.execute("ALTER TABLE secrets ADD PRIMARY KEY (name, product, environment, tenant_id)")
         c.commit()
+        # Verify against the live table AFTER commit. Only then is it safe to cache.
+        pk = _read_pk(cur)
+    if pk != _EXPECTED_PK:
+        raise RuntimeError(
+            f"secrets PRIMARY KEY is {sorted(pk)}, expected {sorted(_EXPECTED_PK)} — refusing to "
+            "cache schema as ready so put_secret's ON CONFLICT stays valid")
     _SCHEMA_READY = True
 
 

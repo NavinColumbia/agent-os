@@ -47,9 +47,34 @@ def _tenant(token):
         return None
 
 
-def _products(cur, tid):
-    cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s ORDER BY created_at DESC", (tid,))
+def _default_org(cur, tid):
+    """The tenant's default org — its oldest org. Legacy products (org_id NULL, created before the
+    org layer) belong here, so they surface when the default org is the active one. None if no orgs."""
+    try:
+        cur.execute("SELECT min(id) FROM orgs WHERE tenant_id=%s", (tid,))
+        r = cur.fetchone()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def _scoped_products(cur, tid, org_id=0):
+    """Products for a tenant, optionally scoped to ONE org (the active org in the 'This org' nav).
+    org_id falsy → the whole tenant (legacy/CLI behaviour). When an org is selected we filter
+    tenant_products by org_id; legacy NULL org_id rows count as the tenant's default org."""
+    if not org_id:
+        cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s ORDER BY created_at DESC", (tid,))
+    elif int(org_id) == (_default_org(cur, tid) or -1):
+        cur.execute("""SELECT product FROM tenant_products WHERE tenant_id=%s
+                       AND (org_id=%s OR org_id IS NULL) ORDER BY created_at DESC""", (tid, int(org_id)))
+    else:
+        cur.execute("""SELECT product FROM tenant_products WHERE tenant_id=%s AND org_id=%s
+                       ORDER BY created_at DESC""", (tid, int(org_id)))
     return [r[0] for r in cur.fetchall()]
+
+
+def _products(cur, tid, org_id=0):
+    return _scoped_products(cur, tid, org_id)
 
 
 def _product_view(cur, product):
@@ -82,10 +107,11 @@ def _product_view(cur, product):
             "workers": workers, "halted": killswitch.is_halted(product).get("halted", False)}
 
 
-def cockpit(tid):
-    """The whole tenant-scoped payload: per-product progress/spend/workers + comms + budget + queue."""
+def cockpit(tid, org_id=0):
+    """The whole tenant-scoped payload: per-product progress/spend/workers + comms + budget + queue.
+    When org_id is set, scopes to the active org's products ('This org' nav); 0 = the whole tenant."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        prods = _products(cur, tid)
+        prods = _products(cur, tid, org_id)
         products = [_product_view(cur, p) for p in prods]
         # communications among THIS tenant's agents (agents currently/recently on their products)
         comms = []
@@ -146,23 +172,23 @@ def control(tid, product, action):
 # deadlock cycles, conflicts) but scope EVERYTHING to the caller's own agents — the agents on their
 # products, derived exactly the way cockpit() does (tenant_products -> directory -> agent_ids).
 
-def _tenant_agents(cur, tid):
-    """The agent_ids working on THIS tenant's products (same derivation cockpit() uses for comms)."""
-    cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s", (tid,))
-    prods = [r[0] for r in cur.fetchall()]
+def _tenant_agents(cur, tid, org_id=0):
+    """The agent_ids working on THIS tenant's products (same derivation cockpit() uses for comms),
+    optionally scoped to the active org's products."""
+    prods = _scoped_products(cur, tid, org_id)
     if not prods:
         return [], []
     cur.execute("SELECT DISTINCT agent_id FROM directory WHERE product = ANY(%s)", (prods,))
     return prods, [r[0] for r in cur.fetchall()]
 
 
-def health(tid):
+def health(tid, org_id=0):
     """Tenant org-health: blocked waits, deadlock cycles, conflicts, dead-letter + stuck tasks — all
     scoped to the tenant's own agents. Every table read is guarded; never crashes (returns [] on error)."""
     out = {"blocked": [], "deadlocks": [], "conflicts": [], "dead_letter": 0, "stuck": 0, "ok": True}
     with psycopg.connect(DB) as c, c.cursor() as cur:
         try:
-            prods, agents = _tenant_agents(cur, tid)
+            prods, agents = _tenant_agents(cur, tid, org_id)
         except Exception:
             prods, agents = [], []
         aset = set(agents)
@@ -215,11 +241,12 @@ def health(tid):
     return out
 
 
-def company_summary(tid):
-    """ONE plain-language verdict over the whole tenant, composed from signals already computed
-    (cockpit summary + forecast level + qualityview + health). healthy | attention | critical."""
+def company_summary(tid, org_id=0):
+    """ONE plain-language verdict over the active org (or whole tenant when org_id=0), composed from
+    signals already computed (cockpit summary + forecast level + qualityview + health). healthy |
+    attention | critical."""
     try:
-        view = cockpit(tid)
+        view = cockpit(tid, org_id)
         s = view["summary"]
     except Exception:
         s = {"products": 0, "launched": 0, "building": 0, "failed": 0}
@@ -238,7 +265,7 @@ def company_summary(tid):
         quality = []
     quality_failed = sum(1 for q in quality if q.get("overall") == "failed")
 
-    h = health(tid)
+    h = health(tid, org_id)
     has_deadlock = bool(h["deadlocks"])
     over_budget = (f_level == "over")
     failed_unaddressed = (failed > 0 or quality_failed > 0)
@@ -279,13 +306,14 @@ def company_summary(tid):
     return {"verdict": verdict, "line": line}
 
 
-def comms_graph(tid):
+def comms_graph(tid, org_id=0):
     """Tenant-scoped agent communication graph: nodes + edges from the last 6h of conversations among
-    THIS tenant's agents (same aggregation dashboard.py uses, but scoped). Nodes capped ~20."""
+    THIS tenant's agents (same aggregation dashboard.py uses, but scoped). When org_id is set, scoped
+    to the active org's agents. Nodes capped ~20."""
     nodes, edges = {}, []
     with psycopg.connect(DB) as c, c.cursor() as cur:
         try:
-            _, agents = _tenant_agents(cur, tid)
+            _, agents = _tenant_agents(cur, tid, org_id)
         except Exception:
             agents = []
         if agents:
@@ -388,7 +416,8 @@ class H(BaseHTTPRequestHandler):
             tid = _tenant(self.headers.get("X-Tenant-Token"))
             if not tid:
                 return self._json(401, {"error": "sign up first"})
-            self._json(200, cockpit(tid))
+            org_id = int(parse_qs(urlparse(self.path).query).get("org", ["0"])[0] or 0)
+            self._json(200, cockpit(tid, org_id))
         else:
             self._json(404, {"error": "not found"})
 

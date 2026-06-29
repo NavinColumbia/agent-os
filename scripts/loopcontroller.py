@@ -79,6 +79,9 @@ def _set(thread_id, **kw):
 
 
 def _report(tid, thread_id, text, meta=None, urgent=False):
+    # Defense-in-depth: control markup is never user-facing. Strip any orphan [[TAG]]/[[/TAG]] markers
+    # (e.g. a dangling [[/PLAN]] left when a paired block couldn't be matched) before posting to chat.
+    text = re.sub(r"\[\[/?[A-Z][A-Z0-9_]*\]\]", "", text or "").strip()
     orchestrator.post(tid, thread_id, text, meta or {})
     if urgent:
         try:
@@ -108,6 +111,17 @@ def _dispatch(thread_id, kind, fn):
             result = fn() or {}
         except Exception as e:
             result, status = {"error": str(e)[:200]}, "failed"
+        # A long-but-healthy async run (e.g. a research fleet still going past the in-worker poll budget)
+        # returns a 'pending' sentinel. We must NOT mark it done/failed (that would surface a FALSE timeout
+        # and park the thread on a feedback gate, orphaning the eventual completion) nor advance(). Park the
+        # job as 'pending' (the crash-reaper ignores it — it only reaps 'running') and leave the thread on
+        # its 'fleet' gate so resume_stalled() reconciles it against the REAL run once it terminates.
+        if isinstance(result, dict) and result.get("pending"):
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("UPDATE controller_jobs SET status='pending', result=%s WHERE id=%s",
+                            (json.dumps(result), jid))
+                c.commit()
+            return
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("UPDATE controller_jobs SET status=%s, result=%s, finished_at=now() WHERE id=%s",
                         (status, json.dumps(result), jid))
@@ -161,6 +175,28 @@ def say(tid, thread_id, msg, api_key=None):
     _store_user(tid, thread_id, msg)
     phase = s["phase"]
     factory._ctx.api_key = api_key
+    factory._ctx.tenant = tid          # lets factory.agent enforce the consent gate as a backstop (defense-in-depth)
+
+    # CONSENT GATE (EU AI Act Art.50 / Apple 5.1.2(i) / Play AI policy): the controller's whole job is AI work —
+    # every phase either sends the CEO's text to the provider (_llm) or fans out paid agent work. Refuse BEFORE
+    # any of that, so we never send a single word to the model pre-consent (this is the "gate before the LLM"
+    # layer; research.start() + factory.agent enforce the same downstream). The user accepts consent in Settings
+    # out-of-band, then any message re-enters here and proceeds. Fail CLOSED (legal gate): a consent-infra error
+    # is treated as "not on file" rather than waved through.
+    try:
+        import consent
+        consented = consent.require_consent(tid)
+    except Exception:
+        consented = False
+    if not consented:
+        _report(tid, thread_id,
+                 "Before I can research or build anything I need your OK to use AI: please accept the "
+                 "AI-processing consent in Settings → Privacy (it names the provider your text is sent to), "
+                 "then say \"ready\" and we'll get going.",
+                 {"kind": "consent_required", "phase": phase}, urgent=True)
+        audit.append(actor="loopcontroller", action="ConsentRequired", resource=str(thread_id),
+                     decision=phase, payload={"tenant": tid})
+        return {"phase": phase, "blocked": "consent_required"}
 
     if phase == "DISCOVER":
         sysp = ("You are a product controller scoping a build for a non-technical CEO. Ask ONE focused "
@@ -269,10 +305,24 @@ def advance(thread_id, job_result=None):
     if job_result and (job_result.get("error") or job_result.get("status") in ("failed", "timeout")):
         err = job_result.get("error") or job_result.get("status")
         _set(thread_id, awaiting="user_feedback")
-        _report(tid, thread_id,
-                 f"⚠️ The **{phase}** step hit a problem and stopped: {err}. "
-                 f"Tell me how you'd like to proceed, or say \"retry\" to run it again.",
-                 {"kind": "job_failed", "phase": phase}, urgent=True)
+        # Map a KNOWN governed-spend block (the gate refused BEFORE any spend) to an ACTIONABLE message so the
+        # user can fix the precondition and resume, instead of an opaque 'failed'. Unknown errors keep the
+        # generic surface. After fixing it they say "ready"/"retry" -> the user_feedback gate re-dispatches.
+        es = str(err).lower()
+        if "consent" in es:
+            text = ("⚠️ I can't research or build yet because AI-processing consent isn't on file. Please accept "
+                    "it in Settings → Privacy (it names the provider your text is sent to), then say \"ready\" "
+                    "and I'll pick up right where we left off.")
+            meta_kind = "consent_required"
+        elif "quota" in es:
+            text = ("⚠️ You've hit your plan's build quota, so I paused before spending anything. Upgrade your "
+                    "plan (or wait for it to reset) in Settings → Billing, then say \"ready\" to continue.")
+            meta_kind = "quota_reached"
+        else:
+            text = (f"⚠️ The **{phase}** step hit a problem and stopped: {err}. "
+                    f"Tell me how you'd like to proceed, or say \"retry\" to run it again.")
+            meta_kind = "job_failed"
+        _report(tid, thread_id, text, {"kind": meta_kind, "phase": phase}, urgent=True)
         audit.append(actor="loopcontroller", action="JobFailed", resource=str(thread_id), decision=phase,
                      payload={"error": str(err)[:200]})
         return
@@ -312,13 +362,28 @@ def advance(thread_id, job_result=None):
         q = (s["brief"] or {}).get("question", "build my product")
         def _do_research():
             import research as _r, time
-            rid = _r.start(tid, s["org_id"], thread_id, q)["run_id"]
-            for _ in range(150):
+            started = _r.start(tid, s["org_id"], thread_id, q)
+            rid = started.get("run_id")
+            if started.get("error"):
+                # The governed-spend gate (consent/quota) refused the fan-out up front — no thread was
+                # started. Carry the REAL reason into the job result so advance() renders an actionable
+                # message ("accept consent / upgrade plan, then say ready") instead of an opaque 'failed'.
+                return {"run_id": rid, "status": "failed", "error": started["error"], "options": []}
+            # Persist the run id up front so resume_stalled() can reconcile this thread against the REAL
+            # research run even if this worker — or the whole process — dies before the run finishes.
+            _set(thread_id, research_run_id=rid)
+            # Poll in-worker for the common (fast) case, but bound the wait to the same window the
+            # crash-sweeper uses (RUNNING_TIMEOUT_MIN) instead of a hard 300s cap that falsely declared a
+            # still-healthy fleet 'timeout'. The research fleet runs in its OWN daemon, so if it outlives
+            # this budget we hand off (pending) rather than killing a live run.
+            deadline = time.time() + RUNNING_TIMEOUT_MIN * 60
+            while time.time() < deadline:
                 st = _r.run_state(tid, rid)
                 if st["status"] in ("done", "failed"):
                     return {"run_id": rid, "status": st["status"], "options": st.get("options", [])}
                 time.sleep(2)
-            return {"run_id": rid, "status": "timeout", "options": []}
+            # Still running and healthy — hand off to resume_stalled() instead of declaring a false timeout.
+            return {"run_id": rid, "status": "pending", "pending": True}
         _dispatch(thread_id, "research", _do_research)
         return
 
@@ -417,10 +482,50 @@ def resume_stalled():
       * status='failed' -> the worker caught an error but its advance() was lost -> advance now, which
         surfaces the failure (advance() handles error/failed dicts instead of re-dispatching).
     For each parked thread we act ONLY on its LATEST job: a thread whose newest job is still legitimately
-    'running' (not timed out) is left untouched, and stale older jobs never trigger a spurious advance.
+    'running'/'pending' (not timed out) is left untouched, and stale older jobs never trigger a spurious
+    advance.
+    RESEARCH threads are special-cased FIRST (block 0): they are reconciled against the real research run,
+    so a long fleet that outran the in-worker poll budget — or that completed after the thread was parked
+    on a feedback gate by an old false-timeout build — still surfaces its options instead of being orphaned.
     """
     _ensure()
     advanced = 0
+    # 0) RESEARCH threads are reconciled against the REAL research run (research_runs) — NOT the dispatch
+    #    poll. A fleet run that outlived the in-worker poll budget (-> 'pending'), or whose worker/process
+    #    died, still reaches a terminal state in its own daemon; pull its result through so the extracted
+    #    options are never orphaned — even if an older build already parked the thread on a feedback gate.
+    #    This OWNS RESEARCH recovery; the generic fleet sweep below skips RESEARCH to avoid a double-advance
+    #    or a spurious failure from a controller_job the reaper marked 'failed' while the run was healthy.
+    try:
+        import research as _r
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT thread_id, tenant_id, research_run_id, awaiting FROM controller_state
+                           WHERE phase='RESEARCH' AND research_run_id IS NOT NULL""")
+            rrows = cur.fetchall()
+        for thread_id, rtid, rid, awaiting in rrows:
+            try:
+                rs = _r.run_state(rtid, rid)
+            except Exception:
+                continue
+            rstatus = rs.get("status")
+            if rstatus == "done":
+                jr = {"run_id": rid, "status": "done", "options": rs.get("options", [])}
+            elif rstatus == "failed" and awaiting == "fleet":
+                # Surface the failure once, from the active dispatch gate; don't re-spam a thread already
+                # parked on a feedback gate (the failure was surfaced when it was first parked there).
+                jr = {"run_id": rid, "status": "failed", "error": "research failed"}
+            else:
+                continue                          # still running, or an already-surfaced failure — leave it
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("""UPDATE controller_jobs SET status=%s, finished_at=COALESCE(finished_at, now())
+                               WHERE thread_id=%s AND kind='research' AND status IN ('running','pending')""",
+                            (rstatus, thread_id))
+                c.commit()
+            _set(thread_id, awaiting=None)
+            advance(thread_id, job_result=jr)     # done -> OPTIONS; failed -> surfaces failure
+            advanced += 1
+    except Exception:
+        pass
     with psycopg.connect(DB) as c, c.cursor() as cur:
         # 1) Reap timed-out 'running' jobs: the worker is gone, so mark them failed (durable terminal state).
         cur.execute("""UPDATE controller_jobs SET status='failed',
@@ -431,15 +536,16 @@ def resume_stalled():
                          AND started_at < now() - make_interval(mins => %s)""",
                     (RUNNING_TIMEOUT_MIN,))
         c.commit()
-        # 2) For every thread parked on 'fleet', take its most recent job (any status).
+        # 2) For every NON-research thread parked on 'fleet', take its most recent job (any status).
+        #    RESEARCH is reconciled above against its real run, so exclude it here.
         cur.execute("""SELECT DISTINCT ON (cj.thread_id) cj.thread_id, cj.result, cj.status
                        FROM controller_jobs cj
                        JOIN controller_state cs ON cs.thread_id=cj.thread_id
-                       WHERE cs.awaiting='fleet'
+                       WHERE cs.awaiting='fleet' AND cs.phase <> 'RESEARCH'
                        ORDER BY cj.thread_id, cj.id DESC""")
         rows = cur.fetchall()
     for thread_id, result, status in rows:
-        if status == "running":
+        if status in ("running", "pending"):
             continue                              # newest job still genuinely in flight — leave it alone
         res = result if isinstance(result, dict) else {}
         if status == "failed" and not (res.get("error") or res.get("status") == "failed"):
@@ -466,7 +572,10 @@ def _llm(tid, thread_id, sysp, s):
     convo = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in orchestrator.history(tid, thread_id)[-12:])
     task = f"{sysp}\n\n{_ctx_brief(s)}\n\nCONVERSATION:\n{convo}\n\nReply now:"
     r = factory.agent("research-growth", str(factory.PRODUCTS), task, tools=[])
-    return (r.get("out") or "").strip() or "Tell me a bit more."
+    # Use the COMPLETE output (out_full) — never the tail-truncated 'out'. The controller's reply carries
+    # leading control blocks ([[RESEARCH]]/[[PLAN]]); a >1500-char plan would lose its OPENING tag under
+    # front-truncation, so _parse_block fails (plan never persists) and a dangling [[/PLAN]] leaks to chat.
+    return (r.get("out_full") or r.get("out") or "").strip() or "Tell me a bit more."
 
 
 def _parse_plan(body):
@@ -481,7 +590,10 @@ def _parse_plan(body):
 
 
 def _affirmative(msg):
-    return bool(re.search(r"\b(looks good|approve|approved|go ahead|yes|ship it|do it|ready|lgtm|perfect|good)\b",
+    # Includes the recovery words the failure UI tells the CEO to type ("retry" etc.) so the instructed
+    # word actually clears the gate and re-dispatches the parked phase via advance() — not a no-op.
+    return bool(re.search(r"\b(looks good|approve|approved|go ahead|yes|ship it|do it|ready|lgtm|perfect|good"
+                          r"|retry|re-?run|try again|redo|run it again)\b",
                           (msg or "").lower()))
 
 
@@ -525,12 +637,18 @@ def _selftest():
     real = (_r.start, _r.run_state, _r.select, _d.prototype, _q.run, _v.verify)
 
     def fake_agent(role, repo, task, **k):
+        # Mirror factory.agent's real contract: a tail-truncated 'out' (1500-char preview) PLUS the
+        # complete 'out_full'. A long preamble pushes the OPENING [[..]] tag out of the 1500-char tail,
+        # so this is a regression test: _llm MUST read out_full or the opening tag is lost.
+        def both(body):
+            full = ("preamble. " * 220) + body          # >1500 chars before the control block
+            return {"rc": 0, "out": full[-1500:], "out_full": full}
         if "[[RESEARCH]]" in task:
-            return {"rc": 0, "out": "Great.\n[[RESEARCH]]\nHow to build a YouTube competitor\n[[/RESEARCH]]"}
+            return both("Great.\n[[RESEARCH]]\nHow to build a YouTube competitor\n[[/RESEARCH]]")
         if "[[PLAN]]" in task:
-            return {"rc": 0, "out": "Plan:\n[[PLAN]]\nname: vid\nkind: service\nplan: - api\n- ui\n"
-                                    "charter: A video API.\n[[/PLAN]]"}
-        return {"rc": 0, "out": "ok"}
+            return both("Plan:\n[[PLAN]]\nname: vid\nkind: service\nplan: - api\n- ui\n"
+                        "charter: A video API.\n[[/PLAN]]")
+        return {"rc": 0, "out": "ok", "out_full": "ok"}
     factory.agent = fake_agent
     _r.start = lambda t, o, th, q: {"run_id": 999}
     _r.run_state = lambda t, rid: {"status": "done", "options": [{"id": 1, "title": "A", "recommended": True}]}
@@ -542,6 +660,7 @@ def _selftest():
         import tenantproviders; tenantproviders.connect(tid, "anthropic", "subscription")
     except Exception:
         pass
+    import consent
 
     def wait(th, target, gate=None, tmax=14):
         for _ in range(tmax * 5):
@@ -552,12 +671,26 @@ def _selftest():
         return False
     try:
         th = start(tid, org)["thread_id"]
+        # CONSENT GATE: pre-consent, say() must REFUSE before touching the LLM (no phase change, no spend) and
+        # tell the CEO to accept consent — not silently send their text to the provider.
+        pre = say(tid, th, "I want a YouTube competitor")
+        consent_gate_ok = (pre.get("blocked") == "consent_required" and _st(th)["phase"] == "DISCOVER")
+        consent.record(tid)                                       # CEO accepts AI-processing consent in Settings
         say(tid, th, "I want a YouTube competitor")               # DISCOVER->RESEARCH->OPTIONS
         opt = wait(th, "OPTIONS", "user_approval")
         gate_held = (say(tid, th, "hmm") or True) and _st(th)["phase"] == "OPTIONS"   # OPTIONS only moves via choose()
         choose(tid, th, 1)                                         # ->DEEP_DESIGN
         in_design = _st(th)["phase"] == "DEEP_DESIGN"
         say(tid, th, "go ahead")                                  # draft PLAN (awaiting feedback)
+        # PLAN must parse from the (front-truncatable) LLM reply: persisted to state, rendered as a plan
+        # card (meta.kind='plan'), and NO dangling control tag leaked into the user-visible chat.
+        plan_persisted = bool((_st(th).get("plan") or {}).get("name"))
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT content, meta FROM chat_messages WHERE thread_id=%s AND role='assistant'
+                           ORDER BY id DESC LIMIT 1""", (th,))
+            pc, pm = cur.fetchone()
+        plan_card = isinstance(pm, dict) and pm.get("kind") == "plan"
+        no_tag_leak = "[[" not in (pc or "")
         say(tid, th, "looks good")                                # approve plan -> PLAN_APPROVAL -> PROTOTYPE
         proto = wait(th, "IMPLEMENT", "user_feedback")            # prototype done -> gated at IMPLEMENT for approval
         say(tid, th, "approve")                                   # -> build -> TESTQA -> DELIVER
@@ -565,15 +698,18 @@ def _selftest():
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM controller_jobs WHERE thread_id=%s AND status='done'", (th,))
             jobs = cur.fetchone()[0]
-        ok = opt and gate_held and in_design and proto and deliver and jobs >= 3
-        print(f"options={opt} gate_held={gate_held} design={in_design} prototype={proto} deliver={deliver} jobs_done={jobs}")
+        ok = (consent_gate_ok and opt and gate_held and in_design and plan_persisted and plan_card
+              and no_tag_leak and proto and deliver and jobs >= 3)
+        print(f"consent_gate={consent_gate_ok} options={opt} gate_held={gate_held} design={in_design} "
+              f"plan_persisted={plan_persisted} plan_card={plan_card} no_tag_leak={no_tag_leak} "
+              f"prototype={proto} deliver={deliver} jobs_done={jobs}")
         print("PASS: loopcontroller DISCOVER->DELIVER with gates + durable jobs ✅" if ok else "FAIL")
     finally:
         factory.agent = real_agent
         _r.start, _r.run_state, _r.select, _d.prototype, _q.run, _v.verify = real
         with psycopg.connect(DB) as c, c.cursor() as cur:
             for t in ("controller_jobs", "controller_state", "chat_messages", "chat_threads", "orgs",
-                      "tenant_providers", "tenant_products", "tenants"):
+                      "tenant_providers", "tenant_products", "ai_consent", "tenants"):
                 cur.execute(f"DELETE FROM {t} WHERE tenant_id=%s", (tid,))
             c.commit()
     sys.exit(0 if ok else 1)

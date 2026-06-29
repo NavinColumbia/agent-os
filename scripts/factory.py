@@ -382,11 +382,11 @@ def _agent_codex(role, repo, prompt, codex_key, timeout=600):
                      decision="executed", payload={"engine": "codex", "rc": rc, "attempt": attempt + 1})
         _trace("agent", role, prompt, out_text, rc, 0.0, cost, tin, tout, used)
         if rc == 0 and out_text.strip():
-            return {"rc": 0, "out": out_text[-1500:], "cost_usd": cost, "tokens_in": tin,
+            return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost, "tokens_in": tin,
                     "tokens_out": tout, "attempts": attempt + 1, "model": used}
         last_out = out_text
         time.sleep(4 * (attempt + 1))
-    return {"rc": 1, "out": (last_out or "")[-1500:], "failed": True, "reason": "codex exhausted"}
+    return {"rc": 1, "out": (last_out or "")[-1500:], "out_full": last_out or "", "failed": True, "reason": "codex exhausted"}
 
 
 def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None,
@@ -425,6 +425,26 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                          decision="spawn-gate-failopen", payload={"spawner": spawner_role, "error": str(e)[:200]})
         except Exception:
             pass
+    # CONSENT BACKSTOP (EU AI Act Art.50 / Apple 5.1.2(i) / Play AI policy): never send a tenant's text to
+    # the model before NAMED AI-processing consent is on file. Front doors gate this up front (research.start,
+    # loopcontroller.say, orchestrator.confirm); this is the defense-in-depth chokepoint so a caller that
+    # forgets to gate (e.g. the controller's conversational _llm) still can't leak pre-consent text. Only
+    # enforced when a tenant is in context (_ctx.tenant): platform/internal builds and the offline selftest
+    # set no tenant -> not gated (higher layers bound the build line; bricking every agent on a missing-tenant
+    # gap is the wrong trade — mirrors the spawn-gate fail-open above). Fail OPEN on consent-infra error (a DB
+    # hiccup shouldn't wedge the fleet); a clean, readable 'no consent on file' for a known tenant fails CLOSED.
+    _tenant = getattr(_ctx, "tenant", None)
+    if _tenant:
+        try:
+            import consent
+            _consented = consent.require_consent(_tenant)
+        except Exception:
+            _consented = True
+        if not _consented:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="consent-required", payload={"tenant": _tenant, "spawner": spawner_role})
+            return {"rc": -1, "failed": True, "out": "consent required", "blocker": "consent_required",
+                    "reason": "AI-processing consent is not on file for this tenant — accept it in Settings, then retry"}
     if BUDGET_USD and spent_usd() >= BUDGET_USD:      # BUDGET cap: stop spawning new work, escalate
         return {"rc": -1, "failed": True, "out": "budget exhausted",
                 "blocker": f"factory budget ${BUDGET_USD:.2f} exhausted (${spent_usd():.2f} spent) — raise AOS_BUDGET_USD or split the work"}
@@ -496,9 +516,11 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                      decision="executed", payload={"rc": rc, "attempt": attempt + 1, "cost_usd": cost, "model": used})
         _trace("agent", role, prompt, out_text, rc, dt, cost, tin, tout, used)
         if key and "Invalid API key" in out_text:       # bad BYO key — don't waste retries
-            return {"rc": rc, "out": out_text[-1500:], "failed": True, "reason": "invalid BYO key"}
+            return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True, "reason": "invalid BYO key"}
         if rc == 0 and out_text.strip():
-            return {"rc": 0, "out": out_text[-1500:], "cost_usd": cost, "tokens_in": tin,
+            # 'out' stays tail-truncated for compact previews/logs; 'out_full' carries the COMPLETE text so
+            # callers parsing leading control blocks ([[PLAN]]/[[RESEARCH]]) never lose the opening marker.
+            return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost, "tokens_in": tin,
                     "tokens_out": tout, "attempts": attempt + 1, "model": used}
         last = {"rc": rc, "out": out_text}
         transient = any(t in (out_text or "").lower() for t in _TRANSIENT)
@@ -522,7 +544,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                                 title="factory", tags="arrows_counterclockwise")
                 except Exception:
                     pass
-                return {"rc": 0, "out": out_text[-1500:], "cost_usd": cost, "tokens_in": tin,
+                return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost, "tokens_in": tin,
                         "tokens_out": tout, "attempts": retries + 1, "model": used, "engine": "codex"}
             last = {"rc": rc, "out": out_text}
         except subprocess.TimeoutExpired:
@@ -535,7 +557,8 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                     title="factory", priority="high", tags="warning")
     except Exception:
         pass
-    return {"rc": last["rc"], "out": (last["out"] or "")[-1500:], "failed": True, "attempts": retries + 1}
+    return {"rc": last["rc"], "out": (last["out"] or "")[-1500:], "out_full": last["out"] or "",
+            "failed": True, "attempts": retries + 1}
 
 
 def _sandbox_config(repo: str) -> dict:

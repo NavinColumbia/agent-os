@@ -81,7 +81,10 @@ def start(tenant_id, org_id, thread_id, question, api_key=None):
     if block:
         audit.append(actor="research", action="ResearchRunBlocked", resource=str(run_id),
                      decision="blocked", payload={"reason": block, "tenant": tenant_id})
-        return {"run_id": run_id, "error": block}
+        # Surface the REAL block reason (e.g. 'consent_required') alongside the terminal status, so a caller
+        # that only sees this return — or polls run_state and gets status='failed' — can still propagate an
+        # ACTIONABLE reason to the user instead of an opaque 'failed'. The thread is NOT started (no spend).
+        return {"run_id": run_id, "status": "failed", "error": block}
     audit.append(actor="research", action="ResearchRunStart", resource=str(run_id),
                  decision="executed", payload={"question": (question or "")[:160], "tenant": tenant_id})
     threading.Thread(target=_run, args=(run_id, question, api_key), daemon=True).start()
@@ -245,6 +248,13 @@ def _selftest():
 
     reg = billing.signup("research-selftest", "free")
     tid = reg["tenant_id"]
+    # Pre-consent: start() must REFUSE the fan-out (no spend, no thread) and return the actionable reason
+    # alongside a terminal status, recording the run as 'failed' durably — this is what lets the controller
+    # render "accept consent, then say ready" instead of a generic 'failed'.
+    pre = start(tid, "org-self", 1, "should be blocked pre-consent")
+    blocked_ok = (pre.get("error") == "consent_required"
+                  and run_state(tid, pre["run_id"])["status"] == "failed")
+    print(f"pre-consent block: error={pre.get('error')} status={run_state(tid, pre['run_id'])['status']}")
     consent.record(tid)                                # start() now gates on consent (governed spend path)
     run_id = None
     ok = False
@@ -271,9 +281,10 @@ def _selftest():
         except ValueError:
             xselect_ok = True
         xtenant_ok = xread == [] and xselect_ok
-        ok = parse_ok and extracted_ok and chosen_ok and xtenant_ok
+        ok = parse_ok and extracted_ok and chosen_ok and xtenant_ok and blocked_ok
         print(f"run {run_id}: status={st['status']} options={len(opts)} recommended={len(recs)} "
-              f"chosen={chosen['title'] if chosen else None} xtenant_guard={xtenant_ok}")
+              f"chosen={chosen['title'] if chosen else None} xtenant_guard={xtenant_ok} "
+              f"preconsent_block={blocked_ok}")
         print("PASS: research STATE+OPTIONS (async run -> 3 selectable cards -> select) ✅" if ok else "FAIL")
     finally:
         research_fleet.research, factory.agent = real_research, real_agent

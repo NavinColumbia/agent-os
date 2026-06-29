@@ -13,7 +13,10 @@ import sys
 
 MASK = "‹REDACTED›"
 # key=value style assignment of a secret: keep the key+separator, mask the value.
-KV_PATTERN = re.compile(r"""(?i)\b(api[_-]?key|secret|token|password|passwd|aosnap_pass)\b(\s*[:=]\s*)(['"]?)[^\s'"]{6,}""")
+# NOTE: do NOT use \b around the keyword — underscore is a \w char, so an env-style key like
+# ACCESS_TOKEN / GITHUB_API_KEY / DB_PASSWORD has NO word boundary before the keyword and would
+# fail open (leak the value). Use character-class lookarounds that also break on underscore.
+KV_PATTERN = re.compile(r"""(?i)(?<![A-Za-z0-9])(api[_-]?key|secret|token|password|passwd|aosnap_pass)(?![A-Za-z0-9])(\s*[:=]\s*)(['"]?)[^\s'"]{6,}""")
 # DB url password: keep prefix + '@', mask the password between them.
 DBURL_PATTERN = re.compile(r"(postgres(?:ql)?://[^:/\s]+:)([^@\s]+)(@)")
 # Standalone secret shapes — masked wholesale.
@@ -54,6 +57,12 @@ def _main(a):
             ("Authorization: Bearer eyJhbGciOiJ.payload.sig", "Bearer eyJ"),
             ("DATABASE_URL=postgresql://agentos:supersecretpw@127.0.0.1:5433/agentos", "supersecretpw"),
             ("password: hunter2hunter2", "hunter2"),
+            # underscore-prefixed env-style keys with opaque values (fail-open regression):
+            ("access_token=abcdef1234567890deadbeef", "abcdef1234567890deadbeef"),
+            ("refresh_token: zzzzz9999988887777", "zzzzz9999988887777"),
+            ("GITHUB_API_KEY=plainsecret123456", "plainsecret123456"),
+            ("MY_SECRET=plainsecret123456", "plainsecret123456"),
+            ("db_password=plainsecret123456", "plainsecret123456"),
         ]
         leaked = [raw for raw, secret in cases if secret in scrub(raw)]
         kept = scrub("the build passed 163 tests in 0.3s") == "the build passed 163 tests in 0.3s"

@@ -40,7 +40,7 @@ def _metrics():
             m.append(("agentos_task_dead_letter_depth", "gauge",
                       "Dead-lettered tasks awaiting human action", by_status.get("dead", 0)))
             cur.execute("SELECT COALESCE(sum(attempts),0) FROM tasks WHERE attempts IS NOT NULL")
-            m.append(("agentos_task_retries_total", "counter", "Total task retry attempts", cur.fetchone()[0]))
+            m.append(("agentos_task_retries_total", "gauge", "Sum of retry attempts across live tasks (point-in-time, non-monotonic)", cur.fetchone()[0]))
 
             # --- build outcomes (last 24h) ---
             cur.execute("""SELECT decision, count(*) FROM audit_log
@@ -61,7 +61,7 @@ def _metrics():
             m.append(("agentos_agent_cost_usd_24h", "gauge", "Agent spend USD last 24h", round(float(cost), 4)))
             m.append(("agentos_agent_tokens_24h", "gauge", "Agent tokens last 24h", int(toks)))
             cur.execute("SELECT count(*) FROM traces WHERE rc <> 0 AND ts > now() - interval '24 hours'")
-            m.append(("agentos_agent_step_errors_24h", "counter", "Failed agent steps last 24h",
+            m.append(("agentos_agent_step_errors_24h", "gauge", "Failed agent steps last 24h",
                       cur.fetchone()[0]))
 
             # --- liveness ---

@@ -403,8 +403,9 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None):
                                        "checks": [(c["check"], c["ok"]) for c in v.get("passes", [])]}
                 if not v.get("passed"):               # verification is a real gate at rigor>1
                     log["result"], log["passed"] = "BLOCKED_AT_VERIFY", False
-            except Exception as e:
+            except Exception as e:                    # fail CLOSED: an unverifiable build is NOT INTEGRATED
                 log["verification"] = {"error": str(e)[:160]}
+                log["result"], log["passed"] = "BLOCKED_AT_VERIFY", False
     if top:
         audit.append(actor="project:controller", action="ProjectComplete", resource=product,
                      decision=log["result"], payload={"components": len(by_id), "layers": len(layers),

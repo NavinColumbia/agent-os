@@ -24,6 +24,7 @@ SECRET_RE = re.compile(r"""(?i)\b(api[_-]?key|secret|token|password|passwd)\b\s*
 BIND_RE = re.compile(r"""['"]0\.0\.0\.0['"]""")  # only an actual quoted bind address, not a comment
 ALLOW_SECRET = ("CHANGE-ME", "os.environ", "getenv", "_cfg", ".env", "example", "AOSNAP_PASS=%s", "token_hex",
                 "Bearer ", "f\"Bearer", "<", "your-", "xxx")
+ALLOW_MARK = "secscan:allow"   # inline marker for intentional test fixtures (e.g. verify.py's self-test)
 
 findings = []
 
@@ -46,6 +47,8 @@ def scan_binds_and_secrets():
         rel = p.relative_to(ROOT)
         for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
             if line.lstrip().startswith("#"):
+                continue
+            if ALLOW_MARK in line:   # intentional test fixture, explicitly annotated
                 continue
             if BIND_RE.search(line):
                 add("HIGH", f"{rel}:{i}", "binds a quoted 0.0.0.0 (must be localhost/tailnet only)")

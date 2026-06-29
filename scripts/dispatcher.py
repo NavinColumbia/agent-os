@@ -20,6 +20,7 @@ import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
+import appguard   # noqa: E402  — per-app circuit-breaker (pause state); gate dispatch so paused apps don't spend
 import audit      # noqa: E402
 import directory  # noqa: E402
 import factory    # noqa: E402
@@ -35,6 +36,9 @@ BACKOFF_S = int(os.environ.get("AOS_TASK_BACKOFF_S", "120"))       # base retry 
 # that legitimately runs longer than tasksweep's AOS_TASK_LEASE_S (default 1800s) is NOT reaped as if its
 # worker were dead. MUST stay comfortably below that lease so several beats land within one lease window.
 HEARTBEAT_S = int(os.environ.get("AOS_TASK_HEARTBEAT_S", "300"))
+# Circuit-breaker gate: how long to defer (not fail) a claimed task whose app appguard has PAUSED, before
+# re-checking. Cheap DB re-poll only — the agent is never invoked while paused, so no money is spent.
+PAUSE_DEFER_S = int(os.environ.get("AOS_PAUSE_DEFER_S", "600"))
 
 
 def _pull(limit):
@@ -127,8 +131,47 @@ def _retry_or_dead(tid, attempts, max_retry, err):
         return "retry"
 
 
-def process(task):
+def _app_of(assignee):
+    """The app/product a task belongs to, for the pause gate. Agent ids are '{role}@{product}' (factory.py
+    aid = f'{role}@{product}'), so the product is the part after '@'. Returns None when there is no product
+    component (e.g. a global/agentless assignee) — then we can't attribute it to an app, so dispatch proceeds."""
+    return assignee.split("@", 1)[1] if assignee and "@" in assignee else None
+
+
+def _paused_apps():
+    """Set of apps the circuit-breaker (appguard) has PAUSED. FAIL-OPEN by design: a transient
+    appguard/DB hiccup must NEVER brick the whole activation loop, so on any lookup error we return an
+    empty set and dispatch normally (factory's per-product budget governor still backstops spend). Only a
+    CONFIRMED 'paused' status withholds work — fail-closed here would strand every tenant's liveness."""
+    try:
+        return {p["app"] for p in appguard.paused_apps()}
+    except Exception as e:                            # lookup failure -> open the gate, but leave a trail
+        audit.append(actor="dispatcher", action="PauseLookupFailed", resource="appguard",
+                     decision="fail-open", payload={"error": str(e)[:160]})
+        return set()
+
+
+def _defer_paused(tid, app):
+    """Release a claimed task for a PAUSED app back to 'pending' with a re-check delay instead of running
+    it — waking its agent would spend the very money the circuit-breaker is halting. attempts/max_retry are
+    left UNTOUCHED so a long pause never dead-letters legitimate work; it simply waits for the human resume."""
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""UPDATE tasks SET status='pending', locked_at=NULL,
+                       not_before=now() + (%s || ' seconds')::interval
+                       WHERE id=%s AND status='active'""", (PAUSE_DEFER_S, tid))
+        c.commit()
+    audit.append(actor="dispatcher", action="SkipPausedApp", resource=app, decision="deferred",
+                 payload={"task_id": tid, "recheck_s": PAUSE_DEFER_S})
+
+
+def process(task, paused=None):
     tid, assignee, requester, title, priority, attempts, max_retry = task
+    app = _app_of(assignee)
+    if paused is None:                                # standalone call (not via tick): resolve pauses now
+        paused = _paused_apps()
+    if app and app in paused:                         # circuit-breaker open for this app -> do NOT spend
+        _defer_paused(tid, app)
+        return {"task_id": tid, "assignee": assignee, "ok": False, "disposition": "paused-skip", "app": app}
     role = assignee.split("@", 1)[0]                  # agent_id 'legal-...@inst' -> role
     workspace = INBOX_WORKSPACE / assignee.replace("@", "_at_").replace("/", "_")
     workspace.mkdir(parents=True, exist_ok=True)
@@ -153,7 +196,8 @@ def process(task):
 def tick():
     INBOX_WORKSPACE.mkdir(parents=True, exist_ok=True)
     rows = _pull(MAX_PER_TICK)
-    results = [process(t) for t in rows]
+    paused = _paused_apps()                           # one lookup per tick; gates every claimed task below
+    results = [process(t, paused) for t in rows]
     return {"processed": len(results), "tasks": results}
 
 
@@ -199,7 +243,33 @@ def _main(a):
                 cur.execute("DELETE FROM tasks WHERE assignee=%s", (hb_ag,)); c.commit()
         print(f"heartbeat refreshed live lease: {hb_ok}")
         ok = ok and hb_ok
-        print("PASS: dispatcher claims + would invoke idle agents + heartbeats live leases ✅" if ok else "FAIL")
+        # circuit-breaker gate: a claimed task whose app appguard PAUSED must be skipped (agent NOT invoked,
+        # so $0 spent) and released back to 'pending' for later — NOT failed/dead-lettered. Proven offline.
+        papp = f"paused-app-{suf}"
+        pag = f"technical-writer@{papp}"
+        try:
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("""INSERT INTO app_policies (app,status,reason) VALUES (%s,'paused','selftest')
+                               ON CONFLICT (app) DO UPDATE SET status='paused', reason='selftest'""", (papp,))
+                c.commit()
+            orchestrate.enqueue(pag, f"selftest paused {suf}", priority=5)
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("""UPDATE tasks SET status='active', locked_at=now() WHERE assignee=%s
+                               RETURNING id, assignee, requester, title, priority,
+                                         COALESCE(attempts,0), COALESCE(max_retry,3)""", (pag,))
+                prow = cur.fetchone(); c.commit()
+            disp = process(prow, _paused_apps()) if prow else {}     # gate; does NOT call factory.agent
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("SELECT status FROM tasks WHERE assignee=%s", (pag,))
+                st = cur.fetchone()
+            pause_ok = bool(prow) and disp.get("disposition") == "paused-skip" and bool(st) and st[0] == "pending"
+        finally:                                          # ALWAYS clean up our fixture rows
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("DELETE FROM tasks WHERE assignee=%s", (pag,))
+                cur.execute("DELETE FROM app_policies WHERE app=%s", (papp,)); c.commit()
+        print(f"paused-app task skipped (no spend) + requeued, not failed: {pause_ok}")
+        ok = ok and pause_ok
+        print("PASS: dispatcher claims + would invoke idle agents + heartbeats live leases + skips paused apps ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
 

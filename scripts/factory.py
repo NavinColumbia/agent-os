@@ -390,17 +390,41 @@ def _agent_codex(role, repo, prompt, codex_key, timeout=600):
 
 
 def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None,
-          tools: list = None) -> dict:
+          tools: list = None, spawner: str = None) -> dict:
     """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry from the CALLEE's
     own estimate (pre-flight handshake). Model is pinned (reproducible) with --fallback-model on overload;
     low-stakes stages pass a cheaper model. A timeout no longer kills the stage (retry w/ backoff),
     transient errors back off longer, a bad BYO key fails fast, exhausted retries escalate."""
     model = model or BUILD_MODEL
     _apply_scale()                                    # dial capability (agents/rigor/depth) to the wallet
-    # GOVERNANCE (can_spawn gate): the factory spawns this sub-agent ON BEHALF of the orchestrating role
-    # (the controller drives the line). Only a role whose manifest grants can_spawn may cause a sub-agent
-    # to be spawned — enforce raises PermissionError + audits 'GovernanceDenied' otherwise.
-    governance.enforce(getattr(_ctx, "spawner", None) or "controller", "spawn")
+    # GOVERNANCE (can_spawn gate): the factory spawns this sub-agent ON BEHALF of the orchestrating role.
+    # Thread the REAL requester (explicit arg > per-build _ctx.spawner > the controller that drives the
+    # line) so can_spawn is enforced against who actually asked, not a hardcoded 'controller'.
+    spawner_role = spawner or getattr(_ctx, "spawner", None) or "controller"
+    # A genuine denial must refuse like every OTHER guard below (budget/killswitch/governor): return the
+    # standard {rc:-1, blocker} dict, NOT raise — a bare governance.enforce() PermissionError would wedge
+    # EVERY agent() call. But a manifest we cannot even LOAD (missing/unreadable -> {}) is infra failure,
+    # not a real deny: bricking the whole fleet on a config hiccup is the wrong trade, so we fail OPEN +
+    # audit there (the budget cap + killswitch below still bound spend/liveness). Fail-closed on a real
+    # deny we could read; fail-open on lost machinery — never brick legitimate liveness.
+    try:
+        manifest = governance.load_manifest(spawner_role)
+        if not manifest:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="spawn-gate-failopen",
+                         payload={"spawner": spawner_role, "reason": "manifest missing/unreadable"})
+        else:
+            governance.enforce(spawner_role, "spawn")   # raises PermissionError + audits 'GovernanceDenied'
+    except PermissionError:
+        return {"rc": -1, "failed": True, "out": "spawn denied",
+                "blocker": f"role '{spawner_role}' is not permitted to spawn sub-agents (can_spawn is "
+                           f"false in its manifest) — escalate for an approval or role change"}
+    except Exception as e:                               # governance infra error -> fail OPEN + audit
+        try:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="spawn-gate-failopen", payload={"spawner": spawner_role, "error": str(e)[:200]})
+        except Exception:
+            pass
     if BUDGET_USD and spent_usd() >= BUDGET_USD:      # BUDGET cap: stop spawning new work, escalate
         return {"rc": -1, "failed": True, "out": "budget exhausted",
                 "blocker": f"factory budget ${BUDGET_USD:.2f} exhausted (${spent_usd():.2f} spent) — raise AOS_BUDGET_USD or split the work"}
@@ -773,15 +797,32 @@ def run_service_qa(repo: str, pkg: str) -> tuple[bool, str]:
     return ok_e, "unit: PASS\n" + out_e
 
 
-def _review_verdict(repo) -> str:
-    """Parse the reviewer's verdict from docs/REVIEW.md — the explicit 'VERDICT:' line if present, else a
-    whole-doc scan. Defaults to APPROVE on ambiguity: QA is the OBJECTIVE ship gate, REVIEW is judgment,
-    so a parse miss must never block a QA-green build."""
+def _review_verdict(repo, text: str = "") -> str:
+    """Parse the reviewer's verdict. The reviewer is READ-ONLY (can_modify_code:false; denied_tools include
+    Edit/Write/Bash) so on the claude engine it has NO write tool and CANNOT write docs/REVIEW.md — its
+    verdict must come from the agent's OWN returned reply (`text`), which the factory then persists. We read
+    `text` FIRST (authoritative — the reviewer can always reply), then fall back to docs/REVIEW.md (the
+    crash-RESUME path, where the factory persisted the prior reply, or a write-capable engine). An explicit
+    'VERDICT:' line wins; else a whole-source scan.
+    FAIL-CLOSED on a SILENT gate: if the reviewer produced NO signal at all — empty reply AND no file — we
+    return REQUEST-CHANGES so a review that yielded nothing ESCALATES to a human (BLOCKED_AT_REVIEW) instead
+    of silently auto-passing. (Pre-fix bug: the verdict was read ONLY from a file the reviewer is FORBIDDEN
+    to write, so it was always missing -> _review_verdict always returned APPROVE -> the load-bearing review
+    gate could never block.) When the reviewer DID produce review prose but no explicit verdict and no
+    change request, we still APPROVE — QA stays the objective ship gate, REVIEW is the judgment layer."""
     f = Path(repo) / "docs" / "REVIEW.md"
-    txt = f.read_text() if f.exists() else ""
-    vlines = [l for l in txt.splitlines() if "VERDICT:" in l.upper()]
-    scope = vlines[-1] if vlines else txt
-    return "REQUEST-CHANGES" if ("REQUEST-CHANGES" in scope.upper() or "REQUEST CHANGES" in scope.upper()) else "APPROVE"
+    ftxt = f.read_text() if f.exists() else ""
+    have_signal = False
+    for src in (text or "", ftxt):                       # nearest source first: live reply, then persisted file
+        vlines = [l for l in src.splitlines() if "VERDICT:" in l.upper()]
+        if vlines:                                       # an explicit VERDICT line is authoritative
+            scope = vlines[-1].upper()
+            return "REQUEST-CHANGES" if ("REQUEST-CHANGES" in scope or "REQUEST CHANGES" in scope) else "APPROVE"
+        if src.strip():
+            have_signal = True
+            if "REQUEST-CHANGES" in src.upper() or "REQUEST CHANGES" in src.upper():
+                return "REQUEST-CHANGES"
+    return "APPROVE" if have_signal else "REQUEST-CHANGES"   # no signal at all -> fail closed, escalate
 
 
 def build_product(product: str, charter: str, kind: str = "lib", api_key: str = None,
@@ -822,6 +863,7 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
 
     cid = f"build-{product}"
     _ctx.run = cid; _ctx.product = product; _ctx.stage = "INIT"   # debug-trace context for this build
+    _ctx.spawner = "controller"   # the controller orchestrates this line — it is the requester of every spawn
 
     def _claims(role):
         f = ROLES / f"{role}.yaml"
@@ -985,24 +1027,36 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
 
     def review():
         def do_review():
-            agent("reviewer", str(repo),
-                  f"Review the implementation against docs/SPEC.md (and your previous docs/REVIEW.md if it "
-                  f"exists). Rewrite docs/REVIEW.md: what's correct, concrete risks, and END WITH A LINE "
-                  f"that is EXACTLY 'VERDICT: APPROVE' or 'VERDICT: REQUEST-CHANGES'. QA is currently "
-                  f"{'GREEN' if qa_ok[0] else 'RED'}.", model=CHEAP_MODEL)
-            return _review_verdict(repo)
-        verdict = do_review()
+            # The reviewer is a READ-ONLY role (no Edit/Write/Bash) so it CANNOT write docs/REVIEW.md — it
+            # returns its findings + verdict in its REPLY, and the FACTORY (not the agent) persists them so
+            # the verdict survives crash-resume and the builder fix loop below can read the concrete risks.
+            res = agent("reviewer", str(repo),
+                  f"Review the implementation against docs/SPEC.md (and docs/REVIEW.md if it exists). You "
+                  f"are READ-ONLY — do NOT write files; put your full review IN YOUR REPLY: what's correct, "
+                  f"concrete risks, and END YOUR REPLY WITH A LINE that is EXACTLY 'VERDICT: APPROVE' or "
+                  f"'VERDICT: REQUEST-CHANGES'. QA is currently {'GREEN' if qa_ok[0] else 'RED'}.",
+                  model=CHEAP_MODEL)
+            out = (res.get("out") or "") if isinstance(res, dict) else ""
+            if out.strip():                              # persist the reviewer's reply as the review artifact
+                try:
+                    (Path(repo) / "docs").mkdir(parents=True, exist_ok=True)
+                    (Path(repo) / "docs" / "REVIEW.md").write_text(out)
+                except Exception:
+                    pass
+            return out, _review_verdict(repo, out)
+        review_out, verdict = do_review()
         cycles = 0
         while verdict == "REQUEST-CHANGES" and qa_ok[0] and cycles < MAX_REVIEW:
             cycles += 1
             print(f"[factory] REVIEW requested changes — fix cycle {cycles}/{MAX_REVIEW}", flush=True)
             agent("builder", str(repo),
-                  "The independent reviewer REQUESTED CHANGES in docs/REVIEW.md. Address every risk/change "
-                  "it raised. Do NOT remove or weaken tests, and add NO network/external dependencies.")
+                  "The independent reviewer REQUESTED CHANGES (also in docs/REVIEW.md). Address every "
+                  "risk/change it raised:\n\n" + (review_out or "(see docs/REVIEW.md)") + "\n\nDo NOT "
+                  "remove or weaken tests, and add NO network/external dependencies.")
             ok, out = qa_run()                                  # re-verify: a review fix must not regress QA
             _trace("test", "qa-security", f"re-QA after review cycle {cycles}", out, 0 if ok else 1)
             qa_ok[0] = ok
-            verdict = do_review()
+            review_out, verdict = do_review()
         return {"passed": qa_ok[0], "verdict": verdict, "cycles": cycles}
     review_res = stage("REVIEW", "reviewer", review)
 
@@ -1020,7 +1074,7 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         verify_checks = []
         try:
             import verify as _verify
-            sec_ok, findings = _verify.static_security(repo)     # mandatory hardened gate (no spend, no infra)
+            sec_ok, findings = _verify.static_security(repo, rigor)  # mandatory gate; rigor scopes NOISY patterns (no spend, no infra)
             verify_checks.append({"check": "static-security", "ok": sec_ok, "findings": findings[:5]})
             verify_ok = sec_ok
             if sec_ok and rigor >= 3 and not (web or ext):       # budget allows -> adversarial (python lines)

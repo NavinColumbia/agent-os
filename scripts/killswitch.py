@@ -14,6 +14,7 @@ mid-write. Scope is 'global' (whole fleet) or any string (a product/tenant id) f
 Run with the agent-os venv python.
 """
 import sys
+import time
 from pathlib import Path
 
 import psycopg
@@ -56,21 +57,74 @@ def resume(scope="global"):
     return True
 
 
+_HALT_RETRIES = 3        # attempts to reach the control-plane before giving up on THIS call
+_HALT_BACKOFF = 0.2      # base seconds between retries (0.2s, 0.4s) — short, this is the per-spawn hot path
+_HALT_CACHE_TTL = 45     # grace window (s): reuse last-known-good halt state during a transient DB blip
+_halt_cache: dict = {}   # scope -> (monotonic_ts, result_dict) of the last SUCCESSFUL read
+
+
+def _alert(msg):
+    """Best-effort operator alert for a control-plane reachability problem. MUST never raise on the hot
+    path, so the DB-backed audit is best-effort and stderr is the always-available fallback."""
+    print(f"[killswitch] {msg}", file=sys.stderr)
+    try:
+        audit.append(actor="killswitch", action="ControlPlaneUnreachable", resource="control-plane",
+                     decision="degraded", payload={"detail": msg})
+    except Exception:
+        pass
+
+
+def _read_halt(scope):
+    """One authoritative read of the halt state from the control-plane. Raises on any DB error."""
+    _ensure()
+    with psycopg.connect(DB, connect_timeout=3) as c, c.cursor() as cur:
+        cur.execute("SELECT scope, reason FROM kill_switch WHERE scope IN ('global', %s)", (scope,))
+        row = cur.fetchone()
+    return {"halted": True, "scope": row[0], "reason": row[1]} if row else {"halted": False}
+
+
 def is_halted(scope="global"):
     """True if the fleet is halted globally OR this specific scope is halted. factory.agent() calls this
-    before every spawn. Fail-CLOSED on a DB error: this is a human-oversight HALT (EU AI Act Art. 14),
-    so if the control-plane is unreachable we cannot prove the operator did NOT press stop — assume halted.
-    A paused fleet during a DB blip is recoverable; silently running a fleet the operator tried to STOP is
-    not. Liveness cost is bounded to the outage window; the safety guarantee is absolute."""
-    try:
-        _ensure()
-        with psycopg.connect(DB, connect_timeout=3) as c, c.cursor() as cur:
-            cur.execute("SELECT scope, reason FROM kill_switch WHERE scope IN ('global', %s)", (scope,))
-            row = cur.fetchone()
-        return {"halted": True, "scope": row[0], "reason": row[1]} if row else {"halted": False}
-    except Exception as e:
-        return {"halted": True, "scope": scope,
-                "reason": f"failsafe: control-plane unreachable ({type(e).__name__}); failing CLOSED"}
+    before EVERY spawn, so a wrong answer here brakes (or bricks) the whole line.
+
+    Failure handling is deliberately tiered so a momentary DB blip can NOT masquerade as an operator STOP:
+      1. Retry the read a few times with short backoff — most blips (a 2s hiccup, a pool exhaustion, a PG
+         restart, a max_connections spike) clear within a second or two.
+      2. If still unreachable, reuse the LAST successfully-read halt state for this scope while it is within
+         a short grace window (TTL). A transient outage thus reuses the last known-good answer instead of
+         inventing a fleet-wide halt — preserving liveness, exactly as the token-budget governor downstream
+         in factory.agent() expects of a shared-Postgres hiccup.
+      3. Only fail CLOSED if the control-plane is DURABLY unreachable (retries exhausted AND no fresh
+         known-good state). This honours the human-oversight HALT (EU AI Act Art. 14): once we genuinely
+         cannot prove the operator did NOT press stop, a recoverable pause beats silently running a fleet
+         someone tried to STOP. Both the stale-reuse and the durable fail-closed paths emit an alert."""
+    last_err = None
+    for attempt in range(_HALT_RETRIES):
+        try:
+            res = _read_halt(scope)
+            _halt_cache[scope] = (time.monotonic(), res)   # remember this KNOWN-GOOD answer (per scope)
+            return res
+        except Exception as e:
+            last_err = e
+            if attempt < _HALT_RETRIES - 1:
+                time.sleep(_HALT_BACKOFF * (attempt + 1))  # short backoff, then retry
+
+    # Retries exhausted: the control-plane is unreachable right now. Prefer the last known-good state.
+    cached = _halt_cache.get(scope)
+    if cached and (time.monotonic() - cached[0]) < _HALT_CACHE_TTL:
+        ts, res = cached
+        out = dict(res)
+        out["stale"] = True
+        out["stale_age_s"] = round(time.monotonic() - ts, 1)
+        _alert(f"control-plane unreachable ({type(last_err).__name__}); reusing last-good state for "
+               f"scope={scope!r} (halted={out['halted']}, age={out['stale_age_s']}s) — NOT inventing a halt")
+        return out
+
+    # Durably unreachable (or no known-good state ever): only NOW do we fail CLOSED, scoped to the caller.
+    _alert(f"control-plane DURABLY unreachable for scope={scope!r} "
+           f"({type(last_err).__name__}, {_HALT_RETRIES} tries, no fresh cache); failing CLOSED")
+    return {"halted": True, "scope": scope,
+            "reason": f"failsafe: control-plane unreachable ({type(last_err).__name__}); failing CLOSED"}
 
 
 def _selftest():

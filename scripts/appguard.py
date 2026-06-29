@@ -108,8 +108,15 @@ def evaluate(app):
 
 
 def _apps():
+    # Enumerate guard targets from the SAME ledger economics() measures real spend on (traces),
+    # UNION the metrics rollup (org_metrics) so an app is evaluated the moment it spends a cent —
+    # not only once it happens to emit an org_metrics row. Enumerating from org_metrics alone
+    # silently skipped whole product classes (custom agents, project builds, research fleets) that
+    # write cost_usd to traces but never call metrics.record, letting them bleed money uncapped.
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT DISTINCT product FROM org_metrics WHERE product IS NOT NULL")
+        cur.execute("""SELECT DISTINCT product FROM traces WHERE product IS NOT NULL
+                       UNION
+                       SELECT DISTINCT product FROM org_metrics WHERE product IS NOT NULL""")
         return [r[0] for r in cur.fetchall()]
 
 

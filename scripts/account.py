@@ -186,18 +186,20 @@ def delete(tid, confirm=False):
         c.commit()
 
     # Purge vault secrets owned by this tenant. Secrets are scoped by `product`; we captured
-    # the tenant's products above. A purge failure is a real GDPR-erasure gap, so it counts
-    # toward `failures` (fail-closed) rather than being silently swallowed.
-    if not products:
-        vault_note = "no products — no vault secrets to purge"
-    else:
-        try:
-            import vault
-            n = vault.delete_secrets_for_products(products)
-            vault_note = f"purged {n} secret(s) across {len(products)} product(s)"
-        except Exception as e:
-            vault_note = f"vault purge errored: {str(e)[:160]}"
-            failures["secrets"] = vault_note
+    # the tenant's products above. A tenant's bring-your-own provider credential is ALSO a
+    # vault secret, but namespaced under the synthetic scope product='tenant:<tid>' (see
+    # tenantproviders.py) — it is NOT a built-product name, so it never appears in `products`.
+    # We must purge it explicitly, and unconditionally: a tenant who added a BYO key but built
+    # no product still has a live decryptable credential to erase. A purge failure is a real
+    # GDPR-erasure gap, so it counts toward `failures` (fail-closed) rather than being swallowed.
+    scopes = list(products) + [f"tenant:{tid}"]
+    try:
+        import vault
+        n = vault.delete_secrets_for_products(scopes)
+        vault_note = f"purged {n} secret(s) across {len(scopes)} scope(s)"
+    except Exception as e:
+        vault_note = f"vault purge errored: {str(e)[:160]}"
+        failures["secrets"] = vault_note
 
     ok = not failures
     result = {"ok": ok, "deleted": ok, "vault": vault_note}
@@ -212,6 +214,7 @@ def delete(tid, confirm=False):
 
 def _selftest():
     import billing
+    import vault
     tid = billing.signup("account-selftest", "free")["tenant_id"]
     prod = tid.replace("t-", "")[:6] + "-acct"
     with psycopg.connect(DB) as c, c.cursor() as cur:
@@ -220,6 +223,13 @@ def _selftest():
         cur.execute("""INSERT INTO notifications (tenant_id, channel, category, level, title, body)
                        VALUES (%s,'in_app','system','info','hello','selftest row')""", (tid,))
         c.commit()
+
+    # Plant the tenant's OWN credential in the vault under the synthetic product='tenant:<tid>'
+    # namespace (exactly how BYO LLM keys + integration keys are stored). This guards the
+    # GDPR-erasure gap: delete(confirm=True) must purge it, not just tenant_products-scoped secrets.
+    vault.put_secret("byo_llm_key", f"tenant:{tid}", "prod", ["builder", "factory"], "sk-acct-selftest")
+    assert vault.get_secret("byo_llm_key", f"tenant:{tid}", "prod", "builder", tenant_id=tid) == "sk-acct-selftest", \
+        "BYO vault secret not readable before delete"
 
     # EXPORT
     ex = export(tid)
@@ -246,6 +256,15 @@ def _selftest():
     assert n_ten == 0, f"tenant not deleted ({n_ten})"
     assert n_tp == 0, f"tenant_products not deleted ({n_tp})"
 
+    # The tenant's BYO credential must be GONE: erasure purges product='tenant:<tid>' secrets,
+    # so a now-orphaned read must fail-closed (not found / access denied), never decrypt.
+    assert done.get("vault", "").startswith("purged"), f"vault not purged: {done.get('vault')!r}"
+    try:
+        vault.get_secret("byo_llm_key", f"tenant:{tid}", "prod", "builder", tenant_id=tid)
+        raise AssertionError("BYO vault secret SURVIVED account deletion (GDPR erasure gap)")
+    except vault.AccessDenied:
+        pass
+
     # remove the export artifact
     try:
         zpath.unlink()
@@ -253,7 +272,8 @@ def _selftest():
         pass
 
     print(f"export: {len(names)} files, manifest✅, products={ex['products']}")
-    print("PASS: account export + GDPR erasure (tenant fully scrubbed, scoped by tenant_id) ✅")
+    print("PASS: account export + GDPR erasure (tenant fully scrubbed, scoped by tenant_id; "
+          "BYO vault secret purged) ✅")
     sys.exit(0)
 
 

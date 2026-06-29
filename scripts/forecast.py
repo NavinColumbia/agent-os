@@ -88,14 +88,23 @@ def check_alerts(tid):
                 cur.execute("SELECT 1 FROM budget_alert_state WHERE tenant_id=%s AND threshold=%s", (tid, th))
                 if cur.fetchone():
                     continue                                # already alerted this threshold
+                lvl = "urgent" if th >= 100 else "standard"
+                # Record-AFTER-act: send first, then durably mark the threshold alerted. If the send
+                # fails we must NOT persist the marker (it would suppress this pre-emptive alert forever
+                # until the tenant drops back below the threshold), and we best-effort it so one tenant's
+                # send failure doesn't abort the whole sweep.
+                try:
+                    notifications.send(tid, "billing",
+                                       f"Budget alert: projected ~{pct}% of your {f['plan']} quota",
+                                       f"At your current burn rate you're trending to {pct}% of the monthly token "
+                                       f"quota{(' in ~'+str(f['eta_days_to_quota'])+' days') if f['eta_days_to_quota'] else ''}. "
+                                       f"Raise your plan or slow builds to avoid a hard stop.", level=lvl)
+                except Exception as e:
+                    print(f"forecast: budget alert send failed for {tid} @ {th}% (will retry next run): {e}",
+                          file=sys.stderr)
+                    continue                                # leave threshold un-marked so it re-fires
                 cur.execute("INSERT INTO budget_alert_state (tenant_id, threshold) VALUES (%s,%s)", (tid, th))
                 c.commit()
-                lvl = "urgent" if th >= 100 else "standard"
-                notifications.send(tid, "billing",
-                                   f"Budget alert: projected ~{pct}% of your {f['plan']} quota",
-                                   f"At your current burn rate you're trending to {pct}% of the monthly token "
-                                   f"quota{(' in ~'+str(f['eta_days_to_quota'])+' days') if f['eta_days_to_quota'] else ''}. "
-                                   f"Raise your plan or slow builds to avoid a hard stop.", level=lvl)
                 fired.append(th)
             else:
                 cur.execute("DELETE FROM budget_alert_state WHERE tenant_id=%s AND threshold=%s", (tid, th))

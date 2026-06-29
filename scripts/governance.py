@@ -54,7 +54,10 @@ _CAP_TOOLS = {
                       "mcp__slack__post_message"],
     "deploy": ["Deploy", "mcp__deploy__release", "mcp__vercel__deploy"],
 }
-# Tools that perform code edits — denied when can_modify_code is false (read-only agent).
+# Tools that perform file edits. Denied when a role is FULLY read-only (can_modify_code:false AND
+# no declared write scope). A role that may write SOME paths (allowed_paths non-empty: docs/tests/
+# tasks) keeps these and is constrained to WHERE by denied_paths + allowed_paths, not denied the
+# tool outright — so non-code authoring (e.g. the SPEC stage's docs/SPEC.md) is not bricked.
 _EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
 # Sub-agent spawn tool — denied unless can_spawn (true only for the controller).
 _SPAWN_TOOLS = ["Task"]
@@ -225,7 +228,15 @@ def spawn_restrictions(role: str) -> dict:
         disallowed += _CAP_TOOLS["post_publicly"]
     if not f["can_deploy"]:
         disallowed += _CAP_TOOLS["deploy"]
-    if not f["can_modify_code"]:
+    # can_modify_code:false forbids authoring CODE — but docs/specs/tests written WITHIN a role's
+    # declared write scope are NOT code, and blanket-denying every edit tool here bricks legitimate
+    # stages (the SPEC stage's product-manager authors docs/SPEC.md, qa-security adds tests/**). So
+    # only treat a role as FULLY read-only (deny all edit tools) when it has NO write scope at all
+    # (empty allowed_paths). A role WITH a write scope keeps Edit/Write and is constrained to WHERE
+    # by denied_paths + allowed_paths (the validate_writes backstop + the PreToolUse hook). A role
+    # that must stay read-only DESPITE having a scope declares that explicitly via denied_tools
+    # (e.g. reviewer, audit-governance, resource-allocator — registry mutates via a flock'd script).
+    if not f["can_modify_code"] and not f["allowed_paths"]:
         disallowed += _EDIT_TOOLS
     if not f["can_spawn"]:
         disallowed += _SPAWN_TOOLS
@@ -325,9 +336,20 @@ def _selftest() -> int:
     if not any("registry" in g for g in b["deny_read"]):
         problems.append("denied_paths should propagate into deny_read")
 
-    # 5) can_modify_code:false makes the agent read-only (resource-allocator).
+    # 5) a FULLY read-only role disallows Edit/Write. resource-allocator (can_modify_code:false,
+    #    mutates the registry only via a flock'd script) declares this explicitly via denied_tools.
     if "Edit" not in ra["disallowed_tools"] or "Write" not in ra["disallowed_tools"]:
-        problems.append("can_modify_code:false must disallow Edit/Write (read-only)")
+        problems.append("resource-allocator (read-only) must disallow Edit/Write")
+
+    # 5b) REGRESSION GUARD (SPEC-stage break): can_modify_code:false must NOT blanket-deny edits for a
+    #     role that HAS a declared write scope — product-manager authors docs/SPEC.md within
+    #     allowed_paths, the first stage of the build line. Denying Edit/Write here would brick it.
+    pm = spawn_restrictions("product-manager")
+    for t in ("Edit", "Write"):
+        if t in pm["disallowed_tools"]:
+            problems.append(f"product-manager (has write scope) must KEEP {t} to author docs/SPEC.md")
+    if not pm["write_scope"]:
+        problems.append("product-manager must have a non-empty write_scope (allowed_paths)")
 
     # 6) only the controller may spawn -> Task denied for everyone else, allowed for controller.
     if "Task" not in b["disallowed_tools"]:

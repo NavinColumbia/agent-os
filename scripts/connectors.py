@@ -16,6 +16,7 @@ fail-closed: any error resolving the policy or the host denies the fetch.
     from connectors import ingest
 Run with the agent-os venv python.
 """
+import contextlib
 import ipaddress
 import socket
 import sys
@@ -74,22 +75,69 @@ def _resolved_addresses(host) -> list:
     return addrs
 
 
-def _is_unsafe_target(host) -> bool:
-    """SSRF guard: True if host is empty, unresolvable, or ANY resolved address is in a private/
-    loopback/link-local/reserved/multicast/unspecified range. Fail-closed: unresolvable -> unsafe."""
+def _safe_addresses(host) -> list:
+    """SSRF guard, resolve-ONCE edition. Resolve `host` a single time and validate EVERY resolved
+    address. Return the list of validated ip_address objects (safe to connect to), or None if the
+    target is empty, unresolvable, or ANY resolved address is in a private/loopback/link-local/
+    reserved/multicast/unspecified range. Fail-closed: unresolvable/empty -> None (unsafe).
+
+    Returning the exact addresses we validated (rather than a bool) is what lets the caller PIN the
+    fetch to those addresses — without that, requests.get() re-resolves the host at connect time and
+    a short-TTL/attacker-controlled record can rebind to 127.0.0.1 / 169.254.169.254 / RFC1918
+    between the check and the connect (TOCTOU / DNS rebinding)."""
     if not host:
-        return True
+        return None
     try:
         addrs = _resolved_addresses(host)
     except (socket.gaierror, ValueError, UnicodeError):
-        return True
+        return None
     if not addrs:
-        return True
+        return None
     for a in addrs:
         if (a.is_private or a.is_loopback or a.is_link_local
                 or a.is_reserved or a.is_multicast or a.is_unspecified):
-            return True
-    return False
+            return None
+    return addrs
+
+
+def _is_unsafe_target(host) -> bool:
+    """Back-compat boolean wrapper over _safe_addresses (True == unsafe/deny)."""
+    return _safe_addresses(host) is None
+
+
+@contextlib.contextmanager
+def _pin_dns(host, addresses):
+    """Pin `host` to exactly `addresses` for the duration of the block by shadowing
+    socket.getaddrinfo. This makes the subsequent fetch connect to the SAME addresses the SSRF
+    guard validated — closing the resolve-check-then-reresolve gap that DNS rebinding exploits.
+
+    The URL host is left untouched, so TLS SNI / certificate validation still happen against the
+    real hostname; only the IP it resolves to is forced to the vetted set. Any other host falls
+    through to the real resolver."""
+    real_getaddrinfo = socket.getaddrinfo
+    pinned = list(addresses)
+
+    def fake_getaddrinfo(h, port, family=0, type=0, proto=0, flags=0):
+        if h == host:
+            results = []
+            for ip in pinned:
+                if ip.version == 6:
+                    af = socket.AF_INET6
+                    sockaddr = (str(ip), port or 0, 0, 0)
+                else:
+                    af = socket.AF_INET
+                    sockaddr = (str(ip), port or 0)
+                if family in (0, af):
+                    results.append((af, type or socket.SOCK_STREAM, proto, "", sockaddr))
+            if results:
+                return results
+        return real_getaddrinfo(h, port, family, type, proto, flags)
+
+    socket.getaddrinfo = fake_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
 
 
 def ingest(url, product, role="data-engineer", timeout=15, ttl_seconds=None, policy_path=None):
@@ -118,16 +166,25 @@ def ingest(url, product, role="data-engineer", timeout=15, ttl_seconds=None, pol
         raise EgressDenied(f"egress to {host!r} denied (not in policy allowlist for {product!r})")
 
     # 3) SSRF guard — even an allow-listed host must not resolve to a private/loopback range
-    #    (defends against DNS rebinding / an internal hostname slipping onto the allowlist),
-    #    unless the policy for this product explicitly opts in (local test/dev fixtures only).
-    if not allow_private and _is_unsafe_target(host):
-        audit.append(actor=role, action="Ingest", resource=url, decision="deny",
-                     payload={"reason": f"host {host!r} resolves to a private/loopback/unsafe address (SSRF guard)",
-                              "product": product})
-        raise EgressDenied(f"egress to {host!r} denied (SSRF guard: private/loopback target)")
+    #    (an internal hostname slipping onto the allowlist), unless the policy for this product
+    #    explicitly opts in (local test/dev fixtures only). Resolve ONCE here and remember the
+    #    validated addresses so step 4 can pin to them — re-resolving at connect time is exactly
+    #    the DNS-rebinding TOCTOU hole this guard is supposed to close.
+    pinned_addrs = None
+    if not allow_private:
+        pinned_addrs = _safe_addresses(host)
+        if pinned_addrs is None:
+            audit.append(actor=role, action="Ingest", resource=url, decision="deny",
+                         payload={"reason": f"host {host!r} resolves to a private/loopback/unsafe address (SSRF guard)",
+                                  "product": product})
+            raise EgressDenied(f"egress to {host!r} denied (SSRF guard: private/loopback target)")
 
-    # 4) fetch — no redirects (a 30x to an internal host would bypass the allowlist).
-    r = requests.get(url, timeout=timeout, allow_redirects=False)
+    # 4) fetch — no redirects (a 30x to an internal host would bypass the allowlist), and pin DNS to
+    #    the exact addresses validated in step 3 so the connect cannot re-resolve to an internal IP.
+    #    (allow_private hosts skip pinning: the policy opted into private targets on purpose.)
+    pin = _pin_dns(host, pinned_addrs) if pinned_addrs is not None else contextlib.nullcontext()
+    with pin:
+        r = requests.get(url, timeout=timeout, allow_redirects=False)
     r.raise_for_status()
     bid = objstore.put(r.content, mime=r.headers.get("content-type", "application/octet-stream"), ttl_seconds=ttl_seconds)
     audit.append(actor=role, action="Ingest", resource=url, decision="allow", payload={"blob_id": bid, "bytes": len(r.content)})

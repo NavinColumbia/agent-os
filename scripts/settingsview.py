@@ -53,7 +53,11 @@ def _profile(tid):
 def _byo_key_set(tid):
     """True iff the tenant has a 'byo_llm_key' secret in the vault. NEVER returns the secret itself."""
     try:
-        vault.get_secret(BYO_KEY_NAME, tid, "prod", "tenant")
+        # BYO keys are stored under product='tenant:<tid>' with allowed_roles=['builder','factory']
+        # (console.py /api/byok, frontdoor.py /api/byok). Read with the same scope: tenant-namespaced
+        # product, an allowed role, and the tenant bind — otherwise get_secret fail-closes and we'd
+        # always report 'no key'. Presence only; the secret itself never leaves the vault.
+        vault.get_secret(BYO_KEY_NAME, f"tenant:{tid}", "prod", "builder", tenant_id=tid)
         return True
     except Exception:
         return False
@@ -115,6 +119,10 @@ def _selftest():
         cats_ok = cats == list(PREF_CATEGORIES)
         fresh_no_key = s["byo_key_set"] is False                  # fresh tenant: no BYO key
 
+        # positive case: a saved BYO key (same scope console/frontdoor use) must read back as set
+        vault.put_secret(BYO_KEY_NAME, f"tenant:{tid}", "prod", ["builder", "factory"], "sk-selftest")
+        byo_key_on = settings(tid)["byo_key_set"] is True
+
         set_consent(tid, True)
         consent_on = settings(tid)["ai_consent"]["accepted"] is True   # accept -> ai_consent.accepted True
 
@@ -122,11 +130,12 @@ def _selftest():
         billing_pref = next(p for p in settings(tid)["notification_prefs"] if p["category"] == "billing")
         pref_ok = billing_pref == {"category": "billing", "in_app": True, "email": False, "push": False}
 
-        ok = sections and cats_ok and fresh_no_key and consent_on and pref_ok
+        ok = sections and cats_ok and fresh_no_key and byo_key_on and consent_on and pref_ok
         print(f"sections={sections} categories={cats_ok} fresh-no-key={fresh_no_key} "
-              f"consent-on={consent_on} pref-reflected={pref_ok}")
+              f"byo-key-on={byo_key_on} consent-on={consent_on} pref-reflected={pref_ok}")
         print("PASS: settings view composes profile/consent/byo-key/prefs + writes reflect ✅" if ok else "FAIL")
     finally:
+        vault.delete_secrets_for_products([f"tenant:{tid}"])      # purge the selftest BYO key
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("DELETE FROM notification_prefs WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,))

@@ -141,8 +141,11 @@ def get_secret(name, product, environment, role, tenant_id=None):
 def delete_secrets_for_products(products):
     """Purge every secret scoped to any of `products` (GDPR right-to-erasure). Returns count deleted.
 
-    Secrets have no tenant_id column — they are scoped by `product` — so erasure for a tenant is
-    done by passing the tenant's owned products. Empty list is a no-op (returns 0).
+    Secrets ARE addressed by `product` (DELETE ... WHERE product = ANY). A tenant's own credentials
+    (BYO LLM key, integration keys) live under the synthetic product='tenant:<tid>', so a complete
+    erasure must include that namespace in `products` (see account.delete), not only the tenant's
+    built-product slugs. (The table also carries a tenant_id column for read-time isolation — #52 —
+    but it is derived from this same namespace.) Empty/falsy entries are dropped; empty list -> 0.
     """
     products = [p for p in products if p]
     if not products:

@@ -52,7 +52,17 @@ else
   warn "noupload dist/ not built (run: cd ~/projects/products/noupload && npm run build)"
 fi
 
-( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/api.py serve 8090" >/tmp/api.log 2>&1 </dev/null & ) ; ok "API on 127.0.0.1:8090"
+hdr "4i. HTTP API (127.0.0.1:8090, Bearer auth)"
+# Boot precondition: api.py fail-closes (sys.exit) if AOS_API_TOKEN is empty, so report that at
+# the source instead of standing up a dead process behind a green check.
+if ! grep -qE '^AOS_API_TOKEN=.+' "$ROOT/.env.local" 2>/dev/null; then
+  warn "AOS_API_TOKEN unset/empty in .env.local — API will refuse to start (fail-closed auth)"
+fi
+if pgrep -f "api.py serve" >/dev/null; then ok "API already running"
+else
+  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/api.py serve 8090" >/tmp/api.log 2>&1 </dev/null & )
+  sleep 1; pgrep -f "api.py serve" >/dev/null && ok "API on 127.0.0.1:8090" || warn "API failed (check AOS_API_TOKEN / /tmp/api.log)"
+fi
 
 hdr "4d. Mission-control dashboard (127.0.0.1:8092)"
 if pgrep -f "dashboard.py serve" >/dev/null; then ok "dashboard already running"

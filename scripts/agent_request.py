@@ -82,7 +82,15 @@ def answer(request_id, answer):
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""UPDATE agent_requests SET status='answered', answer=%s, answered_at=now()
                        WHERE id=%s""", (answer, request_id))
+        matched = cur.rowcount
         c.commit()
+    if matched == 0:
+        # No such request: the answer attached to nothing. Tell the caller instead of
+        # falsely reporting success — a silent no-op here would leave a polling phase
+        # (is_answered) blocked forever while the human believes the reply landed.
+        audit.append(actor="agent_request", action="AgentRequestAnswer", resource=str(request_id),
+                     decision="not_found", payload={"request_id": request_id})
+        raise KeyError(f"no agent_request with id={request_id!r} (answer not recorded)")
     audit.append(actor="agent_request", action="AgentRequestAnswer", resource=str(request_id),
                  decision="answered", payload={"request_id": request_id, "answer": str(answer)[:200]})
     return {"request_id": request_id, "status": "answered"}
@@ -127,9 +135,15 @@ def _selftest():
         after = is_answered(rid)                              # answered -> True
         still_open = any(o["id"] == rid for o in open_requests(tid))  # must now be excluded
         ans_ok = get(rid)["status"] == "answered"
-        ok = opened and (not before) and in_open and after and ans_ok and (not still_open)
+        bad_raises = False                                    # answering a bad id must fail loudly
+        try:
+            answer(-1, "no such request")
+        except KeyError:
+            bad_raises = True
+        ok = (opened and (not before) and in_open and after and ans_ok
+              and (not still_open) and bad_raises)
         print(f"opened={opened} before={before} in_open={in_open} after={after} "
-              f"excluded_after_answer={not still_open}")
+              f"excluded_after_answer={not still_open} bad_id_raises={bad_raises}")
         print("PASS: ask creates open req, is_answered flips on answer, open_requests resolves ✅"
               if ok else "FAIL")
     finally:

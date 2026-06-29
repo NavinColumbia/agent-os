@@ -1020,6 +1020,39 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
             f"criterion, including edge cases. Use `from src...` imports. Make `python -m pytest -q` pass.")
     stage("BUILD", "builder", lambda: agent("builder", str(repo), build_task))
 
+    # DESIGN/UX — for UI products, design-ux applies the product-quality CRAFT standard to the BUILT UI.
+    # The line previously had NO design gate, so UX/forms/accessibility were never reviewed (design-ux was a
+    # bench role the pipeline never called) — that is an OS-pipeline defect, the reason basics like a
+    # confirm-password field / show-password toggle / input labels shipped unflagged. Now every UI build is
+    # reviewed against docs/STANDARDS-product-quality.md and the builder fixes the gaps before QA gates
+    # function. Craft is a quality lens (see docs/quality-lenses.yaml), not a blocker — QA/REVIEW still gate.
+    if web or ext:
+        def design():
+            agent("design-ux", str(repo),
+                  "Review the BUILT UI against docs/STANDARDS-product-quality.md as a HARD checklist: FORMS "
+                  "(confirm-password wherever a password is set; show/hide-password toggle; inline + on-blur "
+                  "validation; autocomplete attrs incl. new-password/current-password/email; autofocus first "
+                  "field; disabled submit + spinner while pending; Enter-to-submit), ACCESSIBILITY (every input "
+                  "has an associated <label> or aria-label; controls keyboard-operable; visible focus ring; "
+                  "sufficient contrast; ARIA on menus/dialogs; error text linked to its field), STATES "
+                  "(empty/loading/error for every data view), MICROCOPY (plain + specific, no raw enum/JSON), "
+                  "CONSISTENCY. Write docs/DESIGN-REVIEW.md listing EVERY gap with the exact file + a concrete "
+                  "fix, then END with a line that is EXACTLY 'CRAFT: PASS' (no material gaps) or 'CRAFT: FIX'.",
+                  model=CHEAP_MODEL)
+            verdict = "FIX"
+            dr = repo / "docs" / "DESIGN-REVIEW.md"
+            if dr.exists():
+                tail = "\n".join(dr.read_text().strip().splitlines()[-6:]).upper()
+                verdict = "PASS" if "CRAFT: PASS" in tail and "CRAFT: FIX" not in tail else "FIX"
+            if verdict == "FIX":
+                agent("builder", str(repo),
+                      "Apply EVERY fix in docs/DESIGN-REVIEW.md to bring the UI up to "
+                      "docs/STANDARDS-product-quality.md (forms best-practices, accessibility "
+                      "labels/focus/ARIA, empty/loading/error states, clear microcopy). Do NOT break existing "
+                      "functionality, tests, or remove features.")
+            return {"passed": True, "verdict": verdict}
+        stage("DESIGN", "design-ux", design)
+
     # QA — run REAL verification (browser smoke for web, pytest for lib); bounded fix loop on failure.
     # qa_run is hoisted so the REVIEW cycle can re-verify after a review-driven fix (no quality regress).
     qa_run = ((lambda: run_ext_qa(str(repo))) if ext else

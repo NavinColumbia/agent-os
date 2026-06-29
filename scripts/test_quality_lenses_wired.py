@@ -69,28 +69,39 @@ def main() -> int:
 
     enforced = [l for l in lenses if l.get("status") == "enforced"]
     building = [l for l in lenses if l.get("status") == "building"]
+    deferred = [l for l in lenses if l.get("status") == "deferred"]
     backlog = [l for l in lenses if l.get("status") == "backlog"]
 
     broken = {}
-    for l in enforced:
+    for l in enforced:                                # enforced -> must have the full triad
         miss = _legs_for(l, labels)
         if miss:
             broken[l["id"]] = miss
+    for l in deferred:                                # deferred -> must carry an honest reason (no silent skips)
+        if not (l.get("reason") or "").strip():
+            broken[l["id"]] = ["deferred without a documented reason"]
 
-    print(f"quality lenses: {len(enforced)} enforced, {len(building)} building, {len(backlog)} backlog")
+    print(f"quality lenses: {len(enforced)} enforced, {len(deferred)} deferred, "
+          f"{len(building)} building, {len(backlog)} undecided")
     if building:
         print("  building (coverage landing): " + ", ".join(l["id"] for l in building))
+    for l in deferred:
+        print(f"  deferred: {l['id']} — {l.get('reason', '')}")
+    # 'backlog' = a lens with no decision yet. The goal is ZERO undecided: every lens is either enforced
+    # or explicitly deferred-with-reason. Undecided lenses are reported but do not fail the suite.
     if backlog:
-        print("  backlog  (NOT yet in pipeline): " + ", ".join(l["id"] for l in backlog))
+        print("  UNDECIDED (drive to enforced or deferred): " + ", ".join(l["id"] for l in backlog))
 
     if broken:
-        print(f"\nFAIL: {len(broken)} enforced lens(es) lost a leg of the triad — fix the leg, do not downgrade:")
+        print(f"\nFAIL: {len(broken)} lens(es) violate the rule (enforced must have all 3 legs; "
+              f"deferred must state a reason):")
         for lid, miss in broken.items():
             for m in miss:
                 print(f"  - {lid}: {m}")
         return 1
 
-    print("PASS: every enforced quality lens has its full triad (standard + role + wired guard) ✅")
+    tail = "" if not backlog else f" ({len(backlog)} undecided — see above)"
+    print(f"PASS: {len(enforced)} enforced lenses have the full triad; {len(deferred)} deferred with reason{tail} ✅")
     return 0
 
 

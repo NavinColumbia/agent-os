@@ -168,6 +168,7 @@ ckp "tenant org chart (live agents)"      "$PY scripts/orgview.py selftest | gre
 ckp "live product status + URL"           "$PY scripts/livestatus.py selftest | grep -q PASS"
 ckp "tenant CONSOLE (all area routes)"    "$PY scripts/console.py selftest | grep -q PASS"
 ckp "console click-through (real browser)" "bash scripts/console_e2e.sh gate | grep -q PASS"
+ckp "product craft (responsive/empty-states/microcopy)" "bash scripts/console_craft_e2e.sh gate | grep -q PASS"
 ckp "prompt-injection sanitize"              "$PY scripts/sanitize.py selftest | grep -q PASS"
 ckp "callsite signature wiring"              "$PY scripts/test_callsites_wired.py | grep -q PASS"
 ckp "enforcement-layer consistency (gov==hook)" "$PY scripts/test_enforcement_consistency.py | grep -q PASS"

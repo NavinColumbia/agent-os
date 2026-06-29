@@ -76,20 +76,42 @@ lenses:
     role: { file: design-ux, keyword: accessib }
     guard: "console click-through (real browser)"   # console_e2e a11y: every visible input must have an accessible name
 
-  # --- backlog: recognized, not yet in the pipeline (honest coverage gaps) ---
+  # --- product-craft trio: enforced by console_craft_e2e (responsive @390px + empty-states + microcopy) ---
   - id: responsive-mobile
-    status: backlog
+    status: enforced
+    standard: docs/STANDARDS-product-quality.md
+    role: { file: design-ux, keyword: responsive }
+    guard: "product craft (responsive/empty-states/microcopy)"
   - id: empty-loading-error-states
-    status: backlog
+    status: enforced
+    standard: docs/STANDARDS-product-quality.md
+    role: { file: design-ux, keyword: empty }
+    guard: "product craft (responsive/empty-states/microcopy)"
   - id: content-microcopy
-    status: backlog
-  - id: performance-load
-    status: backlog
-  - id: data-integrity-migrations
-    status: backlog
-  - id: i18n-readiness
-    status: backlog
+    status: enforced
+    standard: docs/STANDARDS-product-quality.md
+    role: { file: design-ux, keyword: microcopy }
+    guard: "product craft (responsive/empty-states/microcopy)"
+
+  # --- platform lenses enforced via existing guards ---
   - id: observability-telemetry
-    status: backlog
+    status: enforced
+    standard: null                                  # metricsexport.py / traceview.py are the executable spec
+    role: { file: devops-sre, keyword: observ }
+    guard: "observability + trace explorer"
+  - id: data-integrity-migrations
+    status: enforced
+    standard: null                                  # platform/snapshot.py round-trips the DB; migrate.sh is idempotent
+    role: { file: database-admin, keyword: migrat }
+    guard: "portable encrypted snapshot"
+
+  # --- deferred WITH REASON (a decision, not a silent gap) — revisit triggers stated ---
+  - id: performance-load
+    status: deferred
+    reason: "tenant-SERVICE load is already probed by run_service_qa (concurrency) + eval_factory hard tier; a dedicated console/platform load suite is premature for a localhost single-CEO pre-launch tool. Revisit at multi-tenant cloud."
+  - id: i18n-readiness
+    status: deferred
+    reason: "English-only pre-launch internal tool; full string-extraction/i18n is a large refactor with no current user need. Revisit when a non-English market is targeted."
   - id: docs-onboarding
-    status: backlog
+    status: deferred
+    reason: "in-app guided onboarding wizard exists and is guarded ('guided onboarding wizard'); formal end-user product docs + a mandated docs role are deferred to pre-launch. Revisit before public launch."

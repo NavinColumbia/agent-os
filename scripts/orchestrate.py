@@ -83,8 +83,13 @@ def _ensure():
                        requester TEXT, role TEXT, title TEXT NOT NULL, priority INT NOT NULL DEFAULT 5,
                        status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
         cur.execute("""CREATE TABLE IF NOT EXISTS hire_requests (id BIGSERIAL PRIMARY KEY, requester TEXT NOT NULL,
-                       need_role TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'open',
+                       need_role TEXT NOT NULL, reason TEXT, title TEXT, priority INT NOT NULL DEFAULT 5,
+                       status TEXT NOT NULL DEFAULT 'open',
                        created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        # The queued task that motivated the hire MUST survive on the row so fulfill() can route it
+        # (older deployments predate these columns — add them idempotently).
+        cur.execute("ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS title TEXT")
+        cur.execute("ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 5")
         c.commit()
 
 
@@ -153,11 +158,15 @@ def _pending_count(assignee):
         return cur.fetchone()[0]
 
 
-def file_hire(requester, need_role, reason):
+def file_hire(requester, need_role, reason, title=None, priority=5):
+    """File a hire request. The motivating task (title + priority + requester) is persisted on the
+    row so fulfill() can route it to the freshly-spawned instance — otherwise the work is silently
+    dropped on the spawn path."""
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("INSERT INTO hire_requests (requester, need_role, reason) VALUES (%s,%s,%s) RETURNING id",
-                    (requester, need_role, reason))
+        cur.execute("""INSERT INTO hire_requests (requester, need_role, reason, title, priority)
+                       VALUES (%s,%s,%s,%s,%s) RETURNING id""",
+                    (requester, need_role, reason, title, max(1, min(9, priority))))
         hid = cur.fetchone()[0]
         c.commit()
     return hid
@@ -186,13 +195,13 @@ def request_collaborator(requester, need_role, title, priority=5):
         if not governance.may(role, "request_hire"):
             return {"action": "hire_denied", "capability": "request_hire",
                     "note": f"role '{role}' may not request_hire (manifest)"}
-        hid = file_hire(requester, need_role, f"all {need_role} instances overloaded")
+        hid = file_hire(requester, need_role, f"all {need_role} instances overloaded", title, priority)
         return {"action": "hire_requested_overloaded", "hire_id": hid}
     if need_role in known_roles():
         if not governance.may(role, "request_hire"):
             return {"action": "hire_denied", "capability": "request_hire",
                     "note": f"role '{role}' may not request_hire (manifest)"}
-        hid = file_hire(requester, need_role, f"no active {need_role} — needs spawn")
+        hid = file_hire(requester, need_role, f"no active {need_role} — needs spawn", title, priority)
         return {"action": "hire_requested_spawn", "hire_id": hid}
     near = nearest_role(need_role)
     if near:
@@ -205,15 +214,23 @@ def fulfill(hire_id, agent_id):
     _ensure()
     governance.enforce("controller", "spawn")   # only the controller may spawn (manifest invariant)
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT requester, need_role, reason FROM hire_requests WHERE id=%s AND status='open'", (hire_id,))
+        cur.execute("""SELECT requester, need_role, reason, title, priority FROM hire_requests
+                       WHERE id=%s AND status='open'""", (hire_id,))
         row = cur.fetchone()
         if not row:
             return {"error": "no such open hire request"}
-        requester, need_role, reason = row
+        requester, need_role, reason, title, priority = row
         cur.execute("UPDATE hire_requests SET status='fulfilled' WHERE id=%s", (hire_id,))
         c.commit()
     directory.register(agent_id, need_role, None, "available", [])
-    return {"action": "spawned", "agent_id": agent_id, "role": need_role, "for": requester}
+    # Route the queued task that motivated this hire to the freshly-spawned instance. Without this the
+    # task is dropped: the hire is closed and the agent registered, but the work never reaches its queue.
+    task_id = None
+    if title:
+        task_id = enqueue(agent_id, title, priority if priority is not None else 5, requester, need_role)
+        directory.contact(requester, agent_id, "task", title)   # brokered hand-off, same as direct routing
+    return {"action": "spawned", "agent_id": agent_id, "role": need_role, "for": requester,
+            "task_id": task_id, "routed_title": title}
 
 
 def _main(a):
@@ -250,18 +267,26 @@ def _main(a):
         # Case B: no instance active -> hire request -> controller spawns
         directory.release(legal)
         r2 = request_collaborator(dev, "tax-advisor", "review sales-tax nexus", priority=4)
+        # Case B': controller fulfills the spawn — the queued task must reach the new agent's queue
+        # (regression guard for #7: the task used to be dropped on the spawn path).
+        tax = f"tax-advisor@{suf}"
+        ful = fulfill(r2["hire_id"], tax)
+        routed = next_task(tax)
         # Case C: uncovered role
         r3 = request_collaborator(dev, "astrophysicist", "model orbital decay", priority=5)
         ok = (r1["action"] == "routed_to_existing" and top["priority"] == 1
-              and r2["action"] == "hire_requested_spawn" and r3["action"] in ("no_role", "no_exact_role_use_nearest"))
+              and r2["action"] == "hire_requested_spawn"
+              and ful["action"] == "spawned" and ful["routed_title"] == "review sales-tax nexus"
+              and routed is not None and routed["title"] == "review sales-tax nexus" and routed["priority"] == 4
+              and r3["action"] in ("no_role", "no_exact_role_use_nearest"))
         with psycopg.connect(DB) as c, c.cursor() as cur:   # self-clean so test data doesn't accumulate
             cur.execute("DELETE FROM hire_requests WHERE requester=%s", (dev,))
-            cur.execute("DELETE FROM tasks WHERE assignee=%s OR requester=%s", (legal, dev))
-            cur.execute("DELETE FROM directory WHERE agent_id IN (%s,%s)", (legal, dev))
+            cur.execute("DELETE FROM tasks WHERE assignee IN (%s,%s) OR requester=%s", (legal, tax, dev))
+            cur.execute("DELETE FROM directory WHERE agent_id IN (%s,%s,%s)", (legal, dev, tax))
             c.commit()
         print(f"A route-to-existing: {r1['action']}; priority pull: p{top['priority']} first; "
-              f"B spawn-request: {r2['action']}; C uncovered: {r3['action']}")
-        print("PASS: reuse-vs-spawn routing + priority queue + hire flow + uncovered-role ✅" if ok else "FAIL")
+              f"B spawn-request: {r2['action']}; B' fulfilled->routed: {ful['routed_title']!r}; C uncovered: {r3['action']}")
+        print("PASS: reuse-vs-spawn routing + priority queue + hire-then-route flow + uncovered-role ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
 

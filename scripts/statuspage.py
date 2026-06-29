@@ -65,8 +65,16 @@ def status():
     else:
         crit = [a for a in (alerts or []) if a.get("level") in ("crit", "critical", "error")]
         warn = [a for a in (alerts or []) if a.get("level") in ("warn", "warning")]
-        down = [k for k, v in components.items()
-                if isinstance(v, str) and v.lower() not in ("ok", "up", "healthy", "green")]
+        def _is_down(v):
+            # _health()/check() may return booleans OR strings per component.
+            # A boolean False (or any falsy value) means the service is down;
+            # a string is healthy only if it's an explicit ok/up/healthy/green.
+            if isinstance(v, bool):
+                return not v
+            if isinstance(v, str):
+                return v.strip().lower() not in ("ok", "up", "healthy", "green")
+            return not v  # None/0/"" etc. => treat as down (fail-closed on health)
+        down = [k for k, v in components.items() if _is_down(v)]
         if crit or down:
             verdict = "major_outage"
         elif warn or (dlq or 0) > 0:

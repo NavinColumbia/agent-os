@@ -115,6 +115,37 @@ BUDGET_USD = float(os.environ.get("AOS_BUDGET_USD", "0") or 0)
 _SPENT = [0.0]
 _SPENT_LOCK = threading.Lock()
 
+# BUDGET -> CAPABILITY SCALER (scale.py). The "tokens -> capability" mapper turns a tenant's wallet into a
+# capability profile (more $ -> more concurrent agents, deeper recursion, higher verification rigor, more
+# design exploration). Wired into the build path here so the knobs actually scale with spend instead of
+# the mapper sitting dead. Applied ONCE per process, idempotently and thread-safely (a fleet starts many
+# build threads at once): the first build/agent to run sets the env knobs and rebinds the live agent-
+# concurrency semaphore from them. We only scale when a real wallet (AOS_BUDGET_USD > 0) is set — with no
+# budget we leave the operator's explicit AOS_* env untouched (don't clobber hand-tuned knobs).
+_SCALE_LOCK = threading.Lock()
+_SCALE_APPLIED = [False]
+
+
+def _apply_scale():
+    global _AGENT_SEM, BUDGET_USD
+    if _SCALE_APPLIED[0] or not BUDGET_USD:
+        return
+    with _SCALE_LOCK:
+        if _SCALE_APPLIED[0]:
+            return
+        try:
+            import scale
+            prof = scale.profile(BUDGET_USD)
+            applied = scale.apply(prof)                 # sets AOS_MAX_AGENTS/RIGOR/MAX_DEPTH/EXPLORATION/...
+            BUDGET_USD = float(os.environ.get("AOS_BUDGET_USD", "0") or 0)
+            _AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8")))
+            audit.append(actor="factory:controller", action="ScaleProfile", resource="factory",
+                         decision="applied", payload={"profile": prof, "env": applied})
+        except Exception:
+            pass                                        # never block a build on the scaler — fall back to env defaults
+        finally:
+            _SCALE_APPLIED[0] = True
+
 
 def spent_usd():
     return _SPENT[0]
@@ -365,6 +396,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     low-stakes stages pass a cheaper model. A timeout no longer kills the stage (retry w/ backoff),
     transient errors back off longer, a bad BYO key fails fast, exhausted retries escalate."""
     model = model or BUILD_MODEL
+    _apply_scale()                                    # dial capability (agents/rigor/depth) to the wallet
     # GOVERNANCE (can_spawn gate): the factory spawns this sub-agent ON BEHALF of the orchestrating role
     # (the controller drives the line). Only a role whose manifest grants can_spawn may cause a sub-agent
     # to be spawned — enforce raises PermissionError + audits 'GovernanceDenied' otherwise.
@@ -376,6 +408,26 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     if _halt.get("halted"):                           # operator / EU-AI-Act kill-switch: refuse next spawn
         return {"rc": -1, "failed": True, "out": "halted",
                 "blocker": f"fleet HALTED by operator (scope={_halt.get('scope')}): {_halt.get('reason')} — resume with killswitch.py resume"}
+    # RUNTIME COST GOVERNOR (ADR 0002): enforce the per-product HARD token cap before every dispatch.
+    # budget.allow_spend denies (and audits) when this product's configured token_budget would be blown
+    # with hard_stop on — we refuse the dispatch and escalate rather than burn past the cap. No budget set
+    # for the product -> it allows (this only bites tenants who opted into a hard cap). On a governor-infra
+    # error we fail OPEN: the soft USD cap above + the killswitch still bound spend, and blocking every
+    # build because the budgets DB hiccuped would break the whole factory's liveness.
+    product = getattr(_ctx, "product", None)
+    if product:
+        est_tokens = len(role_brief(role)) // 4 + len(task) // 4 + 8000  # prompt-in estimate + output allowance
+        try:
+            import budget as _budget
+            allowed = _budget.allow_spend(product, est_tokens)
+        except Exception:
+            allowed = True
+        if not allowed:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="budget-denied", payload={"product": product, "est_tokens": est_tokens})
+            return {"rc": -1, "failed": True, "out": "token budget exhausted",
+                    "blocker": f"product '{product}' token budget exhausted (governor hard_stop) — "
+                               f"raise it with `budget.py set {product} <tokens>` or split the work"}
     # NB: no home-grown context handling — the agent CLI (claude/codex) manages its own context window
     # (agentic file search, on-demand reads, compaction) far better than a bolt-on retrieval layer would.
     prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
@@ -739,6 +791,7 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
     api_key (BYO): if set, every agent runs on the tenant's own key — they pay their own inference.
     engine ('claude'|'codex'): which provider to run on; provider_key = that provider's BYO key. A tenant
     with only a Codex/OpenAI key builds on Codex; default is Claude."""
+    _apply_scale()                                   # scale agents/rigor/depth to the wallet BEFORE the line runs
     _ctx.api_key = api_key
     _ctx.engine = (engine or "claude").lower()
     _ctx.codex_key = provider_key if (engine or "").lower() == "codex" else None
@@ -953,20 +1006,36 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         return {"passed": qa_ok[0], "verdict": verdict, "cycles": cycles}
     review_res = stage("REVIEW", "reviewer", review)
 
-    # VERIFY gate — scalable verification (tests + static-security + runtime/load + adversarial) as an
-    # additional LAUNCH gate when rigor>=2. Default rigor=1 leaves the path unchanged; the closed-loop
-    # controller builds at higher rigor so it ships only verified work (quality > speed > cost).
+    # VERIFY gate — scalable verification is part of the ship gate BY DEFAULT now, not an opt-in. The old
+    # path only ran when AOS_RIGOR>=2, but AOS_RIGOR defaults to 1, so products LAUNCHED on their test
+    # suite ALONE — no static-security scan, no adversarial probing (finding #50). We now ALWAYS run the
+    # deterministic static-security scan before flipping to LAUNCHED, and ADD the adversarial bug-hunt when
+    # the (budget-scaled) rigor warrants it. AOS_RIGOR=0 is the explicit, audited escape hatch for
+    # throwaway/offline builds; verification is never silently skipped. (We call the cheap, side-effect-
+    # free static scan directly rather than verify.verify, whose tier-1 re-runs pytest — wrong for the
+    # web/extension lines that have no pytest suite, and redundant with the QA gate just above.)
     rigor = int(os.environ.get("AOS_RIGOR", "1"))
     verify_ok = True
-    if rigor >= 2 and qa_ok[0] and review_res.get("verdict") != "REQUEST-CHANGES":
+    if rigor != 0 and qa_ok[0] and review_res.get("verdict") != "REQUEST-CHANGES":
+        verify_checks = []
         try:
             import verify as _verify
-            v = _verify.verify(product, rigor=rigor, api_key=api_key,
-                               engine=_ctx.engine, codex_key=_ctx.codex_key)
-            verify_ok = bool(v.get("passed", True)) if isinstance(v, dict) else True
-            log["verify"] = {"passed": verify_ok, "rigor": rigor}
-        except Exception:
-            verify_ok = True   # never block a ship on a verify-infra error; QA already gated
+            sec_ok, findings = _verify.static_security(repo)     # mandatory hardened gate (no spend, no infra)
+            verify_checks.append({"check": "static-security", "ok": sec_ok, "findings": findings[:5]})
+            verify_ok = sec_ok
+            if sec_ok and rigor >= 3 and not (web or ext):       # budget allows -> adversarial (python lines)
+                n = min(int(os.environ.get("AOS_MAX_ADVERSARIES", "8")), rigor)
+                adv_ok, adv = _verify.adversarial(repo, n, api_key, _ctx.engine, _ctx.codex_key)
+                verify_checks.append({"check": "adversarial", "ok": adv_ok, "agents": n})
+                verify_ok = verify_ok and adv_ok
+            log["verify"] = {"passed": verify_ok, "rigor": rigor, "checks": verify_checks}
+        except Exception as e:
+            # FAIL-CLOSED: a security/verification gate that ERRORS must not wave the product through (the
+            # whole finding is products shipping unverified). This is a deliberate flip from the prior
+            # fail-open. To keep liveness we fail closed only to BLOCKED_AT_VERIFY — a human-reviewable hold
+            # with a notify, never a crash — and the operator can re-run verify or set AOS_RIGOR=0.
+            verify_ok = False
+            log["verify"] = {"passed": False, "rigor": rigor, "error": str(e)[:200], "checks": verify_checks}
 
     # LAUNCH — QA is the hard gate. A review verdict still REQUEST-CHANGES after the cycle escalates.
     if qa_ok[0] and review_res.get("verdict") != "REQUEST-CHANGES" and verify_ok:

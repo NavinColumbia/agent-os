@@ -7,8 +7,12 @@ environment before decrypting, and audits every grant/deny. This is how a QA/tes
 credentials (e.g., an iOS app's test API key for simulator E2E) while PROD secrets never reach test.
 
     vault.py put <name> <product> <env> <role[,role]> <value> [ttl]
-    vault.py get <name> <product> <env> <role>
+    vault.py get <name> <product> <env> <role> [requester_tenant]
     from vault import put_secret, get_secret
+
+Per-tenant secrets are namespaced as product='tenant:<tid>'. get_secret BINDS the requester's
+tenant: a tenant-owned secret is only released when the caller passes tenant_id=<tid> matching the
+owner (role alone — e.g. 'builder' — is shared across tenants and is NOT sufficient). See #52.
 Run with the agent-os venv python.
 """
 import sys
@@ -32,30 +36,97 @@ class AccessDenied(Exception):
     pass
 
 
-def put_secret(name, product, environment, allowed_roles, value, ttl_seconds=None):
+# Sentinel stored for non-tenant (global/infra) secrets. tenant_id is part of the PK and
+# Postgres PK columns cannot be NULL, so global secrets carry the empty string.
+_GLOBAL = ""
+
+
+def _tenant_of(product):
+    """The tenant that OWNS a secret, derived from its product namespace.
+
+    Frontdoor/integrations namespace per-tenant secrets as product='tenant:<tid>'. Anything else
+    (e.g. 'iosapp') is a shared/infra secret owned by no single tenant -> _GLOBAL."""
+    if isinstance(product, str) and product.startswith("tenant:"):
+        return product.split(":", 1)[1]
+    return _GLOBAL
+
+
+_SCHEMA_READY = False
+
+
+def _ensure_schema():
+    """Idempotently make the live `secrets` table tenant-scoped (#52).
+
+    The original PK was (name, product, environment) with no tenant column, so a secret was
+    addressable by anyone who could name its product — and `get_secret` never bound the *requester's*
+    tenant. We add `tenant_id` and fold it into the PK so tenant isolation is enforced in storage,
+    not just by convention. ADD COLUMN IF NOT EXISTS is a no-op once applied; the PK is only
+    rebuilt when tenant_id is not yet part of it."""
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("ALTER TABLE secrets ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT ''")
+        # Backfill tenant_id for any rows written before this column existed.
+        cur.execute("UPDATE secrets SET tenant_id=split_part(product,':',2) "
+                    "WHERE tenant_id='' AND product LIKE 'tenant:%'")
+        cur.execute(
+            """SELECT a.attname FROM pg_index i
+                 JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum = ANY(i.indkey)
+                WHERE i.indrelid='secrets'::regclass AND i.indisprimary"""
+        )
+        pk = {r[0] for r in cur.fetchall()}
+        if "tenant_id" not in pk:
+            cur.execute("ALTER TABLE secrets DROP CONSTRAINT IF EXISTS secrets_pkey")
+            cur.execute("ALTER TABLE secrets ADD PRIMARY KEY (name, product, environment, tenant_id)")
+        c.commit()
+    _SCHEMA_READY = True
+
+
+def put_secret(name, product, environment, allowed_roles, value, ttl_seconds=None, tenant_id=None):
+    """Store an encrypted secret. The owning tenant is derived from the product namespace
+    (product='tenant:<tid>' -> owner <tid>); pass tenant_id only to override that explicitly."""
+    _ensure_schema()
+    owner = tenant_id if tenant_id is not None else _tenant_of(product)
     enc = _F.encrypt(value.encode())
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute(
-            """INSERT INTO secrets (name, product, environment, allowed_roles, value_enc, expires_at)
-               VALUES (%s,%s,%s,%s,%s, CASE WHEN %s::int IS NULL THEN NULL ELSE now()+(%s::int||' seconds')::interval END)
-               ON CONFLICT (name, product, environment)
+            """INSERT INTO secrets (name, product, environment, tenant_id, allowed_roles, value_enc, expires_at)
+               VALUES (%s,%s,%s,%s,%s,%s, CASE WHEN %s::int IS NULL THEN NULL ELSE now()+(%s::int||' seconds')::interval END)
+               ON CONFLICT (name, product, environment, tenant_id)
                DO UPDATE SET allowed_roles=EXCLUDED.allowed_roles, value_enc=EXCLUDED.value_enc, expires_at=EXCLUDED.expires_at""",
-            (name, product, environment, list(allowed_roles), enc, ttl_seconds, ttl_seconds),
+            (name, product, environment, owner, list(allowed_roles), enc, ttl_seconds, ttl_seconds),
         )
         c.commit()
     return True
 
 
-def get_secret(name, product, environment, role):
-    """Return the plaintext secret IFF role is allowed in that product+environment. Else raise + audit."""
+def get_secret(name, product, environment, role, tenant_id=None):
+    """Return the plaintext secret IFF (a) the secret's owning tenant matches the requester's
+    tenant AND (b) `role` is allowed in that product+environment. Else raise + audit.
+
+    #52 fix — tenant binding: a per-tenant secret (product='tenant:<tid>') is only released to a
+    caller that proves it is acting for that same tenant by passing tenant_id=<tid>. Roles such as
+    'builder' are shared across every tenant, so role alone is NOT sufficient — without this bind,
+    tenant A's build agent could read tenant B's BYO model key just by naming product='tenant:B'.
+    The check is FAIL-CLOSED: a tenant-owned secret requested with a missing/mismatched tenant is
+    denied. Global/infra secrets (no tenant namespace) are unaffected."""
+    _ensure_schema()
+    owner = _tenant_of(product)
+    resource = f"{product}/{environment}/{name}"
+    # Bind the requester's tenant BEFORE touching the row. For a tenant-owned secret the caller must
+    # present the matching tenant_id; we never fall back to trusting the product string alone.
+    if owner != _GLOBAL and (tenant_id is None or str(tenant_id) != owner):
+        audit.append(actor=role, action="GetSecret", resource=resource, decision="deny",
+                     payload={"reason": f"tenant bind failed: requester={tenant_id!r} owner={owner!r}"})
+        raise AccessDenied(f"tenant mismatch for {resource}")
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute(
             "SELECT allowed_roles, value_enc FROM secrets WHERE name=%s AND product=%s AND environment=%s "
-            "AND (expires_at IS NULL OR expires_at > now())",
-            (name, product, environment),
+            "AND tenant_id=%s AND (expires_at IS NULL OR expires_at > now())",
+            (name, product, environment, owner),
         )
         r = cur.fetchone()
-    resource = f"{product}/{environment}/{name}"
     if not r:
         audit.append(actor=role, action="GetSecret", resource=resource, decision="deny", payload={"reason": "not found/expired"})
         raise AccessDenied(f"no secret {resource}")
@@ -67,16 +138,33 @@ def get_secret(name, product, environment, role):
     return _F.decrypt(bytes(enc)).decode()
 
 
+def delete_secrets_for_products(products):
+    """Purge every secret scoped to any of `products` (GDPR right-to-erasure). Returns count deleted.
+
+    Secrets have no tenant_id column — they are scoped by `product` — so erasure for a tenant is
+    done by passing the tenant's owned products. Empty list is a no-op (returns 0).
+    """
+    products = [p for p in products if p]
+    if not products:
+        return 0
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("DELETE FROM secrets WHERE product = ANY(%s)", (products,))
+        n = cur.rowcount
+        c.commit()
+    return n
+
+
 def _main(a):
     if a and a[0] == "put":
         ttl = int(a[6]) if len(a) > 6 else None
         put_secret(a[1], a[2], a[3], a[4].split(","), a[5], ttl); print(f"stored {a[2]}/{a[3]}/{a[1]} for roles {a[4]}")
     elif a and a[0] == "get":
         try:
-            print(get_secret(a[1], a[2], a[3], a[4]))
+            tid = a[5] if len(a) > 5 else None  # optional: requester tenant for tenant-scoped secrets
+            print(get_secret(a[1], a[2], a[3], a[4], tenant_id=tid))
         except AccessDenied as e:
             print(f"DENIED: {e}"); sys.exit(1)
-    elif a and a[0] == "test":
+    elif a and a[0] in ("test", "selftest"):
         # prove scoping: test secret reachable in test by qa/builder; prod secret NOT reachable from test
         put_secret("API_KEY", "iosapp", "test", ["builder", "qa-security"], "test-sk-123")
         put_secret("DB_PASSWORD", "iosapp", "prod", ["platform-infra"], "prod-pw-xyz")
@@ -91,9 +179,26 @@ def _main(a):
             get_secret("API_KEY", "iosapp", "test", "research-growth")  # role not allowed
         except AccessDenied:
             denied_role = True
-        print("PASS: scoped vault — test secret to QA ✅, prod secret denied to test ✅, role denied ✅"
-              if (ok and denied_prod and denied_role and audit.verify()[0]) else "FAIL")
-        sys.exit(0 if (ok and denied_prod and denied_role) else 1)
+        # #52: per-tenant BYO key must be tenant-bound. Same role ('builder') across two tenants.
+        put_secret("byo_llm_key", "tenant:A", "prod", ["builder", "factory"], "sk-tenantA")
+        put_secret("byo_llm_key", "tenant:B", "prod", ["builder", "factory"], "sk-tenantB")
+        own = get_secret("byo_llm_key", "tenant:A", "prod", "builder", tenant_id="A") == "sk-tenantA"
+        cross = False
+        try:  # tenant A's builder tries to read tenant B's key -> deny
+            get_secret("byo_llm_key", "tenant:B", "prod", "builder", tenant_id="A")
+        except AccessDenied:
+            cross = True
+        nobind = False
+        try:  # tenant-owned secret requested without proving tenant -> fail-closed deny
+            get_secret("byo_llm_key", "tenant:A", "prod", "builder")
+        except AccessDenied:
+            nobind = True
+        tenant_ok = own and cross and nobind
+        passed = ok and denied_prod and denied_role and tenant_ok
+        print("PASS: scoped vault — test→QA ✅, prod denied to test ✅, role denied ✅, "
+              "tenant-bound BYO key ✅ (cross-tenant + no-bind denied)"
+              if (passed and audit.verify()[0]) else "FAIL")
+        sys.exit(0 if passed else 1)
     else:
         sys.exit("usage: vault.py put|get|test ...")
 

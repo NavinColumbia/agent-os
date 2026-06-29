@@ -199,6 +199,14 @@ def toggle(tid, agent_id, enabled):
         cur.execute("UPDATE custom_agents SET enabled=%s WHERE id=%s AND tenant_id=%s",
                     (bool(enabled), agent_id, tid))
         c.commit()
+    # #12: a disabled recurring agent must also stop firing in the scheduler (pause, don't delete the
+    # schedule so re-enabling resumes it). Best-effort: harmless no-op for non-recurring agents.
+    se = getattr(scheduler, "set_enabled", None)
+    if callable(se):
+        try:
+            se(f"ca-{agent_id}", bool(enabled))
+        except Exception:
+            pass
     audit.append(actor="customagents", action="AgentToggled", resource=tid,
                  decision="enabled" if enabled else "disabled", payload={"agent_id": agent_id})
     return {"agent_id": agent_id, "enabled": bool(enabled)}

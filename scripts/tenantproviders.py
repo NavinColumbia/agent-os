@@ -138,7 +138,7 @@ def resolve(tid):
     key = None
     if auth_mode == "api_key":                            # subscription -> no key, run on the CLI login
         try:
-            v = vault.get_secret(_secret_name(provider), f"tenant:{tid}", "prod", "builder")
+            v = vault.get_secret(_secret_name(provider), f"tenant:{tid}", "prod", "builder", tenant_id=tid)
             key = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
         except Exception:
             key = None

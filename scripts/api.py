@@ -11,6 +11,7 @@ Endpoints:
     POST /products/NAME               (auth) — scaffold a governed product
     POST /run/NAME                    (auth) — run the lifecycle (returns result)
 """
+import hmac
 import json
 import subprocess
 import sys
@@ -21,10 +22,33 @@ from urllib.parse import urlparse, parse_qs
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-_cfg = {l.split("=", 1)[0].strip(): l.split("=", 1)[1].strip()
-        for l in ENV.read_text().splitlines() if l.strip() and not l.startswith("#") and "=" in l}
+
+
+def _load_cfg(path):
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    return {l.split("=", 1)[0].strip(): l.split("=", 1)[1].strip()
+            for l in text.splitlines() if l.strip() and not l.startswith("#") and "=" in l}
+
+
+_cfg = _load_cfg(ENV)
 TOKEN = _cfg.get("AOS_API_TOKEN", "")
 PY = str(SCRIPTS / ".." / ".venv" / "bin" / "python")
+
+
+def _credential_ok(auth_header, token):
+    """FAIL-CLOSED bearer check (findings #1 / #53).
+
+    With an empty/unset token there is NO valid credential, so deny everything: otherwise the
+    naive `auth == f"Bearer {token}"` makes `Bearer ` a valid header and any attacker is authed
+    (fail-open auth bypass). Denying here cannot break liveness — /health stays public and a real
+    token simply has to be configured. Constant-time compare avoids a token timing oracle.
+    """
+    if not token:
+        return False
+    return hmac.compare_digest(auth_header, f"Bearer {token}")
 
 
 class H(BaseHTTPRequestHandler):
@@ -35,7 +59,7 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(obj).encode())
 
     def _authed(self):
-        return self.headers.get("Authorization", "") == f"Bearer {TOKEN}"
+        return _credential_ok(self.headers.get("Authorization", ""), TOKEN)
 
     def do_GET(self):
         u = urlparse(self.path); path = u.path
@@ -79,10 +103,62 @@ class H(BaseHTTPRequestHandler):
 
 
 def main(port=8090):
+    if not TOKEN:
+        # FAIL-CLOSED at startup: an empty token means every authed route would fail-open
+        # (findings #1 / #53). Refuse to serve rather than stand up an open API.
+        sys.exit("refusing to start: AOS_API_TOKEN is empty/unset in .env.local — this would "
+                 "fail-open auth (any 'Bearer ' would authenticate). Set AOS_API_TOKEN and retry.")
     srv = HTTPServer(("127.0.0.1", port), H)   # localhost only; never 0.0.0.0
     print(f"agent-os API on http://127.0.0.1:{port} (Bearer auth)")
     srv.serve_forever()
 
 
+def _selftest() -> int:
+    """Prove the bearer check is FAIL-CLOSED on an empty/unset token (findings #1 / #53)."""
+    problems = []
+    cases = [
+        # (token, auth_header, expected_ok, why)
+        ("",        "",                 False, "empty token + empty header must deny"),
+        ("",        "Bearer ",          False, "empty token + 'Bearer ' must deny (the bypass)"),
+        ("",        "Bearer anything",  False, "empty token must deny any bearer"),
+        ("s3cret",  "Bearer s3cret",    True,  "correct token must authenticate"),
+        ("s3cret",  "Bearer wrong",     False, "wrong token must deny"),
+        ("s3cret",  "Bearer s3cret ",   False, "trailing space must deny (exact match)"),
+        ("s3cret",  "",                 False, "missing header must deny"),
+        ("s3cret",  "s3cret",           False, "missing 'Bearer ' prefix must deny"),
+    ]
+    for token, header, expected, why in cases:
+        got = _credential_ok(header, token)
+        ok = "OK " if got == expected else "BAD"
+        print(f"  [{ok}] token={token!r:10} header={header!r:18} -> {got}  ({why})")
+        if got != expected:
+            problems.append(why)
+
+    # main() must refuse to serve when the configured token is empty.
+    import unittest.mock as _mock
+    refused = False
+    with _mock.patch.object(sys.modules[__name__], "TOKEN", ""):
+        try:
+            main(0)
+        except SystemExit:
+            refused = True
+    if not refused:
+        problems.append("main() must refuse to start with an empty AOS_API_TOKEN")
+    print(f"  [{'OK ' if refused else 'BAD'}] main() refuses to serve when AOS_API_TOKEN is empty")
+
+    print("api.selftest")
+    if problems:
+        print("\nFAIL:")
+        for p in problems:
+            print(f"  - {p}")
+        return 1
+    print("\nPASS: bearer auth is fail-closed; empty token denies all and blocks startup.")
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+        sys.exit(_selftest())
+    if len(sys.argv) > 1 and sys.argv[1] not in ("serve",):
+        sys.exit("usage: api.py serve [port] | api.py selftest")
     main(int(sys.argv[2]) if len(sys.argv) > 2 else 8090)

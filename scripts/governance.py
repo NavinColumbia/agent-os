@@ -12,6 +12,9 @@ from the role manifest (~/projects/control-plane/roles/<role>.yaml) and exposes 
         * write_scope      -> allowed_paths, the WRITE allowlist (real restriction, not display)
   may(role, capability)        -> bool   read the matching can_*/capability flag
   approval_required_for(role)  -> list   actions this role must get human approval for
+  require_approval(role, action, payload, approval_id) -> raise PermissionError unless a hash-pinned,
+      unexpired, single-use HUMAN approval (control-plane verify_approval.py) matches the EXACT
+      payload — the action site that actually GATES deploy/spend/secret behind approval_required_for.
   enforce(role, capability)    -> raise PermissionError (+ audit 'GovernanceDenied') if not may()
   validate_writes(role, repo, changed_paths) -> [violations]  (+ audit) post-run write backstop
 
@@ -104,6 +107,81 @@ def may(role: str, capability: str) -> bool:
 def approval_required_for(role: str) -> list:
     """The list of actions this role may only perform AFTER a human approval (the approval gate)."""
     return _read_flags(load_manifest(role))["approval_required_for"]
+
+
+# Control-plane Article VI human-approval verifier (hash-pin + expiry + single-use). It is the
+# single source of truth for "did a human approve THIS exact payload"; we never re-implement the
+# store, we read/consume its records so an approval can gate at most one action.
+_VERIFY_APPROVAL = Path.home() / "projects" / "control-plane" / "scripts" / "verify_approval.py"
+
+
+def _verify_approval_mod():
+    """Load verify_approval.py by path WITHOUT polluting sys.path (avoids shadowing agent-os modules
+    like audit). Raises if the verifier is absent — require_approval() turns that into a DENY so a
+    gated action can never proceed when the approval machinery is unreachable (fail-closed)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("verify_approval", _VERIFY_APPROVAL)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def require_approval(role: str, action: str, payload, approval_id: str = None) -> dict:
+    """The MISSING gate (#40/#22/#36): turn approval_required_for from a paper list into a real block.
+
+    Call this at an action site BEFORE a gated action (factory LAUNCH/deploy, budget spend, vault
+    secret read). If `action` is NOT in this role's approval_required_for, it is ungated and returns
+    immediately ({"gated": False}). If it IS gated, the action may proceed ONLY if a HUMAN approval
+    exists that is (a) status 'approved', (b) not expired, (c) hash-pinned to the EXACT `payload`
+    about to run, and (d) not already consumed — verified against control-plane verify_approval.py,
+    which we then CONSUME (single-use) so the same approval can't silently gate a second action.
+
+    FAIL-CLOSED by design: a missing approval_id, no record, wrong status, expiry, hash mismatch, OR
+    any error reaching/loading the verifier all DENY (raise PermissionError) and audit. A deploy /
+    spend / secret-read whose approval cannot be positively verified MUST NOT proceed — denying here
+    only blocks gated, high-blast-radius actions (the role declared them needing approval), so this
+    is safe for liveness: ungated work is untouched.
+    """
+    import json
+    if action not in approval_required_for(role):
+        return {"gated": False, "role": role, "action": action}
+
+    payload_text = payload if isinstance(payload, str) else json.dumps(payload, sort_keys=True)
+    try:
+        if not approval_id:
+            raise PermissionError("no approval_id supplied for a gated action")
+        va = _verify_approval_mod()                  # may raise -> caught below -> DENY (fail-closed)
+        rec_path = va._path(approval_id)
+        if not rec_path.exists():
+            raise PermissionError(f"no such approval {approval_id!r}")
+        rec = json.loads(rec_path.read_text())
+        if rec.get("status") != "approved":
+            raise PermissionError(f"approval status={rec.get('status')!r} (need 'approved')")
+        import datetime
+        if va._now() > datetime.datetime.fromisoformat(rec["expires_at"]):
+            rec["status"] = "expired"; rec_path.write_text(json.dumps(rec, indent=2))
+            raise PermissionError("approval expired")
+        if va._hash(payload_text) != rec.get("payload_hash"):
+            raise PermissionError("payload hash mismatch — a human approved A, this is A-prime")
+        # single-use: consume so this approval cannot gate a second action.
+        rec["status"] = "consumed"; rec["consumed_at"] = va._now().isoformat()
+        rec["consumed_for"] = {"role": role, "action": action}
+        rec_path.write_text(json.dumps(rec, indent=2))
+    except PermissionError as e:
+        _audit("ApprovalDenied", role, "deny",
+               {"action": action, "approval_id": approval_id, "reason": str(e)})
+        raise PermissionError(
+            f"role '{role}' may '{action}' only after a verified human approval — none valid "
+            f"(approval_id={approval_id!r}): {e}")
+    except Exception as e:                            # store unreachable / verifier missing / malformed
+        _audit("ApprovalDenied", role, "deny",
+               {"action": action, "approval_id": approval_id, "reason": f"verify error: {e}"})
+        raise PermissionError(
+            f"role '{role}' action '{action}' approval could not be verified, denying (fail-closed): {e}")
+
+    _audit("ApprovalGranted", role, "allow", {"action": action, "approval_id": approval_id})
+    return {"gated": True, "approved": True, "role": role, "action": action,
+            "approval_id": approval_id}
 
 
 def _audit(action: str, role: str, decision: str, payload: dict) -> None:
@@ -273,6 +351,63 @@ def _selftest() -> int:
     if "deploy" not in approval_required_for("controller"):
         problems.append("approval_required_for(controller) should include 'deploy'")
 
+    # 9) require_approval ACTUALLY GATES (#40/#22/#36): the Article VI verifier is invoked, the gate
+    #    is fail-closed, hash-pinned, and single-use.
+    import json as _json
+    import uuid as _uuid
+    import datetime as _dt
+    appr_gate = {"ungated_ok": False, "deny_no_appr": False, "allow_valid": False,
+                 "deny_reuse": False, "deny_hash": False}
+    created = []
+    try:
+        va = _verify_approval_mod()                  # proves verify_approval.py is reachable + wired
+        payload = "deploy NoUpload@v1.2.3 to production"
+
+        # (a) a non-listed action is ungated -> allowed with no approval at all.
+        appr_gate["ungated_ok"] = not require_approval("controller", "not_a_gated_action", payload).get("gated")
+
+        # (b) a GATED action with NO approval is DENIED (fail-closed).
+        try:
+            require_approval("controller", "deploy", payload)        # no approval_id
+        except PermissionError:
+            appr_gate["deny_no_appr"] = True
+
+        # (c) a GATED action WITH a valid hash-pinned approval is ALLOWED, then CONSUMED (single-use).
+        def _mk(aid, pinned):
+            p = va._path(aid); created.append(p)
+            p.write_text(_json.dumps({
+                "approval_id": aid, "action": "deploy", "risk_tier": 2,
+                "exact_command_or_diff": pinned, "payload_hash": va._hash(pinned),
+                "requested_by": "selftest", "created_at": va._now().isoformat(),
+                "expires_at": (va._now() + _dt.timedelta(minutes=10)).isoformat(),
+                "status": "approved", "decided_by": "selftest"}, indent=2))
+            return p
+
+        aid = f"APR-selftest-{_uuid.uuid4().hex[:8]}"; _mk(aid, payload)
+        appr_gate["allow_valid"] = bool(require_approval("controller", "deploy", payload,
+                                                         approval_id=aid).get("approved"))
+        # the SAME approval cannot gate a second deploy (now consumed).
+        try:
+            require_approval("controller", "deploy", payload, approval_id=aid)
+        except PermissionError:
+            appr_gate["deny_reuse"] = True
+
+        # (d) a DIFFERENT payload under an approval pinned to the original is DENIED (hash-pin).
+        aid2 = f"APR-selftest-{_uuid.uuid4().hex[:8]}"; _mk(aid2, payload)
+        try:
+            require_approval("controller", "deploy", payload + " --force", approval_id=aid2)
+        except PermissionError:
+            appr_gate["deny_hash"] = True
+    finally:
+        for p in created:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    for k, ok in appr_gate.items():
+        if not ok:
+            problems.append(f"require_approval gate failed check: {k}")
+
     print("governance.selftest")
     print(f"  resource-allocator disallowed_tools : {ra['disallowed_tools']}")
     print(f"  builder write_scope                 : {b['write_scope']}")
@@ -280,6 +415,7 @@ def _selftest() -> int:
     print(f"  may(builder,deploy)                 : {may('builder','deploy')}")
     print(f"  may(devops-sre,deploy)              : {may('devops-sre','deploy')}")
     print(f"  approval_required_for(controller)   : {approval_required_for('controller')}")
+    print(f"  require_approval gate (ungate/deny/allow/reuse/hash) : {list(appr_gate.values())}")
     print(f"  validate_writes(builder, ...)       : {[ (x['path'], x['reason']) for x in v ]}")
     if problems:
         print("\nFAIL:")

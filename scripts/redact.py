@@ -12,24 +12,34 @@ import re
 import sys
 
 MASK = "‹REDACTED›"
-PATTERNS = [
-    re.compile(r"""(?i)\b(api[_-]?key|secret|token|password|passwd|aosnap_pass)\b(\s*[:=]\s*)(['"]?)[^\s'"]{6,}"""),
+# key=value style assignment of a secret: keep the key+separator, mask the value.
+KV_PATTERN = re.compile(r"""(?i)\b(api[_-]?key|secret|token|password|passwd|aosnap_pass)\b(\s*[:=]\s*)(['"]?)[^\s'"]{6,}""")
+# DB url password: keep prefix + '@', mask the password between them.
+DBURL_PATTERN = re.compile(r"(postgres(?:ql)?://[^:/\s]+:)([^@\s]+)(@)")
+# Standalone secret shapes — masked wholesale.
+TOKEN_PATTERNS = [
     re.compile(r"\baos_[A-Fa-f0-9]{16,}\b"),                      # our tenant tokens
+    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),                 # anthropic keys (sk-ant-api03-...)
+    re.compile(r"\bsk-proj-[A-Za-z0-9_-]{20,}\b"),               # openai project keys
     re.compile(r"\bsk-[A-Za-z0-9]{16,}\b"),                       # openai-style
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),               # github tokens
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),             # slack tokens
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),                   # google api keys
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                          # aws access key id
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{10,}"),           # bearer tokens
-    re.compile(r"(postgres(?:ql)?://[^:/\s]+:)([^@\s]+)(@)"),     # DB url password
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),  # private keys
 ]
+# Back-compat: expose a combined list for any external importer.
+PATTERNS = [KV_PATTERN, DBURL_PATTERN] + TOKEN_PATTERNS
 
 
 def scrub(text):
     if not text:
         return text
     out = text
-    out = PATTERNS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{MASK}", out)
-    out = PATTERNS[5].sub(lambda m: f"{m.group(1)}{MASK}{m.group(3)}", out)
-    for p in (PATTERNS[1], PATTERNS[2], PATTERNS[3], PATTERNS[4], PATTERNS[6]):
+    out = KV_PATTERN.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{MASK}", out)
+    out = DBURL_PATTERN.sub(lambda m: f"{m.group(1)}{MASK}{m.group(3)}", out)
+    for p in TOKEN_PATTERNS:
         out = p.sub(MASK, out)
     return out
 
@@ -38,6 +48,8 @@ def _main(a):
     if a and a[0] == "selftest":
         cases = [
             ("API_KEY=sk-abcdef0123456789ghijkl", "sk-abcdef"),
+            ("ANTHROPIC_API_KEY=sk-ant-api03-AbCdEf0123456789GhIjKlMnOpQr", "sk-ant-api03"),
+            ("key sk-ant-api03-XyZ01234567890abcdefghijKL in trace", "sk-ant-api03-XyZ"),
             ("here is aos_0123456789abcdef0123456789 token", "aos_0123"),
             ("Authorization: Bearer eyJhbGciOiJ.payload.sig", "Bearer eyJ"),
             ("DATABASE_URL=postgresql://agentos:supersecretpw@127.0.0.1:5433/agentos", "supersecretpw"),

@@ -79,23 +79,69 @@ def append(actor, action, resource="", decision="executed", payload=None):
         return new_id, entry_hash
 
 
-def reseal():
-    """Recompute the prev_hash/entry_hash chain in id order. Idempotent (a no-op on an intact chain).
-    Use ONLY to repair a chain broken by legitimate row-deletion test pollution — NOT to hide tampering."""
+def reseal(operator=None, break_glass=False, reason=""):
+    """Repair a chain broken ONLY by legitimate row DELETIONS (gaps) — under break-glass.
+
+    SECURITY (finding #51): the previous reseal() blindly recomputed entry_hash over whatever
+    business content happened to sit in each row, so anyone holding the HMAC key could LAUNDER a
+    tamper simply by re-running it — the chain's entire value is that entry_hash binds the
+    *business fields*, and re-signing changed fields silently destroys that tamper-evidence.
+
+    This version is deliberately narrow and fail-closed:
+      * It is BREAK-GLASS only: requires an explicit operator identity AND break_glass=True, so it
+        can never run by accident or from automation.
+      * Pass 1 proves every surviving row is individually authentic: entry_hash must equal
+        HMAC(canonical(its own business fields) || its own stored prev_hash). A failure here is
+        real content tampering (or forgery), NOT a deletion gap — we REFUSE and abort without
+        touching a single row. reseal must never re-sign changed business fields.
+      * Pass 2 only relinks prev_hash across the deletion gaps of those proven-authentic rows.
+        Business fields are NEVER altered; a row's entry_hash changes solely because the prev_hash
+        it binds legitimately moved to the new surviving predecessor.
+      * It appends a tamper-evident 'AuditResealed' record (who / why / which ids) so the repair
+        is itself attributable and chained.
+
+    Idempotent: a no-op (and no AuditResealed record) on an already-intact chain.
+    """
+    if not break_glass or not operator:
+        raise PermissionError(
+            "reseal() is break-glass only: pass operator=<name> and break_glass=True. It exists "
+            "solely to relink prev_hash across legitimately-deleted rows; it will NOT re-sign "
+            "tampered content. If verify() reports an entry_hash mismatch, investigate — do not reseal.")
     db, key = _cfg()
-    fixed = 0
+    relinked = []
     with psycopg.connect(db) as conn, conn.cursor() as cur:
         cur.execute("SELECT pg_advisory_xact_lock(742042)")
         cur.execute("SELECT id, actor, action, resource, decision, payload, prev_hash, entry_hash FROM audit_log ORDER BY id")
+        rows = cur.fetchall()
+        # Pass 1 (fail-closed): every surviving row must be self-consistent BEFORE we touch anything.
+        # Self-consistency = entry_hash binds this row's own business fields and its own stored
+        # prev_hash. If that fails, the business content was tampered (not merely a deleted neighbour);
+        # re-signing it would launder the tamper, so we abort the whole reseal.
+        for rid, actor, action, resource, decision, payload, prev_hash, entry_hash in rows:
+            self_hash = _chain_hash(key, _canonical(actor, action, resource, decision, payload, prev_hash))
+            if self_hash != entry_hash:
+                raise PermissionError(
+                    f"reseal REFUSED: row id={rid} fails self-consistency — its business fields were "
+                    f"altered after signing (content tamper, not a deletion gap). reseal will not "
+                    f"re-sign changed content; investigate the breach instead.")
+        # Pass 2: relink prev_hash across deletion gaps for these proven-authentic rows only.
         prev = ""
-        for rid, actor, action, resource, decision, payload, prev_hash, entry_hash in cur.fetchall():
-            want = _chain_hash(key, _canonical(actor, action, resource, decision, payload, prev))
-            if prev_hash != prev or entry_hash != want:
-                cur.execute("UPDATE audit_log SET prev_hash=%s, entry_hash=%s WHERE id=%s", (prev, want, rid))
-                fixed += 1
-            prev = want
+        for rid, actor, action, resource, decision, payload, prev_hash, entry_hash in rows:
+            if prev_hash != prev:
+                new_hash = _chain_hash(key, _canonical(actor, action, resource, decision, payload, prev))
+                cur.execute("UPDATE audit_log SET prev_hash=%s, entry_hash=%s WHERE id=%s", (prev, new_hash, rid))
+                relinked.append(rid)
+                prev = new_hash
+            else:
+                prev = entry_hash
         conn.commit()
-    return fixed
+    if relinked:
+        # Tamper-evident, chained record of the break-glass repair (who/why/what).
+        append(actor=f"operator:{operator}", action="AuditResealed", resource="audit_log",
+               decision="break_glass",
+               payload={"operator": operator, "reason": reason,
+                        "relinked_ids": relinked, "count": len(relinked)})
+    return len(relinked)
 
 
 def verify():
@@ -131,8 +177,18 @@ def _main(argv):
         print("AUDIT CHAIN INTACT ✅" if ok else f"AUDIT CHAIN BROKEN ❌ — {err}")
         sys.exit(0 if ok else 1)
     elif cmd == "reseal":
-        n = reseal()
-        print(f"resealed {n} row(s); chain recomputed in id order")
+        # Break-glass only:  audit.py reseal <operator> '<reason>' --break-glass
+        if "--break-glass" not in argv:
+            sys.exit("reseal is break-glass only: audit.py reseal <operator> '<reason>' --break-glass "
+                     "(relinks prev_hash across legitimately-deleted rows; never re-signs tampered content)")
+        rest = [a for a in argv[1:] if a != "--break-glass"]
+        operator = rest[0] if rest else ""
+        if not operator:
+            sys.exit("reseal requires an operator: audit.py reseal <operator> '<reason>' --break-glass")
+        reason = rest[1] if len(rest) > 1 else ""
+        n = reseal(operator=operator, break_glass=True, reason=reason)
+        print(f"resealed {n} row(s) — break-glass by {operator}"
+              + ("" if n else " (chain already intact; no-op)"))
     elif cmd == "tail":
         db, _ = _cfg()
         n = int(argv[1]) if len(argv) > 1 else 10

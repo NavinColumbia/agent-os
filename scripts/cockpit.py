@@ -89,6 +89,7 @@ def cockpit(tid):
         products = [_product_view(cur, p) for p in prods]
         # communications among THIS tenant's agents (agents currently/recently on their products)
         comms = []
+        agents = []
         if prods:
             cur.execute("""SELECT DISTINCT agent_id FROM directory WHERE product = ANY(%s)""", (prods,))
             agents = [r[0] for r in cur.fetchall()]
@@ -98,9 +99,15 @@ def cockpit(tid):
                                ORDER BY turn DESC LIMIT 15""", (agents, agents))
                 comms = [{"from": s, "to": r, "intent": i, "ts": t.strftime("%H:%M:%S")}
                          for s, r, i, t in cur.fetchall()]
-        # queue depth across their products' work (pending/active/dead)
-        cur.execute("""SELECT status, count(*) FROM tasks GROUP BY status""")
-        qd = {s: n for s, n in cur.fetchall()}
+        # queue depth across THIS tenant's products' work (pending/active/dead) — scoped to the
+        # tenant's agents (tasks have no product column; assignee identifies the tenant's agents,
+        # the same scoping used for the per-product worker counts below). A global GROUP BY would
+        # leak other tenants' queue depth and report wrong numbers.
+        qd = {}
+        if agents:
+            cur.execute("""SELECT status, count(*) FROM tasks WHERE assignee = ANY(%s) GROUP BY status""",
+                        (agents,))
+            qd = {s: n for s, n in cur.fetchall()}
     spend = round(sum(p["cost_usd"] for p in products), 4)
     tokens = sum(p["tokens"] for p in products)
     q = billing.quota(tid)

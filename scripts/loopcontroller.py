@@ -262,6 +262,21 @@ def advance(thread_id, job_result=None):
         return
     tid, phase = s["tenant_id"], s["phase"]
 
+    # A dispatched job came back BROKEN — the worker raised (_work() -> {'error':...}, status='failed')
+    # or the underlying module reported failure/timeout. We must NOT fall through to the phase block:
+    # that re-runs the SAME failing job, silently re-dispatching it forever (#9). Surface it to the user
+    # and park on a feedback gate so they decide (e.g. say "retry" to re-dispatch the phase, or change it).
+    if job_result and (job_result.get("error") or job_result.get("status") in ("failed", "timeout")):
+        err = job_result.get("error") or job_result.get("status")
+        _set(thread_id, awaiting="user_feedback")
+        _report(tid, thread_id,
+                 f"⚠️ The **{phase}** step hit a problem and stopped: {err}. "
+                 f"Tell me how you'd like to proceed, or say \"retry\" to run it again.",
+                 {"kind": "job_failed", "phase": phase}, urgent=True)
+        audit.append(actor="loopcontroller", action="JobFailed", resource=str(thread_id), decision=phase,
+                     payload={"error": str(err)[:200]})
+        return
+
     # research job finished -> present options
     if job_result and job_result.get("run_id") and "options" in job_result:
         _set(thread_id, research_run_id=job_result["run_id"], options=job_result.get("options", []))
@@ -278,8 +293,19 @@ def advance(thread_id, job_result=None):
     if job_result and (job_result.get("shipped") is not None or job_result.get("result")):  # build done
         _to(thread_id, "TESTQA"); advance(thread_id)
         return
-    if job_result and "qa_ok" in job_result:                        # qa done
-        _to(thread_id, "DELIVER"); advance(thread_id)
+    if job_result and "qa_ok" in job_result:                        # qa verdict in -> ENFORCE it (#48)
+        if job_result.get("qa_ok"):
+            _to(thread_id, "DELIVER"); advance(thread_id)
+        else:
+            # A failed (or unverifiable) build must NOT reach DELIVER. Loop back to IMPLEMENT, but gate on
+            # the user so we don't silently auto-rebuild forever — they say "approve"/"retry" to rebuild.
+            _set(thread_id, awaiting="user_feedback")
+            _to(thread_id, "IMPLEMENT")
+            _report(tid, thread_id,
+                    "⚠️ QA did not pass — the build failed verification, so I'm holding it back from delivery. "
+                    "Say \"approve\" to rebuild and re-test, or tell me what to change.",
+                    {"kind": "qa_failed"}, urgent=True)
+            audit.append(actor="loopcontroller", action="QAGate", resource=str(thread_id), decision="BLOCKED")
         return
 
     if phase == "RESEARCH":
@@ -354,7 +380,9 @@ def advance(thread_id, job_result=None):
                 v = verify.verify(product, rigor=2)
                 return {"qa_ok": bool(v.get("passed", True)) if isinstance(v, dict) else True}
             except Exception:
-                return {"qa_ok": True}
+                # FAIL-CLOSED: if verification cannot run, we have NO evidence the build is good, so we
+                # must not let it ship. Treat an unverifiable build as a QA failure (gate blocks DELIVER).
+                return {"qa_ok": False}
         _dispatch(thread_id, "qa", _do_qa)
         return
 
@@ -377,17 +405,47 @@ def advance(thread_id, job_result=None):
         return
 
 
+RUNNING_TIMEOUT_MIN = 30  # a job still 'running' past this is presumed crashed (its worker died mid-run)
+
+
 def resume_stalled():
+    """Crash-recovery sweep (run from the scheduler). Recovers EVERY durable job a killed worker left
+    behind on the 'fleet' gate — not just the clean 'done' ones the original query saw (#10):
+      * status='running' older than RUNNING_TIMEOUT_MIN -> the worker died (often before writing status
+        at all), so the row would pin the thread on 'fleet' forever -> flip it to 'failed' durably.
+      * status='done'   -> the worker finished but died before calling advance() -> advance now.
+      * status='failed' -> the worker caught an error but its advance() was lost -> advance now, which
+        surfaces the failure (advance() handles error/failed dicts instead of re-dispatching).
+    For each parked thread we act ONLY on its LATEST job: a thread whose newest job is still legitimately
+    'running' (not timed out) is left untouched, and stale older jobs never trigger a spurious advance.
+    """
     _ensure()
     advanced = 0
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT cj.thread_id, cj.result FROM controller_jobs cj
+        # 1) Reap timed-out 'running' jobs: the worker is gone, so mark them failed (durable terminal state).
+        cur.execute("""UPDATE controller_jobs SET status='failed',
+                           result = COALESCE(result, '{}'::jsonb)
+                                    || '{"error":"worker timed out / crashed","status":"failed"}'::jsonb,
+                           finished_at = now()
+                       WHERE status='running'
+                         AND started_at < now() - make_interval(mins => %s)""",
+                    (RUNNING_TIMEOUT_MIN,))
+        c.commit()
+        # 2) For every thread parked on 'fleet', take its most recent job (any status).
+        cur.execute("""SELECT DISTINCT ON (cj.thread_id) cj.thread_id, cj.result, cj.status
+                       FROM controller_jobs cj
                        JOIN controller_state cs ON cs.thread_id=cj.thread_id
-                       WHERE cj.status='done' AND cs.awaiting='fleet'""")
+                       WHERE cs.awaiting='fleet'
+                       ORDER BY cj.thread_id, cj.id DESC""")
         rows = cur.fetchall()
-    for thread_id, result in rows:
+    for thread_id, result, status in rows:
+        if status == "running":
+            continue                              # newest job still genuinely in flight — leave it alone
+        res = result if isinstance(result, dict) else {}
+        if status == "failed" and not (res.get("error") or res.get("status") == "failed"):
+            res = {**res, "error": "job failed", "status": "failed"}
         _set(thread_id, awaiting=None)
-        advance(thread_id, job_result=result if isinstance(result, dict) else {})
+        advance(thread_id, job_result=res)        # done -> advances phase; failed -> surfaces failure
         advanced += 1
     return {"resumed": advanced}
 

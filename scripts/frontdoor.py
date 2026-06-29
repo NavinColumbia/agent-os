@@ -80,7 +80,7 @@ def _run_build(tid, product, charter, kind):
     bk = tenantproviders.build_kwargs(tid)           # {engine, provider_key, api_key}
     if bk["engine"] == "claude" and not bk["api_key"]:
         try:
-            v = vault.get_secret("byo_llm_key", f"tenant:{tid}", "prod", "builder")
+            v = vault.get_secret("byo_llm_key", f"tenant:{tid}", "prod", "builder", tenant_id=tid)
             bk["api_key"] = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
         except Exception:
             pass

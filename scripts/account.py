@@ -159,36 +159,55 @@ def delete(tid, confirm=False):
             counts["tenants"] = _count(cur, "tenants", "tenant_id", tid)
         return {"requires_confirm": True, "will_delete": counts}
 
+    # Capture the tenant's products FIRST, in their own (read-only) transaction, so that
+    # (a) a failed read can't poison the deletion transaction, and (b) we still know which
+    # products the tenant owned AFTER tenant_products is deleted — vault secrets are scoped
+    # by `product`, so we need this list to purge them below.
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        for table, col in _TENANT_TABLES:
+        products = _products(tid, cur)
+
+    # Delete every tenant-scoped table. CRITICAL: each table runs inside its own SAVEPOINT,
+    # so a failure on ONE table rolls back only that table — never the rows we already
+    # deleted — and we still attempt the remaining tables. Per-table failures are collected
+    # and surfaced (fail-closed: we report partial/ok=False instead of a bogus success).
+    targets = list(_TENANT_TABLES) + [("kill_switch", "scope"), ("tenants", "tenant_id")]
+    failures = {}
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        for i, (table, col) in enumerate(targets):
+            sp = f"sp_{i}"
+            cur.execute(f"SAVEPOINT {sp}")
             try:
                 cur.execute(f"DELETE FROM {table} WHERE {col}=%s", (tid,))
-            except Exception:
-                c.rollback()
-        # kill_switch is scoped by `scope`
-        try:
-            cur.execute("DELETE FROM kill_switch WHERE scope=%s", (tid,))
-        except Exception:
-            c.rollback()
-        # finally remove the tenant identity itself
-        try:
-            cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-        except Exception:
-            c.rollback()
+            except Exception as e:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                failures[table] = str(e)[:200]
+            else:
+                cur.execute(f"RELEASE SAVEPOINT {sp}")
         c.commit()
 
-    # best-effort purge of vault secrets owned by this tenant
-    vault_note = "no vault delete fn — skipped"
-    try:
-        import vault
-        if hasattr(vault, "delete_secret"):
-            vault.delete_secret(owner=f"tenant:{tid}")
-            vault_note = "purged via vault.delete_secret"
-    except Exception:
-        vault_note = "vault purge errored — skipped"
+    # Purge vault secrets owned by this tenant. Secrets are scoped by `product`; we captured
+    # the tenant's products above. A purge failure is a real GDPR-erasure gap, so it counts
+    # toward `failures` (fail-closed) rather than being silently swallowed.
+    if not products:
+        vault_note = "no products — no vault secrets to purge"
+    else:
+        try:
+            import vault
+            n = vault.delete_secrets_for_products(products)
+            vault_note = f"purged {n} secret(s) across {len(products)} product(s)"
+        except Exception as e:
+            vault_note = f"vault purge errored: {str(e)[:160]}"
+            failures["secrets"] = vault_note
 
-    audit.append(actor=tid, action="AccountDeleted", resource=tid, payload={"vault": vault_note})
-    return {"ok": True, "deleted": True, "vault": vault_note}
+    ok = not failures
+    result = {"ok": ok, "deleted": ok, "vault": vault_note}
+    if failures:
+        result["partial"] = True
+        result["failures"] = failures
+
+    audit.append(actor=tid, action="AccountDeleted", resource=tid,
+                 payload={"vault": vault_note, "ok": ok, "failures": list(failures)})
+    return result
 
 
 def _selftest():

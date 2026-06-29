@@ -58,6 +58,29 @@ def _tar_filter(ti):
     return None if parts & SKIP else ti
 
 
+def _safe_extract(tar, dest):
+    """Extract `tar` into `dest`, refusing any member that would escape `dest`
+    (absolute paths, '..' traversal, or symlink/hardlink targets pointing outside).
+    Fails closed: a single bad member aborts the whole extraction."""
+    dest = Path(dest).resolve()
+    members = tar.getmembers()
+    for m in members:
+        target = (dest / m.name).resolve()
+        if target != dest and dest not in target.parents:
+            raise ValueError(f"unsafe tar member (path traversal): {m.name!r}")
+        if m.islnk() or m.issym():
+            link = m.linkname
+            base = dest if m.issym() else dest  # both resolved against dest tree
+            ltarget = (target.parent / link).resolve() if m.issym() else (dest / link).resolve()
+            if ltarget != dest and dest not in ltarget.parents:
+                raise ValueError(f"unsafe tar link target: {m.name!r} -> {link!r}")
+    # Python 3.12+: also apply the stdlib 'data' filter as defense in depth.
+    try:
+        tar.extractall(dest, members=members, filter="data")
+    except TypeError:
+        tar.extractall(dest, members=members)
+
+
 def snapshot(tid, product, label=""):
     """Tar the product's repo dir and record a product_versions row at the next version number."""
     _ensure()
@@ -113,12 +136,44 @@ def rollback(tid, product, version):
     # snapshot current state so the rollback itself can be undone
     if repo.is_dir():
         snapshot(tid, product, label="pre-rollback auto-save")
-    # clear then extract the chosen version over the repo dir
-    if repo.exists():
-        shutil.rmtree(repo)
-    repo.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(snap, "r:gz") as tar:
-        tar.extractall(repo)
+    # SKIP dirs (.git history, node_modules, __pycache__) were never tarred, so a
+    # naive rmtree+extract would destroy them permanently. Preserve them across the
+    # rollback by moving them aside, then restoring after the tracked tree is replaced.
+    stash = None
+    preserved = []
+    if repo.is_dir():
+        stash = repo.parent / f".{product}.rollback-stash"
+        if stash.exists():
+            shutil.rmtree(stash)
+        stash.mkdir(parents=True)
+        for name in SKIP:
+            src = repo / name
+            if src.exists() or src.is_symlink():
+                shutil.move(str(src), str(stash / name))
+                preserved.append(name)
+    try:
+        # clear then extract the chosen version over the repo dir
+        if repo.exists():
+            shutil.rmtree(repo)
+        repo.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(snap, "r:gz") as tar:
+            _safe_extract(tar, repo)
+    finally:
+        # Always restore the preserved SKIP dirs, even if extraction failed, so
+        # .git history etc. is never lost. Only delete the stash once empty.
+        repo.mkdir(parents=True, exist_ok=True)
+        for name in preserved:
+            src = stash / name if stash is not None else None
+            if src is None or not (src.exists() or src.is_symlink()):
+                continue
+            dst = repo / name
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            elif dst.exists() or dst.is_symlink():
+                dst.unlink()
+            shutil.move(str(src), str(dst))
+        if stash is not None and stash.exists():
+            shutil.rmtree(stash, ignore_errors=True)
     audit.append(actor="versions", action="Rollback", resource=product, decision="executed",
                  payload={"tenant_id": tid, "restored_version": version})
     return {"ok": True, "restored_version": version}
@@ -132,10 +187,14 @@ def _selftest():
     foreign = "vtest-foreign-" + os.urandom(3).hex()
     repo = factory.PRODUCTS / product
     f = repo / "app.txt"
+    git = repo / ".git"            # SKIP dir: must survive rollback (its history is precious)
+    git_marker = git / "HEAD"
     try:
         _ensure()
         factory.PRODUCTS.mkdir(parents=True, exist_ok=True)
         repo.mkdir(parents=True, exist_ok=True)
+        git.mkdir(parents=True, exist_ok=True)
+        git_marker.write_text("ref: refs/heads/main")
         f.write_text("v1")
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s)", (product, tid))
@@ -147,6 +206,7 @@ def _selftest():
         before = versions(tid, product)
         rb = rollback(tid, product, 1)                      # restore v1
         restored = f.read_text()
+        git_survived = git_marker.exists() and git_marker.read_text() == "ref: refs/heads/main"
         after = versions(tid, product)
 
         # ownership guard: a product the tenant does not own -> error (no snapshot taken)
@@ -154,12 +214,13 @@ def _selftest():
 
         ok = (s1["version"] == 1 and s2["version"] == 2
               and rb.get("ok") and restored == "v1"
+              and git_survived                              # SKIP dirs (.git) preserved across rollback
               and len(after) > len(before)                  # pre-rollback auto-save added a version
               and any(v["label"] == "pre-rollback auto-save" for v in after)
               and "error" in guard)
-        print(f"v1={s1['version']} v2={s2['version']} restored={restored!r} "
+        print(f"v1={s1['version']} v2={s2['version']} restored={restored!r} git_survived={git_survived} "
               f"versions {len(before)}->{len(after)} guard={guard}")
-        print("PASS: snapshot/rollback restores prior version, auto-saves first, owner-checked ✅"
+        print("PASS: snapshot/rollback restores prior version, preserves .git, auto-saves first, owner-checked ✅"
               if ok else "FAIL")
         sys.exit(0 if ok else 1)
     finally:

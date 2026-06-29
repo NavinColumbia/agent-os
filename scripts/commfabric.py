@@ -24,12 +24,29 @@ DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
            if l.strip().startswith("DATABASE_URL=")), None)
 WF_FILE = Path("/tmp/commfabric_wf_id")
 TOPIC = "ask-await-demo"
+RECV_TIMEOUT = 300   # seconds the requester will durably suspend in recv awaiting a reply
 
 
-def _wait_edge(waiter, awaited, add=True):
+def _wait_edge(waiter, awaited, add=True, reply_by_seconds=None):
+    """Insert/remove a wait-for edge.
+
+    When the edge is created for a reply-expecting act, persist reply_by — the SLA
+    deadline by which a reply is due (mirrors messaging.Message.reply_by, REQUIRED for
+    QUERY/CLARIFY/DELEGATE/PROPOSE). Without it, reply_by stays NULL and
+    accountability.overdue_waits()'s `WHERE reply_by IS NOT NULL AND reply_by < now()`
+    can never fire, making all overdue-wait / SLA-breach detection dead. The deadline is
+    tied to the recv timeout so the wait is flagged overdue before (or as) the recv expires.
+    """
     with psycopg.connect(DB) as c, c.cursor() as cur:
         if add:
-            cur.execute("INSERT INTO waits(waiter,awaited) VALUES(%s,%s) ON CONFLICT DO NOTHING", (waiter, awaited))
+            if reply_by_seconds is not None:
+                cur.execute(
+                    "INSERT INTO waits(waiter,awaited,reply_by) "
+                    "VALUES(%s,%s, now() + make_interval(secs => %s)) "
+                    "ON CONFLICT (waiter,awaited) DO UPDATE SET reply_by = EXCLUDED.reply_by",
+                    (waiter, awaited, reply_by_seconds))
+            else:
+                cur.execute("INSERT INTO waits(waiter,awaited) VALUES(%s,%s) ON CONFLICT DO NOTHING", (waiter, awaited))
         else:
             cur.execute("DELETE FROM waits WHERE waiter=%s AND awaited=%s", (waiter, awaited))
         c.commit()
@@ -41,9 +58,10 @@ DBOS(config=DBOSConfig(name="agentos-comm", database_url=DB))
 @DBOS.workflow()
 def requester(question: str):
     me = DBOS.workflow_id
-    _wait_edge(me, "responder", add=True)         # visible in the wait-for graph while parked
+    # reply-expecting ask: persist the SLA deadline so overdue-wait/SLA-breach detection can fire.
+    _wait_edge(me, "responder", add=True, reply_by_seconds=RECV_TIMEOUT)   # visible in the wait-for graph while parked
     print(f"[requester] asked {question!r}; suspending in recv (no tokens burned)", flush=True)
-    reply = DBOS.recv(topic=TOPIC, timeout_seconds=300)   # DURABLE suspend — survives process death
+    reply = DBOS.recv(topic=TOPIC, timeout_seconds=RECV_TIMEOUT)   # DURABLE suspend — survives process death
     _wait_edge(me, "responder", add=False)
     print(f"[requester] resumed with reply: {reply!r}", flush=True)
     return reply

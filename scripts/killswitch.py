@@ -58,15 +58,19 @@ def resume(scope="global"):
 
 def is_halted(scope="global"):
     """True if the fleet is halted globally OR this specific scope is halted. factory.agent() calls this
-    before every spawn. Fail-OPEN on a DB error (don't let an outage wedge the whole fleet shut)."""
+    before every spawn. Fail-CLOSED on a DB error: this is a human-oversight HALT (EU AI Act Art. 14),
+    so if the control-plane is unreachable we cannot prove the operator did NOT press stop — assume halted.
+    A paused fleet during a DB blip is recoverable; silently running a fleet the operator tried to STOP is
+    not. Liveness cost is bounded to the outage window; the safety guarantee is absolute."""
     try:
         _ensure()
         with psycopg.connect(DB, connect_timeout=3) as c, c.cursor() as cur:
             cur.execute("SELECT scope, reason FROM kill_switch WHERE scope IN ('global', %s)", (scope,))
             row = cur.fetchone()
         return {"halted": True, "scope": row[0], "reason": row[1]} if row else {"halted": False}
-    except Exception:
-        return {"halted": False}
+    except Exception as e:
+        return {"halted": True, "scope": scope,
+                "reason": f"failsafe: control-plane unreachable ({type(e).__name__}); failing CLOSED"}
 
 
 def _selftest():

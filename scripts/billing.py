@@ -39,7 +39,71 @@ def _ensure():
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free'")
         cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT false")
+        # finding #16: every tenant gets a monthly billing-period anchor so metered usage/quota/invoice
+        # reset each cycle instead of accumulating lifetime totals. New tenants anchor to the current
+        # month; existing rows are backfilled to the current month boundary at migration time.
+        cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+                    "period_start timestamptz NOT NULL DEFAULT date_trunc('month', now())")
         c.commit()
+
+
+def _audit(action, tid, payload, actor="billing", decision="executed"):
+    """Best-effort tamper-evident audit (reuse audit.py); never blocks the billing op if the DB/key is down."""
+    try:
+        import audit
+        audit.append(actor=actor, action=action, resource=tid, decision=decision, payload=payload)
+    except Exception:
+        pass
+
+
+def _period(tid):
+    """Return (period_start, period_end) for the tenant's CURRENT monthly billing window, rolling the
+    stored anchor forward through any whole months that have elapsed since it was last set (finding #16).
+    Because the anchor always sits on a month boundary, advancing by the whole-month delta keeps it
+    aligned and means usage()/quota()/invoice() only ever see THIS period's activity."""
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute(
+            """UPDATE tenants
+                  SET period_start = period_start + make_interval(months =>
+                        GREATEST(0,
+                          (extract(year  FROM now())::int - extract(year  FROM period_start)::int) * 12
+                        + (extract(month FROM now())::int - extract(month FROM period_start)::int)))
+                WHERE tenant_id=%s
+            RETURNING period_start, period_start + interval '1 month'""",
+            (tid,),
+        )
+        row = cur.fetchone()
+        c.commit()
+    if not row:
+        raise ValueError(f"no such tenant {tid}")
+    return row[0], row[1]
+
+
+def suspend(tid, reason="", actor="billing:admin"):
+    """Actually WRITE tenants.suspended=true (finding #18) and record an audit entry. This is the
+    abuse/over-quota/admin enforcement path that the suspended flag (read by _plan_of/quota/mrr) was
+    missing — without it the flag could never become true and a tenant could never be suspended."""
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("UPDATE tenants SET suspended=true WHERE tenant_id=%s", (tid,))
+        if cur.rowcount == 0:
+            raise ValueError(f"no such tenant {tid}")
+        c.commit()
+    _audit("TenantSuspended", tid, {"reason": reason}, actor=actor, decision="deny")
+    return {"tenant": tid, "suspended": True, "reason": reason}
+
+
+def unsuspend(tid, actor="billing:admin"):
+    """Lift a suspension (admin path): WRITE tenants.suspended=false + audit."""
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("UPDATE tenants SET suspended=false WHERE tenant_id=%s", (tid,))
+        if cur.rowcount == 0:
+            raise ValueError(f"no such tenant {tid}")
+        c.commit()
+    _audit("TenantUnsuspended", tid, {}, actor=actor, decision="allow")
+    return {"tenant": tid, "suspended": False}
 
 
 def signup(name, plan="free"):
@@ -64,19 +128,25 @@ def _plan_of(tid):
 
 
 def usage(tid):
-    """Real metered usage for the tenant's products: builds shipped (LAUNCHED) + tokens spent."""
+    """Real metered usage for the tenant's products THIS billing period (finding #16): builds shipped
+    (LAUNCHED) + tokens spent, filtered to the current monthly window [period_start, period_end) so
+    quotas and invoices reset each cycle instead of comparing lifetime totals to a monthly plan limit."""
+    start, end = _period(tid)
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s", (tid,))
         prods = [r[0] for r in cur.fetchall()]
         if not prods:
-            return {"products": 0, "builds": 0, "tokens": 0}
+            return {"products": 0, "builds": 0, "tokens": 0, "period_start": start.isoformat()}
         cur.execute("""SELECT count(*) FROM audit_log
                        WHERE actor='factory:controller' AND action='ProductComplete'
-                         AND decision='LAUNCHED' AND resource = ANY(%s)""", (prods,))
+                         AND decision='LAUNCHED' AND resource = ANY(%s)
+                         AND ts >= %s AND ts < %s""", (prods, start, end))
         builds = cur.fetchone()[0]
-        cur.execute("SELECT coalesce(sum(tokens_in+tokens_out),0) FROM org_metrics WHERE product = ANY(%s)", (prods,))
+        cur.execute("""SELECT coalesce(sum(tokens_in+tokens_out),0) FROM org_metrics
+                       WHERE product = ANY(%s) AND ts >= %s AND ts < %s""", (prods, start, end))
         tokens = cur.fetchone()[0]
-    return {"products": len(prods), "builds": builds, "tokens": int(tokens)}
+    return {"products": len(prods), "builds": builds, "tokens": int(tokens),
+            "period_start": start.isoformat()}
 
 
 def invoice(tid):
@@ -95,7 +165,15 @@ def quota(tid):
     plan, suspended = _plan_of(tid)
     p = PLANS[plan]
     u = usage(tid)
-    within = (not suspended) and u["builds"] < p["builds"] and u["tokens"] < p["tokens"]
+    over = u["builds"] >= p["builds"] or u["tokens"] >= p["tokens"]
+    # Over-quota enforcement that actually WRITES the suspended flag (finding #18): a plan with NO
+    # overage pricing (e.g. free) cannot bill for excess, so blowing past its hard limits is
+    # unbillable abuse -> suspend the tenant. Plans that carry overage rates (pro/enterprise) are
+    # BILLED for the excess by invoice() rather than suspended, so paying customers aren't cut off.
+    if over and not suspended and p["ov_build"] == 0 and p["ov_1k_tok"] == 0:
+        suspend(tid, reason=f"over-quota on no-overage plan '{plan}'", actor="billing:quota")
+        suspended = True
+    within = (not suspended) and not over
     return {"tenant": tid, "plan": plan, "within_quota": within, "suspended": suspended,
             "builds": f"{u['builds']}/{p['builds']}", "tokens": f"{u['tokens']}/{p['tokens']}"}
 
@@ -112,7 +190,7 @@ def mrr():
 def _main(a):
     import json
     if not a:
-        sys.exit("usage: billing.py signup|plans|usage|invoice|quota|mrr ...")
+        sys.exit("usage: billing.py signup|plans|usage|invoice|quota|suspend|unsuspend|mrr ...")
     if a[0] == "signup":
         print(json.dumps(signup(a[1], a[2] if len(a) > 2 else "free"), indent=2))
     elif a[0] == "plans":
@@ -123,6 +201,10 @@ def _main(a):
         print(json.dumps(invoice(a[1]), indent=2))
     elif a[0] == "quota":
         print(json.dumps(quota(a[1]), indent=2))
+    elif a[0] == "suspend":
+        print(json.dumps(suspend(a[1], a[2] if len(a) > 2 else "admin action"), indent=2))
+    elif a[0] == "unsuspend":
+        print(json.dumps(unsuspend(a[1]), indent=2))
     elif a[0] == "mrr":
         print(json.dumps(mrr(), indent=2))
     elif a[0] == "test":
@@ -140,12 +222,31 @@ def _main(a):
         audit.append(actor="factory:controller", action="ProductComplete", resource=prod, decision="LAUNCHED")
         metrics.record("state_change", product=prod, task_id="t", tokens_in=6_000_000, tokens_out=0,
                        model="m", outcome="success")
+        # finding #16: an OUT-OF-PERIOD record (2 months ago) must NOT count toward this period's usage.
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO org_metrics (ts, product, task_id, event, tokens_in, tokens_out,
+                           model, outcome) VALUES (now() - interval '2 months', %s,'old','state_change',
+                           9_000_000, 0,'m','success')""", (prod,))
+            c.commit()
         inv = invoice(tid)
         q = quota(tid)
-        ok = inv["plan"] == "pro" and inv["overage"]["tokens"] > 0 and inv["total"] > PLANS["pro"]["price"] and not q["within_quota"]
+        # the 9M out-of-period tokens are excluded -> usage reflects only the 6M from this period.
+        period_scoped = inv["usage"]["tokens"] == 6_000_000 and "period_start" in inv["usage"]
+        # finding #18: suspend() actually WRITES the flag; quota/_plan_of then read it; unsuspend reverts.
+        suspend(tid, reason="selftest")
+        _, susp_after = _plan_of(tid)
+        q_susp = quota(tid)
+        unsuspend(tid)
+        _, unsusp_after = _plan_of(tid)
+        suspend_works = susp_after is True and q_susp["within_quota"] is False and unsusp_after is False
+        ok = (inv["plan"] == "pro" and inv["overage"]["tokens"] > 0
+              and inv["total"] > PLANS["pro"]["price"] and not q["within_quota"]
+              and period_scoped and suspend_works)
         print(f"invoice: {inv}")
         print(f"quota: {q}")
-        print("PASS: SaaS metering + plans + invoice + quota ✅" if ok else "FAIL")
+        print(f"period_scoped (out-of-period excluded): {period_scoped}")
+        print(f"suspend_works (flag written/read/reverted): {suspend_works}")
+        print("PASS: SaaS metering + period window + plans + invoice + quota + suspend ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
 

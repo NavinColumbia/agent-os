@@ -49,6 +49,9 @@ def _ensure():
 
 def create(tenant_id, name, vision=""):
     _ensure()
+    name = (name or "").strip()
+    if not name:
+        return {"error": "org name required"}
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("INSERT INTO orgs (tenant_id, name, vision) VALUES (%s,%s,%s) RETURNING id",
                     (tenant_id, name[:120], vision))

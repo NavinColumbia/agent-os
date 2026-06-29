@@ -939,10 +939,27 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         print(f"[factory] {name}: {r} ({dt}s)", flush=True)
         return r
 
-    # SPEC — a PM turns the charter into a real spec + acceptance criteria
+    # SPEC — a PM turns the charter into a real spec + acceptance criteria. The spec must ACCOUNT FOR
+    # EVERYTHING before code is written: un-propagated signature changes and un-analyzed enforcement edits
+    # are the #1 source of rework loops, so a rigorous IMPACT MAP + parallelization plan is mandatory here.
     stage("SPEC", "product-manager", lambda: agent("product-manager", str(repo),
-          f"Read docs/CHARTER.md. Write docs/SPEC.md: scope, public API, and explicit acceptance "
-          f"criteria as a bullet list of testable behaviours. Keep it tight and unambiguous."))
+          f"Read docs/CHARTER.md. Write docs/SPEC.md as a DETAILED PLAN that accounts for EVERYTHING before "
+          f"any code is written — a plan that misses a caller or an invariant causes a rework loop. It MUST "
+          f"contain these sections:\n"
+          f"1. SCOPE & PUBLIC API: what is in/out of scope and the public surface (functions, endpoints, "
+          f"schemas, contracts).\n"
+          f"2. ACCEPTANCE CRITERIA: a bullet list of testable behaviours (happy path PLUS empty, error, "
+          f"loading, and at least one edge/boundary case).\n"
+          f"3. IMPACT MAP: every file to be created or changed. For ANY function signature, schema, API, or "
+          f"contract you change, grep the codebase and list ALL callers/dependents that must be updated in "
+          f"the same change — nothing left un-propagated. If touching enforcement/permissions, map which "
+          f"roles/paths each rule affects.\n"
+          f"4. INVARIANTS TO PRESERVE: the existing tests, guards, and security constraints that MUST still "
+          f"hold after the change (do not weaken them).\n"
+          f"5. PARALLELIZATION PLAN: group the work items into those that are INDEPENDENT (can run "
+          f"concurrently) vs. those that are ORDERED (and why), so execution can fan out safely.\n"
+          f"6. DONE CHECKLIST: each scope item mapped to the specific selftest/guard/test that PROVES it.\n"
+          f"Keep it tight and unambiguous — but complete: an item you forget here is a bug shipped later."))
 
     # BUILD — a builder implements the product from the spec (library OR static web app)
     pkg = product.replace('-', '_')

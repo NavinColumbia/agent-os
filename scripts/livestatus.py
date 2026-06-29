@@ -85,7 +85,7 @@ def _reachable(url):
                 return True
             if 200 <= e.code < 400:
                 return True
-            return False
+            continue
         except (socket.timeout, TimeoutError):
             return False
         except Exception:

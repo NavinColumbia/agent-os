@@ -208,7 +208,7 @@ POSTS = {
     "/api/account/export": lambda tid, q, b: account.export(tid),
     "/api/account/delete": lambda tid, q, b: account.delete(tid, confirm=bool(b.get("confirm"))),
     "/api/help/ask": lambda tid, q, b: helpagent.ask(tid, b.get("question", "")),
-    "/api/orgs/new": lambda tid, q, b: orgsmod.create(tid, b.get("name", "New org"), b.get("vision", "")),
+    "/api/orgs/new": lambda tid, q, b: orgsmod.create(tid, b.get("name", ""), b.get("vision", "")),
     "/api/controller/say": lambda tid, q, b: loopcontroller.say(tid, loopcontroller.thread_for_org(tid, int(b.get("org") or 0)), b.get("message", "")),
     "/api/controller/choose": lambda tid, q, b: loopcontroller.choose(tid, loopcontroller.thread_for_org(tid, int(b.get("org") or 0)), int(b.get("option_id") or 0)),
     "/api/design/decide": lambda tid, q, b: designview.decide(tid, str(int(b.get("org") or 0)), int(b.get("id") or 0), b.get("status", "approved")),
@@ -426,7 +426,7 @@ const VIEWS={
  },
  orgs:async()=>{const d=await get('/api/orgs');ORGS=d.orgs||[];
   let h='<h1>My orgs</h1><p class=sub>Each org is its own company — its own controller, research, design, build and budget. You can run as many as you like.</p>';
-  h+='<div class=card><h2>Create an org</h2><div class=row><input id=onm placeholder="YouTube competitor"><input id=ovis placeholder="one-line vision (optional)"><button class=pri onclick=orgNew()>Create</button></div></div>';
+  h+='<div class=card><h2>Create an org</h2><div class=row><input id=onm placeholder="YouTube competitor"><input id=ovis placeholder="one-line vision (optional)"><button class=pri onclick=orgNew()>Create</button></div><div id=onote class=muted style=margin-top:8px></div></div>';
   h+='<div class=grid>'+(ORGS.length?ORGS.map(o=>`<div class=tile><div class="row spread"><b>${esc(o.name)}</b>${o.org_id==ORG?pill('active','ok'):''}</div><div class=muted style=margin:6px_0>${esc(o.vision||'—')} · ${esc(o.stage)} · ${o.products} product(s)</div><button class=pri onclick="switchOrg(${o.org_id})">Open</button></div>`).join(''):emptyB('🏢','No orgs yet','Create your first organization above.'))+'</div>';
   $('#view').innerHTML=h;},
  portfolio:async()=>{let p={},a={},f={};try{p=await get('/api/portfolio')}catch(e){}try{a=await get('/api/portfolio/analytics')}catch(e){}try{f=await get('/api/portfolio/failures')}catch(e){}
@@ -502,8 +502,10 @@ const VIEWS={
   if(unread>0)h+=`<div class="row spread" style=margin-bottom:10px><span class=muted>${unread} unread</span><button onclick=markAllRead()>Mark all read</button></div>`;
   h+=(d.feed.length?d.feed.map(n=>`<div class=item><div class="row spread"><span>${pill(n.level,n.level=='urgent'?'bad':(n.level=='standard'?'':'warn'))} <b>${esc(n.title)}</b></span><span class=row style=gap:8px><span class=muted>${esc(n.category)} · ${n.created_at}</span>${n.read?'':`<button onclick="markRead(${n.id})">Mark read</button>`}</span></div><div class=muted>${esc(n.body||'')}</div></div>`).join(''):emptyB('◔','You\'re all caught up','Build updates, billing alerts and agent reports will appear here.'));
   $('#view').innerHTML=h+'</div>';},
- team:async()=>{let o=null;try{o=await get('/api/org')}catch(e){}
+ team:async()=>{let o=null,t=null;try{o=await get('/api/org')}catch(e){}try{t=await get('/api/team')}catch(e){}
   let h='<h1>Your org</h1><p class=sub>Your company of AI agents — who does what, and who\'s working right now.</p>';
+  if(t){const mem=t.members||[];
+   h+='<div class=card><h2>Seats</h2><table><tr><th>member</th><th>role</th><th>status</th></tr>'+(mem.length?mem.map(m=>`<tr><td>${esc(m.id)}</td><td>${esc(m.role)}</td><td>${pill(m.status,m.status=='active'?'ok':'')}</td></tr>`).join(''):'<tr><td class=muted colspan=3>no seats</td></tr>')+'</table>'+(t.seats_note?`<div class=muted style=margin-top:10px>${pill('plan: '+(t.plan||'free'))} ${esc(t.seats_note)}</div>`:'')+'</div>';}
   if(o&&o.tree){const root=o.tree.find(n=>!n.reports_to)||o.tree[0];
    const node=(n)=>`<div class=item><div class="row spread"><span><b>${esc(n.title||n.role)}</b> <span class=muted>${esc(n.role)}</span> ${n.live?pill('live · '+(n.count||1),'ok'):pill('idle')}</span><span class=muted>${esc(n.task||'')}</span></div></div>`;
    h+='<div class=card><h2>Controller</h2>'+(root?node(root):'')+'</div>';
@@ -562,7 +564,12 @@ async function ctlSend(){
  const t=$('#ctltyping');if(t)t.remove();$('#cnote').textContent='';go('controller');
 }
 async function ctlChoose(oid){await post('/api/controller/choose',{org:ORG,option_id:oid});go('controller');}
-async function orgNew(){const r=await post('/api/orgs/new',{name:($('#onm')||{}).value||'New org',vision:($('#ovis')||{}).value||''});if(r.org_id)switchOrg(r.org_id);}
+async function orgNew(){const inp=$('#onm');const name=(inp?inp.value:'').trim();const note=$('#onote');
+ if(!name){if(note)note.textContent='Enter a name for your org';if(inp)inp.focus();return}
+ if(note)note.textContent='';
+ const r=await post('/api/orgs/new',{name,vision:($('#ovis')||{}).value||''});
+ if(r&&r.error){if(note)note.textContent='✗ '+r.error;return}
+ if(r.org_id)switchOrg(r.org_id);}
 async function designOk(id){await post('/api/design/decide',{org:ORG,id,status:'approved'});go('design');}
 async function recAgentic(){
  const i=$('#recneed');const need=(i?i.value:'').trim();const out=$('#recout');if(!out)return;

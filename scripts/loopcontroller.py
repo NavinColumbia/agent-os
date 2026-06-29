@@ -220,17 +220,26 @@ def say(tid, thread_id, msg, api_key=None):
         if _affirmative(msg) and (s["plan"]):
             _set(thread_id, awaiting=None); _to(thread_id, "PLAN_APPROVAL"); advance(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
-        sysp = ("Turn the chosen direction into a concrete plan. Also cover THE CEO'S OWN SIDE: what the product "
-                "looks like for (a) the CEO, (b) their staff/team to control & monitor, and (c) their external "
-                "users — these surfaces are BUILT INTO their product (we don't host them).\n"
+        sysp = ("Turn the chosen direction into a concrete, RIGOROUS plan that accounts for EVERYTHING before "
+                "any code is written — un-propagated signature changes and un-analyzed enforcement edits are the "
+                "#1 cause of rework loops, so the plan must leave nothing un-analyzed. Also cover THE CEO'S OWN "
+                "SIDE: what the product looks like for (a) the CEO, (b) their staff/team to control & monitor, "
+                "and (c) their external users — these surfaces are BUILT INTO their product (we don't host them).\n"
                 "If the CEO wants AI AGENTS to handle part of their product ('let agents take care of X'), don't "
                 "just pick a preset — ASK ONE follow-up about HOW the agent should be invoked, OR RECOMMEND an "
                 "architecture: a button (on-demand/sync), an event→agent pipeline handled ASYNC (form-submit / "
                 "inbound email / webhook — like Kafka but agent workers), or a schedule. Then describe that "
                 "custom agentic feature + its invocation in the agentic line (free text). If they don't want any, "
                 "put 'none'.\n"
+                "The plan bullets MUST embed a detailed-design pass so implementation is right the FIRST time: "
+                "(1) an IMPACT MAP — every file/component to change, and for any function/signature/schema/"
+                "contract being changed, ALL its callers/dependents so nothing is left un-propagated; "
+                "(2) the INVARIANTS to preserve (existing behaviour, guards, security constraints) plus the "
+                "empty/error/loading/edge cases each surface must handle; "
+                "(3) a PARALLELIZATION note — which work items are INDEPENDENT (can build concurrently) vs. "
+                "ordered; (4) a DONE checklist mapping each item to the check that proves it.\n"
                 "End with EXACTLY:\n[[PLAN]]\nname: <slug>\nkind: lib|web|service|project\n"
-                "plan: <bullets, one per line '- '>\n"
+                "plan: <bullets incl. the impact map, invariants/edge cases, parallelization, and done checks; one per line '- '>\n"
                 "agentic: <free-text: the agentic feature(s) the CEO wants + how each is invoked (button/event-async/"
                 "schedule), or 'none'>\ncharter: <2-4 sentences incl. the team/external surfaces to build in>\n[[/PLAN]]")
         reply = _llm(tid, thread_id, sysp, s)

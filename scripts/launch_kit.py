@@ -50,7 +50,7 @@ def _main(a):
     import json
     if not a:
         sys.exit("usage: launch_kit.py make <product> | selftest")
-    if a[0] == "make":
+    if a[0] == "make" and len(a) > 1:
         print(json.dumps(make(a[1]), indent=2))
     elif a[0] == "selftest":
         # offline: the marketing role exists and never auto-publishes (its manifest gates public_post)
@@ -59,6 +59,8 @@ def _main(a):
         print(f"marketing-growth role present + public_post gated: {ok}")
         print("PASS: launch-kit wiring (generate, never auto-publish) ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
+    else:
+        sys.exit("usage: launch_kit.py make <product> | selftest")
 
 
 if __name__ == "__main__":

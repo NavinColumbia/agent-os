@@ -44,7 +44,7 @@ def _main(a):
     import json
     if not a:
         sys.exit("usage: intel.py analyze <product> | selftest")
-    if a[0] == "analyze":
+    if a[0] == "analyze" and len(a) > 1:
         print(json.dumps(analyze(a[1]), indent=2))
     elif a[0] == "selftest":
         rolefile = Path.home() / "projects" / "control-plane" / "roles" / "research-growth.yaml"
@@ -52,6 +52,8 @@ def _main(a):
         print(f"research role present: {ok}")
         print("PASS: market-intel wiring (advisory, no fabrication) ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
+    else:
+        sys.exit("usage: intel.py analyze <product> | selftest")
 
 
 if __name__ == "__main__":

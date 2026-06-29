@@ -71,6 +71,22 @@ _EDIT_TOOLS = _EDIT_TOOLS_SCOPED + _EDIT_TOOLS_ALWAYS   # full set (kept for bac
 _SPAWN_TOOLS = ["Task"]
 # Read-side secret material denied unless can_read_secrets.
 _SECRET_GLOBS = [".env", ".env.*", ".env*", "secrets/**", "**/secrets/**", "**/.env*"]
+# Substrings that mark a denied_paths glob as READ-sensitive (secret/credential/registry material).
+# ONLY these classes may propagate from denied_paths into deny_read. A denied_paths glob is a WRITE
+# restriction; pouring the whole list into deny_read mis-reads a code-WRITE deny (e.g. src/**, which
+# read-only roles like qa-security/product-manager list because can_modify_code:false) as a code-READ
+# ban — bricking the very roles whose core function is to READ src to test/security-audit/spec it.
+# Write protection on those paths is independently preserved by the PreToolUse hook's WRITE_TOOLS
+# branch and validate_writes, so dropping them from deny_read loses no write enforcement.
+_READ_DENY_SUBSTRINGS = ("secret", ".env", "registry", "credential")
+
+
+def _is_read_sensitive(glob: str) -> bool:
+    """A denied_paths WRITE glob is eligible for the READ-deny set only when it names secret/
+    credential/registry material — never a source/docs/tests tree (those stay readable so QA/security
+    and product-manager can inspect the code they audit/spec). Write enforcement is unaffected."""
+    g = glob.lower()
+    return any(s in g for s in _READ_DENY_SUBSTRINGS)
 
 
 def load_manifest(role: str) -> dict:
@@ -226,8 +242,15 @@ def spawn_restrictions(role: str) -> dict:
                          it may not spawn). Passed to `claude --disallowedTools` (deny beats allow).
       deny_read        : secret material (.env/secrets) when not can_read_secrets, PLUS denied_paths
                          — the read-side denies the enforce_manifest.py hook keys on.
-      write_scope      : allowed_paths — the WRITE allowlist (real restriction): the post-run
-                         validator and the hook's allowlist branch both reject writes outside it.
+      write_scope      : allowed_paths — the WRITE allowlist. Enforced ONLY by the post-run
+                         validate_writes backstop (allowlist semantics, but flag-and-revert not a
+                         hard block: a path outside every glob is returned as
+                         reason="outside_allowed_paths" for the caller to revert). The PreToolUse
+                         hook does NOT enforce allowed_paths — enforce_manifest.py never reads it;
+                         it keys writes on denied_paths (a DENYLIST) plus the registry carve-out
+                         only, and its `tools` allowlist gates WHICH tool, not WHICH path. So
+                         allowed_paths has no deterministic pre-write enforcement layer; treat the
+                         post-run validator as its sole (best-effort) backstop.
     """
     f = _read_flags(load_manifest(role))
 
@@ -268,7 +291,11 @@ def spawn_restrictions(role: str) -> dict:
     deny_read = []
     if not f["can_read_secrets"]:
         deny_read += _SECRET_GLOBS
-    deny_read += f["denied_paths"]
+    # Propagate ONLY the read-sensitive (secret/credential/registry) denied_paths globs — NOT code/
+    # docs/tests trees. A write-deny of src/** must not become a read-deny of src/**, which would brick
+    # read-only auditing roles (qa-security/product-manager) from reading the source they exist to test
+    # and spec. The write side of every denied_paths glob is still enforced by the hook + validate_writes.
+    deny_read += [g for g in f["denied_paths"] if _is_read_sensitive(g)]
     seen, deny_read_dedup = set(), []
     for g in deny_read:
         if g not in seen:
@@ -350,9 +377,22 @@ def _selftest() -> int:
     # 4) can_read_secrets:false adds secret read-denies (builder).
     if not any(".env" in g or "secrets" in g for g in b["deny_read"]):
         problems.append("can_read_secrets:false must add .env/secrets to deny_read")
-    # builder denied_paths also propagate into deny_read.
+    # builder denied_paths also propagate into deny_read (registry IS read-sensitive).
     if not any("registry" in g for g in b["deny_read"]):
         problems.append("denied_paths should propagate into deny_read")
+
+    # 4b) REGRESSION GUARD (write/read conflation): a code-WRITE deny (src/**) must NEVER become a
+    #     code-READ deny. qa-security and product-manager list src/** in denied_paths (can_modify_code
+    #     :false) yet exist to READ src to test/security-audit/spec it — deny_read must NOT contain any
+    #     source/docs/tests tree, only secret/credential/registry material. Write protection on src/**
+    #     stays enforced by the PreToolUse hook's WRITE_TOOLS branch + validate_writes.
+    for role in ("qa-security", "product-manager"):
+        dr = spawn_restrictions(role)["deny_read"]
+        if any("src" in g for g in dr):
+            problems.append(f"{role} must NOT read-deny src/** (write-deny conflated with read-deny): {dr}")
+        for g in dr:                                  # every surviving deny_read glob must be read-sensitive
+            if not _is_read_sensitive(g):
+                problems.append(f"{role} deny_read leaked a non-secret/registry glob: {g}")
 
     # 5) a FULLY read-only role disallows Edit/Write. resource-allocator (can_modify_code:false,
     #    mutates the registry only via a flock'd script) declares this explicitly via denied_tools.

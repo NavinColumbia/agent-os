@@ -14,6 +14,7 @@ probe (2s HTTP HEAD/GET, localhost/tailnet/registered urls only — never crawls
     livestatus.py selftest
 Run with the agent-os venv python. NO web server — read-only surface other panes/CLI consume.
 """
+import ipaddress
 import json
 import socket
 import sys
@@ -50,8 +51,12 @@ def _safe_host(url):
         return True
     if host.endswith(".ts.net"):           # tailscale MagicDNS
         return True
-    if host.startswith("100."):            # tailscale CGNAT range
-        return True
+    if host.startswith("100."):            # tailscale CGNAT range is ONLY 100.64.0.0/10
+        try:                               # — NOT the whole 100.0.0.0/8 (rest is public)
+            if ipaddress.ip_address(host) in ipaddress.ip_network("100.64.0.0/10"):
+                return True
+        except ValueError:
+            pass
     if host.startswith(("10.", "192.168.")):
         return True
     if host.startswith("172."):            # 172.16.0.0/12 private range

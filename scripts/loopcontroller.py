@@ -244,7 +244,7 @@ def choose(tid, thread_id, option_id):
     chosen = {"option_id": option_id}
     try:
         import research
-        chosen = research.select(s["research_run_id"], option_id) or chosen
+        chosen = research.select(tid, s["research_run_id"], option_id) or chosen
     except Exception:
         pass
     _set(thread_id, chosen_option=chosen, awaiting="user_feedback")
@@ -314,7 +314,7 @@ def advance(thread_id, job_result=None):
             import research as _r, time
             rid = _r.start(tid, s["org_id"], thread_id, q)["run_id"]
             for _ in range(150):
-                st = _r.run_state(rid)
+                st = _r.run_state(tid, rid)
                 if st["status"] in ("done", "failed"):
                     return {"run_id": rid, "status": st["status"], "options": st.get("options", [])}
                 time.sleep(2)
@@ -533,8 +533,8 @@ def _selftest():
         return {"rc": 0, "out": "ok"}
     factory.agent = fake_agent
     _r.start = lambda t, o, th, q: {"run_id": 999}
-    _r.run_state = lambda rid: {"status": "done", "options": [{"id": 1, "title": "A", "recommended": True}]}
-    _r.select = lambda rid, oid: {"option_id": oid, "title": "A"}
+    _r.run_state = lambda t, rid: {"status": "done", "options": [{"id": 1, "title": "A", "recommended": True}]}
+    _r.select = lambda t, rid, oid: {"option_id": oid, "title": "A"}
     _d.prototype = lambda t, o, p, pl, **k: {"screens": 3, "surfaces": ["cockpit", "team", "external"]}
     _q.run = lambda product, **k: {"run_id": 1, "status": "shipped", "shipped": True, "rounds": 1}
     _v.verify = lambda product, **k: {"passed": True}

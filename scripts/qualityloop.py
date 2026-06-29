@@ -42,6 +42,16 @@ DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
 W_TESTS, W_SECURITY, W_VERIFIED = 0.5, 0.25, 0.25
 MAX_ROUNDS_CAP = 12   # hard ceiling so a stubborn product can never loop forever (cost guard)
 
+# Bar -> verification rigor. 'standard' = rigor 2 (tests + static security, +runtime/load for services).
+# 'high' = rigor 3, which is where verify.py actually runs the ADVERSARIAL tier (independent agents that
+# try to break the product). Pinning rigor to 2 silently collapses 'high' down to 'standard' — the bug.
+_BAR_RIGOR = {"standard": 2, "high": 3}
+
+
+def _rigor_for(bar: str) -> int:
+    """Map a ship bar to a verify rigor; unknown bars default to the stricter 'high' rigor (matches _bar_met)."""
+    return _BAR_RIGOR.get(bar, 3)
+
 
 def _ensure():
     with psycopg.connect(DB) as c, c.cursor() as cur:
@@ -67,17 +77,24 @@ def _check(passes, name):
     return None
 
 
-def _measure(product, api_key=None) -> dict:
-    """Run the verifier once (rigor 2 = baseline tests + static security, +runtime/load for services) and
-    distill it into the loop's quality signals. score = weighted (tests .5 + security .25 + verified .25)."""
-    v = verify.verify(product, rigor=2, api_key=api_key)
+def _measure(product, bar="standard", api_key=None) -> dict:
+    """Run the verifier once AT THE BAR'S RIGOR (standard->2: tests + static security, +runtime/load for
+    services ; high->3: ALSO the adversarial tier) and distill it into the loop's quality signals.
+    score = weighted (tests .5 + security .25 + verified .25)."""
+    rigor = _rigor_for(bar)
+    v = verify.verify(product, rigor=rigor, api_key=api_key)
     passes = v.get("passes", [])
     tests_pass = bool(_check(passes, "test-suite"))
     sec = _check(passes, "static-security")
     security_clean = bool(sec) if sec is not None else False
-    # "verified" = the verifier as a whole signed off (all tiers it ran passed). That's the independent,
-    # adversarial assurance the 'high' bar demands beyond just-tests-and-security.
-    verified = bool(v.get("passed"))
+    # "verified" = genuine independent/adversarial sign-off. At the 'high' bar this REQUIRES the adversarial
+    # check to have actually RUN and passed (rigor>=3); it must not collapse to just-tests-and-security.
+    # At 'standard' it's the verifier's overall verdict. _check returns None when a tier never ran.
+    adv = _check(passes, "adversarial")
+    if rigor >= 3:
+        verified = bool(v.get("passed")) and adv is True
+    else:
+        verified = bool(v.get("passed"))
     score = (W_TESTS * tests_pass) + (W_SECURITY * security_clean) + (W_VERIFIED * verified)
     return {"tests_pass": tests_pass, "security_clean": security_clean, "verified": verified,
             "score": round(score, 4), "error": v.get("error")}
@@ -132,7 +149,7 @@ def _loop(run_id, product, bar, max_rounds, start_round=0, api_key=None) -> dict
     result = "did not reach the bar within the round budget"
     for rnd in range(start_round + 1, max_rounds + 1):
         rounds = rnd
-        m = _measure(product, api_key=api_key)
+        m = _measure(product, bar=bar, api_key=api_key)
         _record_measurement(run_id, rnd, m)
         if m.get("error"):                                   # no such product / verifier couldn't run
             status, result = "error", m["error"]
@@ -141,7 +158,9 @@ def _loop(run_id, product, bar, max_rounds, start_round=0, api_key=None) -> dict
             status, result, shipped = "shipped", f"met '{bar}' bar at round {rnd}", True
             break
         if rnd < max_rounds:                                  # below the bar -> safely raise quality, re-measure next round
-            improve.improve_once(product, rigor=2,
+            # gate the improvement at the SAME rigor we're shipping against, so 'high' improvements are
+            # eval-gated by the adversarial tier too (consistent with the bar; not pinned to 2).
+            improve.improve_once(product, rigor=_rigor_for(bar),
                                  focus="raise quality to pass the bar", api_key=api_key)
     _finish(run_id, status, result, rounds, product, m, shipped)
     return {"run_id": run_id, "status": status, "rounds": rounds,
@@ -220,6 +239,24 @@ def _selftest():
         bar_logic = (_bar_met(m_pass2, "standard") and not _bar_met(m_pass2, "high")
                      and _bar_met(m_pass3, "high") and not _bar_met(m_redsec, "standard"))
 
+        # high bar maps to rigor 3 and DEMANDS the adversarial tier actually ran + passed.
+        # with the (rigor-2 shaped) mock above — no 'adversarial' check — the high bar must NOT verify.
+        m_high_noadv = _measure(product, bar="high")
+        high_needs_adv = (m_high_noadv["verified"] is False) and not _bar_met(m_high_noadv, "high")
+        # now a verifier that DID run the adversarial tier and passed -> high bar verifies.
+        verify.verify = lambda product, rigor=2, api_key=None: {
+            "product": product, "passed": True,
+            "passes": [{"check": "test-suite", "ok": True},
+                       {"check": "static-security", "ok": True},
+                       {"check": "adversarial", "ok": True}]}
+        m_high_adv = _measure(product, bar="high")
+        high_with_adv = (m_high_adv["verified"] is True) and _bar_met(m_high_adv, "high")
+        # restore the no-adversarial (standard-shaped) mock for the loop ship test below
+        verify.verify = lambda product, rigor=2, api_key=None: {
+            "product": product, "passed": True,
+            "passes": [{"check": "test-suite", "ok": True},
+                       {"check": "static-security", "ok": True}]}
+
         # the loop itself: bar is met on the first measurement -> ships in 1 round, never calls improve
         res = run(product, bar="standard", max_rounds=3)
         run_id = res["run_id"]
@@ -236,8 +273,9 @@ def _selftest():
             n_out = cur.fetchone()[0]
         rows_ok = (qr is not None and qr[0] == "shipped" and n_meas == 1 and n_out == 1)
 
-        ok = bar_logic and shipped_1round and rows_ok
-        print(f"bar_logic={bar_logic} shipped_1round={shipped_1round} "
+        ok = bar_logic and high_needs_adv and high_with_adv and shipped_1round and rows_ok
+        print(f"bar_logic={bar_logic} high_needs_adv={high_needs_adv} high_with_adv={high_with_adv} "
+              f"shipped_1round={shipped_1round} "
               f"rows(run={qr and qr[0]}, meas={n_meas}, outcomes={n_out})={rows_ok}")
         print("PASS: climb-to-bar quality loop (measure→bar→ship, learning store, resume) ✅"
               if ok else "FAIL")

@@ -389,25 +389,41 @@ def run_tests(repo: str, sandboxed: bool = True, target: str = "", python: str =
     component's tests/<pkg>) — empty means the whole repo. `python` overrides the interpreter (e.g. a
     per-product venv when the product assembles open-source deps) — defaults to the platform venv."""
     py = python or VENV_PY
-    inner = f"cd {repo} && {py} -m pytest -q {target}".rstrip()
-    if sandboxed:
+    pytest_cmd = f"cd {repo} && {py} -m pytest -q {target}".rstrip()
+    if sandboxed and shutil.which("srt"):                # srt binary present? (missing = real infra signal)
+        # SANDBOX-ESCAPE GUARD: decide "infra broken -> re-run UNSANDBOXED" ONLY on signals the untrusted
+        # child cannot forge. The child's stdout/stderr is fully attacker-controlled (a generated test can
+        # print anything), so substring-matching the captured output let a malicious product print an
+        # "infra" string to trigger its OWN unsandboxed re-run. Instead we echo a per-run random SENTINEL
+        # as the FIRST thing inside the sandbox: srt setup failures (bad settings, spawn failure, fatal —
+        # all `console.error`+exit, inner command never runs) exit 1 just like a pytest failure, so the
+        # sentinel's PRESENCE is the only reliable proof srt actually executed the command. The child can't
+        # un-emit a line printed before pytest starts, and can't guess the random token to fake it.
+        import uuid
+        sentinel = f"__AOS_SBX_{uuid.uuid4().hex}__"
+        inner = f"echo {sentinel}; {pytest_cmd}"
         sf = tempfile.NamedTemporaryFile("w", suffix=".srt.json", delete=False)
         json.dump(_sandbox_config(repo), sf); sf.close()
         try:
             p = subprocess.run(["srt", "-s", sf.name, "-c", inner], capture_output=True, text=True, timeout=300)
-            out = (p.stdout or "") + (p.stderr or "")
-            infra_broken = ("Could not load settings" in out or "No usable temporary directory" in out
-                            or "srt:" in out.lower()[:40])
-            if not infra_broken:
+            sandbox_ran = sentinel in (p.stdout or "")   # the sandbox set up AND ran our inner command
+            out = ((p.stdout or "") + (p.stderr or "")).replace(sentinel + "\n", "").replace(sentinel, "")
+            if sandbox_ran:
                 audit.append(actor="factory:qa-security", action="RunTests", resource=Path(repo).name,
                              decision="executed", payload={"rc": p.returncode, "sandboxed": True})
                 return p.returncode == 0, out[-2500:]
+            # sentinel absent -> srt failed to start the command (genuine sandbox-infra failure), NOT a
+            # test failure: fall through to the flagged direct run.
+            audit.append(actor="factory:qa-security", action="RunTests", resource=Path(repo).name,
+                         decision="sandbox-unavailable", payload={"rc": p.returncode, "sandboxed": True})
+        except FileNotFoundError:
+            pass                                         # srt vanished after the which() check — infra gone
         except Exception:
             pass
         finally:
             os.unlink(sf.name)
     # sandbox unavailable — best-effort direct run, clearly flagged in the audit
-    p = subprocess.run(["bash", "-c", inner], capture_output=True, text=True, timeout=300)
+    p = subprocess.run(["bash", "-c", pytest_cmd], capture_output=True, text=True, timeout=300)
     out = (p.stdout or "") + (p.stderr or "")
     audit.append(actor="factory:qa-security", action="RunTests", resource=Path(repo).name,
                  decision="executed", payload={"rc": p.returncode, "sandboxed": False})
@@ -679,8 +695,16 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         # QA always re-runs — it's the idempotent gate that re-derives the pass/fail the LAUNCH gate needs.
         if name != "QA" and _stage_done(cid, name):
             print(f"\n[factory] === {name} === (RESUMED — already complete, skipping)", flush=True)
-            log["stages"].append({name: {"resumed": True}})
-            return {"resumed": True, "passed": True, "rc": 0}
+            resumed = {"resumed": True, "passed": True, "rc": 0}
+            # A gate stage whose pass/fail is FILE-derived (not rc-derived) must re-derive its verdict on
+            # resume: _stage_done only proves an rc=0 agent trace exists, but the reviewer ALWAYS exits 0 —
+            # the real verdict lives in docs/REVIEW.md. Without this, review_res.get('verdict') is None and
+            # the LAUNCH gate ships a REQUEST-CHANGES build after a crash. (QA is already re-run above.)
+            if name == "REVIEW":
+                resumed["verdict"] = _review_verdict(repo)
+                resumed["passed"] = resumed["verdict"] != "REQUEST-CHANGES"
+            log["stages"].append({name: resumed})
+            return resumed
         print(f"\n[factory] === {name} ===", flush=True)
         _ctx.stage = name
         aid = f"{role}@{product}"
@@ -850,7 +874,8 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
     if rigor >= 2 and qa_ok[0] and review_res.get("verdict") != "REQUEST-CHANGES":
         try:
             import verify as _verify
-            v = _verify.verify(product, rigor=rigor, api_key=api_key)
+            v = _verify.verify(product, rigor=rigor, api_key=api_key,
+                               engine=_ctx.engine, codex_key=_ctx.codex_key)
             verify_ok = bool(v.get("passed", True)) if isinstance(v, dict) else True
             log["verify"] = {"passed": verify_ok, "rigor": rigor}
         except Exception:

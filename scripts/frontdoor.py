@@ -12,6 +12,7 @@ Run with the agent-os venv python.
 """
 import io
 import json
+import re
 import sys
 import threading
 import zipfile
@@ -252,7 +253,20 @@ class H(BaseHTTPRequestHandler):
             self._json(200, {"builds": [_status(p) for p in prods]})
         elif p.startswith("/download/"):
             product = p[len("/download/"):]
-            tid = _tenant(self.headers.get("X-Tenant-Token"))  # browsers won't send header; allow if owned
+            tid = _tenant(self.headers.get("X-Tenant-Token"))
+            if not tid:                                          # AUTH: a token is mandatory
+                return self._json(401, {"error": "sign up first"})
+            # PATH-TRAVERSAL: only flat, slug-shaped names, and the resolved path must stay inside PRODUCTS
+            if not re.fullmatch(r"[a-z0-9-]+", product):
+                return self._json(404, {"error": "not found"})
+            if not (PRODUCTS / product).resolve().is_relative_to(PRODUCTS.resolve()):
+                return self._json(404, {"error": "not found"})
+            # OWNERSHIP: a tenant may only download a product it owns
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("SELECT 1 FROM tenant_products WHERE tenant_id=%s AND product=%s", (tid, product))
+                owned = cur.fetchone() is not None
+            if not owned:
+                return self._json(404, {"error": "not found"})
             if not (PRODUCTS / product).exists():
                 return self._json(404, {"error": "not found"})
             data = _zip(product)

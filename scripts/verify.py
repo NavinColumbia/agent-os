@@ -58,13 +58,25 @@ def static_security(repo: Path):
     return (len(findings) == 0), findings
 
 
-def adversarial(repo: Path, n: int, api_key=None):
+def adversarial(repo: Path, n: int, api_key=None, engine=None, codex_key=None):
     """Spawn n agents that try to BREAK the product: each writes failing edge-case tests under
-    tests/adversarial/, then defects are fixed (bounded). Returns (ok, summary)."""
+    tests/adversarial/, then defects are fixed (bounded). Returns (ok, summary).
+    api_key/engine/codex_key are the TENANT's BYO routing — they must reach every attack worker."""
+    # Set this thread's context for the (serial) builder fix-loop and run_tests below.
     factory._ctx.api_key = api_key
+    factory._ctx.engine = engine
+    factory._ctx.codex_key = codex_key
     (repo / "tests" / "adversarial").mkdir(parents=True, exist_ok=True)
 
     def attack(i):
+        # Each ThreadPoolExecutor worker is a FRESH thread and factory._ctx is threading.local(), so it
+        # does NOT inherit the submitting thread's context. Re-set this worker's OWN thread-local from the
+        # values captured in the enclosing scope — otherwise the attack agent silently runs on the PLATFORM
+        # key/engine (api_key=None -> 'claude') instead of the tenant's BYO key, billing the wrong account
+        # and ignoring a Codex-only tenant. agent()/_agent_codex read engine + codex_key from _ctx too.
+        factory._ctx.api_key = api_key
+        factory._ctx.engine = engine
+        factory._ctx.codex_key = codex_key
         factory._ctx.product = repo.name; factory._ctx.run = f"verify-{repo.name}"; factory._ctx.stage = f"ADVERSARY:{i}"
         factory.agent("qa-security", str(repo),
                       f"You are adversary #{i}. Read the product under src/ and its docs. Try HARD to BREAK it: "
@@ -86,8 +98,9 @@ def adversarial(repo: Path, n: int, api_key=None):
     return ok, f"{n} adversaries, {fixes} fix loops, {'ROBUST' if ok else 'DEFECTS REMAIN'}"
 
 
-def verify(product, rigor=1, api_key=None):
-    """Run scalable verification at the given rigor. Returns a structured result; each tier must pass."""
+def verify(product, rigor=1, api_key=None, engine=None, codex_key=None):
+    """Run scalable verification at the given rigor. Returns a structured result; each tier must pass.
+    engine/codex_key thread the tenant's BYO provider routing down to the adversarial attack workers."""
     repo = factory.PRODUCTS / product
     if not repo.exists():
         return {"product": product, "error": "no such product"}
@@ -104,7 +117,7 @@ def verify(product, rigor=1, api_key=None):
             result["passes"].append({"check": "runtime+load", "ok": rt_ok, "detail": rt[-200:]})
     if all(p["ok"] for p in result["passes"]) and rigor >= 3:   # tier 3+: adversarial (scales with rigor)
         n = min(MAX_ADVERSARIES, rigor)
-        adv_ok, adv = adversarial(repo, n, api_key)
+        adv_ok, adv = adversarial(repo, n, api_key, engine, codex_key)
         result["passes"].append({"check": "adversarial", "ok": adv_ok, "agents": n, "detail": adv})
 
     result["passed"] = all(p["ok"] for p in result["passes"])

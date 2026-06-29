@@ -60,14 +60,20 @@ import vault             # noqa: E402
 import versions          # noqa: E402
 
 
+# Sentinel for an infrastructure/transient failure (e.g. Postgres briefly unreachable during WSL
+# boot) — distinct from a genuine "unknown token". A real no-match returns None -> 401; this sentinel
+# -> 503 so a momentary backend blip never force-logs-out a valid user nor wipes their saved token.
+_TENANT_ERROR = object()
+
+
 def _tenant(token):
     if not token:
         return None
     try:
         t = tenancy.tenant_for_token(token)
-        return t["tenant_id"] if isinstance(t, dict) else t
+        return t["tenant_id"] if isinstance(t, dict) else t   # None when no match -> genuine 401
     except Exception:
-        return None
+        return _TENANT_ERROR                                  # transient/infra failure -> 503, not 401
 
 
 def _owns(tid, org_id):
@@ -295,6 +301,8 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
 .menu{position:absolute;right:20px;top:52px;background:var(--panel2);border:1px solid var(--line2);border-radius:12px;box-shadow:0 12px 36px -10px rgba(0,0,0,.6);padding:8px;min-width:240px;z-index:30}
 .menu a{display:block;padding:8px 10px;border-radius:8px;color:var(--tx2);text-decoration:none;cursor:pointer;font-size:13px}.menu a:hover{background:var(--hover);color:var(--tx)}
 </style></head><body>
+<div id=splash style="display:none;position:fixed;inset:0;align-items:center;justify-content:center;flex-direction:column;gap:14px;background:var(--bg);z-index:50;color:var(--mut)">
+  <div class=brand style="font-size:22px"><span class=mk>⬡</span> agent-os</div><div style="font-size:13px">Reconnecting…</div></div>
 <div id=signin style="display:none;max-width:440px;margin:11vh auto;padding:0 18px">
   <div class=card><div class=brand style="padding-bottom:6px;font-size:20px"><span class=mk>⬡</span> agent-os</div>
   <p class=muted style="margin:0 0 18px">Be the CEO of a company of AI agents that build &amp; ship your software.</p>
@@ -373,13 +381,13 @@ async function signIn(){
  TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||email);
  showApp(true);boot();
 }
-function signOut(){localStorage.removeItem('aos_tenant');TOK='';resetSession();suTab('in');showApp(false)}
+function signOut(msg){localStorage.removeItem('aos_tenant');TOK='';clearTimers();resetSession();suTab('in');showApp(false);const n=$('#si_note');if(n)n.textContent=msg||''}
 function toggleAcct(){const m=$('#acctmenu');m.style.display=m.style.display==='none'?'block':'none'}
 async function get(p){
  if(!TOK){const e=new Error('Your session expired — sign in again with your email and password.');e.kind='auth';throw e}
  let r;try{r=await fetch(p,{headers:H()})}catch(_){const e=new Error('Can\'t reach the server — is the console running?');e.kind='net';throw e}
  let d={};try{d=await r.json()}catch(_){}
- if(r.status===401){const e=new Error(d.error||'Your session expired — sign in again with your email and password.');e.kind='auth';throw e}
+ if(r.status===401){const m=d.error||'Your session expired — sign in again with your email and password.';if(TOK)signOut(m);const e=new Error(m);e.kind='auth';throw e}
  if(!r.ok||(d&&d.error)){const e=new Error((d&&d.error)||('Request failed ('+r.status+')'));e.kind='error';throw e}
  return d||{};
 }
@@ -395,7 +403,9 @@ function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':
 function pill(txt,cls){return `<span class="pill ${cls||''}">${esc(txt)}</span>`}
 function emptyB(ic,t,m,cta){return '<div class=empty><div class=ic>'+ic+'</div><h3>'+esc(t)+'</h3><p>'+esc(m)+'</p>'+(cta||'')+'</div>'}
 function renderNav(){$('#nav').innerHTML=NAV.map(([sec,items])=>`<div class=nsec>${sec}</div>`+items.map(([k,l,ic])=>`<a class="${k==CUR?'on':''}" onclick="go('${k}')"><span class=ico>${ic}</span><span class=lbl>${l}</span>${BADGES[k]?`<span class=b>${BADGES[k]}</span>`:''}</a>`).join('')).join('')}
+function clearTimers(){for(const k of ['CTLPOLL','CHATPOLL','TOPBARPOLL','AUTOPOLL']){if(window[k]){clearInterval(window[k]);window[k]=null}}}
 async function refreshTopbar(){
+ if(!TOK)return;
  try{const b=await get('/api/billing');const f=await get('/api/forecast').catch(()=>null);
    const lvl=f?(f.level==='over'?'bad':(f.level==='warn'?'warn':'ok')):'ok';
    $('#spenddot').className='dot '+lvl;$('#spendtxt').textContent='$'+((b.usage&&b.usage.tokens!=null)?(b.invoice&&b.invoice.total!=null?b.invoice.total:'') : '')+(f?(' · '+f.pct_of_quota_projected+'% quota'):'');
@@ -406,7 +416,13 @@ async function refreshTopbar(){
  try{const s=await get('/api/status');$('#statusdot').className='dot '+({operational:'ok',degraded:'warn',major_outage:'bad'}[s.verdict]||'ok')}catch(e){}
 }
 async function go(k){CUR=k;renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
- try{await VIEWS[k]()}catch(e){if(e.kind==='auth'){signOut();return}$('#view').innerHTML=errCard(k,e.message)}}
+ try{await VIEWS[k]()}catch(e){if(e.kind==='auth'){if(TOK)signOut();return}$('#view').innerHTML=errCard(k,e.message)}}
+function userBusy(){const a=document.activeElement;if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'||a.isContentEditable))return true;const m=$('#acctmenu');if(m&&m.style.display!=='none')return true;return false}
+async function refreshView(){ // background poll: no skeleton flash, no nav/scroll disruption, never clobber what the user is touching
+ if(!TOK)return;const k=CUR;if(!VIEWS[k])return;if(userBusy())return;
+ const sx=window.scrollX,sy=window.scrollY;
+ try{await VIEWS[k]()}catch(e){if(e.kind==='auth'){if(TOK)signOut();return}return}
+ if(CUR===k&&!userBusy())window.scrollTo(sx,sy)}
 function kpis(arr){return '<div class=kpis>'+arr.map(a=>`<div class=kpi><b>${esc(a[1])}</b><span>${esc(a[0])}</span></div>`).join('')+'</div>'}
 function stages(ss){return '<div class=stages>'+ss.map(s=>`<div class="st ${s.done?(s.ok===false?'bad':'ok'):''}" title="${s.stage}"></div>`).join('')+'</div>'}
 
@@ -422,7 +438,7 @@ const VIEWS={
    <div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>
    <div class=card><div class=row><input id=cmsg placeholder="e.g. build a competitor to YouTube" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
   ctlRender(d.messages||[]);
-  if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}if(CTLBUSY)return;try{const s=await get('/api/controller/state?org='+ORG);ctlRender(s.messages||[])}catch(e){}},5000);
+  if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(!TOK||CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}if(CTLBUSY)return;try{const s=await get('/api/controller/state?org='+ORG);ctlRender(s.messages||[])}catch(e){}},5000);
  },
  orgs:async()=>{const d=await get('/api/orgs');ORGS=d.orgs||[];
   let h='<h1>My orgs</h1><p class=sub>Each org is its own company — its own controller, research, design, build and budget. You can run as many as you like.</p>';
@@ -528,10 +544,11 @@ let PREFS=[];
 let LAST_PROPOSAL=null;
 function md(s){return esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>')}
 async function chatRender(){
- if(CUR!=='chat'){if(window.CHATPOLL){clearInterval(window.CHATPOLL);window.CHATPOLL=null}return}
+ if(!TOK||CUR!=='chat'){if(window.CHATPOLL){clearInterval(window.CHATPOLL);window.CHATPOLL=null}return}
  if(CHATBUSY)return;
  let d;try{d=await get('/api/chat/history?thread='+THREAD)}catch(e){return}
  const log=$('#chatlog');if(!log)return;
+ const atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<40;
  log.innerHTML=(d.messages||[]).map(m=>{
   const me=m.role==='user';const meta=m.meta||{};const prop=meta.proposal;const ns=(meta.kind==='next_steps')&&meta.suggestions;
   let extra='';
@@ -540,19 +557,20 @@ async function chatRender(){
   if(ns)extra=`<div class=chips style="margin:8px 0">`+meta.suggestions.map(s=>`<span class=chip-s onclick="chipFill('${s.replace(/'/g,"")}')">${esc(s)}</span>`).join('')+`</div>`;
   return `<div class="msg ${me?'me':'ai'}" style="margin:8px 0"><div><span class=bubble>${md(m.content)}</span>${extra}</div></div>`;
  }).join('')||'<div class=muted>Say hello, or describe a product — I\'ll ask a couple of questions, then build it.</div>';
- log.scrollTop=log.scrollHeight;
+ if(atBottom)log.scrollTop=log.scrollHeight;   // only re-pin if user was already at the bottom; don't yank scrollback
  if(!window.CHATPOLL)window.CHATPOLL=setInterval(chatRender,5000);   // live updates as the controller reports back
 }
 function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus()}}
 function ctlFill(t){const i=$('#cmsg');if(i){i.value=t;i.focus()}}
 function ctlRender(msgs){const log=$('#clog');if(!log)return;
+ const atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<40;
  log.innerHTML=(msgs||[]).map(m=>{const me=m.role==='user';const meta=m.meta||{};let extra='';
   if(meta.kind==='options'&&meta.options)extra='<div class=chips style="margin:8px 0">'+meta.options.map(o=>`<span class=chip-s onclick="ctlChoose(${o.id})">${esc(o.title||('Option '+o.id))}${o.recommended?' ★':''}</span>`).join('')+'</div>';
   else if(meta.kind==='plan'&&meta.plan)extra='<div class=tile style="margin:8px 0;text-align:left"><b>Plan: '+esc(meta.plan.name||'')+'</b> '+pill(meta.plan.kind||'')+'<div class=muted style=margin-top:4px>'+esc(meta.plan.charter||'')+'</div></div>';
   else if(meta.kind==='next_steps'&&meta.suggestions)extra='<div class=chips style="margin:8px 0">'+meta.suggestions.map(s=>`<span class=chip-s onclick="ctlFill('${s.replace(/'/g,"")}')">${esc(s)}</span>`).join('')+'</div>';
   return `<div class="msg ${me?'me':'ai'}" style="margin:8px 0"><div><span class=bubble>${md(m.content)}</span>${extra}</div></div>`;
  }).join('')||'<div class=muted>Describe what you want to build — I\'ll ask a few questions, then research it and bring you options.</div>';
- log.scrollTop=log.scrollHeight;
+ if(atBottom)log.scrollTop=log.scrollHeight;   // only re-pin if user was already at the bottom; don't yank scrollback
 }
 async function ctlSend(){
  if(CTLBUSY)return;const i=$('#cmsg');const m=(i?i.value:'').trim();if(!m)return;CTLBUSY=true;
@@ -633,16 +651,28 @@ async function helpAsk(){const q=$('#hq').value.trim();if(!q)return;$('#hans').i
 async function setConsent(a){await post('/api/settings/consent',{accept:a});go('settings');}
 async function saveKey(){const v=($('#bk')||{}).value||'';const note=$('#bknote');if(note)note.textContent='saving…';const r=await post('/api/byok',{key:v});if(r&&r.error){if(note)note.textContent='✗ '+r.error;else alert('Could not save key: '+r.error);return}go('settings');}
 async function acctExport(){$('#acctnote').textContent='preparing export…';const r=await post('/api/account/export',{});$('#acctnote').textContent=r.ok?('Export ready ('+r.products+' products) on the server: '+(r.path||'')):'export failed';}
-async function acctDelete(){const r=await post('/api/account/delete',{confirm:false});if(!confirm('Permanently delete your account and ALL data? This cannot be undone.'))return;const r2=await post('/api/account/delete',{confirm:true});if(r2.ok){localStorage.removeItem('aos_tenant');TOK='';$('#view').innerHTML='<div class=card>Your account and data were deleted. Goodbye.</div>';}}
+async function acctDelete(){const r=await post('/api/account/delete',{confirm:false});if(!confirm('Permanently delete your account and ALL data? This cannot be undone.'))return;const r2=await post('/api/account/delete',{confirm:true});if(r2.ok){localStorage.removeItem('aos_tenant');TOK='';clearTimers();$('#view').innerHTML='<div class=card>Your account and data were deleted. Goodbye.</div>';}}
 async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
 async function boot(){renderNav();refreshTopbar();await loadOrgs();
  let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
  if(!ORGS.length)go('orgs');                              // brand-new CEO (0 orgs): orgs are first-class — guide them to create their first org before anything else
  else if(ob&&!ob.completed&&ob.step!=='done')go('cockpit');   // first-run: Cockpit renders the guided onboarding banner
  else go(ORG?'controller':'orgs');
- setInterval(refreshTopbar,15000);setInterval(()=>{if(['cockpit','activity'].includes(CUR))go(CUR)},6000)}
+ if(!window.TOPBARPOLL)window.TOPBARPOLL=setInterval(refreshTopbar,15000);
+ if(!window.AUTOPOLL)window.AUTOPOLL=setInterval(()=>{if(!TOK)return;if(!['cockpit','activity'].includes(CUR))return;if(($('#acctmenu')||{}).style&&$('#acctmenu').style.display==='block')return;if(document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#view'))return;refreshView()},6000)}
 document.addEventListener('click',e=>{if(!e.target.closest('#acctmenu')&&!String(e.target.getAttribute&&e.target.getAttribute('onclick')||'').includes('toggleAcct'))$('#acctmenu').style.display='none'});
-if(TOK){showApp(true);boot()}else{showApp(false)}
+async function start(){                                   // validate the saved token BEFORE revealing the app shell
+ if(!TOK){showApp(false);return}
+ $('#signin').style.display='none';$('#app').style.display='none';   // neutral loading state — no flash of the signed-in UI
+ const sp=$('#splash');if(sp)sp.style.display='flex';
+ let authFailed=false;
+ try{await get('/api/onboarding');}                       // lightweight authed probe
+ catch(e){if(e.kind==='auth')authFailed=true;}            // 5xx/net errors fall through: token still valid, reveal + reconnect
+ if(sp)sp.style.display='none';
+ if(authFailed||!TOK){showApp(false);return}              // stale/invalid token -> sign-in; app shell never shown
+ showApp(true);boot();                                    // valid (or transient backend blip) -> reveal; boot()/go() surface reconnecting state
+}
+start();
 </script></body></html>"""
 
 
@@ -684,6 +714,8 @@ class Handler(BaseHTTPRequestHandler):
         if not fn:
             return self._json(404, {"error": "not found"})
         tid = _tenant(self.headers.get("X-Tenant-Token"))
+        if tid is _TENANT_ERROR:                              # transient backend blip — keep the session
+            return self._json(503, {"error": "backend temporarily unavailable — reconnecting"})
         if not tid:
             return self._json(401, {"error": "sign up first"})
         q = parse_qs(u.query)
@@ -712,6 +744,8 @@ class Handler(BaseHTTPRequestHandler):
         if not fn:
             return self._json(404, {"error": "not found"})
         tid = _tenant(self.headers.get("X-Tenant-Token"))
+        if tid is _TENANT_ERROR:                              # transient backend blip — keep the session
+            return self._json(503, {"error": "backend temporarily unavailable — reconnecting"})
         if not tid:
             return self._json(401, {"error": "sign up first"})
         body = self._body()

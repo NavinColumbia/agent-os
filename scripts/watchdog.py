@@ -35,7 +35,8 @@ DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
 
 # daemons recover.sh keeps alive — if one is missing, that's an incident
 EXPECTED = {"ticker": "ticker.sh", "dashboard": "dashboard.py serve",
-            "api": "api.py serve", "listener": "reply_listener.py"}
+            "api": "api.py serve", "listener": "reply_listener.py",
+            "console": "console.py serve"}   # the CEO-facing app — supervise it like the others (#resilience)
 STALL_MIN = 8          # a running factory build with no audit activity for this long = stalled
 COOLDOWN_S = 1800      # re-ping an unresolved issue at most every 30 min
 PRIO = {"crit": "urgent", "warn": "high"}

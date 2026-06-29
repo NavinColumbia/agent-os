@@ -33,6 +33,7 @@ VENV = str(ROOT / ".venv" / "bin" / "python")
 DAEMONS = {
     "dashboard": (f"cd {ROOT} && exec {VENV} scripts/dashboard.py serve 8092", "dashboard.py serve"),
     "api":       (f"cd {ROOT} && exec {VENV} scripts/api.py serve 8090", "api.py serve"),
+    "console":   (f"cd {ROOT} && exec {VENV} scripts/console.py serve 8099", "console.py serve"),
     "ticker":    (f"exec bash {ROOT}/scripts/ticker.sh", "ticker.sh"),
     "listener":  (f"bash {ROOT}/scripts/bridge.sh start", "reply_listener.py"),
 }

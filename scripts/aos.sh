@@ -8,9 +8,10 @@
 #   aos --resume     # ensure stack up, then `claude --resume` (pick a session)
 #   aos doctor       # just check stack health, don't launch Claude
 set -u
-ROOT="$HOME/projects/agent-os"
+ROOT="$HOME/projects/agent-os"          # the repo (recover.sh lives here)
+WORKDIR="$HOME/projects"                # where the Claude session history lives (resume is dir-scoped)
 CLAUDE="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
-cd "$ROOT" 2>/dev/null || { echo "agent-os not found at $ROOT"; exit 1; }
+cd "$WORKDIR" 2>/dev/null || { echo "workdir not found at $WORKDIR"; exit 1; }
 
 stack_up() { ss -ltn 2>/dev/null | grep -q ':5433 '; }   # Postgres is the keystone; if it's up, recover.sh already ran
 

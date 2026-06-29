@@ -264,7 +264,9 @@ td{padding:11px 10px;color:var(--tx2);border-bottom:1px solid var(--line)}td:fir
 .muted{color:var(--mut)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:820px){.grid{grid-template-columns:1fr}.side{width:64px}.side .lbl,.side .nsec{display:none}}
 .tile{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:14px}
 .chat{display:flex;flex-direction:column;gap:14px}.msg{display:flex;max-width:80%}.msg.me{align-self:flex-end;justify-content:flex-end}
-.bubble{padding:11px 15px;border-radius:18px;font-size:14px;line-height:1.5}
+.chat{display:flex;flex-direction:column;gap:12px}
+.msg{display:flex;max-width:82%}.msg.me{align-self:flex-end;justify-content:flex-end}.msg.ai{align-self:flex-start}
+.bubble{display:inline-block;max-width:100%;padding:11px 15px;border-radius:18px;font-size:14px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere}
 .msg.ai .bubble{background:var(--panel2);border:1px solid var(--line);border-bottom-left-radius:6px}
 .msg.me .bubble{background:var(--accent);color:#0b0d12;font-weight:500;border-bottom-right-radius:6px;box-shadow:0 2px 8px -2px rgba(110,139,255,.4)}
 code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(--asoft);padding:1px 5px;border-radius:5px}
@@ -278,18 +280,21 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
   <p class=muted style="margin:0 0 18px">Be the CEO of a company of AI agents that build &amp; ship your software.</p>
   <div id=su_signup>
     <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Create your account</h2>
-    <p class=muted style="margin:0 0 10px">Free to start — no card needed.</p>
-    <label>Your name or company</label><input id=su_name placeholder="Acme Co" onkeydown="if(event.key==='Enter')signUp()">
-    <label>Plan</label><select id=su_plan><option value=free>Free — 3 builds</option><option value=pro>Pro — $49 · 50 builds</option></select>
-    <div style="margin-top:14px"><button class=pri onclick=signUp() style=width:100%>Create account &amp; open console</button></div>
+    <p class=muted style="margin:0 0 10px">Free to start — no card needed. You'll create your companies (orgs) once you're in.</p>
+    <label>Your name</label><input id=su_name placeholder="Jane Doe">
+    <label>Email</label><input id=su_email type=email placeholder="you@example.com">
+    <label>Password</label><input id=su_pw type=password placeholder="at least 8 characters" onkeydown="if(event.key==='Enter')signUp()">
+    <div style="margin-top:14px"><button class=pri onclick=signUp() style=width:100%>Create account</button></div>
     <div id=su_note class=muted style="margin-top:10px"></div>
-    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">Already have an account? <a onclick="document.getElementById('su_signup').style.display='none';document.getElementById('su_signin').style.display='block'" style="cursor:pointer;color:var(--atext)">Sign in with your token</a></p>
+    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">Already have an account? <a onclick="suTab('in')" style="cursor:pointer;color:var(--atext)">Sign in</a></p>
   </div>
   <div id=su_signin style=display:none>
     <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Sign in</h2>
-    <label>Your access token</label><input id=tok placeholder="aos_…" onkeydown="if(event.key==='Enter')saveTok()">
-    <div style="margin-top:14px"><button class=pri onclick=saveTok() style=width:100%>Open console</button></div>
-    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px"><a onclick="document.getElementById('su_signin').style.display='none';document.getElementById('su_signup').style.display='block'" style="cursor:pointer;color:var(--atext)">← Back to create account</a></p>
+    <label>Email</label><input id=si_email type=email placeholder="you@example.com">
+    <label>Password</label><input id=si_pw type=password placeholder="your password" onkeydown="if(event.key==='Enter')signIn()">
+    <div style="margin-top:14px"><button class=pri onclick=signIn() style=width:100%>Sign in</button></div>
+    <div id=si_note class=muted style="margin-top:10px"></div>
+    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px"><a onclick="suTab('up')" style="cursor:pointer;color:var(--atext)">← Create an account</a></p>
   </div></div>
 </div>
 <div class=app id=app style="display:none">
@@ -323,14 +328,25 @@ async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];if(
 function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);loadOrgs();go('controller');}
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none'}
-function saveTok(){TOK=($('#tok').value||'').trim();if(!TOK)return;localStorage.setItem('aos_tenant',TOK);showApp(true);boot()}
+function saveTok(){TOK=($('#tok')||{}).value||'';TOK=TOK.trim();if(!TOK)return;localStorage.setItem('aos_tenant',TOK);showApp(true);boot()}
+function suTab(t){$('#su_signup').style.display=t==='up'?'block':'none';$('#su_signin').style.display=t==='in'?'block':'none'}
 async function signUp(){
- const name=($('#su_name').value||'').trim()||'there';const note=$('#su_note');note.textContent='Creating your account…';
- let r;try{r=await (await fetch('/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,plan:($('#su_plan')||{}).value||'free'})})).json()}catch(e){note.textContent='Could not reach the server — is the console running?';return}
+ const note=$('#su_note');const email=($('#su_email').value||'').trim();const pw=$('#su_pw').value||'';const name=($('#su_name').value||'').trim();
+ if(!email){note.textContent='Enter your email';return} if(pw.length<8){note.textContent='Password must be at least 8 characters';return}
+ note.textContent='Creating your account…';
+ let r;try{r=await (await fetch('/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,email,password:pw})})).json()}catch(e){note.textContent='Could not reach the server — is the console running?';return}
  if(r.error){note.textContent='✗ '+r.error;return}
- TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);
- note.innerHTML='✅ Account ready! Save your access token to sign in from another device:<br><code style="word-break:break-all">'+esc(TOK)+'</code><br>Opening your console…';
- setTimeout(()=>{showApp(true);boot()},1400);
+ TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||email);
+ showApp(true);boot();
+}
+async function signIn(){
+ const note=$('#si_note');const email=($('#si_email').value||'').trim();const pw=$('#si_pw').value||'';
+ if(!email||!pw){note.textContent='Enter your email and password';return}
+ note.textContent='Signing in…';
+ let r;try{r=await (await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})})).json()}catch(e){note.textContent='Could not reach the server';return}
+ if(r.error){note.textContent='✗ '+r.error;return}
+ TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||email);
+ showApp(true);boot();
 }
 function signOut(){localStorage.removeItem('aos_tenant');TOK='';showApp(false)}
 function toggleAcct(){const m=$('#acctmenu');m.style.display=m.style.display==='none'?'block':'none'}
@@ -375,7 +391,7 @@ const VIEWS={
   if(d.error){$('#view').innerHTML='<div class=card>'+esc(d.error)+'</div>';return}
   const phase=d.phase||'DISCOVER';const gate=d.awaiting?(' · waiting on '+esc(d.awaiting)):'';
   $('#view').innerHTML=`<h1>Controller</h1><p class=sub>Tell your controller what to build. It researches, brings options, designs, and ships — asking you at each step. <b>${esc(phase)}</b>${gate}</p>
-   <div class=card id=clog style="max-height:54vh;overflow:auto"></div>
+   <div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>
    <div class=card><div class=row><input id=cmsg placeholder="e.g. build a competitor to YouTube" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
   ctlRender(d.messages||[]);
   if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}try{const s=await get('/api/controller/state?org='+ORG);ctlRender(s.messages||[])}catch(e){}},5000);
@@ -404,7 +420,7 @@ const VIEWS={
   const CHIPS=['Track my gym members','An invoice generator','A URL shortener','A booking page for my salon','An internal tool for my team'];
   $('#view').innerHTML=`<h1>Direct your fleet</h1><p class=sub>Describe what you want in plain words. I'll ask questions, then build it — you approve.</p>
    <div class=chips>`+CHIPS.map(c=>`<span class=chip-s onclick="chipFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div>
-   <div class=card id=chatlog style="max-height:52vh;overflow:auto"></div>
+   <div class=card id=chatlog style="max-height:52vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>
    <div class=card><div class=row><input id=msg placeholder="e.g. I want an app to track my gym members…" onkeydown="if(event.key==='Enter')chatSend()"><button class=pri onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
   await chatRender();
  },
@@ -538,7 +554,7 @@ async function boot(){renderNav();refreshTopbar();await loadOrgs();
  go(ORG?'controller':'orgs');
  setInterval(refreshTopbar,15000);setInterval(()=>{if(['cockpit','activity'].includes(CUR))go(CUR)},6000)}
 document.addEventListener('click',e=>{if(!e.target.closest('#acctmenu')&&!String(e.target.getAttribute&&e.target.getAttribute('onclick')||'').includes('toggleAcct'))$('#acctmenu').style.display='none'});
-if(TOK){$('#tok').value=TOK;showApp(true);boot()}else{showApp(false)}
+if(TOK){showApp(true);boot()}else{showApp(false)}
 </script></body></html>"""
 
 
@@ -589,11 +605,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path); p = u.path
-        if p == "/api/signup":                            # UNAUTHENTICATED: create an account -> token
+        if p in ("/api/signup", "/api/login"):            # UNAUTHENTICATED: real email+password accounts
+            import auth
             b = self._body()
             try:
-                reg = billing.signup((b.get("name") or "there").strip()[:60], b.get("plan", "free"))
-                return self._json(200, reg)               # {tenant_id, api_token, plan}
+                if p == "/api/signup":
+                    r = auth.signup(b.get("email", ""), b.get("password", ""),
+                                    (b.get("name") or "").strip()[:60] or None, b.get("plan", "free"))
+                else:
+                    r = auth.login(b.get("email", ""), b.get("password", ""))
+                return self._json(200 if not r.get("error") else 400, r)
             except Exception as e:
                 return self._json(400, {"error": str(e)[:200]})
         fn = POSTS.get(p)

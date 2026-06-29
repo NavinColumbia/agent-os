@@ -36,7 +36,10 @@ const SCREENS = [
       await p.waitForSelector('#signin', { state: 'visible', timeout: 8000 });
       if (shotDir) await p.screenshot({ path: `${shotDir}/console-00-signin.png` }).catch(() => {});
       await p.fill('#su_name', 'E2E CEO');
-      await p.click('#su_signup button.pri');           // "Create account & open console"
+      await p.fill('#su_email', `e2e-${Date.now()}@example.com`);   // real email+password account
+      await p.fill('#su_pw', 'e2e-password-123');
+      await p.click('#su_signup button.pri');           // "Create account"
+      // a NEW user should land in the app WITHOUT being shown-and-vanished a token (the bug we just fixed)
     }
     // the app shell must become visible — via signup (new user) or seeded token (returning)
     await p.waitForSelector('#app', { state: 'visible', timeout: 12000 });

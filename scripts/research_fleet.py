@@ -13,6 +13,7 @@ Run with the agent-os venv python. Agents already have WebSearch/WebFetch (facto
 import json
 import os
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -145,9 +146,19 @@ def synthesize(repo: Path, question: str, out_rel: str):
     return repo / out_rel
 
 
-def research(question: str, out_rel: str = "REPORT.md", api_key=None) -> dict:
-    """Full pipeline: decompose -> PARALLEL fleet research -> synthesize. Bounded by factory._AGENT_SEM."""
-    repo = factory.PRODUCTS / f"research-{_slug(question)}"
+def research(question: str, out_rel: str = "REPORT.md", api_key=None, run_id=None) -> dict:
+    """Full pipeline: decompose -> PARALLEL fleet research -> synthesize. Bounded by factory._AGENT_SEM.
+
+    TENANT/RUN ISOLATION: the workspace is namespaced per run_id, NOT by the question slug alone.
+    factory.PRODUCTS is one shared, non-tenant-partitioned dir and _slug truncates to 40 chars, so two
+    runs of the same/similarly-slugged question — including two different tenants via research.start —
+    would otherwise resolve to the SAME repo, findings/ and REPORT.md (and decompose() unconditionally
+    clears findings/, wiping a concurrent run; synthesize() overwrites the shared report). research.start
+    should thread its DB run_id (and tenant) in here; when none is supplied we MINT a unique one so
+    concurrent and cross-tenant runs can never share findings/ or REPORT.md."""
+    if run_id is None:
+        run_id = uuid.uuid4().hex[:12]
+    repo = factory.PRODUCTS / f"research-{run_id}-{_slug(question)}"
     (repo / "findings").mkdir(parents=True, exist_ok=True)
     audit.append(actor="research:lead", action="ResearchStart", resource=repo.name, decision="executed",
                  payload={"question": question[:160]})

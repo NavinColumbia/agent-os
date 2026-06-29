@@ -7,7 +7,7 @@ research_fleet (decompose -> parallel fleet -> synthesize) with durable run stat
 step: once the report lands, a research-growth agent reads it and proposes 3 DISTINCT strategic
 options, one marked recommended. The controller starts a run, polls run_state, then select()s.
 
-    research.py json <run_id>     # the run state + option cards
+    research.py json <tenant_id> <run_id>     # the run state + option cards
     research.py selftest
 Run with the agent-os venv python. No web server — DB + a daemon thread, like the orchestrator.
 """
@@ -40,25 +40,59 @@ def _ensure():
         c.commit()
 
 
-def start(tenant_id, org_id, thread_id, question):
-    """Insert a running research_runs row and kick off the fleet in a daemon thread. Returns {run_id}."""
+def start(tenant_id, org_id, thread_id, question, api_key=None):
+    """Insert a research_runs row and kick off the fleet in a daemon thread. Returns {run_id}.
+
+    GOVERNED SPEND PATH (mirrors orchestrator.confirm): launching the fleet fans out unbounded LLM
+    work, so gate on consent + billing quota BEFORE any spend, and thread the TENANT's connected
+    provider key (not the platform default) so the work is billed to the tenant who asked for it.
+    A blocked run is still recorded durably with status='failed' (so a poller on run_state()
+    terminates promptly instead of hanging) and the thread is NOT started.
+    """
     _ensure()
+    import billing
+    import consent
+    import tenantproviders
+    # Resolve the per-tenant provider key unless one was passed explicitly (mirrors frontdoor._run_build).
+    if api_key is None:
+        try:
+            api_key = tenantproviders.build_kwargs(tenant_id).get("api_key")
+        except Exception:
+            api_key = None
+    # Consent + quota gate: refuse the fan-out for a missing/over-quota tenant, but keep the contract
+    # (always return a run_id) so the caller's poll loop sees a terminal status and stops.
+    block = None
+    if not consent.require_consent(tenant_id):
+        block = "consent_required"
+    else:
+        try:
+            q = billing.quota(tenant_id)
+            if not q["within_quota"]:
+                block = f"quota reached ({q['builds']})"
+        except Exception as e:
+            block = f"quota_check_failed: {str(e)[:120]}"
+    status = "failed" if block else "running"
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO research_runs (tenant_id, org_id, thread_id, question, status)
-                       VALUES (%s,%s,%s,%s,'running') RETURNING id""",
-                    (tenant_id, org_id, thread_id, question))
+                       VALUES (%s,%s,%s,%s,%s) RETURNING id""",
+                    (tenant_id, org_id, thread_id, question, status))
         run_id = cur.fetchone()[0]
         c.commit()
+    if block:
+        audit.append(actor="research", action="ResearchRunBlocked", resource=str(run_id),
+                     decision="blocked", payload={"reason": block, "tenant": tenant_id})
+        return {"run_id": run_id, "error": block}
     audit.append(actor="research", action="ResearchRunStart", resource=str(run_id),
                  decision="executed", payload={"question": (question or "")[:160], "tenant": tenant_id})
-    threading.Thread(target=_run, args=(run_id, question), daemon=True).start()
+    threading.Thread(target=_run, args=(run_id, question, api_key), daemon=True).start()
     return {"run_id": run_id}
 
 
-def _run(run_id, question):
-    """Daemon worker: run the fleet, persist the report, distill option cards. Exceptions -> failed."""
+def _run(run_id, question, api_key=None):
+    """Daemon worker: run the fleet (on the tenant's provider key), persist the report, distill option
+    cards. Exceptions -> failed."""
     try:
-        res = research_fleet.research(question, "REPORT.md")
+        res = research_fleet.research(question, "REPORT.md", api_key=api_key)
         report_path = res.get("report")
         report_text = ""
         try:
@@ -149,25 +183,32 @@ def _extract_options(run_id, report_text):
     return len(opts)
 
 
-def run_state(run_id):
-    """Full state for a run: status + the SELECTABLE option cards."""
+def run_state(tenant_id, run_id):
+    """Full state for a run: status + the SELECTABLE option cards. Scoped by tenant_id so a tenant can
+    never read another tenant's question or option cards (IDOR hardening, mirrors designview.gallery)."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT status, question FROM research_runs WHERE id=%s", (run_id,))
+        cur.execute("SELECT status, question FROM research_runs WHERE id=%s AND tenant_id=%s",
+                    (run_id, tenant_id))
         row = cur.fetchone()
         if not row:
             raise ValueError(f"no such run {run_id}")
         status, question = row
-        cur.execute("""SELECT id, title, summary, recommended, chosen FROM research_options
-                       WHERE run_id=%s ORDER BY id""", (run_id,))
+        # Join options back to the (already tenant-matched) run as defense-in-depth.
+        cur.execute("""SELECT o.id, o.title, o.summary, o.recommended, o.chosen FROM research_options o
+                       JOIN research_runs r ON o.run_id=r.id
+                       WHERE o.run_id=%s AND r.tenant_id=%s ORDER BY o.id""", (run_id, tenant_id))
         options = [{"id": r[0], "title": r[1], "summary": r[2], "recommended": r[3], "chosen": r[4]}
                    for r in cur.fetchall()]
     return {"run_id": run_id, "status": status, "question": question, "options": options}
 
 
-def select(run_id, option_id):
-    """Mark an option chosen for this run; return the chosen option dict."""
+def select(tenant_id, run_id, option_id):
+    """Mark an option chosen for this run; return the chosen option dict. Ownership via tenant match: the
+    UPDATE only touches an option whose run belongs to tenant_id, so no cross-tenant caller can flip it."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("UPDATE research_options SET chosen=true WHERE id=%s AND run_id=%s", (option_id, run_id))
+        cur.execute("""UPDATE research_options SET chosen=true WHERE id=%s AND run_id=%s
+                       AND run_id IN (SELECT id FROM research_runs WHERE tenant_id=%s)""",
+                    (option_id, run_id, tenant_id))
         if cur.rowcount == 0:
             raise ValueError(f"no option {option_id} for run {run_id}")
         c.commit()
@@ -175,7 +216,7 @@ def select(run_id, option_id):
                        WHERE id=%s""", (option_id,))
         r = cur.fetchone()
     audit.append(actor="research", action="ResearchOptionChosen", resource=str(run_id),
-                 decision="executed", payload={"option_id": option_id, "title": r[1]})
+                 decision="executed", payload={"option_id": option_id, "title": r[1], "tenant": tenant_id})
     return {"id": r[0], "title": r[1], "summary": r[2], "recommended": r[3], "chosen": r[4]}
 
 
@@ -184,6 +225,7 @@ def _selftest():
     import tempfile
     import time
     import billing
+    import consent
 
     # parse must survive the real reply shapes the distiller produces.
     p = _parse_options("* OPT: Creator-first :: focus on creators\nOPT: Ad-free subs :: subscription model\n"
@@ -203,23 +245,35 @@ def _selftest():
 
     reg = billing.signup("research-selftest", "free")
     tid = reg["tenant_id"]
+    consent.record(tid)                                # start() now gates on consent (governed spend path)
     run_id = None
     ok = False
     try:
         run_id = start(tid, "org-self", 1, "how should we grow the creator platform")["run_id"]
         deadline = time.time() + 10
-        st = run_state(run_id)
+        st = run_state(tid, run_id)
         while st["status"] not in ("done", "failed") and time.time() < deadline:
             time.sleep(0.2)
-            st = run_state(run_id)
+            st = run_state(tid, run_id)
         opts = st["options"]
         recs = [o for o in opts if o["recommended"]]
         extracted_ok = st["status"] == "done" and len(opts) == 3 and len(recs) == 1
-        chosen = select(run_id, opts[-1]["id"]) if opts else None
-        chosen_ok = bool(chosen) and chosen["chosen"] and run_state(run_id)["options"][-1]["chosen"]
-        ok = parse_ok and extracted_ok and chosen_ok
+        chosen = select(tid, run_id, opts[-1]["id"]) if opts else None
+        chosen_ok = bool(chosen) and chosen["chosen"] and run_state(tid, run_id)["options"][-1]["chosen"]
+        # Cross-tenant guard: another tenant can neither read this run nor flip its options (IDOR).
+        try:
+            xread = run_state("t-not-mine", run_id)["options"]
+        except ValueError:
+            xread = []
+        try:
+            select("t-not-mine", run_id, opts[-1]["id"]) if opts else None
+            xselect_ok = False
+        except ValueError:
+            xselect_ok = True
+        xtenant_ok = xread == [] and xselect_ok
+        ok = parse_ok and extracted_ok and chosen_ok and xtenant_ok
         print(f"run {run_id}: status={st['status']} options={len(opts)} recommended={len(recs)} "
-              f"chosen={chosen['title'] if chosen else None}")
+              f"chosen={chosen['title'] if chosen else None} xtenant_guard={xtenant_ok}")
         print("PASS: research STATE+OPTIONS (async run -> 3 selectable cards -> select) ✅" if ok else "FAIL")
     finally:
         research_fleet.research, factory.agent = real_research, real_agent
@@ -227,6 +281,7 @@ def _selftest():
             cur.execute("""DELETE FROM research_options WHERE run_id IN
                            (SELECT id FROM research_runs WHERE tenant_id=%s)""", (tid,))
             cur.execute("DELETE FROM research_runs WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
             c.commit()
         try:
@@ -240,10 +295,10 @@ def _main(a):
     import json
     if not a or a[0] == "selftest":
         _selftest()
-    elif a[0] == "json" and len(a) > 1:
-        print(json.dumps(run_state(int(a[1])), indent=2))
+    elif a[0] == "json" and len(a) > 2:
+        print(json.dumps(run_state(a[1], int(a[2])), indent=2))
     else:
-        sys.exit("usage: research.py json <run_id> | selftest")
+        sys.exit("usage: research.py json <tenant_id> <run_id> | selftest")
 
 
 if __name__ == "__main__":

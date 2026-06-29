@@ -52,16 +52,21 @@ def file(source, need_role, title, detail="", severity="med", priority=5):
                        VALUES (%s,%s,%s,%s,%s) RETURNING id""", (source, title, detail, severity, need_role))
         fid = cur.fetchone()[0]; c.commit()
     # ROUTE through the directory-aware router — assign to an active agent or spawn one (governed)
+    _STATUS = {"routed_to_existing": "routed", "hire_requested_overloaded": "hire_pending",
+               "hire_requested_spawn": "hire_pending", "no_exact_role_use_nearest": "routed",
+               "no_role": "no_role"}
     r = orchestrate.request_collaborator(f"finding:{source}", need_role, title, priority)
     act = r.get("action")
-    status = {"routed_to_existing": "routed", "hire_requested_overloaded": "hire_pending",
-              "hire_requested_spawn": "hire_pending", "no_exact_role_use_nearest": "routed",
-              "no_role": "no_role"}.get(act, "open")
-    owner = r.get("assignee") or r.get("suggested_role")
+    eff = r  # the disposition we actually persist (the re-routed result wins, if any)
     # if no exact role, re-route to the nearest role so it still gets an owner (don't drop it)
     if act == "no_exact_role_use_nearest" and r.get("suggested_role"):
-        r2 = orchestrate.request_collaborator(f"finding:{source}", r["suggested_role"], title, priority)
-        owner = r2.get("assignee") or r["suggested_role"]
+        eff = orchestrate.request_collaborator(f"finding:{source}", r["suggested_role"], title, priority)
+    # derive the real disposition from the EFFECTIVE result so r2's task_id/hire_id/status aren't lost
+    eff_act = eff.get("action")
+    status = _STATUS.get(eff_act, "open")
+    owner = eff.get("assignee") or eff.get("suggested_role")
+    task_id = eff.get("task_id")
+    hire_id = eff.get("hire_id")
     # CEO visibility on the task board
     bid = None
     try:
@@ -70,12 +75,12 @@ def file(source, need_role, title, detail="", severity="med", priority=5):
         pass
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""UPDATE findings SET status=%s, owner=%s, task_id=%s, hire_id=%s, board_id=%s WHERE id=%s""",
-                    (status, owner, r.get("task_id"), r.get("hire_id"), bid, fid))
+                    (status, owner, task_id, hire_id, bid, fid))
         c.commit()
     audit.append(actor="findings", action="FindingFiled", resource=str(fid), decision=status,
-                 payload={"source": source, "need_role": need_role, "owner": owner, "routing": act})
-    return {"finding_id": fid, "status": status, "owner": owner, "routing": act,
-            "task_id": r.get("task_id"), "hire_id": r.get("hire_id"), "board_id": bid}
+                 payload={"source": source, "need_role": need_role, "owner": owner, "routing": eff_act})
+    return {"finding_id": fid, "status": status, "owner": owner, "routing": eff_act,
+            "task_id": task_id, "hire_id": hire_id, "board_id": bid}
 
 
 def resolve(fid, by="agent"):

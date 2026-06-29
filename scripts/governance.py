@@ -54,11 +54,19 @@ _CAP_TOOLS = {
                       "mcp__slack__post_message"],
     "deploy": ["Deploy", "mcp__deploy__release", "mcp__vercel__deploy"],
 }
-# Tools that perform file edits. Denied when a role is FULLY read-only (can_modify_code:false AND
-# no declared write scope). A role that may write SOME paths (allowed_paths non-empty: docs/tests/
-# tasks) keeps these and is constrained to WHERE by denied_paths + allowed_paths, not denied the
-# tool outright — so non-code authoring (e.g. the SPEC stage's docs/SPEC.md) is not bricked.
-_EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+# Tools that perform file edits, split by how a read-only role (can_modify_code:false) is treated:
+#   _EDIT_TOOLS_ALWAYS : MultiEdit/NotebookEdit — NO read-only role (doc/test author) needs these;
+#                        denied unconditionally whenever can_modify_code is false.
+#   _EDIT_TOOLS_SCOPED : Edit/Write — denied too UNLESS the role has a BOUNDED write scope (a
+#                        concrete non-['**'] allowed_paths like docs/**, tests/**, tasks/**), so
+#                        legitimate non-code authoring (the SPEC stage's docs/SPEC.md, qa-security's
+#                        tests/**) is not bricked. A FULLY read-only role (empty allowed_paths) OR
+#                        one scoped to the UNBOUNDED ['**'] wildcard (reviewer/audit-governance/
+#                        security-appsec — auditors that mutate via flock'd scripts, not freehand
+#                        edits) loses Edit/Write too.
+_EDIT_TOOLS_ALWAYS = ["MultiEdit", "NotebookEdit"]
+_EDIT_TOOLS_SCOPED = ["Edit", "Write"]
+_EDIT_TOOLS = _EDIT_TOOLS_SCOPED + _EDIT_TOOLS_ALWAYS   # full set (kept for back-compat / docs)
 # Sub-agent spawn tool — denied unless can_spawn (true only for the controller).
 _SPAWN_TOOLS = ["Task"]
 # Read-side secret material denied unless can_read_secrets.
@@ -229,15 +237,25 @@ def spawn_restrictions(role: str) -> dict:
     if not f["can_deploy"]:
         disallowed += _CAP_TOOLS["deploy"]
     # can_modify_code:false forbids authoring CODE — but docs/specs/tests written WITHIN a role's
-    # declared write scope are NOT code, and blanket-denying every edit tool here bricks legitimate
-    # stages (the SPEC stage's product-manager authors docs/SPEC.md, qa-security adds tests/**). So
-    # only treat a role as FULLY read-only (deny all edit tools) when it has NO write scope at all
-    # (empty allowed_paths). A role WITH a write scope keeps Edit/Write and is constrained to WHERE
-    # by denied_paths + allowed_paths (the validate_writes backstop + the PreToolUse hook). A role
-    # that must stay read-only DESPITE having a scope declares that explicitly via denied_tools
-    # (e.g. reviewer, audit-governance, resource-allocator — registry mutates via a flock'd script).
-    if not f["can_modify_code"] and not f["allowed_paths"]:
-        disallowed += _EDIT_TOOLS
+    # declared BOUNDED write scope are NOT code, so the edit-tool deny is graduated rather than
+    # all-or-nothing:
+    #   * MultiEdit/NotebookEdit are ALWAYS denied for a read-only role — no doc/test author needs
+    #     them (Edit/Write suffice), so they must never leak into --disallowedTools just because the
+    #     role has a write scope. (This closes the post-77793f0 regression where a non-empty
+    #     allowed_paths skipped the WHOLE _EDIT_TOOLS block, omitting MultiEdit/NotebookEdit — and,
+    #     for ['**'] roles with empty denied_tools, Edit/Write too — from the deny layer.)
+    #   * Edit/Write are denied too UNLESS the role has a BOUNDED scope (non-empty allowed_paths that
+    #     is not the unbounded ['**'] wildcard). product-manager (docs/**, tasks/**) and qa-security
+    #     (tests/**) keep them to author the SPEC/test stages; a FULLY read-only role (empty
+    #     allowed_paths) OR an unbounded ['**'] auditor scope (security-appsec/reviewer/
+    #     audit-governance — they mutate via flock'd scripts, not freehand edits) loses them too.
+    # This makes the --disallowedTools layer match the PreToolUse hook's tools-allowlist (defense in
+    # depth) instead of relying on each read-only role's (often incomplete) denied_tools list.
+    if not f["can_modify_code"]:
+        disallowed += _EDIT_TOOLS_ALWAYS
+        bounded_scope = f["allowed_paths"] and "**" not in f["allowed_paths"]
+        if not bounded_scope:
+            disallowed += _EDIT_TOOLS_SCOPED
     if not f["can_spawn"]:
         disallowed += _SPAWN_TOOLS
     # de-dup, preserve order
@@ -350,6 +368,21 @@ def _selftest() -> int:
             problems.append(f"product-manager (has write scope) must KEEP {t} to author docs/SPEC.md")
     if not pm["write_scope"]:
         problems.append("product-manager must have a non-empty write_scope (allowed_paths)")
+    # ...but MultiEdit/NotebookEdit are STILL denied for a read-only role even WITH a write scope:
+    # no doc/test author needs them, and they must not leak back into --disallowedTools.
+    for t in ("MultiEdit", "NotebookEdit"):
+        if t not in pm["disallowed_tools"]:
+            problems.append(f"product-manager (read-only) must still disallow {t}")
+
+    # 5c) REGRESSION GUARD (post-77793f0 edit-tool leak): a read-only role whose write scope is the
+    #     UNBOUNDED ['**'] wildcard (security-appsec, denied_tools:[]) must have ALL FOUR edit tools
+    #     denied in the --disallowedTools layer — a '**' scope is not a bounded doc/test scope, and
+    #     this layer must match the PreToolUse hook's tools-allowlist rather than rely on the role's
+    #     denied_tools (which is empty here).
+    sa = spawn_restrictions("security-appsec")
+    for t in _EDIT_TOOLS:
+        if t not in sa["disallowed_tools"]:
+            problems.append(f"security-appsec (read-only, ['**'] scope) must disallow {t}")
 
     # 6) only the controller may spawn -> Task denied for everyone else, allowed for controller.
     if "Task" not in b["disallowed_tools"]:

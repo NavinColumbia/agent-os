@@ -1036,7 +1036,16 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
                   f"concrete risks, and END YOUR REPLY WITH A LINE that is EXACTLY 'VERDICT: APPROVE' or "
                   f"'VERDICT: REQUEST-CHANGES'. QA is currently {'GREEN' if qa_ok[0] else 'RED'}.",
                   model=CHEAP_MODEL)
-            out = (res.get("out") or "") if isinstance(res, dict) else ""
+            # A FAILED reviewer run is NO review signal — NOT review content. agent() returns failed=True /
+            # rc=-1 with a non-empty BLOCKER sentinel ('halted', 'budget/token budget exhausted', 'spawn
+            # denied') that contains no VERDICT line, so feeding it to _review_verdict would hit the
+            # have_signal path and silently APPROVE an UNREVIEWED build (and persist the blocker as the review
+            # artifact). Fail CLOSED: treat any non-success as a missing review -> REQUEST-CHANGES, which
+            # escalates to a human (BLOCKED_AT_REVIEW) instead of shipping. Only a CLEAN run (rc==0, not
+            # failed) is persisted and parsed as the verdict.
+            if not isinstance(res, dict) or res.get("failed") or res.get("rc") not in (0, None):
+                return "", "REQUEST-CHANGES"
+            out = res.get("out") or ""
             if out.strip():                              # persist the reviewer's reply as the review artifact
                 try:
                     (Path(repo) / "docs").mkdir(parents=True, exist_ok=True)

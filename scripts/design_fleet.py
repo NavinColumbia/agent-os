@@ -9,7 +9,7 @@ workspace repo. Every produced screen is recorded as a design_artifacts row (sta
 gallery view (designview.py) can show it and a human can approve/reject. Bounded + honest: if an agent
 doesn't write its file, we drop in a minimal placeholder so a row still exists (no silent gaps).
 
-    design_fleet.py prototype <org_id> <product> '<plan-json>'   # 3 audiences in parallel -> screens
+    design_fleet.py prototype <tenant_id> <org_id> <product> '<plan-json>'  # 3 audiences -> screens
     design_fleet.py selftest                                     # covers design_fleet AND designview
 Run with the agent-os venv python. Agents already have file edits via the factory runtime.
 """
@@ -48,6 +48,8 @@ def _ensure():
             id BIGSERIAL PRIMARY KEY, org_id TEXT, product TEXT, kind TEXT DEFAULT 'screen',
             surface TEXT, title TEXT, html_path TEXT, status TEXT DEFAULT 'draft',
             created_at TIMESTAMPTZ DEFAULT now())""")
+        # Scope every artifact by tenant as well as org (IDOR hardening), mirroring designview._ensure.
+        cur.execute("ALTER TABLE design_artifacts ADD COLUMN IF NOT EXISTS tenant_id TEXT")
         c.commit()
 
 
@@ -98,8 +100,9 @@ def design_one(repo: Path, org_id: str, product: str, surface: str, plan: dict, 
             "ok": fp.exists(), "rc": r.get("rc")}
 
 
-def prototype(org_id: str, product: str, plan: dict, api_key=None) -> dict:
+def prototype(tenant_id: str, org_id: str, product: str, plan: dict, api_key=None) -> dict:
     """Full prototype phase: 3 audiences in PARALLEL -> a design_artifacts row per produced screen.
+    Each row is scoped by (tenant_id, org_id) so designview's tenant-scoped gallery/decide can read it.
     Bounded by factory._AGENT_SEM (global agent cap). Returns {screens, surfaces}."""
     _ensure()
     repo = factory.PRODUCTS / f"{org_id}-design"
@@ -121,9 +124,9 @@ def prototype(org_id: str, product: str, plan: dict, api_key=None) -> dict:
         for r in results:
             if not r.get("ok"):
                 continue
-            cur.execute("""INSERT INTO design_artifacts (org_id, product, kind, surface, title,
-                             html_path, status) VALUES (%s,%s,'screen',%s,%s,%s,'review')""",
-                        (org_id, product, r["surface"], r["title"], r["html_path"]))
+            cur.execute("""INSERT INTO design_artifacts (tenant_id, org_id, product, kind, surface,
+                             title, html_path, status) VALUES (%s,%s,%s,'screen',%s,%s,%s,'review')""",
+                        (tenant_id, org_id, product, r["surface"], r["title"], r["html_path"]))
             surfaces.append(r["surface"])
         c.commit()
     audit.append(actor="design:lead", action="PrototypeComplete", resource=repo.name,
@@ -145,6 +148,7 @@ def _selftest():
     import designview
 
     _ensure()
+    tenant_id = "t-selftest-" + uuid.uuid4().hex[:8]
     org_id = "o-selftest-" + uuid.uuid4().hex[:8]
     workdir = Path(tempfile.mkdtemp(prefix="design-selftest-"))
     real_agent, real_products = factory.agent, factory.PRODUCTS
@@ -161,14 +165,14 @@ def _selftest():
 
     ok = False
     try:
-        res = prototype(org_id, "demo", {"features": ["x"]})
+        res = prototype(tenant_id, org_id, "demo", {"features": ["x"]})
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM design_artifacts WHERE org_id=%s", (org_id,))
             n_rows = cur.fetchone()[0]
-        gallery = designview.gallery(org_id)
+        gallery = designview.gallery(tenant_id, org_id)
         first_id = gallery[0]["id"]
-        flipped = designview.decide(org_id, first_id, "approved")
-        approved = next(g for g in designview.gallery(org_id) if g["id"] == first_id)
+        flipped = designview.decide(tenant_id, org_id, first_id, "approved")
+        approved = next(g for g in designview.gallery(tenant_id, org_id) if g["id"] == first_id)
         no_placeholders = all(not r.get("placeholder") for r in [])  # agent wrote files -> none expected
         sfc = designview.surfaces()
 
@@ -176,7 +180,7 @@ def _selftest():
               and sorted(res["surfaces"]) == ["cockpit", "external", "team"]
               and n_rows == 3
               and len(gallery) == 3
-              and all(g["status"] == "review" for g in designview.gallery(org_id) if g["id"] != first_id)
+              and all(g["status"] == "review" for g in designview.gallery(tenant_id, org_id) if g["id"] != first_id)
               and flipped.get("ok") is True
               and approved["status"] == "approved"
               and len(sfc) == 3)
@@ -196,11 +200,11 @@ def _selftest():
 def _main(a):
     if not a or a[0] == "selftest":
         _selftest()
-    elif a[0] == "prototype" and len(a) >= 3:
-        plan = json.loads(a[3]) if len(a) > 3 else {"features": []}
-        print(prototype(a[1], a[2], plan))
+    elif a[0] == "prototype" and len(a) >= 4:
+        plan = json.loads(a[4]) if len(a) > 4 else {"features": []}
+        print(prototype(a[1], a[2], a[3], plan))
     else:
-        sys.exit("usage: design_fleet.py prototype <org_id> <product> '<plan-json>' | selftest")
+        sys.exit("usage: design_fleet.py prototype <tenant_id> <org_id> <product> '<plan-json>' | selftest")
 
 
 if __name__ == "__main__":

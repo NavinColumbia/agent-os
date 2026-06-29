@@ -318,7 +318,7 @@ def advance(thread_id, job_result=None):
         _set(thread_id, product=product)
         def _do_proto():
             import design_fleet
-            return design_fleet.prototype(str(s["org_id"]), product, plan)
+            return design_fleet.prototype(tid, str(s["org_id"]), product, plan)
         _dispatch(thread_id, "design", _do_proto)
         return
 
@@ -477,7 +477,7 @@ def _selftest():
     _r.start = lambda t, o, th, q: {"run_id": 999}
     _r.run_state = lambda rid: {"status": "done", "options": [{"id": 1, "title": "A", "recommended": True}]}
     _r.select = lambda rid, oid: {"option_id": oid, "title": "A"}
-    _d.prototype = lambda o, p, pl, **k: {"screens": 3, "surfaces": ["cockpit", "team", "external"]}
+    _d.prototype = lambda t, o, p, pl, **k: {"screens": 3, "surfaces": ["cockpit", "team", "external"]}
     _q.run = lambda product, **k: {"run_id": 1, "status": "shipped", "shipped": True, "rounds": 1}
     _v.verify = lambda product, **k: {"passed": True}
     try:

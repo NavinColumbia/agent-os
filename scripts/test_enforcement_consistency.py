@@ -16,6 +16,7 @@ every divergence, if they disagree. It also asserts standing invariants.
 
 Run:  .venv/bin/python scripts/test_enforcement_consistency.py     -> PASS / FAIL
 """
+import functools
 import os
 import sys
 from pathlib import Path
@@ -32,6 +33,33 @@ import enforce_manifest
 import manifest_policy as mp
 
 REPO = "/tmp/consistency_repo"
+
+# ---- PERF (no DECISION change) ---------------------------------------------------------------
+# This guard is an in-process sweep of ~92 roles x ~54 cases (~5000 iterations). The naive path
+# was dominated by two REDUNDANT per-iteration costs (confirmed by cProfile, ~71% + ~27% of wall):
+#   1) governance.spawn_restrictions/validate_writes each call governance.load_manifest, which
+#      re-reads + yaml.safe_load()s the role's YAML EVERY time — the same file ~100x per role.
+#   2) governance.validate_writes audits every flagged write ('GovernanceWriteViolation'), and
+#      governance._audit opens a fresh Postgres connection PER violation (hundreds of DB connects).
+# Both are pure overhead for a guard that only compares DECISIONS, so we remove them without
+# touching enforcement: (a) memoize load_manifest so each manifest is parsed ONCE (manifests are
+# static config for the lifetime of this process, so the cache is behavior-identical — Python
+# resolves the module global at call time, so spawn_restrictions/validate_writes pick it up too);
+# (b) silence governance._audit for the sweep — the audit ROW is a side-effect the guard never
+# inspects, and suppressing it changes no allow/deny result. These are in-test monkeypatches only.
+governance.load_manifest = functools.lru_cache(maxsize=None)(governance.load_manifest)
+governance._audit = lambda *a, **k: None
+
+# Compute each layer's per-role inputs ONCE and reuse across that role's cases:
+#   * spawn_restrictions(role) (disallowed_tools/deny_read) is identical for all of a role's cases.
+#   * validate_writes(role,REPO,[path]) depends only on (role, path), NOT the write tool — so the
+#     four write tools share one result per path (the tool gate is applied separately in gov_decision).
+_spawn_restrictions = functools.lru_cache(maxsize=None)(governance.spawn_restrictions)
+
+
+@functools.lru_cache(maxsize=None)
+def _gov_write_denied(role, path):
+    return bool(governance.validate_writes(role, REPO, [os.path.join(REPO, path)]))
 
 # NotebookEdit is a first-class member of WRITE_TOOLS in BOTH layers (manifest_policy.WRITE_TOOLS
 # and enforce_manifest.WRITE_TOOLS), so the guard MUST exercise it or it cannot see a NotebookEdit
@@ -104,18 +132,18 @@ MUST_READ_SRC = {"qa-security", "product-manager", "security-appsec",
 
 
 def load(role):
-    return yaml.safe_load((ROLES / f"{role}.yaml").read_text()) or {}
+    # Share governance's memoized parse (same yaml.safe_load) so each manifest is read ONCE total.
+    return governance.load_manifest(role)
 
 
 # ---- each layer's EFFECTIVE allow/deny for a (role, tool, path) ------------------------------
 def gov_decision(role, tool, path):
     """Layer A effective decision, read from governance's PUBLIC surface only."""
-    sr = governance.spawn_restrictions(role)
+    sr = _spawn_restrictions(role)
     if tool in sr["disallowed_tools"]:
         return "deny"
     if tool in WRITE_TOOLS:
-        viol = governance.validate_writes(role, REPO, [os.path.join(REPO, path)])
-        return "deny" if viol else "allow"
+        return "deny" if _gov_write_denied(role, path) else "allow"
     if tool == READ_TOOL:
         return "deny" if any(mp._match(path, g) for g in sr["deny_read"]) else "allow"
     return "allow"

@@ -251,15 +251,16 @@ def spawn_restrictions(role: str) -> dict:
                          it may not spawn). Passed to `claude --disallowedTools` (deny beats allow).
       deny_read        : secret material (.env/secrets) when not can_read_secrets, PLUS denied_paths
                          — the read-side denies the enforce_manifest.py hook keys on.
-      write_scope      : allowed_paths — the WRITE allowlist. Enforced ONLY by the post-run
-                         validate_writes backstop (allowlist semantics, but flag-and-revert not a
-                         hard block: a path outside every glob is returned as
-                         reason="outside_allowed_paths" for the caller to revert). The PreToolUse
-                         hook does NOT enforce allowed_paths — enforce_manifest.py never reads it;
-                         it keys writes on denied_paths (a DENYLIST) plus the registry carve-out
-                         only, and its `tools` allowlist gates WHICH tool, not WHICH path. So
-                         allowed_paths has no deterministic pre-write enforcement layer; treat the
-                         post-run validator as its sole (best-effort) backstop.
+      write_scope      : allowed_paths — the WRITE allowlist. Since the hook unification the
+                         PreToolUse hook DOES enforce allowed_paths: enforce_manifest.evaluate()
+                         calls the canonical manifest_policy.write_decision(), where denied_paths
+                         always win first and then the positive allowed_paths scope decides — a
+                         path matching no allowed_paths glob is hard-denied pre-write (with
+                         ['**']/empty meaning "anywhere not denied"). So allowed_paths now has a
+                         deterministic pre-write enforcement layer. The post-run validate_writes
+                         backstop (also keyed on write_decision) is SECONDARY — its job is the
+                         Codex engine, which does not honor claude hooks, plus belt-and-suspenders
+                         flag-and-revert (reason="outside_allowed_paths") for the claude path.
     """
     m = load_manifest(role)
     _read_flags(m)   # genuinely READ every governance flag (the wiring guard keys on these reads)

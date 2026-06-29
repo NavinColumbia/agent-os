@@ -41,16 +41,23 @@ HEARTBEAT_S = int(os.environ.get("AOS_TASK_HEARTBEAT_S", "300"))
 PAUSE_DEFER_S = int(os.environ.get("AOS_PAUSE_DEFER_S", "600"))
 
 
-def _pull(limit):
+def _pull(limit, assignee=None):
     """Atomically claim up to `limit` runnable highest-priority tasks (concurrent-dispatcher-safe).
     Runnable = pending AND past its backoff (`not_before`). Stamps `locked_at` so a crashed dispatcher's
     task can be lease-reclaimed by tasksweep instead of being orphaned in 'active' forever. The holding
-    worker then refreshes locked_at on a heartbeat (see _Heartbeat) so only DEAD workers get reclaimed."""
+    worker then refreshes locked_at on a heartbeat (see _Heartbeat) so only DEAD workers get reclaimed.
+
+    `assignee` (default None=whole queue, i.e. production) optionally scopes the claim to ONE assignee.
+    selftest passes its throwaway test assignee so it exercises the real claim SQL against its OWN row
+    only — never claiming (and stranding in 'active') genuinely-pending production tasks, and staying
+    deterministic regardless of how many real pending rows sort ahead of it under ORDER BY priority,id."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT id, assignee, requester, title, priority,
+        cur.execute(f"""SELECT id, assignee, requester, title, priority,
                               COALESCE(attempts,0), COALESCE(max_retry,3)
                        FROM tasks WHERE status='pending' AND (not_before IS NULL OR not_before <= now())
-                       ORDER BY priority, id FOR UPDATE SKIP LOCKED LIMIT %s""", (limit,))
+                       {"AND assignee=%(ag)s" if assignee is not None else ""}
+                       ORDER BY priority, id FOR UPDATE SKIP LOCKED LIMIT %(lim)s""",
+                    {"ag": assignee, "lim": limit})
         rows = cur.fetchall()
         if rows:
             cur.execute("UPDATE tasks SET status='active', locked_at=now() WHERE id = ANY(%s)",
@@ -217,7 +224,10 @@ def _main(a):
                         "AND title LIKE 'selftest task %%'"); c.commit()
         try:
             orchestrate.enqueue(ag, f"selftest task {suf}", priority=5, requester=f"controller@{suf}")
-            claimed = _pull(5)
+            # scope the claim to our throwaway assignee: exercises the real _pull SELECT FOR UPDATE
+            # SKIP LOCKED + UPDATE->active path, but CANNOT claim (and strand) real production tasks,
+            # and is deterministic no matter how many real pending rows sort ahead under priority,id.
+            claimed = _pull(5, ag)
             got = [r for r in claimed if r[1] == ag]
             ok = len(got) == 1 and got[0][3].startswith("selftest task")
         finally:                                          # ALWAYS release our own row, even on error

@@ -63,18 +63,18 @@ lenses:
     role: { file: qa-security, keyword: security }
     guard: "security scan (invariants)"
 
-  # --- being promoted now (the product-craft class the user hit) ---
+  # --- the product-craft class the user hit — now enforced (standard + design-ux role + gating e2e guard) ---
   - id: product-craft-ux
-    status: building
+    status: enforced
     standard: docs/STANDARDS-product-quality.md
-    role: { file: reviewer, keyword: craft }
-    guard: null                                     # forms/a11y assertions being wired into console_e2e
+    role: { file: design-ux, keyword: craft }
+    guard: "console click-through (real browser)"   # console_e2e create-account-quality: confirm-pw + show/hide + autocomplete + labels (gates: exit 1 on fail)
 
   - id: accessibility
-    status: building
+    status: enforced
     standard: docs/STANDARDS-product-quality.md
-    role: { file: reviewer, keyword: accessib }
-    guard: null                                     # target: @axe-core/playwright in console_e2e (fails closed)
+    role: { file: design-ux, keyword: accessib }
+    guard: "console click-through (real browser)"   # console_e2e a11y: every visible input must have an accessible name
 
   # --- backlog: recognized, not yet in the pipeline (honest coverage gaps) ---
   - id: responsive-mobile

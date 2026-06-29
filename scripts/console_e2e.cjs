@@ -67,6 +67,43 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
       await p.waitForSelector('#signin', { state: 'visible', timeout: 8000 });
       if (shotDir) await p.screenshot({ path: `${shotDir}/console-00-signin.png` }).catch(() => {});
 
+      // STANDING product-quality assertions on the create-account screen. These are permanent
+      // guards: if a basic form/a11y affordance regresses the WHOLE suite fails. We check the
+      // create-account tab as freshly loaded (su_signup is the default-visible form, su_signin is
+      // display:none). Requirements asserted:
+      //   - a confirm-password field exists (#su_pw2, type=password)
+      //   - a show/hide-password toggle exists (a .pwtoggle button in the create-account form)
+      //   - password inputs carry the right autocomplete hints (new-password on create, the
+      //     sign-in password gets current-password) so password managers behave
+      //   - every VISIBLE input has an accessible name: <label for=…>, a wrapping <label>,
+      //     aria-label, or aria-labelledby (placeholder alone does NOT count)
+      //   - the first field of the form is autofocused (cursor lands ready to type)
+      current = 'create-account-quality';
+      const caq = await p.evaluate(() => {
+        const $ = s => document.querySelector(s);
+        const visible = el => !!el && getComputedStyle(el).display !== 'none' && el.offsetParent !== null;
+        const named = el => !!(el.getAttribute('aria-label') || el.getAttribute('aria-labelledby')
+          || el.closest('label') || (el.id && document.querySelector(`label[for="${el.id}"]`)));
+        const ac = (sel, want) => { const e = $(sel); return !!e && e.getAttribute('autocomplete') === want; };
+        const inputs = [...document.querySelectorAll('#signin input')].filter(visible);
+        const unlabeled = inputs.filter(i => !named(i)).map(i => i.id || i.outerHTML.slice(0, 60));
+        const first = inputs[0] || null;
+        return {
+          confirmPw: !!($('#su_pw2') && $('#su_pw2').type === 'password'),
+          toggle: document.querySelectorAll('#su_signup .pwtoggle, #su_signup button[aria-pressed]').length >= 1,
+          acCreatePw: ac('#su_pw', 'new-password'),
+          acConfirmPw: ac('#su_pw2', 'new-password'),
+          acSignInPw: ac('#si_pw', 'current-password'),
+          allLabeled: unlabeled.length === 0,
+          unlabeled,
+          autofocusFirst: !!(first && first.hasAttribute('autofocus')),
+          firstId: first && first.id,
+        };
+      });
+      const caqOk = caq.confirmPw && caq.toggle && caq.acCreatePw && caq.acConfirmPw
+        && caq.acSignInPw && caq.allLabeled && caq.autofocusFirst;
+      results.push({ screen: 'create-account-quality', ok: caqOk, detail: caq });
+
       // (1) IDLE-DWELL / no-disruption regression: go to the create-account tab, type a name, then
       //     SIT IDLE for 12s. The app must NOT bounce us to the sign-in tab, hide the create-account
       //     form, reveal the app shell, or wipe what we typed. This is a permanent regression test for
@@ -90,6 +127,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
       current = 'signup';
       await p.fill('#su_email', e2eEmail);   // real email+password account
       await p.fill('#su_pw', e2ePw);
+      await p.fill('#su_pw2', e2ePw);        // confirm-password must match or signUp() rejects
       await p.click('#su_signup button.pri');           // "Create account"
       // a NEW user should land in the app WITHOUT being shown-and-vanished a token (the bug we just fixed)
     }
@@ -120,6 +158,32 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     // no unexpected navigation: we settled on the cockpit and we're STILL on the cockpit after 8s idle.
     const stableOk = stab.cur === 'cockpit' && stab.title === t0 && stab.appVisible && !stab.signinVisible;
     results.push({ screen: 'cockpit-dwell', ok: stableOk, detail: { ...stab, expectedTitle: t0 } });
+
+    // LIGHT a11y guard on the signed-in app: every visible TEXT-ish input on the primary
+    // working screens must have an accessible name (label / aria-label / aria-labelledby). A
+    // placeholder is NOT a label — it vanishes on type and screen readers skip it. This is a
+    // STANDING assertion: a new placeholder-only input on any of these screens fails the suite.
+    current = 'app-a11y';
+    const a11yScreens = ['controller', 'chat', 'orgs', 'agentic', 'help', 'settings', 'build', 'agents'];
+    const a11yBad = [];
+    for (const s of a11yScreens) {
+      await p.evaluate(x => window.go(x), s);
+      await p.waitForFunction(() => {
+        const v = document.querySelector('#view');
+        return v && v.innerText.trim().length > 0 && !/^loading…?$/i.test(v.innerText.trim());
+      }, { timeout: 8000 }).catch(() => {});
+      const bad = await p.evaluate(() => {
+        const visible = el => getComputedStyle(el).display !== 'none' && el.offsetParent !== null;
+        const named = el => !!(el.getAttribute('aria-label') || el.getAttribute('aria-labelledby')
+          || el.closest('label') || (el.id && document.querySelector(`label[for="${el.id}"]`)));
+        const textish = i => ['text', 'email', 'password', 'search', 'url', 'tel', 'number', '']
+          .includes((i.getAttribute('type') || '').toLowerCase());
+        return [...document.querySelectorAll('#view input')]
+          .filter(i => textish(i) && visible(i) && !named(i)).map(i => i.id || 'anon');
+      });
+      if (bad.length) a11yBad.push({ screen: s, unlabeled: bad });
+    }
+    results.push({ screen: 'app-a11y', ok: a11yBad.length === 0, detail: { unlabeled: a11yBad } });
 
     for (const screen of SCREENS) {
       current = screen;

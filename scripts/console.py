@@ -300,30 +300,47 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
 .skel{background:linear-gradient(90deg,#171b24 25%,#1d222d 50%,#171b24 75%);background-size:200% 100%;animation:shim 1.4s infinite;border-radius:6px;height:14px;margin:8px 0}@keyframes shim{to{background-position:-200% 0}}
 .menu{position:absolute;right:20px;top:52px;background:var(--panel2);border:1px solid var(--line2);border-radius:12px;box-shadow:0 12px 36px -10px rgba(0,0,0,.6);padding:8px;min-width:240px;z-index:30}
 .menu a{display:block;padding:8px 10px;border-radius:8px;color:var(--tx2);text-decoration:none;cursor:pointer;font-size:13px}.menu a:hover{background:var(--hover);color:var(--tx)}
+.pwwrap{position:relative}.pwwrap input{padding-right:62px}
+.pwtoggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:transparent;border:none;color:var(--mut);font-size:12px;font-weight:600;padding:5px 8px;border-radius:7px;cursor:pointer}
+.pwtoggle:hover{background:var(--hover);border:none;color:var(--tx2)}
+.pwhint{margin-top:8px;font-size:12px;min-height:0}.pwbar{height:5px;border-radius:3px;background:var(--line2);overflow:hidden;margin-bottom:6px}
+.pwbar span{display:block;height:100%;width:0;border-radius:3px;transition:width .2s,background .2s}.pwbar span.bad{background:var(--r)}.pwbar span.warn{background:var(--y)}.pwbar span.ok{background:var(--g)}
+.pwreq{display:flex;justify-content:space-between;align-items:center;color:var(--mut)}.pwreq .met{color:var(--gtext)}.pwlvl{font-weight:600}
+.note{font-size:12.5px}.note.err{color:var(--rtext)}
+.linkbtn{background:none;border:none;padding:2px 0;color:var(--atext);font-size:inherit;font-weight:550;cursor:pointer;border-radius:4px}.linkbtn:hover{background:none;border:none;text-decoration:underline}
+input[aria-invalid=true]{border-color:var(--r);box-shadow:0 0 0 3px var(--rsoft)}
+.spin{width:13px;height:13px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;display:inline-block;animation:sp .6s linear infinite;vertical-align:-2px}@keyframes sp{to{transform:rotate(360deg)}}
+button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
 </style></head><body>
 <div id=splash style="display:none;position:fixed;inset:0;align-items:center;justify-content:center;flex-direction:column;gap:14px;background:var(--bg);z-index:50;color:var(--mut)">
   <div class=brand style="font-size:22px"><span class=mk>⬡</span> agent-os</div><div style="font-size:13px">Reconnecting…</div></div>
 <div id=signin style="display:none;max-width:440px;margin:11vh auto;padding:0 18px">
   <div class=card><div class=brand style="padding-bottom:6px;font-size:20px"><span class=mk>⬡</span> agent-os</div>
   <p class=muted style="margin:0 0 18px">Be the CEO of a company of AI agents that build &amp; ship your software.</p>
-  <div id=su_signup>
+  <form id=su_signup onsubmit="signUp();return false" novalidate>
     <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Create your account</h2>
     <p class=muted style="margin:0 0 10px">Free to start — no card needed. You'll create your companies (orgs) once you're in.</p>
-    <label>Your name</label><input id=su_name placeholder="Jane Doe">
-    <label>Email</label><input id=su_email type=email placeholder="you@example.com">
-    <label>Password</label><input id=su_pw type=password placeholder="at least 8 characters" onkeydown="if(event.key==='Enter')signUp()">
-    <div style="margin-top:14px"><button class=pri onclick=signUp() style=width:100%>Create account</button></div>
-    <div id=su_note class=muted style="margin-top:10px"></div>
-    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">Already have an account? <a onclick="suTab('in')" style="cursor:pointer;color:var(--atext)">Sign in</a></p>
-  </div>
-  <div id=su_signin style=display:none>
+    <label for=su_name>Your name</label><input id=su_name autocomplete=name autofocus placeholder="Jane Doe">
+    <label for=su_email>Email</label><input id=su_email type=email autocomplete=email placeholder="you@example.com" onblur="vEmail('su')" aria-describedby=su_note>
+    <label for=su_pw>Password</label>
+    <div class=pwwrap><input id=su_pw type=password autocomplete=new-password placeholder="at least 8 characters" oninput="pwStrength()" onblur="vPw()" aria-describedby="su_pwhint su_note"><button type=button class=pwtoggle aria-label="Show password" aria-pressed=false onclick="pwToggle('su_pw',this)">Show</button></div>
+    <div id=su_pwhint class=pwhint aria-live=polite></div>
+    <label for=su_pw2>Confirm password</label>
+    <div class=pwwrap><input id=su_pw2 type=password autocomplete=new-password placeholder="re-enter your password" onblur="vPw2()" aria-describedby=su_note><button type=button class=pwtoggle aria-label="Show password" aria-pressed=false onclick="pwToggle('su_pw2',this)">Show</button></div>
+    <div style="margin-top:14px"><button type=submit id=su_btn class=pri style=width:100%>Create account</button></div>
+    <div id=su_note class="note muted" role=alert aria-live=polite style="margin-top:10px"></div>
+    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">Already have an account? <button type=button class=linkbtn onclick="suTab('in')">Sign in</button></p>
+  </form>
+  <form id=su_signin style=display:none onsubmit="signIn();return false" novalidate>
     <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Sign in</h2>
-    <label>Email</label><input id=si_email type=email placeholder="you@example.com">
-    <label>Password</label><input id=si_pw type=password placeholder="your password" onkeydown="if(event.key==='Enter')signIn()">
-    <div style="margin-top:14px"><button class=pri onclick=signIn() style=width:100%>Sign in</button></div>
-    <div id=si_note class=muted style="margin-top:10px"></div>
-    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px"><a onclick="suTab('up')" style="cursor:pointer;color:var(--atext)">← Create an account</a></p>
-  </div></div>
+    <label for=si_email>Email</label><input id=si_email type=email autocomplete=email placeholder="you@example.com" onblur="vEmail('si')" aria-describedby=si_note>
+    <label for=si_pw>Password</label>
+    <div class=pwwrap><input id=si_pw type=password autocomplete=current-password placeholder="your password" aria-describedby=si_note><button type=button class=pwtoggle aria-label="Show password" aria-pressed=false onclick="pwToggle('si_pw',this)">Show</button></div>
+    <div style="margin-top:6px"><button type=button class=linkbtn onclick=forgotPw()>Forgot password?</button></div>
+    <div style="margin-top:14px"><button type=submit id=si_btn class=pri style=width:100%>Sign in</button></div>
+    <div id=si_note class="note muted" role=alert aria-live=polite style="margin-top:10px"></div>
+    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px"><button type=button class=linkbtn onclick="suTab('up')">← Create an account</button></p>
+  </form></div>
 </div>
 <div class=app id=app style="display:none">
 <div class=side><div class=brand><span class=mk>⬡</span> agent-os</div><div class=nav id=nav style=flex:1></div>
@@ -358,26 +375,52 @@ async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];
   const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=cur?cur.name:(ORGS.length?'pick an org':'no orgs');}catch(e){}}
 function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);loadOrgs();go('controller');}
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
-function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none'}
+function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none';if(!on){const up=($('#su_signup')||{}).style&&$('#su_signup').style.display!=='none';const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}}
 function resetSession(){localStorage.removeItem('aos_org');localStorage.removeItem('aos_email');ORG=0;ORGS=[];THREAD=null;CUR='cockpit'}
-function suTab(t){$('#su_signup').style.display=t==='up'?'block':'none';$('#su_signin').style.display=t==='in'?'block':'none'}
+function suTab(t){const up=t==='up';$('#su_signup').style.display=up?'block':'none';$('#su_signin').style.display=up?'none':'block';setNote(up?'su':'si','');const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}
+function emailOK(e){return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)}
+function aInv(id,on){const el=$('#'+id);if(el)el.setAttribute('aria-invalid',on?'true':'false')}
+function setNote(p,msg,kind){const n=$('#'+p+'_note');if(!n)return;n.textContent=msg||'';const err=kind==='err';n.classList.toggle('err',err);n.classList.toggle('muted',!err)}
+function pwToggle(id,btn){const el=$('#'+id);if(!el)return;const pos=el.selectionStart;const show=el.type==='password';el.type=show?'text':'password';btn.setAttribute('aria-pressed',show?'true':'false');btn.setAttribute('aria-label',show?'Hide password':'Show password');btn.textContent=show?'Hide':'Show';try{el.focus();el.setSelectionRange(pos,pos)}catch(_){}}
+function pwStrength(){const el=$('#su_pw');const hint=$('#su_pwhint');if(!el||!hint)return;const pw=el.value||'';const ok8=pw.length>=8;let s=0;if(ok8)s++;if(pw.length>=12)s++;if(/[0-9]/.test(pw))s++;if(/[^A-Za-z0-9]/.test(pw))s++;const lvl=pw.length===0?0:(s<=1?1:(s<=2?2:3));const L={1:'Weak',2:'Fair',3:'Strong'},C={1:'bad',2:'warn',3:'ok'};hint.innerHTML='<div class=pwbar><span class="'+(C[lvl]||'')+'" style="width:'+(lvl*33.4)+'%"></span></div><div class=pwreq><span class="'+(ok8?'met':'')+'">'+(ok8?'✓':'•')+' At least 8 characters</span>'+(lvl?'<span class=pwlvl>'+L[lvl]+' password</span>':'')+'</div>'}
+function vEmail(p){const v=($('#'+p+'_email').value||'').trim();if(v&&!emailOK(v)){aInv(p+'_email',true);setNote(p,'That email doesn\'t look right — check for a typo.','err');return false}aInv(p+'_email',false);if(($('#'+p+'_note')||{}).classList&&$('#'+p+'_note').classList.contains('err'))setNote(p,'');return true}
+function vPw(){const v=$('#su_pw').value||'';if(v&&v.length<8){aInv('su_pw',true);setNote('su','Password must be at least 8 characters.','err');return false}aInv('su_pw',false);if($('#su_note').classList.contains('err'))setNote('su','');return true}
+function vPw2(){const a=$('#su_pw').value||'',b=$('#su_pw2').value||'';if(b&&a!==b){aInv('su_pw2',true);setNote('su','Passwords don\'t match.','err');return false}aInv('su_pw2',false);if($('#su_note').classList.contains('err'))setNote('su','');return true}
+function forgotPw(){setNote('si','Password reset isn\'t available yet — email support@agent-os.dev and we\'ll get you back in.');aInv('si_email',false);}
+function pend(btn,label){if(!btn)return ()=>{};const html=btn.innerHTML;btn.disabled=true;btn.innerHTML='<span class=spin></span>'+label;return ()=>{btn.disabled=false;btn.innerHTML=html}}
+function humanError(raw,ctx){const s=String(raw||'').toLowerCase();
+ if(s.includes('already exists')||s.includes('already regist'))return 'This email is already registered — sign in instead.';
+ if(s.includes('wrong password')||s.includes('no account'))return 'That email or password doesn\'t match. Check both and try again.';
+ if(s.includes('valid email'))return 'That email doesn\'t look right — check for a typo.';
+ if(s.includes('8 characters'))return 'Password must be at least 8 characters.';
+ return ctx==='signup'?'We couldn\'t create your account — please try again.':'We couldn\'t sign you in — please try again.';}
 async function signUp(){
- const note=$('#su_note');const email=($('#su_email').value||'').trim();const pw=$('#su_pw').value||'';const name=($('#su_name').value||'').trim();
- if(!email){note.textContent='Enter your email';return} if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){note.textContent='Enter a valid email';return} if(pw.length<8){note.textContent='Password must be at least 8 characters';return}
+ const email=($('#su_email').value||'').trim();const pw=$('#su_pw').value||'';const pw2=$('#su_pw2').value||'';const name=($('#su_name').value||'').trim();const btn=$('#su_btn');
+ if(!email){aInv('su_email',true);setNote('su','Enter your email.','err');$('#su_email').focus();return}
+ if(!emailOK(email)){aInv('su_email',true);setNote('su','That email doesn\'t look right — check for a typo.','err');$('#su_email').focus();return}
+ if(pw.length<8){aInv('su_pw',true);setNote('su','Password must be at least 8 characters.','err');$('#su_pw').focus();return}
+ if(pw!==pw2){aInv('su_pw2',true);setNote('su','Passwords don\'t match.','err');$('#su_pw2').focus();return}
+ aInv('su_email',false);aInv('su_pw',false);aInv('su_pw2',false);
  resetSession();
- note.textContent='Creating your account…';
- let r;try{r=await (await fetch('/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,email,password:pw})})).json()}catch(e){note.textContent='Could not reach the server — is the console running?';return}
- if(r.error){note.textContent='✗ '+r.error;return}
+ const restore=pend(btn,'Creating your account…');setNote('su','Creating your account…');
+ let r;try{r=await (await fetch('/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,email,password:pw})})).json()}
+ catch(e){restore();setNote('su','Couldn\'t reach the server — is the console running?','err');return}
+ if(r.error){restore();if(/already/.test(r.error)){aInv('su_email',true);$('#su_email').focus()}setNote('su',humanError(r.error,'signup'),'err');return}
+ restore();setNote('su','');  // re-enable the button & clear the note so a later sign-out→sign-in isn't stuck disabled
  TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||email);
  showApp(true);boot();
 }
 async function signIn(){
- const note=$('#si_note');const email=($('#si_email').value||'').trim();const pw=$('#si_pw').value||'';
- if(!email||!pw){note.textContent='Enter your email and password';return}
+ const email=($('#si_email').value||'').trim();const pw=$('#si_pw').value||'';const btn=$('#si_btn');
+ if(!email){aInv('si_email',true);setNote('si','Enter your email.','err');$('#si_email').focus();return}
+ if(!pw){aInv('si_pw',true);setNote('si','Enter your password.','err');$('#si_pw').focus();return}
+ aInv('si_email',false);aInv('si_pw',false);
  resetSession();
- note.textContent='Signing in…';
- let r;try{r=await (await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})})).json()}catch(e){note.textContent='Could not reach the server';return}
- if(r.error){note.textContent='✗ '+r.error;return}
+ const restore=pend(btn,'Signing in…');setNote('si','Signing in…');
+ let r;try{r=await (await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})})).json()}
+ catch(e){restore();setNote('si','Couldn\'t reach the server — is the console running?','err');return}
+ if(r.error){restore();setNote('si',humanError(r.error,'signin'),'err');return}
+ restore();setNote('si','');  // re-enable the button & clear the note so a later sign-out→sign-in isn't stuck disabled
  TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||email);
  showApp(true);boot();
 }
@@ -436,13 +479,13 @@ const VIEWS={
   const rawPhase=d.phase||'DISCOVER';const phase=rawPhase.charAt(0)+rawPhase.slice(1).toLowerCase();const gate=d.awaiting?(' · waiting on '+esc(GATE[d.awaiting]||d.awaiting)):'';
   $('#view').innerHTML=`<h1>Controller</h1><p class=sub>Tell your controller what to build. It researches, brings options, designs, and ships — asking you at each step. <b>${esc(phase)}</b>${gate}</p>
    <div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>
-   <div class=card><div class=row><input id=cmsg placeholder="e.g. build a competitor to YouTube" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
+   <div class=card><div class=row><input id=cmsg aria-label="Describe what to build" placeholder="e.g. build a competitor to YouTube" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
   ctlRender(d.messages||[]);
   if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(!TOK||CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}if(CTLBUSY)return;try{const s=await get('/api/controller/state?org='+ORG);ctlRender(s.messages||[])}catch(e){}},5000);
  },
  orgs:async()=>{const d=await get('/api/orgs');ORGS=d.orgs||[];
   let h='<h1>My orgs</h1><p class=sub>Each org is its own company — its own controller, research, design, build and budget. You can run as many as you like.</p>';
-  h+='<div class=card><h2>Create an org</h2><div class=row><input id=onm placeholder="YouTube competitor"><input id=ovis placeholder="one-line vision (optional)"><button class=pri onclick=orgNew()>Create</button></div><div id=onote class=muted style=margin-top:8px></div></div>';
+  h+='<div class=card><h2>Create an org</h2><div class=row><input id=onm aria-label="Org name" placeholder="YouTube competitor"><input id=ovis aria-label="Org vision (optional)" placeholder="one-line vision (optional)"><button class=pri onclick=orgNew()>Create</button></div><div id=onote class=muted style=margin-top:8px></div></div>';
   h+='<div class=grid>'+(ORGS.length?ORGS.map(o=>`<div class=tile><div class="row spread"><b>${esc(o.name)}</b>${o.org_id==ORG?pill('active','ok'):''}</div><div class=muted style=margin:6px_0>${esc(o.vision||'—')} · ${esc(o.stage)} · ${o.products} product(s)</div><button class=pri onclick="switchOrg(${o.org_id})">Open</button></div>`).join(''):emptyB('🏢','No orgs yet','Create your first organization above.'))+'</div>';
   $('#view').innerHTML=h;},
  portfolio:async()=>{let p={},a={},f={};try{p=await get('/api/portfolio')}catch(e){}try{a=await get('/api/portfolio/analytics')}catch(e){}try{f=await get('/api/portfolio/failures')}catch(e){}
@@ -453,7 +496,7 @@ const VIEWS={
   $('#view').innerHTML=h;},
  agentic:async()=>{const d=await get('/api/agentfeatures');
   let h='<h1>Agentic features</h1><p class=sub>Embed your AI fleet INTO your product — a button or endpoint your users/staff trigger that runs an agent. We build these into your app (you host it); we don\'t run them for you. Tell your Controller which you want during design.</p>';
-  h+=`<div class=card><h2>Recommend an invocation pattern</h2><p class=muted style=margin:0_0_10px>Describe what you need; I'll suggest how to invoke an agent (event, schedule, button, or endpoint) and the closest catalog features.</p><div class=row><input id=recneed placeholder="e.g. process uploads when a user submits" onkeydown="if(event.key==='Enter')recAgentic()"><button class=pri id=recbtn onclick=recAgentic()>Recommend</button></div><div id=recout style=margin-top:10px></div></div>`;
+  h+=`<div class=card><h2>Recommend an invocation pattern</h2><p class=muted style=margin:0_0_10px>Describe what you need; I'll suggest how to invoke an agent (event, schedule, button, or endpoint) and the closest catalog features.</p><div class=row><input id=recneed aria-label="Describe what you need" placeholder="e.g. process uploads when a user submits" onkeydown="if(event.key==='Enter')recAgentic()"><button class=pri id=recbtn onclick=recAgentic()>Recommend</button></div><div id=recout style=margin-top:10px></div></div>`;
   h+='<div class=grid>'+(d.features||[]).map(f=>`<div class=tile><div class="row spread"><b>${esc(f.name)}</b>${pill(f.audience,f.audience=='external'?'accent':'')}</div><div class=muted style=margin:6px_0>${esc(f.blurb)}</div><div class=muted>${pill('trigger: '+(f.trigger||f.surface),f.trigger=='event'?'warn':'')} ${esc(f.surface)} · ${esc(f.category)}</div></div>`).join('')+'</div>';
   $('#view').innerHTML=h;},
  design:async()=>{if(!ORG){$('#view').innerHTML='<div class=card>Pick an org first.</div>';return}const d=await get('/api/design?org='+ORG);
@@ -466,7 +509,7 @@ const VIEWS={
   $('#view').innerHTML=`<h1>Direct your fleet</h1><p class=sub>Describe what you want in plain words. I'll ask questions, then build it — you approve.</p>
    <div class=chips>`+CHIPS.map(c=>`<span class=chip-s onclick="chipFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div>
    <div class=card id=chatlog style="max-height:52vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>
-   <div class=card><div class=row><input id=msg placeholder="e.g. I want an app to track my gym members…" onkeydown="if(event.key==='Enter')chatSend()"><button class=pri id=chatsend onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
+   <div class=card><div class=row><input id=msg aria-label="Describe your app idea" placeholder="e.g. I want an app to track my gym members…" onkeydown="if(event.key==='Enter')chatSend()"><button class=pri id=chatsend onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
   await chatRender();
  },
  cockpit:async()=>{const d=await get('/api/cockpit?org='+ORG);const s=d.summary||{},b=d.budget||{};d.products=d.products||[];d.communications=d.communications||[];d.queue=d.queue||{};
@@ -493,11 +536,11 @@ const VIEWS={
   h+=`<div class=card><h2>Work queue</h2>${kpis([['pending',d.queue.pending],['active',d.queue.active],['dead',d.queue.dead]])}</div></div>`;
   $('#view').innerHTML=h;},
  build:async()=>{$('#view').innerHTML=`<h1>New build</h1><p class=sub>Describe a product; the governed factory builds, tests and ships it.</p>
-  <div class=card><label>Name</label><input id=bn placeholder=splitbill><label>Type</label><select id=bk onchange=showEst()><option value=lib>Python library</option><option value=web>Web app</option><option value=service>API service</option></select><label>What should it do?</label><textarea id=bc placeholder="Describe the API, behaviours, edge cases…"></textarea><div id=est class=muted style=margin-top:8px></div><div style=margin-top:10px><button class=pri onclick=doBuild()>Build it</button></div><div id=bnote class=muted style=margin-top:8px></div></div>`;showEst();},
+  <div class=card><label>Name</label><input id=bn aria-label="Project name" placeholder=splitbill><label>Type</label><select id=bk onchange=showEst()><option value=lib>Python library</option><option value=web>Web app</option><option value=service>API service</option></select><label>What should it do?</label><textarea id=bc placeholder="Describe the API, behaviours, edge cases…"></textarea><div id=est class=muted style=margin-top:8px></div><div style=margin-top:10px><button class=pri onclick=doBuild()>Build it</button></div><div id=bnote class=muted style=margin-top:8px></div></div>`;showEst();},
  agents:async()=>{const d=await get('/api/agents');d.agents=d.agents||[];const roles=(d.roles||['research-growth']);
   let h='<h1>Your agents</h1><p class=sub>It\'s a factory — hire standing agents that work on a schedule and report back to you. E.g. a weekly market-watch.</p>';
   h+='<div class=card><h2>Your standing agents</h2>'+(d.agents.length?d.agents.map(a=>`<div class=item><div class="row spread"><span><b>${esc(a.name)}</b> ${pill(a.role)} ${pill(a.trigger==='recurring'?('every '+Math.round((a.interval_s||0)/86400)+'d'):'manual',a.trigger==='recurring'?'accent':'')} ${a.enabled?pill('on','ok'):pill('off')}</span><span><button onclick="agentRun(${a.id})">run now</button> <button onclick="agentToggle(${a.id},${a.enabled?'false':'true'})">${a.enabled?'pause':'enable'}</button> <button class=danger onclick="agentDel(${a.id})">delete</button></span></div><div class=muted>last run: ${a.last_run?esc(a.last_run):'never'} ${a.last_status?('· '+esc(a.last_status)):''}</div></div>`).join(''):emptyB('🤖','No agents yet','Create a standing agent below — it runs on a schedule and reports into your feed.'))+'</div>';
-  h+='<div class=card><h2>Create an agent</h2><label>Name</label><input id=an placeholder="Market Watch"><div class=grid><div><label>Specialty</label><select id=ar>'+roles.map(r=>`<option value="${r}">${r}</option>`).join('')+'</select></div><div><label>Runs</label><select id=at><option value=manual>On demand</option><option value=recurring>Every week</option></select></div></div><label>What should it do?</label><textarea id=ai placeholder="Every week, scan my market for new competitors and pricing changes; give me 3 prioritized takeaways with sources."></textarea><div style=margin-top:10px><button class=pri onclick=agentCreate()>Create agent</button></div><div id=anote class=muted style=margin-top:8px></div></div>';
+  h+='<div class=card><h2>Create an agent</h2><label>Name</label><input id=an aria-label="Agent name" placeholder="Market Watch"><div class=grid><div><label>Specialty</label><select id=ar>'+roles.map(r=>`<option value="${r}">${r}</option>`).join('')+'</select></div><div><label>Runs</label><select id=at><option value=manual>On demand</option><option value=recurring>Every week</option></select></div></div><label>What should it do?</label><textarea id=ai placeholder="Every week, scan my market for new competitors and pricing changes; give me 3 prioritized takeaways with sources."></textarea><div style=margin-top:10px><button class=pri onclick=agentCreate()>Create agent</button></div><div id=anote class=muted style=margin-top:8px></div></div>';
   $('#view').innerHTML=h;},
  templates:async()=>{const d=await get('/api/templates');$('#view').innerHTML=`<h1>Templates</h1><p class=sub>Start from a curated, factory-ready blueprint.</p><div class=grid>`+(d.templates||[]).map(t=>`<div class=tile><div class="row spread"><b>${esc(t.name)}</b>${pill(t.kind)}</div><div class=muted style=margin:6px_0>${esc(t.blurb)}</div><button class=pri onclick="buildTpl('${t.slug}')">Build this</button></div>`).join('')+'</div>';},
  projects:async()=>{const d=await get('/api/projects?org='+ORG);d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):emptyB('▤','No projects yet','Describe your first product and the factory builds, tests and ships it.','<button class=pri onclick="go(\'chat\')">Start your first build</button>'))+'</div>';},
@@ -531,12 +574,12 @@ const VIEWS={
  settings:async()=>{const d=await get('/api/settings');const c=d.ai_consent||{};const pr=d.profile||{};$('#view').innerHTML=`<h1>Settings</h1><p class=sub>Profile, AI consent, keys, notifications.</p>
   <div class=card><h2>Profile</h2><div class=row>plan <b>${esc(pr.plan||'—')}</b> ${pr.suspended?pill('suspended','bad'):pill('active','ok')}</div></div>
   <div class=card><h2>AI consent</h2><div class=row>${c.accepted?pill('accepted','ok'):pill('not accepted','bad')} <span class=muted>${esc(c.provider||'')} ${esc(c.version||'')}</span></div><div style=margin-top:8px>${c.accepted?'<button onclick="setConsent(false)">revoke</button>':'<button class=pri onclick="setConsent(true)">accept</button>'}</div></div>
-  <div class=card><h2>BYO API key</h2><div class=row>${d.byo_key_set?pill('key on file','ok'):pill('no key','warn')}</div><div style=margin-top:8px><input id=bk placeholder="sk-… (stored encrypted)"><button class=pri style=margin-top:6px onclick=saveKey()>save key</button></div><div id=bknote class=muted style=margin-top:8px></div></div>
+  <div class=card><h2>BYO API key</h2><div class=row>${d.byo_key_set?pill('key on file','ok'):pill('no key','warn')}</div><div style=margin-top:8px><input id=bk aria-label="API key" placeholder="sk-… (stored encrypted)"><button class=pri style=margin-top:6px onclick=saveKey()>save key</button></div><div id=bknote class=muted style=margin-top:8px></div></div>
   <div class=card><h2>Notification preferences</h2><table><tr><th>category</th><th>in-app</th><th>email</th><th>push</th></tr>`+(d.notification_prefs||[]).map(p=>`<tr><td>${esc(p.category)}</td><td><input type=checkbox ${p.in_app?'checked':''} onchange="pref('${p.category}',this.checked,null,null)"></td><td><input type=checkbox ${p.email?'checked':''} onchange="pref('${p.category}',null,this.checked,null)"></td><td><input type=checkbox ${p.push?'checked':''} onchange="pref('${p.category}',null,null,this.checked)"></td></tr>`).join('')+`</table></div>
   <div class=card><h2>Your data</h2><div class=row><button onclick=acctExport()>Export my data</button><button onclick=acctDelete() style="border-color:var(--r);color:var(--r)">Delete my account</button></div><div id=acctnote class=muted style=margin-top:8px></div></div>`;PREFS=d.notification_prefs;},
  providers:async()=>{const d=await get('/api/providers');$('#view').innerHTML='<h1>Model providers</h1><p class=sub>Run on Claude, on Codex, or both — you only need one. Use your subscription login (no per-token billing) OR bring an API key.</p><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill(p.auth_mode==='subscription'?'subscription login':'api key','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)} · runs on <b>${esc(p.engine)}</b></div>${p.connected?`<button onclick="provRemove('${p.slug}')">disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Use subscription login</button><button onclick="provAdd('${p.slug}','${esc(p.key_hint)}')">Use API key</button></div>`}</div>`).join('')+'</div><p class=muted>The build uses your highest-priority connected provider. Subscription login uses the Claude/ChatGPT account signed in on this machine; no key → platform default.</p>';},
  help:async()=>{const d=await get('/api/help/topics');$('#view').innerHTML=`<h1>Help</h1><p class=sub>Ask me anything about using agent-os.</p>
-  <div class=card><div class=row><input id=hq placeholder="e.g. how do I add my Codex key?" onkeydown="if(event.key==='Enter')helpAsk()"><button class=pri onclick=helpAsk()>Ask</button></div><div id=hans style=margin-top:10px></div></div>
+  <div class=card><div class=row><input id=hq aria-label="Ask a help question" placeholder="e.g. how do I add my Codex key?" onkeydown="if(event.key==='Enter')helpAsk()"><button class=pri onclick=helpAsk()>Ask</button></div><div id=hans style=margin-top:10px></div></div>
   <div class=card><h2>Topics</h2>`+(d.topics||[]).map(t=>`<div class=item><b>${esc(t.area||t.key||'')}</b> <span class=muted>${esc(t.desc||t.description||'')}</span></div>`).join('')+'</div>';},
  status:async()=>{const d=await get('/api/status');const m={operational:'ok',degraded:'warn',major_outage:'bad',unknown:''}[d.verdict];$('#view').innerHTML='<h1>Status</h1><p class=sub>Live platform health.</p><div class=card><div class=row>'+pill(d.verdict,m)+'</div></div><div class=card><h2>Services</h2>'+Object.entries(d.components||{}).map(([k,v])=>{const up=v===true||v=='ok'||v=='up';return `<div class="row spread item"><span>${esc(k)}</span>${pill(up?'Operational':'Down',up?'ok':'bad')}</div>`}).join('')+`<div class="row spread item"><span>dead-letter depth</span>${pill(d.dead_letter_depth,d.dead_letter_depth?'bad':'ok')}</div></div>`;},
 };

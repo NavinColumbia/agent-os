@@ -498,6 +498,15 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
 input[aria-invalid=true]{border-color:var(--r);box-shadow:0 0 0 3px var(--rsoft)}
 .spin{width:13px;height:13px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;display:inline-block;animation:sp .6s linear infinite;vertical-align:-2px}@keyframes sp{to{transform:rotate(360deg)}}
 button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
+.menubtn{display:none}.navscrim{display:none}
+@media(max-width:700px){
+ .menubtn{display:inline-flex}
+ .side{position:fixed;left:0;top:0;width:248px;height:100vh;z-index:60;transform:translateX(-100%);transition:transform .2s ease;box-shadow:0 0 50px rgba(0,0,0,.6)}
+ .side .lbl,.side .nsec{display:block}.side .brand{font-size:15px;justify-content:flex-start;padding:4px 10px 14px}.side .brand .mk{font-size:15px}
+ .app.navopen .side{transform:none}
+ .navscrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:55}.app.navopen .navscrim{display:block}
+ .main{padding:18px 14px}.topbar{padding:0 10px}
+}
 </style></head><body>
 <div id=splash style="display:none;position:fixed;inset:0;align-items:center;justify-content:center;flex-direction:column;gap:14px;background:var(--bg);z-index:50;color:var(--mut)">
   <div class=brand style="font-size:22px"><span class=mk>⬡</span> agent-os</div><div style="font-size:13px">Reconnecting…</div></div>
@@ -540,11 +549,12 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
   </form></div>
 </div>
 <div class=app id=app style="display:none">
+<div class=navscrim onclick="toggleNav(false)"></div>
 <div class=side><div class=brand><span class=mk>⬡</span> agent-os</div><div class=nav id=nav style=flex:1></div>
   <a class=nav-foot id=statusfoot onclick="go('status')" style="display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;color:var(--tx2);cursor:pointer;font-size:13px;border-top:1px solid var(--line);margin-top:8px"><span class="dot ok" id=statusdot></span><span class=lbl>Status</span></a>
 </div>
 <div class=colmain>
-  <div class=topbar><span class=title id=tbtitle>Cockpit</span>
+  <div class=topbar><button class="tbtn menubtn" aria-label="Open menu" onclick="toggleNav()">☰</button><span class=title id=tbtitle>Cockpit</span>
     <span class=orgsw>
       <span class=chip id=orgchip onclick="toggleOrgSw()" title="Switch company" aria-haspopup=listbox aria-expanded=false style=cursor:pointer><span id=orgname>—</span> ▾</span>
       <div class=menu id=orgmenu role=listbox aria-label="Companies" style=display:none>
@@ -557,7 +567,7 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
     <span class=chip id=spendchip onclick="go('billing')"><span class="dot ok" id=spenddot></span><span id=spendtxt>—</span></span>
     <button class=tbtn onclick="go('notifications')" title=Notifications>◔<span class=nb id=bellbadge style=display:none></span></button>
     <button class=tbtn onclick="go('help')" title=Help>?</button>
-    <button class=tbtn onclick="toggleAcct()" title=Account>☰</button>
+    <button class=tbtn onclick="toggleAcct()" title=Account>⋯</button>
     <div class=menu id=acctmenu style=display:none><a onclick="go('settings')">Settings</a><a onclick="go('team')">Org chart</a><a onclick="go('billing')">Billing &amp; plan</a><a onclick="go('settings')">AI consent &amp; data</a><a onclick="go('status')">Status</a><a onclick=signOut()>Sign out</a></div>
   </div>
   <div class=main><div id=view></div></div>
@@ -675,6 +685,7 @@ async function signIn(){
 }
 function signOut(msg){localStorage.removeItem('aos_tenant');TOK='';clearTimers();resetSession();suTab('in');showApp(false);const n=$('#si_note');if(n)n.textContent=msg||''}
 function toggleAcct(){const m=$('#acctmenu');m.style.display=m.style.display==='none'?'block':'none'}
+function toggleNav(force){const a=$('#app');if(!a)return;const open=force!==undefined?force:!a.classList.contains('navopen');a.classList.toggle('navopen',open)}   // mobile: slide the sidebar in/out as a drawer
 async function get(p){
  if(!TOK){const e=new Error('Your session expired — sign in again with your email and password.');e.kind='auth';throw e}
  let r;try{r=await fetch(p,{headers:H()})}catch(_){const e=new Error('Can\'t reach the server — is the console running?');e.kind='net';throw e}
@@ -694,7 +705,13 @@ function errCard(k,msg){return `<div class=card><h2>Something went wrong</h2><p 
 function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function pill(txt,cls){return `<span class="pill ${cls||''}">${esc(txt)}</span>`}
 function emptyB(ic,t,m,cta){return '<div class=empty><div class=ic>'+ic+'</div><h3>'+esc(t)+'</h3><p>'+esc(m)+'</p>'+(cta||'')+'</div>'}
-function renderNav(){$('#nav').innerHTML=NAV.map(([sec,items])=>`<div class=nsec>${sec}</div>`+items.map(([k,l,ic])=>`<a class="${k==CUR?'on':''}" onclick="go('${k}')"><span class=ico>${ic}</span><span class=lbl>${l}</span>${BADGES[k]?`<span class=b>${BADGES[k]}</span>`:''}</a>`).join('')).join('')}
+const NAV_ESSENTIALS=['controller','orgs'];   // PROGRESSIVE NAV: a 0-company user sees only Assistant + create-company
+function renderNav(){const lean=!ORGS.length;   // reveal the full 13-item nav only once a company exists
+ $('#nav').innerHTML=NAV.map(([sec,items])=>{
+   const vis=lean?items.filter(([k])=>NAV_ESSENTIALS.includes(k)):items;
+   if(!vis.length)return '';   // drop section headers that have nothing under them in the lean state
+   return `<div class=nsec>${sec}</div>`+vis.map(([k,l,ic])=>`<a class="${k==CUR?'on':''}" onclick="go('${k}')"><span class=ico>${ic}</span><span class=lbl>${l}</span>${BADGES[k]?`<span class=b>${BADGES[k]}</span>`:''}</a>`).join('');
+ }).join('')}
 function clearTimers(){for(const k of ['CTLPOLL','CTLTICK','CHATPOLL','TOPBARPOLL','AUTOPOLL']){if(window[k]){clearInterval(window[k]);window[k]=null}}}
 async function refreshTopbar(){
  if(!TOK)return;
@@ -708,7 +725,7 @@ async function refreshTopbar(){
  try{const s=await get('/api/status');$('#statusdot').className='dot '+({operational:'ok',degraded:'warn',major_outage:'bad'}[s.verdict]||'ok')}catch(e){}
  loadProviders();   // keep PROVIDER_OK fresh so the Assistant connect-banner reflects the latest provider state
 }
-async function go(k){CUR=k;renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
+async function go(k){CUR=k;renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';toggleNav(false);$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
  try{await VIEWS[k]()}catch(e){if(e.kind==='auth'){if(TOK)signOut();return}$('#view').innerHTML=errCard(k,e.message)}}
 function userBusy(){const a=document.activeElement;if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'||a.isContentEditable))return true;const m=$('#acctmenu');if(m&&m.style.display!=='none')return true;return false}
 async function refreshView(){ // background poll: no skeleton flash, no nav/scroll disruption, never clobber what the user is touching
@@ -789,9 +806,16 @@ const VIEWS={
    else h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Step 3 — Approve AI use.</b> A one-time, revocable OK to let your AI model process what you type, so your agents can build.</span><button class=pri onclick=frConsent()>Approve AI use</button></div></div>';
   }
   h+='<div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>';
-  const CHIPS=home?['Create a new company','What needs my attention across all companies?','A quick throwaway prototype']:['Build a competitor to YouTube','An internal tool for my team','A booking page for my salon'];
+  // CONTEXT-AWARE CHIPS: hide the generic starters once a build is in flight; after scoping swap for next-step suggestions
+  const inFlight=(d.awaiting==='fleet')||!!d.progress;
+  const ph0=(d.phase||'').toUpperCase();
+  let CHIPS;
+  if(inFlight||gateErr)CHIPS=[];
+  else if(home)CHIPS=['Create a new company','What needs my attention across all companies?','A quick throwaway prototype'];
+  else if(ph0&&ph0!=='DISCOVER')CHIPS=ctlNextChips(ph0);
+  else CHIPS=['Build a competitor to YouTube','An internal tool for my team','A booking page for my salon'];
   const ph=home?'e.g. start a new company, or ask about any of them…':'e.g. build a competitor to YouTube';
-  h+='<div class=card><div class=chips>'+CHIPS.map(c=>`<span class=chip-s onclick="ctlFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div><div class="row composer"><textarea id=cmsg class=chatbox rows=1 aria-label="Message your assistant" placeholder="${ph}" oninput="grow(this)" onkeydown="taKey(event,ctlSend)"></textarea><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
+  h+='<div class=card>'+(CHIPS.length?'<div class=chips>'+CHIPS.map(c=>`<span class=chip-s onclick="ctlFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+'</div>':'')+`<div class="row composer"><textarea id=cmsg class=chatbox rows=1 aria-label="Message your assistant" placeholder="${ph}" oninput="grow(this)" onkeydown="taKey(event,ctlSend)"></textarea><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
   $('#view').innerHTML=h;
   if(gateErr){$('#cnote').innerHTML=gateNote(d.error);ctlRender([]);}
   else if(d&&d.error){const log=$('#clog');if(log)log.innerHTML='<div class=muted>'+esc(d.error)+'</div>';}
@@ -929,6 +953,13 @@ function grow(t){if(!t)return;t.style.height='auto';t.style.height=Math.min(t.sc
 function taKey(e,fn){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();fn()}}   // ChatGPT/Claude: Enter sends, Shift+Enter inserts a newline
 function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus();grow(i)}}
 function ctlFill(t){const i=$('#cmsg');if(i){i.value=t;i.focus();grow(i)}}
+function ctlNextChips(phase){   // CONTEXT-AWARE CHIPS: after scoping, swap the generic starters for next-step suggestions tied to the phase
+ const M={OPTIONS:['Go with the recommended option','Compare the options'],
+  DEEP_DESIGN:['Approve the plan','Change part of the plan'],
+  PLAN_APPROVAL:['Approve the plan','Change part of the plan'],
+  PROTOTYPE:['Approve the screens','Request design changes'],
+  DELIVER:['Start another build','Add a feature to this one']};
+ return M[(phase||'').toUpperCase()]||['Add a feature','Refine what we have'];}
 function ctlRender(msgs,prog){const log=$('#clog');if(!log)return;
  const atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<40;
  let html=(msgs||[]).map(m=>{const me=m.role==='user';const meta=m.meta||{};let extra='';

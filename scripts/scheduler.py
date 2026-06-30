@@ -42,6 +42,9 @@ JOB_TIMEOUT = 120
 # orphan processes are never recovered.
 DEFAULT_SCHEDULES = [
     ("controller-resume", f"{VENV_PY} {SCRIPTS / 'loopcontroller.py'} resume", 600),
+    # User-facing SLA: surface "taking longer than usual" on jobs that overran their ETA promptly (tight
+    # cadence), well before the 30-min reaper. `controller-resume` also calls it as a 10-min backstop.
+    ("controller-sla",    f"{VENV_PY} {SCRIPTS / 'loopcontroller.py'} watchdog", 120),
     ("resume-sweep",      f"{VENV_PY} {SCRIPTS / 'factory.py'} resume-sweep", 600),
     ("tasksweep",         f"{VENV_PY} {SCRIPTS / 'tasksweep.py'} run", 600),
     ("reap-orphans",      f"{VENV_PY} {SCRIPTS / 'reap.py'} run", 600),

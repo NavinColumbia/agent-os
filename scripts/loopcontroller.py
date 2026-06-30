@@ -16,6 +16,7 @@ process) — resume_stalled() (run from the scheduler) recovers a killed worker 
     loopcontroller.py live <thread_id>                   # live progress: phase + elapsed + ETA + status
     loopcontroller.py cancel <tenant> <thread_id> [reason]  # halt the in-flight run (kill-switch) + park it
     loopcontroller.py resume
+    loopcontroller.py watchdog                           # user-facing SLA: warn on jobs that overran their ETA
     loopcontroller.py selftest
 Run with the agent-os venv python.
 """
@@ -48,6 +49,12 @@ _KIND_LABEL = {"research": "Researching directions…", "design": "Designing pro
 _GATE_LABEL = {"user_feedback": "Waiting on you", "user_approval": "Waiting for your pick",
                "credentials": "Waiting on a provider connection"}
 
+# Gate prompts that become STALE the instant their prerequisite is satisfied. By the time _llm() runs,
+# say()'s consent + provider gates have BOTH passed — so these messages must be dropped from the model
+# context, or the model parrots an old "please accept consent / connect a provider" back at a CEO who
+# already did it (the 3.4 "re-asked for consent I already accepted" bug).
+_RESOLVED_GATE_KINDS = {"consent_required", "provider_required"}
+
 
 def _ensure():
     with psycopg.connect(DB) as c, c.cursor() as cur:
@@ -61,7 +68,8 @@ def _ensure():
             ADD COLUMN IF NOT EXISTS job_kind TEXT,
             ADD COLUMN IF NOT EXISTS job_started_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS job_eta_min INTEGER,
-            ADD COLUMN IF NOT EXISTS job_status TEXT""")
+            ADD COLUMN IF NOT EXISTS job_status TEXT,
+            ADD COLUMN IF NOT EXISTS job_sla_warned BOOLEAN DEFAULT false""")
         cur.execute("""CREATE TABLE IF NOT EXISTS controller_jobs (
             id BIGSERIAL PRIMARY KEY, thread_id BIGINT, tenant_id TEXT, phase TEXT, kind TEXT,
             status TEXT DEFAULT 'running', result JSONB,
@@ -100,7 +108,7 @@ def _job_begin(thread_id, kind, eta_min, status):
     can render a real, ticking 'Researching… (Nm elapsed, ~M min)' bubble instead of a static one."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""UPDATE controller_state SET job_kind=%s, job_started_at=now(), job_eta_min=%s,
-                       job_status=%s, updated_at=now() WHERE thread_id=%s""",
+                       job_status=%s, job_sla_warned=false, updated_at=now() WHERE thread_id=%s""",
                     (kind, eta_min, status, thread_id))
         c.commit()
 
@@ -118,7 +126,8 @@ def _job_clear(thread_id):
     """Clear the LIVE-PROGRESS fields once a job leaves flight (done/failed/cancelled)."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""UPDATE controller_state SET job_kind=NULL, job_started_at=NULL, job_eta_min=NULL,
-                       job_status=NULL, updated_at=now() WHERE thread_id=%s""", (thread_id,))
+                       job_status=NULL, job_sla_warned=false, updated_at=now() WHERE thread_id=%s""",
+                    (thread_id,))
         c.commit()
 
 
@@ -381,6 +390,22 @@ def say(tid, thread_id, msg, api_key=None):
                      decision=phase, payload={"tenant": tid})
         return {"phase": phase, "blocked": "provider_required"}
     _apply_provider_ctx(prov)
+
+    # STATUS HONESTY (#2.1): a message typed WHILE a durable job is in flight must NEVER reach a free-form
+    # LLM answer — that's the fall-through where the model hallucinated a confident "Done — research written
+    # to…" while the real run was still going. Reply with the TRUE live status (running + elapsed + ETA) and
+    # stop; the actual results post themselves (with a ping) when the job genuinely finishes.
+    if s["awaiting"] == "fleet":
+        ls = live_status(thread_id)
+        em, eta = ls.get("elapsed_min") or 0, ls.get("eta_min")
+        doing = (ls.get("status") or "Working").rstrip("…").lower()
+        eta_txt = f", usually ~{eta} min" if eta else ""
+        _report(tid, thread_id,
+                f"I'm already on it — {doing} ({em}m elapsed{eta_txt}). I'll post the results right here and "
+                f"ping you the moment they're ready. Say \"cancel\" to stop.",
+                {"kind": "working", "phase": phase, "job": ls.get("job_kind"),
+                 "elapsed_min": em, "eta_min": eta})
+        return {"phase": phase, "awaiting": "fleet", "running": True}
 
     if phase == "DISCOVER":
         sysp = ("You are a product controller scoping a build for a non-technical CEO. Ask ONE focused "
@@ -700,6 +725,13 @@ def resume_stalled():
     """
     _ensure()
     advanced = 0
+    # USER-FACING SLA first (#2.6): surface "taking longer than usual" the moment a job overruns its ETA —
+    # well before the 30-min crash-reap below — so the same scheduler tick that recovers dead workers also
+    # keeps live-but-slow jobs honest. Best-effort: a watchdog hiccup must never block crash recovery.
+    try:
+        sla_watchdog()
+    except Exception:
+        pass
     # 0) RESEARCH threads are reconciled against the REAL research run (research_runs) — NOT the dispatch
     #    poll. A fleet run that outlived the in-worker poll budget (-> 'pending'), or whose worker/process
     #    died, still reaches a terminal state in its own daemon; pull its result through so the extracted
@@ -766,6 +798,47 @@ def resume_stalled():
     return {"resumed": advanced}
 
 
+def sla_watchdog():
+    """USER-FACING SLA WATCHDOG (#2.6). The moment a still-running fleet job overruns its ETA, post ONE
+    visible "this is taking longer than usual — retry or cancel?" heads-up (with the retry/cancel
+    affordances the failure UI already understands), well BEFORE the 30-min crash-reaper — so the CEO is
+    never left staring at a static "give me a little time" bubble wondering whether the job is dead.
+
+    Idempotent: warns AT MOST once per job (job_sla_warned, reset when the next job begins/clears), and the
+    'mark-warned' UPDATE is guarded on `awaiting='fleet' AND NOT job_sla_warned` so a racing tick — or a job
+    that finishes mid-sweep — can never double-post. The job keeps running untouched; this only narrates."""
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""SELECT thread_id, tenant_id, phase, job_kind, job_eta_min,
+                              EXTRACT(EPOCH FROM (now()-job_started_at))::int
+                       FROM controller_state
+                       WHERE awaiting='fleet' AND job_started_at IS NOT NULL AND job_eta_min IS NOT NULL
+                         AND COALESCE(job_sla_warned, false) = false
+                         AND now() - job_started_at > make_interval(mins => job_eta_min)""")
+        rows = cur.fetchall()
+    warned = 0
+    for thread_id, tid, phase, jk, eta, elapsed in rows:
+        # Claim the warning atomically (still on its fleet gate + still un-warned) so a concurrent sweep or a
+        # job that just finished can't also post. 0 rows -> someone/something beat us; skip.
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""UPDATE controller_state SET job_sla_warned=true, updated_at=now()
+                           WHERE thread_id=%s AND awaiting='fleet'
+                             AND COALESCE(job_sla_warned, false) = false""", (thread_id,))
+            claimed = cur.rowcount; c.commit()
+        if not claimed:
+            continue
+        em = int((elapsed or 0) // 60)
+        _report(tid, thread_id,
+                f"⏳ This is taking longer than usual — still running ({em}m elapsed). It may just need a "
+                f"little more time; say \"retry\" to start it over or \"cancel\" to stop.",
+                {"kind": "sla_warning", "phase": phase, "job": jk, "elapsed_min": em, "eta_min": eta,
+                 "actions": ["retry", "cancel"]}, urgent=True)
+        audit.append(actor="loopcontroller", action="SLAWarn", resource=str(thread_id), decision=phase,
+                     payload={"elapsed_min": em, "eta_min": eta})
+        warned += 1
+    return {"warned": warned}
+
+
 def _to(thread_id, phase):
     _set(thread_id, phase=phase)
     audit.append(actor="loopcontroller", action="PhaseChange", resource=str(thread_id), decision=phase)
@@ -779,8 +852,18 @@ def _store_user(tid, thread_id, msg):
 
 
 def _llm(tid, thread_id, sysp, s):
-    convo = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in orchestrator.history(tid, thread_id)[-12:])
-    task = f"{sysp}\n\n{_ctx_brief(s)}\n\nCONVERSATION:\n{convo}\n\nReply now:"
+    # CONSENT/PROVIDER ON FILE (#3.4): _llm only ever runs AFTER say()'s consent + provider gates have BOTH
+    # passed, so those prerequisites are satisfied right now. (a) Drop any stale resolved-gate messages from
+    # the context so the model can't parrot an old "please accept consent / connect a provider" back at the
+    # CEO, and (b) tell it plainly they're on file — together this kills the "re-asked for consent I already
+    # accepted" bug. Filter BEFORE the [-12:] window so the note + filtered turns are what the model sees.
+    hist = [m for m in orchestrator.history(tid, thread_id)
+            if (m.get("meta") or {}).get("kind") not in _RESOLVED_GATE_KINDS][-12:]
+    convo = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in hist)
+    onfile = ("NOTE: AI-processing consent is already on file and a model provider is connected — you are "
+              "cleared to proceed. Do NOT ask the CEO to accept consent or connect a provider again; if an "
+              "earlier turn asked for either, treat it as already resolved.")
+    task = f"{sysp}\n\n{onfile}\n\n{_ctx_brief(s)}\n\nCONVERSATION:\n{convo}\n\nReply now:"
     # light=True: these are QUICK conversational turns (clarify / scope / plan-draft chat). Route them to the
     # FAST model (haiku) with a minimal prompt and NO estimate handshake, so a reply feels near-instant instead
     # of blocking ~30s on a cold Opus + full charter. `task` already carries the system prompt + context, so we
@@ -894,10 +977,13 @@ def _selftest():
     import research as _r, design_fleet as _d, qualityloop as _q, verify as _v
     real = (_r.start, _r.run_state, _r.select, _d.prototype, _q.run, _v.verify)
 
+    tasks = []                                          # every prompt _llm hands the model (for #3.4 checks)
+
     def fake_agent(role, repo, task, **k):
         # Mirror factory.agent's real contract: a tail-truncated 'out' (1500-char preview) PLUS the
         # complete 'out_full'. A long preamble pushes the OPENING [[..]] tag out of the 1500-char tail,
         # so this is a regression test: _llm MUST read out_full or the opening tag is lost.
+        tasks.append(task)
         def both(body):
             full = ("preamble. " * 220) + body          # >1500 chars before the control block
             return {"rc": 0, "out": full[-1500:], "out_full": full}
@@ -969,6 +1055,44 @@ def _selftest():
         import notifications as _n
         ping_ok = len(_n.feed(tid)) >= 1
 
+        # (3.4) CONSENT RE-ASK: every prompt _llm built AFTER consent was recorded must (a) carry the
+        # 'consent is already on file' note and (b) NOT replay the stale consent_required gate message into
+        # the model context — so the assistant never re-asks for consent the CEO already gave.
+        consent_note_ok = any("consent is already on file" in t.lower() for t in tasks)
+        no_stale_consent_ctx = not any("accept the AI-processing consent in Settings" in t for t in tasks)
+        consent_reask_ok = consent_note_ok and no_stale_consent_ctx
+
+        # (2.6) USER-FACING SLA WATCHDOG: a fleet job that overruns its ETA gets ONE visible
+        # 'taking longer than usual — retry or cancel?' heads-up, well before the 30-min reaper, and the
+        # watchdog never double-warns the same job.
+        th3 = start(tid, org)["thread_id"]
+        _set(th3, awaiting="fleet")
+        _job_begin(th3, "build", 5, "Building…")
+        with psycopg.connect(DB) as c, c.cursor() as cur:    # backdate start so it has clearly overrun ~5m ETA
+            cur.execute("UPDATE controller_state SET job_started_at=now()-interval '9 min' WHERE thread_id=%s",
+                        (th3,))
+            c.commit()
+        w1 = sla_watchdog().get("warned", 0)
+        w2 = sla_watchdog().get("warned", 0)                 # second sweep must NOT re-warn the same job
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT count(*) FROM chat_messages WHERE thread_id=%s AND role='assistant'
+                           AND meta->>'kind'='sla_warning'""", (th3,))
+            sla_msgs = cur.fetchone()[0]
+        sla_ok = w1 >= 1 and w2 == 0 and sla_msgs == 1
+
+        # (2.1) STATUS HONESTY: a message typed WHILE a durable job is in flight must return the TRUE running
+        # status (kind='working') and run NO free-form LLM turn — never a hallucinated "Done".
+        th4 = start(tid, org)["thread_id"]
+        _to(th4, "RESEARCH"); _set(th4, awaiting="fleet")
+        _job_begin(th4, "research", 6, "Researching directions…")
+        n_before = len(tasks)
+        r4 = say(tid, th4, "is it done yet?")
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT meta->>'kind' FROM chat_messages WHERE thread_id=%s AND role='assistant'
+                           ORDER BY id DESC LIMIT 1""", (th4,))
+            last_kind = cur.fetchone()[0]
+        status_honest_ok = (r4.get("running") is True and len(tasks) == n_before and last_kind == "working")
+
         # (2) LIVE PROGRESS + (4) NO FALSE DONE + (5) CANCEL — on a fresh thread with a stamped in-flight job:
         th2 = start(tid, org)["thread_id"]
         _set(th2, awaiting="fleet", product="liveprod-" + os.urandom(2).hex())
@@ -988,14 +1112,18 @@ def _selftest():
 
         ok = (consent_gate_ok and opt and gate_held and in_design and plan_persisted and plan_card
               and no_tag_leak and proto and deliver and jobs >= 3
-              and eta_ok and ping_ok and live_cancel_ok)
+              and eta_ok and ping_ok and live_cancel_ok
+              and consent_reask_ok and sla_ok and status_honest_ok)
         print(f"consent_gate={consent_gate_ok} options={opt} gate_held={gate_held} design={in_design} "
               f"plan_persisted={plan_persisted} plan_card={plan_card} no_tag_leak={no_tag_leak} "
               f"prototype={proto} deliver={deliver} jobs_done={jobs}")
         print(f"eta(kickoff ~min)={eta_ok}(est={eta_min}m) ping(results-land)={ping_ok} "
               f"live_progress={live_ok} no_false_done={no_false_done_running and no_false_done_after} "
               f"cancel(killswitch)={cancel_ok}")
-        print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel ✅" if ok else "FAIL")
+        print(f"consent_reask_fixed={consent_reask_ok}(note={consent_note_ok},no_stale={no_stale_consent_ctx}) "
+              f"sla_watchdog={sla_ok}(w1={w1},w2={w2},msgs={sla_msgs}) status_honest={status_honest_ok}")
+        print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel"
+              " + consent-reask/sla/status-honesty ✅" if ok else "FAIL")
     finally:
         factory.agent = real_agent
         _r.start, _r.run_state, _r.select, _d.prototype, _q.run, _v.verify = real
@@ -1025,8 +1153,10 @@ def _main(a):
         print(json.dumps(cancel(a[1], int(a[2]), a[3] if len(a) > 3 else "stopped by user")))
     elif a[0] == "resume":
         print(json.dumps(resume_stalled()))
+    elif a[0] == "watchdog":
+        print(json.dumps(sla_watchdog()))
     else:
-        sys.exit("usage: loopcontroller.py start|say|choose|state|live|cancel|resume|selftest ...")
+        sys.exit("usage: loopcontroller.py start|say|choose|state|live|cancel|resume|watchdog|selftest ...")
 
 
 if __name__ == "__main__":

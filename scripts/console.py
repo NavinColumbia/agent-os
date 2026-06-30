@@ -107,17 +107,74 @@ def _fleet(tid, org_id=0):
             "products_active": sum(1 for p in c["products"] if p.get("workers"))}
 
 
+def _assistant():
+    """Account-level home router for the org=0 'All orgs (home)' thread. Lands as a separate, parallel
+    module (assistant.py); until it does, org=0 gracefully falls back to the tenant's first company so
+    the single Assistant surface stays functional. Imported lazily so console boots/selftests without it.
+    Expected interface: state(tid) -> {messages,...} · say(tid, msg) · choose(tid, option_id)."""
+    try:
+        import assistant as _a
+        return _a
+    except Exception:
+        return None
+
+
+def _home_org(tid):
+    """Fallback target for org=0 home work when assistant.py isn't present yet: the tenant's first
+    company. Returns its org_id, or 0 when the tenant has no company yet."""
+    orgs = orgsmod.list_orgs(tid)
+    return orgs[0]["org_id"] if orgs else 0
+
+
 def _controller_state(tid, org_id):
-    """The per-org controller: its thread, phase/gate, and the conversation (for the closed-loop chat)."""
+    """The Assistant surface state. org=N -> that company's loopcontroller thread (unchanged). org=0 ->
+    the account-wide home thread via assistant.py when present, else the first company (fallback)."""
     if not org_id:
-        orgs = orgsmod.list_orgs(tid)
-        if not orgs:
-            return {"error": "no org — create one first"}
-        org_id = orgs[0]["org_id"]
+        a = _assistant()
+        if a is not None and hasattr(a, "state"):
+            return a.state(tid)
+        org_id = _home_org(tid)
+        if not org_id:
+            return {"home": True, "messages": [],
+                    "error": "Create your first company to begin — tell me its name."}
     thread = loopcontroller.thread_for_org(tid, org_id)
     st = loopcontroller.state(thread)
     return {"org_id": org_id, "thread": thread, "phase": st.get("phase"), "awaiting": st.get("awaiting"),
             "messages": orchestrator.history(tid, thread)}
+
+
+def _ctl_say(tid, org_id, msg):
+    """Route a message: org=0 home -> assistant.py (account router) when present; org=N -> the company's
+    loopcontroller (which applies the consent + provider gate before any model call). org=0 is never sent
+    to thread_for_org(tid, 0); it resolves to a real company first."""
+    if not org_id:
+        a = _assistant()
+        if a is not None and hasattr(a, "say"):
+            return a.say(tid, msg)
+        org_id = _home_org(tid)
+        if not org_id:
+            return {"error": "Create a company first — open My orgs to start one."}
+    return loopcontroller.say(tid, loopcontroller.thread_for_org(tid, org_id), msg)
+
+
+def _ctl_choose(tid, org_id, option_id):
+    if not org_id:
+        a = _assistant()
+        if a is not None and hasattr(a, "choose"):
+            return a.choose(tid, option_id)
+        org_id = _home_org(tid)
+        if not org_id:
+            return {"error": "Create a company first — open My orgs to start one."}
+    return loopcontroller.choose(tid, loopcontroller.thread_for_org(tid, org_id), option_id)
+
+
+def _system_agents():
+    """Tier-A system roles — the standing org hierarchy, surfaced READ-ONLY in the Agents view. Sourced
+    from the real role manifest (orgview.ORG); 'controller' is the sole spawner
+    (control-plane/roles/controller.yaml can_spawn:true). None are tenant-editable."""
+    return [{"role": role, "title": title, "reports_to": reports_to,
+             "can_spawn": role == "controller"}
+            for role, title, reports_to in orgview.ORG]
 
 
 def _team(tid):
@@ -180,7 +237,7 @@ GETS = {
     "/api/budgets": lambda tid, q: {"budgets": projbudget.list_budgets(tid)},
     "/api/versions": lambda tid, q: {"versions": versions.versions(tid, q.get("product", [""])[0])},
     "/api/help/topics": lambda tid, q: {"topics": helpagent.topics()},
-    "/api/agents": lambda tid, q: {"agents": customagents.list_agents(tid), "roles": list(customagents.ALLOWED_ROLES)},
+    "/api/agents": lambda tid, q: {"agents": customagents.list_agents(tid), "roles": list(customagents.ALLOWED_ROLES), "system": _system_agents()},
     "/api/orgs": lambda tid, q: {"orgs": orgsmod.list_orgs(tid)},
     "/api/portfolio": lambda tid, q: crossorgview.portfolio(tid),
     "/api/portfolio/analytics": lambda tid, q: crossorgview.analytics(tid),
@@ -215,8 +272,8 @@ POSTS = {
     "/api/account/delete": lambda tid, q, b: account.delete(tid, confirm=bool(b.get("confirm"))),
     "/api/help/ask": lambda tid, q, b: helpagent.ask(tid, b.get("question", "")),
     "/api/orgs/new": lambda tid, q, b: orgsmod.create(tid, b.get("name", ""), b.get("vision", "")),
-    "/api/controller/say": lambda tid, q, b: loopcontroller.say(tid, loopcontroller.thread_for_org(tid, int(b.get("org") or 0)), b.get("message", "")),
-    "/api/controller/choose": lambda tid, q, b: loopcontroller.choose(tid, loopcontroller.thread_for_org(tid, int(b.get("org") or 0)), int(b.get("option_id") or 0)),
+    "/api/controller/say": lambda tid, q, b: _ctl_say(tid, int(b.get("org") or 0), b.get("message", "")),
+    "/api/controller/choose": lambda tid, q, b: _ctl_choose(tid, int(b.get("org") or 0), int(b.get("option_id") or 0)),
     "/api/design/decide": lambda tid, q, b: designview.decide(tid, str(int(b.get("org") or 0)), int(b.get("id") or 0), b.get("status", "approved")),
     "/api/xorg/propose": lambda tid, q, b: crossorg.propose(tid, b.get("kind", "steal_feature"), int(b.get("source") or 0), int(b.get("target") or 0) or None, b.get("feature")),
     "/api/agents/create": lambda tid, q, b: customagents.define(tid, b.get("name", ""), b.get("instructions", ""), b.get("role", "research-growth"), b.get("trigger", "manual"), int(b.get("interval_s") or 0) or None, b.get("output", "report"), b.get("product")),
@@ -300,6 +357,15 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
 .skel{background:linear-gradient(90deg,#171b24 25%,#1d222d 50%,#171b24 75%);background-size:200% 100%;animation:shim 1.4s infinite;border-radius:6px;height:14px;margin:8px 0}@keyframes shim{to{background-position:-200% 0}}
 .menu{position:absolute;right:20px;top:52px;background:var(--panel2);border:1px solid var(--line2);border-radius:12px;box-shadow:0 12px 36px -10px rgba(0,0,0,.6);padding:8px;min-width:240px;z-index:30}
 .menu a{display:block;padding:8px 10px;border-radius:8px;color:var(--tx2);text-decoration:none;cursor:pointer;font-size:13px}.menu a:hover{background:var(--hover);color:var(--tx)}
+.orgsw{position:relative;display:inline-flex}
+#orgmenu{position:absolute;left:0;top:38px;right:auto;min-width:280px;max-width:340px}
+.orgsearch{margin-bottom:6px}
+.orglist{max-height:300px;overflow:auto;display:flex;flex-direction:column}
+.orgopt{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;color:var(--tx2);cursor:pointer;font-size:13px}
+.orgopt:hover{background:var(--hover);color:var(--tx)}.orgopt.on{background:var(--asoft);color:var(--atext);font-weight:600}
+.orgopt .oname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.orgopt .ock{color:var(--gtext)}
+.orgopt .ovis{color:var(--mut);font-size:11px;font-weight:400}
+.orgnew{display:block;margin-top:6px;padding:8px 10px;border-top:1px solid var(--line);border-radius:0 0 8px 8px;color:var(--atext);cursor:pointer;font-size:13px;font-weight:550}.orgnew:hover{background:var(--hover)}
 .pwwrap{position:relative}.pwwrap input{padding-right:62px}
 .pwtoggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:transparent;border:none;color:var(--mut);font-size:12px;font-weight:600;padding:5px 8px;border-radius:7px;cursor:pointer}
 .pwtoggle:hover{background:var(--hover);border:none;color:var(--tx2)}
@@ -348,7 +414,14 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
 </div>
 <div class=colmain>
   <div class=topbar><span class=title id=tbtitle>Cockpit</span>
-    <span class=chip id=orgchip onclick="go('orgs')" title="Switch org" style=cursor:pointer><span id=orgname>—</span> ▾</span>
+    <span class=orgsw>
+      <span class=chip id=orgchip onclick="toggleOrgSw()" title="Switch company" aria-haspopup=listbox aria-expanded=false style=cursor:pointer><span id=orgname>—</span> ▾</span>
+      <div class=menu id=orgmenu role=listbox aria-label="Companies" style=display:none>
+        <input id=orgsearch class=orgsearch aria-label="Search companies" placeholder="Search companies…" oninput=renderOrgSw() onkeydown="if(event.key==='Escape')toggleOrgSw(false)">
+        <div id=orglist class=orglist></div>
+        <a class=orgnew onclick="toggleOrgSw(false);go('orgs')">+ New company</a>
+      </div>
+    </span>
     <span class=sp></span>
     <span class=chip id=spendchip onclick="go('billing')"><span class="dot ok" id=spenddot></span><span id=spendtxt>—</span></span>
     <button class=tbtn onclick="go('notifications')" title=Notifications>◔<span class=nb id=bellbadge style=display:none></span></button>
@@ -361,22 +434,37 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
 </div>
 <script>
 const NAV=[
- ['Direct',[['controller','Controller','🧭'],['chat','Quick build','💬'],['agents','Agents','🤖'],['templates','Templates','▦']]],
- ['This org',[['cockpit','Cockpit','◧'],['projects','Projects','▤'],['design','Design','🎨'],['agentic','Agentic features','⚡'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
- ['All orgs',[['orgs','My orgs','🏢'],['portfolio','Portfolio','◎']]],
- ['Business',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
+ ['Workspace',[['controller','Assistant','🧭'],['cockpit','Cockpit','◧'],['projects','Projects','▤'],['design','Design','🎨'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
+ ['Build',[['agents','Agents','🤖'],['agentic','Agentic features','⚡'],['templates','Templates','▦']]],
+ ['Portfolio',[['orgs','My orgs','🏢'],['portfolio','Portfolio','◎']]],
+ ['Account',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
 ];
-const LABEL={controller:'Controller',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My orgs',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
+const LABEL={controller:'Assistant',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My orgs',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
-let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];
+let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];let PROVIDER_OK=true;
 async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];
-  if(ORG && !ORGS.some(o=>o.org_id==ORG)){ORG=0;localStorage.removeItem('aos_org');}
-  if(!ORG&&ORGS.length){ORG=ORGS[0].org_id;localStorage.setItem('aos_org',ORG);}
-  const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=cur?cur.name:(ORGS.length?'pick an org':'no orgs');}catch(e){}}
-function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);loadOrgs();go('controller');}
+  if(ORG && !ORGS.some(o=>o.org_id==ORG)){ORG=0;localStorage.removeItem('aos_org');}   // stale/deleted org -> home (org=0)
+  setOrgName();}catch(e){}}
+function setOrgName(){const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=ORG?(cur?cur.name:'company'):'All orgs (home)';}
+async function loadProviders(){try{const d=await get('/api/providers');PROVIDER_OK=(d.providers||[]).some(p=>p.connected);}catch(e){}}   // subscription login OR api key both count as connected
+function toggleOrgSw(force){const m=$('#orgmenu');if(!m)return;const open=force!==undefined?force:(m.style.display==='none');m.style.display=open?'block':'none';const chip=$('#orgchip');if(chip)chip.setAttribute('aria-expanded',open?'true':'false');if(open){renderOrgSw();const s=$('#orgsearch');if(s){s.value='';setTimeout(()=>{try{s.focus()}catch(_){}} ,0)}}}
+function renderOrgSw(){const list=$('#orglist');if(!list)return;const q=(($('#orgsearch')||{}).value||'').toLowerCase();
+  const opts=[{org_id:0,name:'All orgs (home)',vision:'Ask across every company · start a new one'}].concat(ORGS);
+  const f=opts.filter(o=>!q||(''+o.name).toLowerCase().includes(q)||(''+(o.vision||'')).toLowerCase().includes(q));
+  list.innerHTML=f.length?f.map(o=>`<a class="orgopt${o.org_id==ORG?' on':''}" role=option aria-selected=${o.org_id==ORG} onclick="pickOrg(${o.org_id})"><span class=oname>${esc(o.name)}${o.vision?(' <span class=ovis>· '+esc(o.vision)+'</span>'):''}</span>${o.org_id==ORG?'<span class=ock>✓</span>':''}</a>`).join(''):'<div class=muted style=padding:8px_10px>No matching company</div>';}
+function pickOrg(id){ORG=id;if(id)localStorage.setItem('aos_org',id);else localStorage.removeItem('aos_org');   // org=0 = home; org=N = a company
+  setOrgName();toggleOrgSw(false);if(window.CTLPOLL){clearInterval(window.CTLPOLL);window.CTLPOLL=null;}   // re-target the controller poll at the new context
+  if(VIEWS[CUR])go(CUR);else go('controller');}   // re-render the CURRENT view in place — never navigate away
+function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);setOrgName();go('controller');}   // intentional navigation: "Open" from My orgs lands on the Assistant
+function gateError(e){return e==='consent_required'||e==='provider_required';}
+function gateKey(r){return r?(r.error||r.blocked):'';}   // same gates surface as 'error' (front door) OR 'blocked' (controller/chat loop) — handle both
+function gateNote(e){
+ if(e==='provider_required')return 'Connect a model provider to start — <button class=linkbtn onclick="go(\'providers\')">connect a provider</button>. Use your Claude / ChatGPT subscription login (no key needed) or an API key.';
+ if(e==='consent_required')return 'One-time setup: approve AI processing before your agents run — <button class=linkbtn onclick="go(\'settings\')">review AI consent</button>.';
+ return esc(''+e);}
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none';if(!on){const up=($('#su_signup')||{}).style&&$('#su_signup').style.display!=='none';const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}}
-function resetSession(){localStorage.removeItem('aos_org');localStorage.removeItem('aos_email');ORG=0;ORGS=[];THREAD=null;CUR='cockpit'}
+function resetSession(){localStorage.removeItem('aos_org');localStorage.removeItem('aos_email');ORG=0;ORGS=[];THREAD=null;PROVIDER_OK=true;CUR='controller'}
 function suTab(t){const up=t==='up';$('#su_signup').style.display=up?'block':'none';$('#su_signin').style.display=up?'none':'block';setNote(up?'su':'si','');const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}
 function emailOK(e){return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)}
 function aInv(id,on){const el=$('#'+id);if(el)el.setAttribute('aria-invalid',on?'true':'false')}
@@ -457,6 +545,7 @@ async function refreshTopbar(){
  try{const n=await get('/api/notifications');const bb=$('#bellbadge');if(n.unread>0){bb.style.display='inline-flex';bb.textContent=n.unread}else bb.style.display='none'}catch(e){}
  try{const ap=await get('/api/approvals');BADGES.approvals=(ap.items||[]).filter(i=>i.kind!=='consent').length;renderNav()}catch(e){}
  try{const s=await get('/api/status');$('#statusdot').className='dot '+({operational:'ok',degraded:'warn',major_outage:'bad'}[s.verdict]||'ok')}catch(e){}
+ loadProviders();   // keep PROVIDER_OK fresh so the Assistant connect-banner reflects the latest provider state
 }
 async function go(k){CUR=k;renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
  try{await VIEWS[k]()}catch(e){if(e.kind==='auth'){if(TOK)signOut();return}$('#view').innerHTML=errCard(k,e.message)}}
@@ -472,16 +561,29 @@ function stages(ss){return '<div class=stages>'+ss.map(s=>`<div class="st ${s.do
 let THREAD=null;let CTLBUSY=false;let CHATBUSY=false;
 const VIEWS={
  controller:async()=>{
-  if(!ORG){await loadOrgs();if(!ORG){$('#view').innerHTML=emptyB('🏢','No org yet','Create your first organization — then your controller will help you build it.','<button class=pri onclick="go(\'orgs\')">Create an org</button>');return}}
-  let d;try{d=await get('/api/controller/state?org='+ORG)}catch(e){$('#view').innerHTML=errCard('controller',e.message);return}
-  if(d.error){$('#view').innerHTML='<div class=card>'+esc(d.error)+'</div>';return}
+  if(!ORGS.length){try{await loadOrgs()}catch(e){}}
+  try{await loadProviders()}catch(e){}   // keep the connect banner current right after a provider is added
+  const home=!ORG;const noOrgs=!ORGS.length;   // org=0 -> account-wide home / quick-build · org=N -> that company's controller
+  let d={};try{d=await get('/api/controller/state?org='+(ORG||0))}catch(e){$('#view').innerHTML=errCard('controller',e.message);return}
+  const gateErr=d&&d.error&&gateError(d.error);
+  const cur=ORGS.find(o=>o.org_id==ORG)||{};
+  const scope=home?(noOrgs?'Start your first company':'All orgs · home'):('Company · '+(cur.name||''));
   const GATE={user_feedback:'your reply',user_approval:'your go-ahead',credentials:'a connected provider',fleet:'your agents to finish'};
-  const rawPhase=d.phase||'DISCOVER';const phase=rawPhase.charAt(0)+rawPhase.slice(1).toLowerCase();const gate=d.awaiting?(' · waiting on '+esc(GATE[d.awaiting]||d.awaiting)):'';
-  $('#view').innerHTML=`<h1>Controller</h1><p class=sub>Tell your controller what to build. It researches, brings options, designs, and ships — asking you at each step. <b>${esc(phase)}</b>${gate}</p>
-   <div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>
-   <div class=card><div class=row><input id=cmsg aria-label="Describe what to build" placeholder="e.g. build a competitor to YouTube" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
-  ctlRender(d.messages||[]);
-  if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(!TOK||CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}if(CTLBUSY)return;try{const s=await get('/api/controller/state?org='+ORG);ctlRender(s.messages||[])}catch(e){}},5000);
+  let phaseLine='';
+  if(!home&&d.phase){const rawPhase=d.phase;const phase=rawPhase.charAt(0)+rawPhase.slice(1).toLowerCase();phaseLine=' · <b>'+esc(phase)+'</b>'+(d.awaiting?(' · waiting on '+esc(GATE[d.awaiting]||d.awaiting)):'');}
+  const intro=home?'Your account-wide assistant — ask across all your companies, spin up a new one, or start a quick build. I route it to the right place.':'Tell this company\'s controller what to build. It researches, brings options, designs and ships — asking you at each step.';
+  let h='<h1>Assistant</h1><p class=sub>'+pill(scope,home?'accent':'')+' '+esc(intro)+phaseLine+'</p>';
+  if(noOrgs)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Welcome</b> — create your first company to begin. Each company gets its own controller, research, design and budget.</span><button class=pri onclick="go(\'orgs\')">Create your first company</button></div></div>';
+  if(!PROVIDER_OK)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span>⚡ Connect a model provider so your agents can run — use your Claude / ChatGPT subscription login (no key) or an API key.</span><button class=pri onclick="go(\'providers\')">Connect a provider</button></div></div>';
+  h+='<div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>';
+  const CHIPS=home?['Create a new company','What needs my attention across all companies?','A quick throwaway prototype']:['Build a competitor to YouTube','An internal tool for my team','A booking page for my salon'];
+  const ph=home?(noOrgs?'e.g. start a company called Acme that builds…':'e.g. start a new company, or ask about any of them…'):'e.g. build a competitor to YouTube';
+  h+='<div class=card><div class=chips>'+CHIPS.map(c=>`<span class=chip-s onclick="ctlFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div><div class=row><input id=cmsg aria-label="Message your assistant" placeholder="${ph}" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
+  $('#view').innerHTML=h;
+  if(gateErr){$('#cnote').innerHTML=gateNote(d.error);ctlRender([]);}
+  else if(d&&d.error){const log=$('#clog');if(log)log.innerHTML='<div class=muted>'+esc(d.error)+'</div>';}
+  else ctlRender(d.messages||[]);
+  if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(!TOK||CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}if(CTLBUSY)return;try{const s=await get('/api/controller/state?org='+(ORG||0));if(!(s&&s.error))ctlRender(s.messages||[])}catch(e){}},5000);
  },
  orgs:async()=>{const d=await get('/api/orgs');ORGS=d.orgs||[];
   let h='<h1>My orgs</h1><p class=sub>Each org is its own company — its own controller, research, design, build and budget. You can run as many as you like.</p>';
@@ -531,19 +633,21 @@ const VIEWS={
     if((hl.dead_letter||0))hi+=`<div class=item>${pill('stuck','bad')} ${hl.dead_letter} task(s) need a human decision — see Approvals</div>`;
     if(hi)h+='<div class=card><h2>Needs attention · org health</h2>'+hi+'</div>';}
   else if(hl&&hl.ok){h+='<div class=card><h2>Org health</h2><div class=row>'+pill('all clear','ok')+' <span class=muted>no blocked or stuck agents</span></div></div>';}
-  h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${ql[p.product]?pill('✓ '+ql[p.product].overall,(ql[p.product].overall=='verified'||ql[p.product].overall=='passed')?'ok':(ql[p.product].overall=='failed'?'bad':'')):''} ${ls[p.product]&&ls[p.product].url?'<a href="'+ls[p.product].url+'" target=_blank>'+(ls[p.product].reachable?'● live':'open ↗')+'</a>':''} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in New build</div>')+'</div>';
+  h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${ql[p.product]?pill('✓ '+ql[p.product].overall,(ql[p.product].overall=='verified'||ql[p.product].overall=='passed')?'ok':(ql[p.product].overall=='failed'?'bad':'')):''} ${ls[p.product]&&ls[p.product].url?'<a href="'+ls[p.product].url+'" target=_blank>'+(ls[p.product].reachable?'● live':'open ↗')+'</a>':''} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in the Assistant</div>')+'</div>';
   h+='<div class=grid><div class=card><h2>Communications</h2><table>'+(d.communications.length?d.communications.map(m=>`<tr><td>${m.ts}</td><td>${esc(m.from)}</td><td>→ ${esc(m.to)}</td><td>${esc(m.intent)}</td></tr>`).join(''):'<tr><td class=muted>no recent agent messages</td></tr>')+'</table></div>';
   h+=`<div class=card><h2>Work queue</h2>${kpis([['pending',d.queue.pending],['active',d.queue.active],['dead',d.queue.dead]])}</div></div>`;
   $('#view').innerHTML=h;},
  build:async()=>{$('#view').innerHTML=`<h1>New build</h1><p class=sub>Describe a product; the governed factory builds, tests and ships it.</p>
   <div class=card><label>Name</label><input id=bn aria-label="Project name" placeholder=splitbill><label>Type</label><select id=bk onchange=showEst()><option value=lib>Python library</option><option value=web>Web app</option><option value=service>API service</option></select><label>What should it do?</label><textarea id=bc placeholder="Describe the API, behaviours, edge cases…"></textarea><div id=est class=muted style=margin-top:8px></div><div style=margin-top:10px><button class=pri onclick=doBuild()>Build it</button></div><div id=bnote class=muted style=margin-top:8px></div></div>`;showEst();},
- agents:async()=>{const d=await get('/api/agents');d.agents=d.agents||[];const roles=(d.roles||['research-growth']);
-  let h='<h1>Your agents</h1><p class=sub>It\'s a factory — hire standing agents that work on a schedule and report back to you. E.g. a weekly market-watch.</p>';
-  h+='<div class=card><h2>Your standing agents</h2>'+(d.agents.length?d.agents.map(a=>`<div class=item><div class="row spread"><span><b>${esc(a.name)}</b> ${pill(a.role)} ${pill(a.trigger==='recurring'?('every '+Math.round((a.interval_s||0)/86400)+'d'):'manual',a.trigger==='recurring'?'accent':'')} ${a.enabled?pill('on','ok'):pill('off')}</span><span><button onclick="agentRun(${a.id})">run now</button> <button onclick="agentToggle(${a.id},${a.enabled?'false':'true'})">${a.enabled?'pause':'enable'}</button> <button class=danger onclick="agentDel(${a.id})">delete</button></span></div><div class=muted>last run: ${a.last_run?esc(a.last_run):'never'} ${a.last_status?('· '+esc(a.last_status)):''}</div></div>`).join(''):emptyB('🤖','No agents yet','Create a standing agent below — it runs on a schedule and reports into your feed.'))+'</div>';
+ agents:async()=>{const d=await get('/api/agents');d.agents=d.agents||[];const roles=(d.roles||['research-growth']);const sys=d.system||[];
+  let h='<h1>Your agents</h1><p class=sub>Three tiers: the built-in system org that runs your builds (read-only), your own standing agents (yours to edit), and agentic features you embed in your product.</p>';
+  h+='<div class=card><h2>System agents · read-only</h2><p class=muted style=margin:0_0_10px>The standing org your Assistant runs. These are governed and built-in — you can\'t edit or delete them, and only the Controller can spawn workers.</p>'+(sys.length?sys.map(a=>`<div class=item><div class="row spread"><span><b>${esc(a.title)}</b> ${pill(a.role)} ${a.can_spawn?pill('sole spawner','accent'):''} ${a.reports_to?('<span class=muted>reports to '+esc(a.reports_to)+'</span>'):pill('chief of staff','ok')}</span>${pill('read-only')}</div></div>`).join(''):'<div class=muted>—</div>')+'</div>';
+  h+='<div class=card><h2>Your custom agents</h2>'+(d.agents.length?d.agents.map(a=>`<div class=item><div class="row spread"><span><b>${esc(a.name)}</b> ${pill(a.role)} ${pill(a.trigger==='recurring'?('every '+Math.round((a.interval_s||0)/86400)+'d'):'manual',a.trigger==='recurring'?'accent':'')} ${a.enabled?pill('on','ok'):pill('off')}</span><span><button onclick="agentRun(${a.id})">run now</button> <button onclick="agentToggle(${a.id},${a.enabled?'false':'true'})">${a.enabled?'pause':'enable'}</button> <button class=danger onclick="agentDel(${a.id})">delete</button></span></div><div class=muted>last run: ${a.last_run?esc(a.last_run):'never'} ${a.last_status?('· '+esc(a.last_status)):''}</div></div>`).join(''):emptyB('🤖','No custom agents yet','Create a standing agent below — it runs on a schedule and reports into your feed.'))+'</div>';
   h+='<div class=card><h2>Create an agent</h2><label>Name</label><input id=an aria-label="Agent name" placeholder="Market Watch"><div class=grid><div><label>Specialty</label><select id=ar>'+roles.map(r=>`<option value="${r}">${r}</option>`).join('')+'</select></div><div><label>Runs</label><select id=at><option value=manual>On demand</option><option value=recurring>Every week</option></select></div></div><label>What should it do?</label><textarea id=ai placeholder="Every week, scan my market for new competitors and pricing changes; give me 3 prioritized takeaways with sources."></textarea><div style=margin-top:10px><button class=pri onclick=agentCreate()>Create agent</button></div><div id=anote class=muted style=margin-top:8px></div></div>';
+  h+='<div class=card><h2>Agentic features</h2><div class="row spread"><span class=muted>Embed agents INTO your product — buttons and endpoints your own users trigger. A curated catalog your fleet builds into your app.</span><button onclick="go(\'agentic\')">Browse features</button></div></div>';
   $('#view').innerHTML=h;},
  templates:async()=>{const d=await get('/api/templates');$('#view').innerHTML=`<h1>Templates</h1><p class=sub>Start from a curated, factory-ready blueprint.</p><div class=grid>`+(d.templates||[]).map(t=>`<div class=tile><div class="row spread"><b>${esc(t.name)}</b>${pill(t.kind)}</div><div class=muted style=margin:6px_0>${esc(t.blurb)}</div><button class=pri onclick="buildTpl('${t.slug}')">Build this</button></div>`).join('')+'</div>';},
- projects:async()=>{const d=await get('/api/projects?org='+ORG);d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):emptyB('▤','No projects yet','Describe your first product and the factory builds, tests and ships it.','<button class=pri onclick="go(\'chat\')">Start your first build</button>'))+'</div>';},
+ projects:async()=>{const d=await get('/api/projects?org='+ORG);d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages</span></div></div>`).join(''):emptyB('▤','No projects yet','Describe your first product and the factory builds, tests and ships it.','<button class=pri onclick="go(\'controller\')">Start your first build</button>'))+'</div>';},
  activity:async()=>{const o=await get('/api/observability');let fl={workers:[]};try{fl=await get('/api/fleet?org='+ORG)}catch(e){}fl.workers=fl.workers||[];
   let h='<h1>Activity</h1><p class=sub>Runs, errors, spend, and the live workers across your fleet.</p>';
   h+=kpis([['Runs',o.runs||0],['Steps',o.steps||0],['Errors',o.errors||0],['Cost $',o.cost_usd||0],['Workers',fl.workers.length]]);
@@ -620,11 +724,15 @@ async function ctlSend(){
  const btn=$('#ctlsend');if(btn)btn.disabled=true;if(i){i.value='';i.disabled=true}
  const log=$('#clog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=ctltyping style="margin:8px 0"><div><span class=bubble><span class=muted>… thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
  $('#cnote').textContent='thinking…';
- try{await post('/api/controller/say',{org:ORG,message:m});}
+ let r;
+ try{r=await post('/api/controller/say',{org:ORG||0,message:m},90000);}
  finally{CTLBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false;i.focus()}}
- const t=$('#ctltyping');if(t)t.remove();$('#cnote').textContent='';go('controller');
+ const t=$('#ctltyping');if(t)t.remove();
+ const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote').innerHTML=gateNote(cg);if(i)i.value=m;return;}   // friendly connect/consent prompt — keep their text
+ if(r&&r.error){$('#cnote').textContent='✗ '+r.error+' — your message is in the box, press Send to retry.';if(i)i.value=m;return;}
+ $('#cnote').textContent='';go('controller');
 }
-async function ctlChoose(oid){await post('/api/controller/choose',{org:ORG,option_id:oid});go('controller');}
+async function ctlChoose(oid){const r=await post('/api/controller/choose',{org:ORG||0,option_id:oid});const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote')&&($('#cnote').innerHTML=gateNote(cg));return;}go('controller');}
 async function orgNew(){const inp=$('#onm');const name=(inp?inp.value:'').trim();const note=$('#onote');
  if(!name){if(note)note.textContent='Enter a name for your org';if(inp)inp.focus();return}
  if(note)note.textContent='';
@@ -650,6 +758,7 @@ async function chatSend(){
  let r;
  try{r=await post('/api/chat/say',{thread:THREAD,message:m},90000);}
  finally{CHATBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false}}
+ const cg=gateKey(r);if(r&&gateError(cg)){const t=$('#chattyping');if(t)t.remove();$('#chatnote').innerHTML=gateNote(cg);if(i){i.value=m;i.focus()}await chatRender();return;}   // gate (consent/provider) -> friendly CTA, keep their text
  if(r&&r.error){   // never leave a silent spinner: surface a clear, retryable failure
   const t=$('#chattyping');if(t)t.remove();
   const em=r.error==='timeout'?'The assistant is taking too long to respond. Your message is still in the box — press Send to try again.':('✗ '+r.error+' — your message is still in the box, press Send to retry.');
@@ -663,19 +772,21 @@ async function chatSend(){
 }
 async function chatConfirm(){
  $('#chatnote').textContent='starting build…';const r=await post('/api/chat/confirm',{thread:THREAD});
- $('#chatnote').textContent=r.error?('✗ '+(r.error==='consent_required'?'accept AI consent in Settings first':r.error)):('building '+r.product+' — see Cockpit');
+ const cg=gateKey(r);if(r&&gateError(cg)){$('#chatnote').innerHTML=gateNote(cg);return;}
+ $('#chatnote').textContent=r.error?('✗ '+r.error):('building '+r.product+' — see Cockpit');
 }
 async function showEst(){const k=($('#bk')||{}).value||'lib';let e;try{e=await get('/api/estimate?kind='+k)}catch(_){return}if($('#est'))$('#est').textContent='Estimate: '+(e.note||('~$'+e.cost_usd_estimate+', ~'+e.minutes_estimate+' min'));}
-async function doBuild(){$('#bnote').textContent='submitting…';const r=await post('/api/build',{name:$('#bn').value,kind:$('#bk').value,charter:$('#bc').value});$('#bnote').textContent=r.error?('✗ '+(r.error==='consent_required'?'accept AI consent in Settings first':r.error)):('building '+r.product+' — see Cockpit');}
+async function doBuild(){$('#bnote').textContent='submitting…';const r=await post('/api/build',{name:$('#bn').value,kind:$('#bk').value,charter:$('#bc').value});if(r&&r.error&&gateError(r.error)){$('#bnote').innerHTML=gateNote(r.error);return;}$('#bnote').textContent=r.error?('✗ '+r.error):('building '+r.product+' — see Cockpit');}
 async function obContinue(step){
- const SCREEN={welcome:'providers',provider:'providers',consent:'settings',first_build:'chat'};
+ const SCREEN={welcome:'providers',provider:'providers',consent:'settings',first_build:'controller'};
  const NEXT={welcome:'provider',provider:'consent',consent:'first_build',first_build:'done'};
  await post('/api/onboarding/advance',{step:NEXT[step]||'done'});   // record progress past the current step
- go(SCREEN[step]||'chat');
+ go(SCREEN[step]||'controller');
 }
 async function buildTpl(slug){
  const r=await post('/api/build_template',{slug});
  if(r.error==='consent_required'){go('settings');return}
+ if(r.error==='provider_required'){go('providers');return}
  if(r.error){alert('Could not build: '+r.error);return}
  go('cockpit');
 }
@@ -686,7 +797,7 @@ async function plan(p){await post('/api/billing/plan',{plan:p});go('billing');}
 async function provAdd(slug,hint){const k=prompt('Paste your '+slug+' API key ('+hint+'):');if(k===null)return;const r=await post('/api/providers/connect',{provider:slug,mode:'api_key',key:k});if(r&&r.error){alert('Could not connect '+slug+': '+r.error);return}go('providers');}
 async function provSub(slug){const r=await post('/api/providers/connect',{provider:slug,mode:'subscription'});if(r&&r.error){alert('Could not connect '+slug+': '+r.error);return}go('providers');}
 async function agentCreate(){const t=$('#at').value;const r=await post('/api/agents/create',{name:$('#an').value,instructions:$('#ai').value,role:$('#ar').value,trigger:t,interval_s:t==='recurring'?604800:0,output:'report'});$('#anote').textContent=r.error?('✗ '+r.error):'agent created';if(!r.error)go('agents');}
-async function agentRun(id){await post('/api/agents/run',{id});$('#anote')&&($('#anote').textContent='running — it\'ll report into your notifications');}
+async function agentRun(id){const r=await post('/api/agents/run',{id});const n=$('#anote');if(!n)return;if(r&&r.error&&gateError(r.error)){n.innerHTML=gateNote(r.error);return;}n.textContent=r&&r.error?('✗ '+r.error):'running — it\'ll report into your notifications';}
 async function agentToggle(id,en){await post('/api/agents/toggle',{id,enabled:en});go('agents');}
 async function agentDel(id){if(!confirm('Delete this agent?'))return;await post('/api/agents/delete',{id});go('agents');}
 async function provRemove(slug){await post('/api/providers/remove',{provider:slug});go('providers');}
@@ -696,14 +807,15 @@ async function saveKey(){const v=($('#bk')||{}).value||'';const note=$('#bknote'
 async function acctExport(){$('#acctnote').textContent='preparing export…';const r=await post('/api/account/export',{});$('#acctnote').textContent=r.ok?('Export ready ('+r.products+' products) on the server: '+(r.path||'')):'export failed';}
 async function acctDelete(){const r=await post('/api/account/delete',{confirm:false});if(!confirm('Permanently delete your account and ALL data? This cannot be undone.'))return;const r2=await post('/api/account/delete',{confirm:true});if(r2.ok){localStorage.removeItem('aos_tenant');TOK='';clearTimers();$('#view').innerHTML='<div class=card>Your account and data were deleted. Goodbye.</div>';}}
 async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
-async function boot(){renderNav();refreshTopbar();await loadOrgs();
+async function boot(){renderNav();refreshTopbar();await loadOrgs();await loadProviders();
+ if(!ORG&&ORGS.length){ORG=ORGS[0].org_id;localStorage.setItem('aos_org',ORG);setOrgName();}   // default into a company at boot; the user can switch to All orgs (home) anytime
  let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
- if(!ORGS.length)go('orgs');                              // brand-new CEO (0 orgs): orgs are first-class — guide them to create their first org before anything else
- else if(ob&&!ob.completed&&ob.step!=='done')go('cockpit');   // first-run: Cockpit renders the guided onboarding banner
- else go(ORG?'controller':'orgs');
+ if(ORGS.length&&ob&&!ob.completed&&ob.step!=='done')go('cockpit');   // first-run with a company: Cockpit renders the guided onboarding banner
+ else go('controller');   // Assistant is the primary surface — it handles the zero-company home state itself
  if(!window.TOPBARPOLL)window.TOPBARPOLL=setInterval(refreshTopbar,15000);
  if(!window.AUTOPOLL)window.AUTOPOLL=setInterval(()=>{if(!TOK)return;if(!['cockpit','activity'].includes(CUR))return;if(($('#acctmenu')||{}).style&&$('#acctmenu').style.display==='block')return;if(document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#view'))return;refreshView()},6000)}
-document.addEventListener('click',e=>{if(!e.target.closest('#acctmenu')&&!String(e.target.getAttribute&&e.target.getAttribute('onclick')||'').includes('toggleAcct'))$('#acctmenu').style.display='none'});
+document.addEventListener('click',e=>{if(!e.target.closest('#acctmenu')&&!String(e.target.getAttribute&&e.target.getAttribute('onclick')||'').includes('toggleAcct'))$('#acctmenu').style.display='none';
+  if(!e.target.closest('.orgsw'))toggleOrgSw(false);});
 async function start(){                                   // validate the saved token BEFORE revealing the app shell
  if(!TOK){showApp(false);return}
  $('#signin').style.display='none';$('#app').style.display='none';   // neutral loading state — no flash of the signed-in UI

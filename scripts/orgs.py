@@ -73,6 +73,42 @@ def list_orgs(tenant_id, include_archived=False):
                  "created_at": str(ca), "products": p} for i, n, v, st, stat, ca, p in cur.fetchall()]
 
 
+HOME_ORG = 0  # the account-wide "All orgs (home)" context; org=N is a specific company.
+
+
+def switcher(tenant_id):
+    """The org list shaped for the inline context switcher / Assistant home selector. Returns the home
+    sentinel (org_id=0, the account-wide "All orgs (home)" thread) followed by the tenant's active
+    companies (most-recent first), each compact: id, name, vision, stage, products. This is the ONE
+    backend definition of the switcher options, so the frontend + assistant.py agree on what "home" is
+    instead of hardcoding it. `default_org` is where a fresh session lands (the only/first company, or
+    home when there are none); `count` excludes the home sentinel."""
+    companies = [{"org_id": o["org_id"], "name": o["name"], "vision": o["vision"],
+                  "stage": o["stage"], "products": o["products"]} for o in list_orgs(tenant_id)]
+    home = {"org_id": HOME_ORG, "name": "All orgs (home)",
+            "vision": "Ask across every company · start a new one", "stage": "home", "products": 0}
+    return {"orgs": [home] + companies, "count": len(companies),
+            "default_org": companies[0]["org_id"] if companies else HOME_ORG}
+
+
+def resolve(tenant_id, org_id):
+    """Resolve a switcher selection to its context. org_id=0 (HOME_ORG) is the account-wide home thread
+    (no company precondition); org_id=N is a specific company, ownership-checked. This is the ONE place
+    the org=0-vs-org=N dispatch is decided, so the route/assistant never re-hardcodes it. Non-owned or
+    non-numeric N returns an error rather than leaking another tenant's org."""
+    try:
+        oid = int(org_id or 0)
+    except (TypeError, ValueError):
+        oid = HOME_ORG
+    if oid == HOME_ORG:
+        return {"home": True, "org_id": HOME_ORG, "name": "All orgs (home)"}
+    g = get(tenant_id, oid)
+    if g.get("error"):
+        return {"home": False, "org_id": oid, "error": g["error"]}
+    return {"home": False, "org_id": oid, "name": g["name"], "vision": g["vision"],
+            "stage": g["stage"], "status": g["status"]}
+
+
 def get(tenant_id, org_id):
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
@@ -165,8 +201,15 @@ def _selftest():
         g = get(tid, a["org_id"]); updated = g["vision"] == "v2 vision" and g["stage"] == "researching"
         guard = get("t-someone-else", a["org_id"]).get("error") == "not your org"
         archive(tid, b["org_id"]); after = len(list_orgs(tid)) == 1   # archived hidden
-        ok = a["org_id"] and two and updated and guard and after
-        print(f"created=2 listed={len(listed)} vision/stage-updated={updated} ownership-guard={guard} archive-hides={after}")
+        sw = switcher(tid)
+        sw_ok = (sw["orgs"][0]["org_id"] == HOME_ORG and sw["count"] == 1
+                 and sw["default_org"] == a["org_id"])
+        rz_ok = (resolve(tid, 0)["home"] is True
+                 and resolve(tid, a["org_id"]).get("name") == "YouTube competitor"
+                 and resolve("t-someone-else", a["org_id"]).get("error") == "not your org")
+        ok = a["org_id"] and two and updated and guard and after and sw_ok and rz_ok
+        print(f"created=2 listed={len(listed)} vision/stage-updated={updated} ownership-guard={guard} "
+              f"archive-hides={after} switcher={sw_ok} resolve={rz_ok}")
         print("PASS: orgs are first-class per-tenant (create/list/vision/stage/archive, owner-scoped) ✅" if ok else "FAIL")
     finally:
         with psycopg.connect(DB) as c, c.cursor() as cur:
@@ -184,12 +227,17 @@ def _main(a):
         print(json.dumps(create(a[1], a[2], a[3] if len(a) > 3 else "")))
     elif a[0] == "list" and len(a) > 1:
         print(json.dumps(list_orgs(a[1]), indent=2))
+    elif a[0] == "switcher" and len(a) > 1:
+        print(json.dumps(switcher(a[1]), indent=2))
+    elif a[0] == "resolve" and len(a) > 2:
+        print(json.dumps(resolve(a[1], int(a[2])), indent=2))
     elif a[0] == "get" and len(a) > 2:
         print(json.dumps(get(a[1], int(a[2])), indent=2))
     elif a[0] == "vision" and len(a) > 3:
         print(json.dumps(set_vision(a[1], int(a[2]), a[3])))
     else:
-        sys.exit('usage: orgs.py create <tenant> "<name>" ["vision"] | list <tenant> | get <tenant> <id> | vision ... | selftest')
+        sys.exit('usage: orgs.py create <tenant> "<name>" ["vision"] | list <tenant> | switcher <tenant> | '
+                 'resolve <tenant> <org_id> | get <tenant> <id> | vision ... | selftest')
 
 
 if __name__ == "__main__":

@@ -110,6 +110,54 @@ def _parse_build(text):
     return (proposal if proposal["charter"] else None), reply
 
 
+def _resolved_provider(tid):
+    """A tenant has a USABLE model provider when they've connected one with a key, OR signed in via a
+    SUBSCRIPTION login (runs on the host CLI's own account — no key needed). Nothing connected -> None,
+    so we refuse BEFORE any spend instead of silently billing the platform default."""
+    try:
+        import tenantproviders
+        r = tenantproviders.resolve(tid)
+    except Exception:
+        return None
+    return r if (r.get("key") or r.get("auth_mode") == "subscription") else None
+
+
+def _apply_provider_ctx(tid):
+    """Wire the tenant's resolved provider into factory._ctx so model spend lands on THEIR account
+    (engine + key), not the platform default — mirrors factory.build_product's engine routing."""
+    r = _resolved_provider(tid) or {}
+    if r.get("engine") == "codex":
+        factory._ctx.engine, factory._ctx.codex_key, factory._ctx.api_key = "codex", r.get("key"), None
+    else:
+        factory._ctx.engine, factory._ctx.api_key, factory._ctx.codex_key = "claude", r.get("key"), None
+
+
+def _gate(tid, thread_id):
+    """Refuse a model turn BEFORE any spend when AI-processing consent isn't on file, or no provider is
+    connected. Posts a visible assistant turn explaining how to unblock and returns the blocked result;
+    returns None to proceed. Fail CLOSED on the (legal) consent gate."""
+    try:
+        consented = consent.require_consent(tid)
+    except Exception:
+        consented = False
+    if not consented:
+        msg = ("Before I can build anything I need your OK to use AI — accept the AI-processing consent in "
+               "Settings → Privacy (it names the provider your text is sent to), then tell me again what "
+               "you'd like to build.")
+        post(tid, thread_id, msg, {"kind": "consent_required"})
+        audit.append(actor="orchestrator", action="ConsentRequired", resource=str(thread_id),
+                     decision="say", payload={"tenant": tid})
+        return {"reply": msg, "proposal": None, "blocked": "consent_required"}
+    if not _resolved_provider(tid):
+        msg = ("I need a model provider connected first — add Anthropic or OpenAI/Codex in Settings → "
+               "Providers (or sign in with your subscription), then tell me again what to build.")
+        post(tid, thread_id, msg, {"kind": "provider_required"})
+        audit.append(actor="orchestrator", action="ProviderRequired", resource=str(thread_id),
+                     decision="say", payload={"tenant": tid})
+        return {"reply": msg, "proposal": None, "blocked": "provider_required"}
+    return None
+
+
 def say(tid, thread_id, message, api_key=None):
     """One chat turn: persist the CEO msg, ask the orchestrator agent, persist + return its reply/proposal."""
     _ensure()
@@ -117,9 +165,17 @@ def say(tid, thread_id, message, api_key=None):
         cur.execute("INSERT INTO chat_messages (thread_id, tenant_id, role, content) VALUES (%s,%s,'user',%s)",
                     (thread_id, tid, message))
         c.commit()
+    # CONSENT + PROVIDER GATE: this turn sends the CEO's text to the model. Refuse BEFORE any spend if
+    # AI-processing consent isn't on file, or no provider is connected — so we never leak pre-consent text
+    # and spend always lands on the tenant's own account (the quick-build front door used to skip this).
+    blocked = _gate(tid, thread_id)
+    if blocked:
+        return blocked
     convo = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history(tid, thread_id))
     task = f"{SYS}\n\n{_state_brief(tid)}\n\nCONVERSATION SO FAR:\n{convo}\n\nReply now as ORCHESTRATOR:"
     factory._ctx.api_key = api_key
+    factory._ctx.tenant = tid          # lets factory.agent enforce the consent backstop (was never set -> bypassed)
+    _apply_provider_ctx(tid)           # spend lands on the tenant's account (engine + key), not platform default
     factory._ctx.product = None; factory._ctx.run = f"chat-{thread_id}"; factory._ctx.stage = "ORCHESTRATE"
     r = factory.agent("orchestrator", str(frontdoor.PRODUCTS), task, tools=[])
     reply_raw = (r.get("out") or "").strip() or "Tell me a bit more about what you'd like to build."
@@ -207,6 +263,8 @@ def confirm(tid, thread_id, api_key=None):
     p = msgs[-1]["meta"]["proposal"]
     if not consent.require_consent(tid):
         return {"error": "consent_required", "consent": consent.state(tid)}
+    if not _resolved_provider(tid):    # no usable provider -> refuse before the build fans out any paid work
+        return {"error": "provider_required"}
     q = billing.quota(tid)
     if not q["within_quota"]:
         return {"error": f"quota reached ({q['builds']}) — upgrade your plan"}
@@ -239,19 +297,30 @@ def _selftest():
                                 "charter: A REST API to track expenses with categories, monthly totals, and CSV export. "
                                 "Includes input validation and tests.\n[[/BUILD]]"}
     factory.agent = fake_agent
+    import tenantproviders
     try:
         th = start_thread(tid)
+        # CONSENT GATE: pre-consent, say() must REFUSE before touching the agent (no proposal, no spend).
+        pre_consent = say(tid, th, "I want to track my expenses")
+        consent_gate = pre_consent.get("blocked") == "consent_required" and turns["n"] == 0
+        consent.record(tid)                                          # CEO accepts AI-processing consent
+        # PROVIDER GATE: consented but NO provider connected -> still refuse before any spend.
+        pre_prov = say(tid, th, "I want to track my expenses")
+        provider_gate = pre_prov.get("blocked") == "provider_required" and turns["n"] == 0
+        tenantproviders.connect(tid, "anthropic", "subscription")   # subscription login = resolved (no key)
         t1 = say(tid, th, "I want to track my expenses")
         clarified = t1["proposal"] is None and "?" in t1["reply"]    # asked a question, no build yet
         t2 = say(tid, th, "just me, a simple API")
         proposed = t2["proposal"] and t2["proposal"]["kind"] == "service" and "expense" in t2["proposal"]["charter"].lower()
-        gate = confirm(tid, th).get("error") == "consent_required"   # confirm respects the consent gate
+        consent.revoke(tid)
+        gate = confirm(tid, th).get("error") == "consent_required"   # confirm independently re-checks consent
         consent.record(tid)
         built = confirm(tid, th).get("status") == "building"
         hist = len(history(tid, th)) >= 4                            # 2 user + 2 assistant (+ async reports)
-        ok = clarified and proposed and gate and built and hist
-        print(f"clarify={clarified} propose={proposed} consent-gated={gate} build-on-confirm={built} history>=4={hist}")
-        print("PASS: orchestrator chat (clarify -> propose -> governed build, reports back) ✅" if ok else "FAIL")
+        ok = consent_gate and provider_gate and clarified and proposed and gate and built and hist
+        print(f"consent_gate={consent_gate} provider_gate={provider_gate} clarify={clarified} propose={proposed} "
+              f"confirm-consent-gated={gate} build-on-confirm={built} history>=4={hist}")
+        print("PASS: orchestrator chat (gated clarify -> propose -> governed build, reports back) ✅" if ok else "FAIL")
     finally:
         factory.agent = real
         frontdoor._run_build = real_build
@@ -260,6 +329,7 @@ def _selftest():
             cur.execute("DELETE FROM chat_messages WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM chat_threads WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM tenant_providers WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
             c.commit()

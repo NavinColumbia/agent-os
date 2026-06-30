@@ -167,6 +167,29 @@ def _ctx_brief(s):
         return ""
 
 
+def _resolved_provider(tid):
+    """A tenant has a USABLE model provider when they've connected one with a key, OR signed in via a
+    SUBSCRIPTION login (runs on the host CLI's own account — no key needed). Nothing connected -> None,
+    so we refuse BEFORE any spend instead of silently billing the platform default. (Mirrors the
+    PLAN_APPROVAL credential check at line ~399 — applied up front so no _llm/fan-out runs un-provided.)"""
+    try:
+        import tenantproviders
+        r = tenantproviders.resolve(tid)
+    except Exception:
+        return None
+    return r if (r.get("key") or r.get("auth_mode") == "subscription") else None
+
+
+def _apply_provider_ctx(r):
+    """Wire the tenant's resolved provider into factory._ctx so model spend lands on THEIR account
+    (engine + key), not the platform default — mirrors factory.build_product's engine routing. This
+    SUPERSEDES the always-None `factory._ctx.api_key = api_key` set earlier in say()."""
+    if (r or {}).get("engine") == "codex":
+        factory._ctx.engine, factory._ctx.codex_key, factory._ctx.api_key = "codex", r.get("key"), None
+    else:
+        factory._ctx.engine, factory._ctx.api_key, factory._ctx.codex_key = "claude", (r or {}).get("key"), None
+
+
 def say(tid, thread_id, msg, api_key=None):
     _ensure()
     s = _st(thread_id)
@@ -197,6 +220,23 @@ def say(tid, thread_id, msg, api_key=None):
         audit.append(actor="loopcontroller", action="ConsentRequired", resource=str(thread_id),
                      decision=phase, payload={"tenant": tid})
         return {"phase": phase, "blocked": "consent_required"}
+
+    # PROVIDER GATE (spend lands on the TENANT, not the platform): every phase below either sends the CEO's
+    # text to the model (_llm) or fans out paid agent work. AFTER consent, require a RESOLVED provider — a
+    # connected key, or a subscription login that runs on the CLI's own account — BEFORE any spend, and wire
+    # it into factory._ctx so the cost is billed to THEIR account. Fail CLOSED: nothing connected -> ask them
+    # to connect one in Settings; they say "ready" and the message re-enters here and proceeds.
+    prov = _resolved_provider(tid)
+    if not prov:
+        _report(tid, thread_id,
+                 "Before I can research or build I need a model provider connected — add Anthropic or "
+                 "OpenAI/Codex in Settings → Providers (or sign in with your subscription), then say "
+                 "\"ready\" and I'll pick up right where we left off.",
+                 {"kind": "provider_required", "phase": phase}, urgent=True)
+        audit.append(actor="loopcontroller", action="ProviderRequired", resource=str(thread_id),
+                     decision=phase, payload={"tenant": tid})
+        return {"phase": phase, "blocked": "provider_required"}
+    _apply_provider_ctx(prov)
 
     if phase == "DISCOVER":
         sysp = ("You are a product controller scoping a build for a non-technical CEO. Ask ONE focused "

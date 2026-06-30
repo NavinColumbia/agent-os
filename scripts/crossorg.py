@@ -213,6 +213,47 @@ def get_op(op_id):
     return _row(op_id) or {"error": "no such op"}
 
 
+def actions(tenant_id):
+    """The cross-org ACTIONS the home/Assistant thread can offer, paired with the tenant's companies to
+    pick a source/target. Read-only catalog (no state change): the assistant surfaces these, then drives
+    the existing propose -> scope -> request_approval -> execute pipeline. 'merge' needs a source+target;
+    'steal_feature' needs a source, a target, and the feature to port. Cross-org ops only make sense with
+    >=2 companies, so `available` reflects that and the catalog is empty below the threshold."""
+    companies = [{"org_id": o["org_id"], "name": o["name"], "stage": o["stage"]}
+                 for o in orgs.list_orgs(tenant_id)]
+    catalog = [
+        {"kind": "merge", "label": "Merge two companies", "needs": ["source_org", "target_org"],
+         "desc": "combine two of your companies into one product (governed lineage bookkeeping)"},
+        {"kind": "steal_feature", "label": "Port a feature across companies",
+         "needs": ["source_org", "target_org", "feature"],
+         "desc": "take a feature built in one company and bring it into another"},
+    ]
+    enough = len(companies) >= 2
+    return {"available": enough, "orgs": companies,
+            "actions": catalog if enough else [], "recent_ops": list_ops(tenant_id)[:5]}
+
+
+def portfolio_brief(tenant_id):
+    """Compact portfolio summary for the home thread's cross-org Q&A — the cross-org analogue of
+    orgs.context_brief. Rolls up every company (reusing crossorgview's recorded-truth rollup, best
+    effort) into a one-paragraph text the assistant can feed an LLM, plus the structured rollup and any
+    in-flight cross-org ops. Read-only; never spends, never mutates."""
+    companies = orgs.list_orgs(tenant_id)
+    roll = {}
+    try:
+        import crossorgview  # lazy: avoids any import-time coupling; crossorgview imports only orgs
+        roll = crossorgview.portfolio(tenant_id)
+    except Exception:
+        roll = {}
+    totals = roll.get("totals", {})
+    names = ", ".join(o["name"] for o in companies) or "none yet"
+    text = (f"PORTFOLIO: {len(companies)} compan{'y' if len(companies) == 1 else 'ies'} ({names}). "
+            f"Products: {totals.get('products', 0)}, live: {totals.get('live', 0)}, "
+            f"building: {totals.get('building', 0)}, spend: ${totals.get('spend_usd', 0)}.")
+    open_ops = [o for o in list_ops(tenant_id) if o["status"] != "done"][:10]
+    return {"text": text, "orgs": roll.get("orgs", []), "totals": totals, "open_ops": open_ops}
+
+
 def _selftest():
     import billing
     tid = billing.signup("crossorg-selftest", "free")["tenant_id"]
@@ -247,9 +288,19 @@ def _selftest():
         guard = propose(tid, "steal_feature", foreign, b, "x").get("error") == "source_org not your org" \
             and propose(tid, "steal_feature", a, foreign, "x").get("error") == "target_org not your org"
 
-        ok = (proposed and planned and awaiting and requires and is_done and lineage_ok and guard)
+        # assistant-facing surfaces: action catalog (>=2 orgs) + portfolio brief for cross-org Q&A.
+        acts = actions(tid)
+        actions_ok = (acts["available"] is True and len(acts["actions"]) == 2
+                      and any(o["org_id"] == a for o in acts["orgs"]))
+        pb = portfolio_brief(tid)
+        brief_ok = ("PORTFOLIO" in (pb.get("text") or "") and isinstance(pb.get("orgs"), list)
+                    and isinstance(pb.get("open_ops"), list))
+
+        ok = (proposed and planned and awaiting and requires and is_done and lineage_ok and guard
+              and actions_ok and brief_ok)
         print(f"proposed={proposed} scoped/planned={planned} await_approval={awaiting} "
-              f"requires_confirm={requires} done={is_done} lineage_row={lineage_ok} ownership_guard={guard}")
+              f"requires_confirm={requires} done={is_done} lineage_row={lineage_ok} "
+              f"ownership_guard={guard} actions={actions_ok} portfolio_brief={brief_ok}")
         print("PASS: cross-org ops are owner-scoped, scoped to a plan, human-gated, "
               "and executed as governed lineage bookkeeping ✅" if ok else "FAIL")
     finally:
@@ -280,12 +331,17 @@ def _main(a):
         print(json.dumps(execute(int(a[1]), confirmed="--confirm" in a), indent=2, default=str))
     elif a[0] == "list" and len(a) > 1:
         print(json.dumps(list_ops(a[1]), indent=2))
+    elif a[0] == "actions" and len(a) > 1:
+        print(json.dumps(actions(a[1]), indent=2, default=str))
+    elif a[0] == "portfolio-brief" and len(a) > 1:
+        print(json.dumps(portfolio_brief(a[1]), indent=2, default=str))
     elif a[0] in ("get", "json") and len(a) > 1:
         print(json.dumps(get_op(int(a[1])), indent=2, default=str))
     else:
         sys.exit("usage: crossorg.py propose <tenant> <kind> <source_org> [target_org] [feature] | "
                  "scope <op_id> | request-approval <tenant> <op_id> | execute <op_id> [--confirm] | "
-                 "list <tenant> | get <op_id> | json <op_id> | selftest")
+                 "list <tenant> | actions <tenant> | portfolio-brief <tenant> | get <op_id> | "
+                 "json <op_id> | selftest")
 
 
 if __name__ == "__main__":

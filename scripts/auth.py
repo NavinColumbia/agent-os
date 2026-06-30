@@ -97,6 +97,29 @@ def login(email, password):
     return {"tenant_id": tid, "api_token": token, "email": email}
 
 
+def provider_resolved(tid):
+    """Provider-resolution gate: does this tenant have a USABLE model provider on file, so the fleet runs
+    on THEIR account instead of silently spending the platform's own credentials? Resolved iff a connected
+    provider exists AND it is either a SUBSCRIPTION login (runs on the host CLI's logged-in account, no key)
+    OR carries a usable BYO API key. Nothing connected, or an api_key connection whose vault secret is
+    missing, -> NOT resolved (would fall back to platform credit -> refuse upstream; never silent-fallback).
+
+    No tenant in context (platform/internal build, offline selftest) -> resolved=True (not a tenant action,
+    not gated — symmetric to factory's consent backstop, which only fires when _ctx.tenant is set). Fails
+    OPEN on resolver-infra error: a DB/vault hiccup must not wedge the fleet (consent + budget caps still
+    bound spend), so a clean 'nothing resolved' fails closed but a broken resolver does not."""
+    if not tid:
+        return True                                                  # no tenant => not a gated tenant action
+    try:
+        import tenantproviders
+        r = tenantproviders.resolve(tid)
+    except Exception:
+        return True                                                  # resolver infra error => fail OPEN
+    if not r or not r.get("provider"):
+        return False                                                 # nothing connected => platform default
+    return r.get("auth_mode") == "subscription" or bool(r.get("key"))
+
+
 def _selftest():
     email = f"qa-{os.urandom(3).hex()}@example.com"
     try:
@@ -106,12 +129,16 @@ def _selftest():
         good = login(email, "correct-horse-battery")                 # login returns the same tenant + a token
         wrong = login(email, "nope")                                 # wrong password rejected
         nouser = login("ghost@example.com", "whatever")
+        no_prov = provider_resolved(ok1["tenant_id"])                # fresh account, nothing connected -> NOT resolved
+        no_tenant = provider_resolved("")                            # no tenant in context -> not gated (resolved)
         passed = (bad.get("error") and ok1.get("api_token") and dup.get("error")
                   and good.get("tenant_id") == ok1["tenant_id"] and good.get("api_token")
-                  and wrong.get("error") == "wrong password" and nouser.get("error"))
+                  and wrong.get("error") == "wrong password" and nouser.get("error")
+                  and no_prov is False and no_tenant is True)
         print(f"reject-short={bool(bad.get('error'))} signup={bool(ok1.get('api_token'))} "
               f"dup-blocked={bool(dup.get('error'))} login-token={bool(good.get('api_token'))} "
-              f"wrong-pw={wrong.get('error')=='wrong password'}")
+              f"wrong-pw={wrong.get('error')=='wrong password'} "
+              f"provider-gate(none={no_prov},no-tenant={no_tenant})")
         print("PASS: email+password accounts (signup/login, hashed, no token-pasting) ✅" if passed else "FAIL")
     finally:
         with psycopg.connect(DB) as c, c.cursor() as cur:

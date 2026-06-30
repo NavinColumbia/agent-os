@@ -9,8 +9,18 @@ is pinned to a small allowlist of GOVERNED roles (no arbitrary capability), and 
 own provider key (tenantproviders.build_kwargs). Recurring agents are wired into scheduler.py by id, so
 the scheduler's shell command is literally `customagents.py run <id>`.
 
+Two TIERS share this surface, and the split is structural, not cosmetic:
+  * SYSTEM agents (Tier-A) — the standing org-chart roles (Controller + the governed fleet). They are
+    DEFAULT and UNEDITABLE: surfaced READ-ONLY via system_agents(); they are NOT rows in custom_agents,
+    so no define/run_now/toggle/delete path can mutate one. The Controller is the sole spawner
+    (control-plane/roles/controller.yaml can_spawn:true).
+  * CUSTOM agents (Tier-B) — the tenant's OWN standing agents (rows in custom_agents): editable, pinned
+    to ALLOWED_ROLES, ownership-checked on every mutation. list_agents() tags these editable.
+tiers(tid) returns both in one read for the Agents view.
+
     customagents.py run <id>        # execute one agent (the scheduler calls this)
     customagents.py list <tid>      # a tenant's defined agents
+    customagents.py tiers <tid>     # system (read-only) + custom (editable) tiers as one payload
     customagents.py selftest        # offline-ish check (no real LLM spend; factory.agent monkeypatched)
 Run with the agent-os venv python.
 """
@@ -27,6 +37,7 @@ sys.path.insert(0, str(SCRIPTS))
 import audit             # noqa: E402
 import factory           # noqa: E402
 import notifications     # noqa: E402
+import orgview           # noqa: E402  (canonical standing org-chart = the Tier-A system roles)
 import sanitize          # noqa: E402
 import scheduler         # noqa: E402
 import tenantproviders   # noqa: E402
@@ -180,7 +191,36 @@ def run_now(tid, agent_id):
     return run(agent_id)
 
 
+def system_agents():
+    """Tier-A SYSTEM agents — the standing org-chart roles (Controller + governed fleet), surfaced
+    READ-ONLY. These are DEFAULT and UNEDITABLE: they are NOT rows in custom_agents, so no tenant route
+    can create/run/toggle/delete one (`editable: False`). Sourced from the canonical standing hierarchy
+    (orgview.ORG); the Controller is the sole spawner (control-plane/roles/controller.yaml can_spawn:true)
+    — every other node is `can_spawn: False`. Manifest summary/title overlaid when a role manifest exists.
+    No tenant_id: identical for everyone, so this is a pure read with no DB hit and no per-tenant state."""
+    try:
+        import governance
+        manifest = governance.load_manifest
+    except Exception:
+        manifest = lambda _role: {}        # noqa: E731  (best-effort: manifest detail is optional)
+    out = []
+    for role, title, reports_to in orgview.ORG:
+        m = manifest(role) or {}
+        out.append({
+            "role": role,
+            "title": m.get("display_name") or title,
+            "reports_to": reports_to,
+            "summary": (m.get("summary") or "").strip() or None,
+            "can_spawn": role == "controller",   # sole-spawner invariant, surfaced read-only
+            "tier": "system",
+            "editable": False,
+        })
+    return out
+
+
 def list_agents(tid):
+    """Tier-B CUSTOM agents — the tenant's OWN standing agents (rows they own). Tagged `editable: True`
+    to distinguish them from the read-only system tier in the same Agents view."""
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""SELECT id, name, role, trigger, interval_s, output, enabled, last_run, last_status
@@ -188,7 +228,13 @@ def list_agents(tid):
         rows = cur.fetchall()
     return [{"id": r[0], "name": r[1], "role": r[2], "trigger": r[3], "interval_s": r[4],
              "output": r[5], "enabled": r[6], "last_run": str(r[7]) if r[7] else None,
-             "last_status": r[8]} for r in rows]
+             "last_status": r[8], "tier": "custom", "editable": True} for r in rows]
+
+
+def tiers(tid):
+    """One read for the Agents view: the read-only SYSTEM tier, the tenant's editable CUSTOM tier, and
+    the governed role allowlist a tenant may pick from when defining a custom agent."""
+    return {"system": system_agents(), "custom": list_agents(tid), "roles": list(ALLOWED_ROLES)}
 
 
 def toggle(tid, agent_id, enabled):
@@ -266,6 +312,21 @@ def _selftest():
         res = run_now(tid, agent_id)
         report_written = bool(res.get("report")) and Path(res["report"]).exists()
 
+        # Tier boundary: SYSTEM agents are default + UNEDITABLE; exactly one spawner (Controller);
+        # the privileged spawner roles are NOT in the tenant's custom allowlist (can't be stood up).
+        sys_agents = system_agents()
+        sys_readonly = bool(sys_agents) and all(not s["editable"] and s["tier"] == "system"
+                                                for s in sys_agents)
+        sole_spawner = sum(1 for s in sys_agents if s["can_spawn"]) == 1
+        no_privileged_custom = ("controller" not in ALLOWED_ROLES
+                                and "builder" not in ALLOWED_ROLES)
+        # The tenant's defined agent shows up in the CUSTOM tier, tagged editable.
+        t = tiers(tid)
+        custom_editable = (any(c["id"] == agent_id and c["editable"] and c["tier"] == "custom"
+                               for c in t["custom"])
+                           and t["system"] == sys_agents)
+        tier_ok = sys_readonly and sole_spawner and no_privileged_custom and custom_editable
+
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM custom_agent_runs WHERE agent_id=%s", (agent_id,))
             run_rows = cur.fetchone()[0]
@@ -276,9 +337,11 @@ def _selftest():
             notif_rows = cur.fetchone()[0]
 
         ok = (bad_role_ok and guard_ok and run_rows == 1 and last_status == "ok"
-              and notif_rows >= 1 and report_written)
+              and notif_rows >= 1 and report_written and tier_ok)
         print(f"bad-role-rejected={bad_role_ok} ownership-guard={guard_ok} runs={run_rows} "
               f"last_status={last_status} notifications={notif_rows} report={report_written}")
+        print(f"tiers: system-readonly={sys_readonly} sole-spawner={sole_spawner} "
+              f"no-privileged-custom={no_privileged_custom} custom-editable={custom_editable}")
         print("PASS: tenant custom-agent define/run via governed factory, reports back, audited ✅"
               if ok else "FAIL")
     finally:
@@ -296,15 +359,17 @@ def _selftest():
 
 def _main(a):
     if not a:
-        sys.exit("usage: customagents.py run <id> | list <tid> | selftest")
+        sys.exit("usage: customagents.py run <id> | list <tid> | tiers <tid> | selftest")
     if a[0] == "run" and len(a) > 1:
         print(json.dumps(run(int(a[1]))))
     elif a[0] == "list" and len(a) > 1:
         print(json.dumps(list_agents(a[1]), indent=2))
+    elif a[0] == "tiers" and len(a) > 1:
+        print(json.dumps(tiers(a[1]), indent=2))
     elif a[0] == "selftest":
         _selftest()
     else:
-        sys.exit("usage: customagents.py run <id> | list <tid> | selftest")
+        sys.exit("usage: customagents.py run <id> | list <tid> | tiers <tid> | selftest")
 
 
 if __name__ == "__main__":

@@ -445,6 +445,28 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                          decision="consent-required", payload={"tenant": _tenant, "spawner": spawner_role})
             return {"rc": -1, "failed": True, "out": "consent required", "blocker": "consent_required",
                     "reason": "AI-processing consent is not on file for this tenant — accept it in Settings, then retry"}
+    # PROVIDER BACKSTOP (symmetric to the consent backstop above; keyed on the same _ctx.tenant): never run
+    # a TENANT's work on the PLATFORM's own model credentials. When a tenant is in context they must have a
+    # resolved provider on file — a connected BYO key OR a subscription login. auth.provider_resolved accepts
+    # auth_mode='subscription' as resolved, so a subscription login is NEVER blocked; nothing connected (or an
+    # api_key connection whose vault secret went missing) is refused here rather than silently billing the
+    # platform. Front doors gate this up front (loopcontroller.say / orchestrator); this is the defense-in-
+    # depth chokepoint so a caller that forgets still can't spend platform credit on tenant work. Only fires
+    # when _ctx.tenant is set (platform/internal builds + the offline selftest set none -> not gated), and
+    # auth.provider_resolved already fails OPEN on resolver-infra error so a DB/vault hiccup can't wedge the
+    # fleet — a clean 'no provider on file' fails CLOSED.
+    if _tenant:
+        try:
+            import auth
+            _resolved = auth.provider_resolved(_tenant)
+        except Exception:
+            _resolved = True
+        if not _resolved:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="provider-required", payload={"tenant": _tenant, "spawner": spawner_role})
+            return {"rc": -1, "failed": True, "out": "provider required", "blocker": "provider_required",
+                    "reason": "no model provider is connected for this tenant — connect a key or a "
+                              "subscription login in Providers, then retry"}
     if BUDGET_USD and spent_usd() >= BUDGET_USD:      # BUDGET cap: stop spawning new work, escalate
         return {"rc": -1, "failed": True, "out": "budget exhausted",
                 "blocker": f"factory budget ${BUDGET_USD:.2f} exhausted (${spent_usd():.2f} spent) — raise AOS_BUDGET_USD or split the work"}

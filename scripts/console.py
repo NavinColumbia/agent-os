@@ -92,7 +92,8 @@ def _owns(tid, org_id):
 ORG_SCOPED_GET = {"/api/controller/state", "/api/design",
                   "/api/cockpit", "/api/projects", "/api/fleet",
                   "/api/health", "/api/company", "/api/comms_graph"}
-ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/design/decide"}
+ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/controller/cancel",
+                   "/api/design/decide"}
 
 
 def _fleet(tid, org_id=0):
@@ -140,8 +141,122 @@ def _controller_state(tid, org_id):
             return {"home": True, "first_run": True, "messages": []}
     thread = loopcontroller.thread_for_org(tid, org_id)
     st = loopcontroller.state(thread)
-    return {"org_id": org_id, "thread": thread, "phase": st.get("phase"), "awaiting": st.get("awaiting"),
-            "messages": orchestrator.history(tid, thread)}
+    out = {"org_id": org_id, "thread": thread, "phase": st.get("phase"), "awaiting": st.get("awaiting"),
+           "phase_label": _phase_label(st.get("phase")), "messages": orchestrator.history(tid, thread)}
+    # LIVE PROGRESS: while a build/research job runs, hand the Assistant a phase label, elapsed seconds
+    # and an ETA so it can render a live, working bubble instead of a static "give me a little time".
+    if st.get("awaiting") == "fleet":
+        try:
+            out["progress"] = _controller_progress(thread, st)
+        except Exception:
+            pass
+    return out
+
+
+# Plain-language phase names + coarse per-phase ETAs (minutes) for the live-progress bubble. Build phases
+# defer to estimate.py's historical median; the rest use these sensible defaults. We prefer anything the
+# loopcontroller agent exposes (loopcontroller.progress / a richer state) and only fall back to these.
+_PHASE_LABEL = {"DISCOVER": "Scoping", "RESEARCH": "Researching", "OPTIONS": "Options ready",
+                "DEEP_DESIGN": "Designing the plan", "PLAN_APPROVAL": "Checking setup",
+                "PROTOTYPE": "Designing screens", "IMPLEMENT": "Building", "TESTQA": "Testing",
+                "DELIVER": "Finishing up"}
+_PHASE_ETA_MIN = {"RESEARCH": 10, "DEEP_DESIGN": 4, "PROTOTYPE": 6,
+                  "IMPLEMENT": 14, "TESTQA": 5, "DELIVER": 1}
+
+
+def _phase_label(phase):
+    return _PHASE_LABEL.get((phase or "").upper(), (phase or "Working").title())
+
+
+def _job_eta_min(phase, kind):
+    """Best ETA (minutes) for the in-flight phase: build/prototype reuse estimate.py's historical median;
+    everything else uses a coarse per-phase default."""
+    p = (phase or "").upper()
+    if p in ("IMPLEMENT", "PROTOTYPE"):
+        try:
+            m = estimate.estimate(kind or "lib").get("minutes_estimate")
+            if m:
+                return int(round(m))
+        except Exception:
+            pass
+    return _PHASE_ETA_MIN.get(p, 8)
+
+
+def _active_job(thread_id):
+    """The newest in-flight (running/pending) controller job for this thread, with elapsed seconds.
+    Reads through loopcontroller's own DB handle so console stays a thin shell over it."""
+    with loopcontroller.psycopg.connect(loopcontroller.DB) as c, c.cursor() as cur:
+        cur.execute("""SELECT id, kind, phase, EXTRACT(EPOCH FROM (now()-started_at))::int
+                       FROM controller_jobs WHERE thread_id=%s AND status IN ('running','pending')
+                       ORDER BY id DESC LIMIT 1""", (thread_id,))
+        r = cur.fetchone()
+    if not r:
+        return None
+    return {"job_id": r[0], "kind": r[1], "job_phase": r[2], "elapsed_s": int(r[3] or 0)}
+
+
+def _controller_progress(thread_id, st):
+    """Live-progress payload for an in-flight job: phase label, elapsed seconds, ETA minutes + a
+    plain-language note. Prefers loopcontroller's own live snapshot (live_status/progress/live); only
+    falls back to a local controller_jobs read + estimate.py so the bubble works regardless."""
+    for fn in ("live_status", "progress", "live"):
+        f = getattr(loopcontroller, fn, None)
+        if callable(f):
+            try:
+                p = f(thread_id)
+            except Exception:
+                p = None
+            if isinstance(p, dict) and p and not p.get("error"):
+                label = (p.get("status") or p.get("label") or p.get("phase_label")
+                         or _phase_label(p.get("phase") or st.get("phase")))
+                label = str(label).rstrip("…. ") or _phase_label(st.get("phase"))
+                elapsed_s = int(p.get("elapsed_s") or (p.get("elapsed_min") or 0) * 60)
+                eta = p.get("eta_min")
+                mins_in = elapsed_s // 60
+                note = "" if not eta else (f"about {max(1, int(eta) - mins_in)} min left" if mins_in < eta
+                                           else "taking a little longer than usual — still working")
+                return {"phase_label": label, "elapsed_s": elapsed_s, "eta_min": eta,
+                        "eta_note": note, "kind": p.get("job_kind") or p.get("kind")}
+    job = _active_job(thread_id) or {}
+    phase = job.get("job_phase") or st.get("phase")
+    eta = _job_eta_min(phase, job.get("kind"))
+    elapsed_s = int(job.get("elapsed_s") or 0)
+    mins_in = elapsed_s // 60
+    note = (f"about {max(1, eta - mins_in)} min left" if mins_in < eta
+            else "taking a little longer than usual — still working")
+    return {"phase_label": _phase_label(phase), "elapsed_s": elapsed_s,
+            "eta_min": eta, "eta_note": note, "kind": job.get("kind")}
+
+
+def _ctl_cancel(tid, org_id):
+    """STOP/CANCEL: abort the in-flight controller job and park the thread on a feedback gate so the CEO
+    can say "retry" to resume. Defers to loopcontroller.cancel() when present; otherwise marks the active
+    controller_jobs row cancelled and posts a 'Stopped' note (the fallback the dogfood brief specifies)."""
+    if not org_id:
+        a = _assistant()
+        if a is not None and hasattr(a, "cancel"):
+            return a.cancel(tid)
+        org_id = _home_org(tid)
+        if not org_id:
+            return {"error": "Create a company first."}
+    thread = loopcontroller.thread_for_org(tid, org_id)
+    if hasattr(loopcontroller, "cancel"):
+        try:
+            return loopcontroller.cancel(tid, thread)
+        except Exception as e:
+            return {"error": str(e)[:160]}
+    try:
+        with loopcontroller.psycopg.connect(loopcontroller.DB) as c, c.cursor() as cur:
+            cur.execute("""UPDATE controller_jobs SET status='cancelled', finished_at=now()
+                           WHERE thread_id=%s AND status IN ('running','pending')""", (thread,))
+            cur.execute("UPDATE controller_state SET awaiting='user_feedback', updated_at=now() WHERE thread_id=%s",
+                        (thread,))
+            c.commit()
+        orchestrator.post(tid, thread, "⏹ Stopped. Say \"retry\" to pick up where we left off, or tell me "
+                                       "what to change.", {"kind": "cancelled"})
+        return {"cancelled": True, "thread": thread}
+    except Exception as e:
+        return {"error": str(e)[:160]}
 
 
 def _ctl_say(tid, org_id, msg):
@@ -154,7 +269,7 @@ def _ctl_say(tid, org_id, msg):
             return a.say(tid, msg)
         org_id = _home_org(tid)
         if not org_id:
-            return {"error": "Create a company first — open My orgs to start one."}
+            return {"error": "Create a company first — open My companies to start one."}
     return loopcontroller.say(tid, loopcontroller.thread_for_org(tid, org_id), msg)
 
 
@@ -165,7 +280,7 @@ def _ctl_choose(tid, org_id, option_id):
             return a.choose(tid, option_id)
         org_id = _home_org(tid)
         if not org_id:
-            return {"error": "Create a company first — open My orgs to start one."}
+            return {"error": "Create a company first — open My companies to start one."}
     return loopcontroller.choose(tid, loopcontroller.thread_for_org(tid, org_id), option_id)
 
 
@@ -277,6 +392,7 @@ POSTS = {
     "/api/orgs/new": lambda tid, q, b: orgsmod.create(tid, b.get("name", ""), b.get("vision", "")),
     "/api/controller/say": lambda tid, q, b: _ctl_say(tid, int(b.get("org") or 0), b.get("message", "")),
     "/api/controller/choose": lambda tid, q, b: _ctl_choose(tid, int(b.get("org") or 0), int(b.get("option_id") or 0)),
+    "/api/controller/cancel": lambda tid, q, b: _ctl_cancel(tid, int(b.get("org") or 0)),
     "/api/design/decide": lambda tid, q, b: designview.decide(tid, str(int(b.get("org") or 0)), int(b.get("id") or 0), b.get("status", "approved")),
     "/api/xorg/propose": lambda tid, q, b: crossorg.propose(tid, b.get("kind", "steal_feature"), int(b.get("source") or 0), int(b.get("target") or 0) or None, b.get("feature")),
     "/api/agents/create": lambda tid, q, b: customagents.define(tid, b.get("name", ""), b.get("instructions", ""), b.get("role", "research-growth"), b.get("trigger", "manual"), int(b.get("interval_s") or 0) or None, b.get("output", "report"), b.get("product")),
@@ -451,20 +567,20 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
 const NAV=[
  ['Workspace',[['controller','Assistant','🧭'],['cockpit','Cockpit','◧'],['projects','Projects','▤'],['design','Design','🎨'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
  ['Build',[['agents','Agents','🤖'],['agentic','Agentic features','⚡'],['templates','Templates','▦']]],
- ['Portfolio',[['orgs','My orgs','🏢'],['portfolio','Portfolio','◎']]],
+ ['Portfolio',[['orgs','My companies','🏢'],['portfolio','Portfolio','◎']]],
  ['Account',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
 ];
-const LABEL={controller:'Assistant',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My orgs',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
+const LABEL={controller:'Assistant',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My companies',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
 let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];let PROVIDER_OK=true;let PEND_EMAIL='';
 async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];
   if(ORG && !ORGS.some(o=>o.org_id==ORG)){ORG=0;localStorage.removeItem('aos_org');}   // stale/deleted org -> home (org=0)
   setOrgName();}catch(e){}}
-function setOrgName(){const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=ORG?(cur?cur.name:'company'):'All orgs (home)';}
+function setOrgName(){const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=ORG?(cur?cur.name:'company'):'All companies (home)';}
 async function loadProviders(){try{const d=await get('/api/providers');PROVIDER_OK=(d.providers||[]).some(p=>p.connected);}catch(e){}}   // subscription login OR api key both count as connected
 function toggleOrgSw(force){const m=$('#orgmenu');if(!m)return;const open=force!==undefined?force:(m.style.display==='none');m.style.display=open?'block':'none';const chip=$('#orgchip');if(chip)chip.setAttribute('aria-expanded',open?'true':'false');if(open){renderOrgSw();const s=$('#orgsearch');if(s){s.value='';setTimeout(()=>{try{s.focus()}catch(_){}} ,0)}}}
 function renderOrgSw(){const list=$('#orglist');if(!list)return;const q=(($('#orgsearch')||{}).value||'').toLowerCase();
-  const opts=[{org_id:0,name:'All orgs (home)',vision:'Ask across every company · start a new one'}].concat(ORGS);
+  const opts=[{org_id:0,name:'All companies (home)',vision:'Ask across every company · start a new one'}].concat(ORGS);
   const f=opts.filter(o=>!q||(''+o.name).toLowerCase().includes(q)||(''+(o.vision||'')).toLowerCase().includes(q));
   list.innerHTML=f.length?f.map(o=>`<a class="orgopt${o.org_id==ORG?' on':''}" role=option aria-selected=${o.org_id==ORG} onclick="pickOrg(${o.org_id})"><span class=oname>${esc(o.name)}${o.vision?(' <span class=ovis>· '+esc(o.vision)+'</span>'):''}</span>${o.org_id==ORG?'<span class=ock>✓</span>':''}</a>`).join(''):'<div class=muted style=padding:8px_10px>No matching company</div>';}
 function pickOrg(id){ORG=id;if(id)localStorage.setItem('aos_org',id);else localStorage.removeItem('aos_org');   // org=0 = home; org=N = a company
@@ -474,8 +590,8 @@ function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);setOrgName();go
 function gateError(e){return e==='consent_required'||e==='provider_required';}
 function gateKey(r){return r?(r.error||r.blocked):'';}   // same gates surface as 'error' (front door) OR 'blocked' (controller/chat loop) — handle both
 function gateNote(e){
- if(e==='provider_required')return 'Connect a model provider to start — <button class=linkbtn onclick="go(\'providers\')">connect a provider</button>. Use the Claude / ChatGPT account already signed in on this machine (no key) or an API key.';
- if(e==='consent_required')return 'One-time setup: approve AI processing before your agents run — <button class=linkbtn onclick="go(\'settings\')">review AI consent</button>.';
+ if(e==='provider_required')return 'Connect an AI model to start — <button class=linkbtn onclick="go(\'providers\')">connect a model</button>. It takes one click.';
+ if(e==='consent_required')return 'One-time setup: approve AI use before your agents run — <button class=linkbtn onclick="go(\'settings\')">approve AI use</button>.';
  return esc(''+e);}
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none';if(!on){const up=($('#su_signup')||{}).style&&$('#su_signup').style.display!=='none';const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}}
@@ -579,7 +695,7 @@ function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':
 function pill(txt,cls){return `<span class="pill ${cls||''}">${esc(txt)}</span>`}
 function emptyB(ic,t,m,cta){return '<div class=empty><div class=ic>'+ic+'</div><h3>'+esc(t)+'</h3><p>'+esc(m)+'</p>'+(cta||'')+'</div>'}
 function renderNav(){$('#nav').innerHTML=NAV.map(([sec,items])=>`<div class=nsec>${sec}</div>`+items.map(([k,l,ic])=>`<a class="${k==CUR?'on':''}" onclick="go('${k}')"><span class=ico>${ic}</span><span class=lbl>${l}</span>${BADGES[k]?`<span class=b>${BADGES[k]}</span>`:''}</a>`).join('')).join('')}
-function clearTimers(){for(const k of ['CTLPOLL','CHATPOLL','TOPBARPOLL','AUTOPOLL']){if(window[k]){clearInterval(window[k]);window[k]=null}}}
+function clearTimers(){for(const k of ['CTLPOLL','CTLTICK','CHATPOLL','TOPBARPOLL','AUTOPOLL']){if(window[k]){clearInterval(window[k]);window[k]=null}}}
 async function refreshTopbar(){
  if(!TOK)return;
  try{const b=await get('/api/billing');const f=await get('/api/forecast').catch(()=>null);
@@ -604,57 +720,102 @@ function kpis(arr){return '<div class=kpis>'+arr.map(a=>`<div class=kpi><b>${esc
 function stages(ss){return '<div class=stages>'+ss.map(s=>`<div class="st ${s.done?(s.ok===false?'bad':'ok'):''}" title="${s.stage}"></div>`).join('')+'</div>'}
 
 let THREAD=null;let CTLBUSY=false;let CHATBUSY=false;
+let CONSENT_OK=false;let PEND_IDEA='';let PROG=null;let CTLABORT=null;   // guided first-run + live-progress state
+function firstRunSteps(){return [
+ {k:'company',done:ORGS.length>0,label:'Create your company'},
+ {k:'provider',done:PROVIDER_OK,label:'Connect an AI model'},
+ {k:'consent',done:CONSENT_OK,label:'Approve AI use'},
+ {k:'describe',done:false,label:'Describe your product'}];}
+function firstRunChecklist(steps){const cur=steps.findIndex(s=>!s.done);
+ return '<div class=card><div class=row style="gap:10px;flex-wrap:wrap;align-items:center">'+steps.map((s,i)=>{
+   const ic=s.done?'✓':(i+1);const cls=s.done?'ok':(i===cur?'accent':'');
+   return '<span class=row style="gap:6px;align-items:center">'+pill(ic,cls)+'<span class="'+(s.done?'muted':'')+'" style="'+(i===cur?'font-weight:600':'')+'">'+esc(s.label)+'</span></span>';
+ }).join('<span class=muted>›</span>')+'</div></div>';}
+async function firstRunCreate(){const nm=(($('#fr_nm')||{}).value||'').trim();const vis=(($('#fr_vis')||{}).value||'').trim();const note=$('#fr_note');
+ if(!nm){if(note)note.textContent='Enter a name for your company';const f=$('#fr_nm');if(f)f.focus();return}
+ if(note)note.textContent='Creating…';
+ const r=await post('/api/orgs/new',{name:nm,vision:vis});
+ if(r&&r.error){if(note)note.textContent='✗ '+r.error;return}
+ if(r.org_id){ORG=r.org_id;localStorage.setItem('aos_org',ORG);await loadOrgs();setOrgName();go('controller');}}   // advance the wizard to step 2 in place
+async function frConsent(){const r=await post('/api/settings/consent',{accept:true});if(r&&r.error){const n=$('#cnote');if(n)n.textContent='✗ '+r.error;else alert('Could not record consent: '+r.error);return}CONSENT_OK=true;go('controller');}
+async function frFlush(){if(PEND_IDEA&&PROVIDER_OK&&CONSENT_OK){const t=PEND_IDEA;PEND_IDEA='';const i=$('#cmsg');if(i){i.value=t;grow(i)}await ctlSend();}}   // auto-resume the saved idea once setup is done
+function setSendMode(busy){const b=$('#ctlsend');if(!b)return;if(busy){b.classList.remove('pri');b.textContent='Stop';b.title='Stop';b.onclick=ctlStop;}else{b.classList.add('pri');b.textContent='Send';b.title='Send';b.onclick=ctlSend;}}
+async function ctlStop(){
+ if(CTLABORT){try{CTLABORT.abort()}catch(_){}}
+ try{await post('/api/controller/cancel',{org:ORG||0})}catch(e){}
+ CTLBUSY=false;CTLABORT=null;setSendMode(false);stopTick();PROG=null;
+ const t=$('#ctltyping');if(t)t.remove();const p=$('#ctlprog');if(p)p.remove();
+ const cm=$('#cmsg');if(cm)cm.disabled=false;const n=$('#cnote');if(n)n.textContent='Stopped.';
+ go('controller');}
+function fmtElapsed(s){s=Math.max(0,Math.floor(s));const m=Math.floor(s/60),ss=s%60;return m+'m '+(ss<10?'0':'')+ss+'s elapsed';}
+function progressBubble(p){const lab=esc(p.phase_label||'Working');const eta=p.eta_note?(' · '+esc(p.eta_note)):'';
+ return '<div class="msg ai" id=ctlprog style="margin:8px 0"><div><span class=bubble><span class=spin></span> <b>'+lab+'…</b> <span id=progelapsed class=muted>'+fmtElapsed(p.elapsed_s||0)+'</span>'+eta+'<div style="margin-top:8px"><button onclick=ctlStop()>Stop</button></div></span></div></div>';}
+function startTick(){if(window.CTLTICK)return;window.CTLTICK=setInterval(()=>{
+  if(!TOK||CUR!=='controller'||!PROG){clearInterval(window.CTLTICK);window.CTLTICK=null;return}
+  const el=$('#progelapsed');if(el)el.textContent=fmtElapsed((Date.now()-PROG._anchor)/1000);},1000);}
+function stopTick(){if(window.CTLTICK){clearInterval(window.CTLTICK);window.CTLTICK=null}}
 const VIEWS={
  controller:async()=>{
   if(!ORGS.length){try{await loadOrgs()}catch(e){}}
-  try{await loadProviders()}catch(e){}   // keep the connect banner current right after a provider is added
-  if(!ORGS.length){   // brand-new 0-company tenant: a welcoming first-run screen, never an error+retry card
-   if(window.CTLPOLL){clearInterval(window.CTLPOLL);window.CTLPOLL=null;}
+  try{await loadProviders()}catch(e){}                                  // keep setup steps current after a provider is added
+  try{const sd=await get('/api/settings');CONSENT_OK=!!(sd.ai_consent&&sd.ai_consent.accepted)}catch(e){}
+  if(!ORGS.length){   // GUIDED FIRST-RUN · Step 1: name your company INLINE (no detour to a list page)
+   if(window.CTLPOLL){clearInterval(window.CTLPOLL);window.CTLPOLL=null;}stopTick();
    $('#view').innerHTML='<h1>Welcome to agent-os</h1>'
-    +'<p class=sub>'+pill('Get started','accent')+' You\'re the CEO of a company of AI agents that build and ship your software. Create your first company to begin.</p>'
-    +'<div class=card style="border-color:var(--accent)"><div class=empty><div class=ic>🏢</div><h3>Create your first company</h3>'
-    +'<p>Give it a name and a one-line vision. Each company gets its own controller, research, design and budget — your assistant takes it from there, asking you at each step.</p>'
-    +'<button class=pri onclick="go(\'orgs\')">Create your first company</button></div></div>';
+    +'<p class=sub>'+pill('Step 1 of 4','accent')+' You\'re the CEO — your AI agents research, build and ship your software. Let\'s get you set up; it takes about a minute.</p>'
+    +firstRunChecklist(firstRunSteps())
+    +'<div class=card style="border-color:var(--accent)"><h2>Name your company</h2>'
+    +'<p class=muted style="margin:0 0 8px">Give it a name and an optional one-line vision. Your assistant takes it from there, asking you at each step.</p>'
+    +'<label for=fr_nm>Company name</label><input id=fr_nm placeholder="Acme" aria-label="Company name" onkeydown="if(event.key===\'Enter\')firstRunCreate()">'
+    +'<label for=fr_vis>Vision (optional)</label><input id=fr_vis placeholder="one line on what it does" aria-label="Company vision" onkeydown="if(event.key===\'Enter\')firstRunCreate()">'
+    +'<div style="margin-top:12px"><button class=pri onclick=firstRunCreate()>Create company →</button></div>'
+    +'<div id=fr_note class=muted style=margin-top:8px></div></div>';
+   const f=$('#fr_nm');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0);
    return;
   }
-  const home=!ORG;const noOrgs=!ORGS.length;   // org=0 -> account-wide home / quick-build · org=N -> that company's controller
+  const home=!ORG;   // org=0 -> account-wide home · org=N -> that company's controller
   let d={};try{d=await get('/api/controller/state?org='+(ORG||0))}catch(e){$('#view').innerHTML=errCard('controller',e.message);return}
   const gateErr=d&&d.error&&gateError(d.error);
   const cur=ORGS.find(o=>o.org_id==ORG)||{};
-  const scope=home?(noOrgs?'Start your first company':'All orgs · home'):('Company · '+(cur.name||''));
-  const GATE={user_feedback:'your reply',user_approval:'your go-ahead',credentials:'a connected provider',fleet:'your agents to finish'};
+  const scope=home?'All companies · home':('Company · '+(cur.name||''));
   let phaseLine='';
-  if(!home&&d.phase){const rawPhase=d.phase;const phase=rawPhase.charAt(0)+rawPhase.slice(1).toLowerCase();phaseLine=' · <b>'+esc(phase)+'</b>'+(d.awaiting?(' · waiting on '+esc(GATE[d.awaiting]||d.awaiting)):'');}
+  if(!home&&d.phase&&d.awaiting!=='fleet'){phaseLine=' · <b>'+esc(d.phase_label||d.phase)+'</b>';}   // live phase lives in the progress bubble instead
   const intro=home?'Your account-wide assistant — ask across all your companies, spin up a new one, or start a quick build. I route it to the right place.':'Tell this company\'s controller what to build. It researches, brings options, designs and ships — asking you at each step.';
   let h='<h1>Assistant</h1><p class=sub>'+pill(scope,home?'accent':'')+' '+esc(intro)+phaseLine+'</p>';
-  if(!PROVIDER_OK)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span>⚡ Connect a model provider so your agents can run — use the Claude / ChatGPT account already signed in on this machine (no key) or an API key.</span><button class=pri onclick="go(\'providers\')">Connect a provider</button></div></div>';
+  const setupDone=PROVIDER_OK&&CONSENT_OK;
+  if(!setupDone){   // GUIDED FIRST-RUN · Steps 2-3: connect a model, then approve AI use — shown PROACTIVELY, not as a rejection
+   h+=firstRunChecklist(firstRunSteps());
+   if(!PROVIDER_OK)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Step 2 — Connect an AI model.</b> Your agents need an AI model to do the work. It takes one click.</span><button class=pri onclick="go(\'providers\')">Connect an AI model</button></div></div>';
+   else h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Step 3 — Approve AI use.</b> A one-time, revocable OK to let your AI model process what you type, so your agents can build.</span><button class=pri onclick=frConsent()>Approve AI use</button></div></div>';
+  }
   h+='<div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>';
   const CHIPS=home?['Create a new company','What needs my attention across all companies?','A quick throwaway prototype']:['Build a competitor to YouTube','An internal tool for my team','A booking page for my salon'];
-  const ph=home?(noOrgs?'e.g. start a company called Acme that builds…':'e.g. start a new company, or ask about any of them…'):'e.g. build a competitor to YouTube';
+  const ph=home?'e.g. start a new company, or ask about any of them…':'e.g. build a competitor to YouTube';
   h+='<div class=card><div class=chips>'+CHIPS.map(c=>`<span class=chip-s onclick="ctlFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div><div class="row composer"><textarea id=cmsg class=chatbox rows=1 aria-label="Message your assistant" placeholder="${ph}" oninput="grow(this)" onkeydown="taKey(event,ctlSend)"></textarea><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
   $('#view').innerHTML=h;
   if(gateErr){$('#cnote').innerHTML=gateNote(d.error);ctlRender([]);}
   else if(d&&d.error){const log=$('#clog');if(log)log.innerHTML='<div class=muted>'+esc(d.error)+'</div>';}
-  else ctlRender(d.messages||[]);
-  if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(!TOK||CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;return}if(CTLBUSY)return;try{const s=await get('/api/controller/state?org='+(ORG||0));if(!(s&&s.error))ctlRender(s.messages||[])}catch(e){}},5000);
+  else ctlRender(d.messages||[],d.progress);
+  if(PEND_IDEA&&setupDone)frFlush();   // auto-resume the idea they typed before setup was finished
+  if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(!TOK||CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;stopTick();return}if(CTLBUSY)return;try{const s=await get('/api/controller/state?org='+(ORG||0));if(!(s&&s.error))ctlRender(s.messages||[],s.progress)}catch(e){}},5000);
  },
  orgs:async()=>{const d=await get('/api/orgs');ORGS=d.orgs||[];
-  let h='<h1>My orgs</h1><p class=sub>Each org is its own company — its own controller, research, design, build and budget. You can run as many as you like.</p>';
-  h+='<div class=card><h2>Create an org</h2><div class=row><input id=onm aria-label="Org name" placeholder="YouTube competitor"><input id=ovis aria-label="Org vision (optional)" placeholder="one-line vision (optional)"><button class=pri onclick=orgNew()>Create</button></div><div id=onote class=muted style=margin-top:8px></div></div>';
-  h+='<div class=grid>'+(ORGS.length?ORGS.map(o=>`<div class=tile><div class="row spread"><b>${esc(o.name)}</b>${o.org_id==ORG?pill('active','ok'):''}</div><div class=muted style=margin:6px_0>${esc(o.vision||'—')} · ${esc(o.stage)} · ${o.products} product(s)</div><button class=pri onclick="switchOrg(${o.org_id})">Open</button></div>`).join(''):emptyB('🏢','No orgs yet','Create your first organization above.'))+'</div>';
+  let h='<h1>My companies</h1><p class=sub>Each company has its own controller, research, design, build and budget. You can run as many as you like.</p>';
+  h+='<div class=card><h2>Create a company</h2><div class=row><input id=onm aria-label="Company name" placeholder="YouTube competitor"><input id=ovis aria-label="Company vision (optional)" placeholder="one-line vision (optional)"><button class=pri onclick=orgNew()>Create</button></div><div id=onote class=muted style=margin-top:8px></div></div>';
+  h+='<div class=grid>'+(ORGS.length?ORGS.map(o=>`<div class=tile><div class="row spread"><b>${esc(o.name)}</b>${o.org_id==ORG?pill('active','ok'):''}</div><div class=muted style=margin:6px_0>${esc(o.vision||'—')} · ${esc(o.stage)} · ${o.products} product(s)</div><button class=pri onclick="switchOrg(${o.org_id})">Open</button></div>`).join(''):emptyB('🏢','No companies yet','Create your first company above.'))+'</div>';
   $('#view').innerHTML=h;},
  portfolio:async()=>{let p={},a={},f={};try{p=await get('/api/portfolio')}catch(e){}try{a=await get('/api/portfolio/analytics')}catch(e){}try{f=await get('/api/portfolio/failures')}catch(e){}
-  const t=p.totals||{};let h='<h1>Portfolio</h1><p class=sub>Everything across all your orgs.</p>';
-  h+=kpis([['Orgs',t.orgs||0],['Products',t.products||0],['Live',t.live||0],['Building',t.building||0],['Failed',t.failed||0],['Spend $',t.spend_usd||0]]);
-  h+='<div class=card><h2>Your orgs</h2><table><tr><th>org</th><th>stage</th><th>products</th><th>live</th><th>spend</th></tr>'+((p.orgs||[]).length?p.orgs.map(o=>`<tr><td>${esc(o.name)}</td><td>${esc(o.stage)}</td><td>${o.products}</td><td>${o.live||0}</td><td>$${o.spend_usd||0}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no orgs yet</td></tr>')+'</table></div>';
-  const fails=(f.failures||f.items||[]);h+='<div class=card><h2>What needs attention (across orgs)</h2>'+(fails.length?fails.map(x=>`<div class=item>${pill('failed','bad')} ${esc(x.product||x.title||'')} <span class=muted>${esc(x.org||x.org_name||'')} ${esc(x.decision||'')}</span></div>`).join(''):'<div class=muted>nothing broken across your orgs ✓</div>')+'</div>';
+  const t=p.totals||{};let h='<h1>Portfolio</h1><p class=sub>Everything across all your companies.</p>';
+  h+=kpis([['Companies',t.orgs||0],['Products',t.products||0],['Live',t.live||0],['Building',t.building||0],['Failed',t.failed||0],['Spend $',t.spend_usd||0]]);
+  h+='<div class=card><h2>Your companies</h2><table><tr><th>company</th><th>stage</th><th>products</th><th>live</th><th>spend</th></tr>'+((p.orgs||[]).length?p.orgs.map(o=>`<tr><td>${esc(o.name)}</td><td>${esc(o.stage)}</td><td>${o.products}</td><td>${o.live||0}</td><td>$${o.spend_usd||0}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no companies yet</td></tr>')+'</table></div>';
+  const fails=(f.failures||f.items||[]);h+='<div class=card><h2>What needs attention (across companies)</h2>'+(fails.length?fails.map(x=>`<div class=item>${pill('failed','bad')} ${esc(x.product||x.title||'')} <span class=muted>${esc(x.org||x.org_name||'')} ${esc(x.decision||'')}</span></div>`).join(''):'<div class=muted>nothing broken across your companies ✓</div>')+'</div>';
   $('#view').innerHTML=h;},
  agentic:async()=>{const d=await get('/api/agentfeatures');
   let h='<h1>Agentic features</h1><p class=sub>Embed your AI fleet INTO your product — a button or endpoint your users/staff trigger that runs an agent. We build these into your app (you host it); we don\'t run them for you. Tell your Controller which you want during design.</p>';
   h+=`<div class=card><h2>Recommend an invocation pattern</h2><p class=muted style=margin:0_0_10px>Describe what you need; I'll suggest how to invoke an agent (event, schedule, button, or endpoint) and the closest catalog features.</p><div class=row><input id=recneed aria-label="Describe what you need" placeholder="e.g. process uploads when a user submits" onkeydown="if(event.key==='Enter')recAgentic()"><button class=pri id=recbtn onclick=recAgentic()>Recommend</button></div><div id=recout style=margin-top:10px></div></div>`;
   h+='<div class=grid>'+(d.features||[]).map(f=>`<div class=tile><div class="row spread"><b>${esc(f.name)}</b>${pill(f.audience,f.audience=='external'?'accent':'')}</div><div class=muted style=margin:6px_0>${esc(f.blurb)}</div><div class=muted>${pill('trigger: '+(f.trigger||f.surface),f.trigger=='event'?'warn':'')} ${esc(f.surface)} · ${esc(f.category)}</div></div>`).join('')+'</div>';
   $('#view').innerHTML=h;},
- design:async()=>{if(!ORG){$('#view').innerHTML='<div class=card>'+emptyB('🎨','No org selected','Pick or create an org first — then your prototypes and screens will show up here.','<button class=pri onclick="go(\'orgs\')">Go to My orgs</button>')+'</div>';return}const d=await get('/api/design?org='+ORG);
+ design:async()=>{if(!ORG){$('#view').innerHTML='<div class=card>'+emptyB('🎨','No company selected','Pick or create a company first — then your prototypes and screens will show up here.','<button class=pri onclick="go(\'orgs\')">Go to My companies</button>')+'</div>';return}const d=await get('/api/design?org='+ORG);
   let h='<h1>Design</h1><p class=sub>Prototype screens your fleet drafted — for your cockpit, your team, and your external users.</p>';
   const g=d.gallery||[];h+='<div class=grid>'+(g.length?g.map(s=>`<div class=tile><div class="row spread"><b>${esc(s.surface||'')}</b>${pill(s.status,s.status=='approved'?'ok':'')}</div><div class=muted style=margin:6px_0>${esc(s.title||'')}</div>${s.status!='approved'?`<button class=pri onclick="designOk(${s.id})">approve</button>`:''}</div>`).join(''):emptyB('🎨','No prototypes yet','When your controller reaches the design phase, screens appear here.'))+'</div>';
   $('#view').innerHTML=h;},
@@ -719,7 +880,7 @@ const VIEWS={
   h+=(d.feed.length?d.feed.map(n=>`<div class=item><div class="row spread"><span>${pill(n.level,n.level=='urgent'?'bad':(n.level=='standard'?'':'warn'))} <b>${esc(n.title)}</b></span><span class=row style=gap:8px><span class=muted>${esc(n.category)} · ${n.created_at}</span>${n.read?'':`<button onclick="markRead(${n.id})">Mark read</button>`}</span></div><div class=muted>${esc(n.body||'')}</div></div>`).join(''):emptyB('◔','You\'re all caught up','Build updates, billing alerts and agent reports will appear here.'));
   $('#view').innerHTML=h+'</div>';},
  team:async()=>{let o=null,t=null;try{o=await get('/api/org')}catch(e){}try{t=await get('/api/team')}catch(e){}
-  let h='<h1>Your org</h1><p class=sub>Your company of AI agents — who does what, and who\'s working right now.</p>';
+  let h='<h1>Org chart</h1><p class=sub>Your fleet of AI agents — who does what, and who\'s working right now.</p>';
   if(t){const mem=t.members||[];
    h+='<div class=card><h2>Seats</h2><table><tr><th>member</th><th>role</th><th>status</th></tr>'+(mem.length?mem.map(m=>`<tr><td>${esc(m.id)}</td><td>${esc(m.role)}</td><td>${pill(m.status,m.status=='active'?'ok':'')}</td></tr>`).join(''):'<tr><td class=muted colspan=3>no seats</td></tr>')+'</table>'+(t.seats_note?`<div class=muted style=margin-top:10px>${pill('plan: '+(t.plan||'free'))} ${esc(t.seats_note)}</div>`:'')+'</div>';}
   if(o&&o.tree){const root=o.tree.find(n=>!n.reports_to)||o.tree[0];
@@ -734,7 +895,11 @@ const VIEWS={
   <div class=card><h2>BYO API key</h2><div class=row>${d.byo_key_set?pill('key on file','ok'):pill('no key','warn')}</div><div style=margin-top:8px><input id=bk aria-label="API key" placeholder="sk-… (stored encrypted)"><button class=pri style=margin-top:6px onclick=saveKey()>save key</button></div><div id=bknote class=muted style=margin-top:8px></div></div>
   <div class=card><h2>Notification preferences</h2><table><tr><th>category</th><th>in-app</th><th>email</th><th>push</th></tr>`+(d.notification_prefs||[]).map(p=>`<tr><td>${esc(p.category)}</td><td><input type=checkbox ${p.in_app?'checked':''} onchange="pref('${p.category}',this.checked,null,null)"></td><td><input type=checkbox ${p.email?'checked':''} onchange="pref('${p.category}',null,this.checked,null)"></td><td><input type=checkbox ${p.push?'checked':''} onchange="pref('${p.category}',null,null,this.checked)"></td></tr>`).join('')+`</table></div>
   <div class=card><h2>Your data</h2><div class=row><button onclick=acctExport()>Export my data</button><button onclick=acctDelete() style="border-color:var(--r);color:var(--r)">Delete my account</button></div><div id=acctnote class=muted style=margin-top:8px></div></div>`;PREFS=d.notification_prefs;},
- providers:async()=>{const d=await get('/api/providers');$('#view').innerHTML='<h1>Model providers</h1><p class=sub>Run on Claude, on Codex, or both — you only need one. Sign in with your Claude/ChatGPT account on THIS machine (real OAuth via the host CLI, no per-token billing) OR bring an API key.</p><div id=provnote class=muted style="margin:0 0 10px"></div><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill(p.auth_mode==='subscription'?'host sign-in':'api key','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)} · runs on <b>${esc(p.engine)}</b></div>${p.connected?`<button onclick="provRemove('${p.slug}')">disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Sign in on this machine</button><button onclick="provAdd('${p.slug}','${esc(p.key_hint)}')">Use API key</button></div>`}</div>`).join('')+'</div><p class=muted>The build uses your highest-priority connected provider. "Sign in on this machine" launches the real Claude/ChatGPT OAuth via the host CLI (<code>claude auth login</code> / <code>codex login</code>) — it opens a browser on THIS host and connects only once the CLI is genuinely signed in. Note this signs the whole host into one account (subscription OAuth is first-party-CLI-only — no per-tenant token), so it suits a self-hosted single-operator box. No provider → platform default.</p>';},
+ providers:async()=>{const d=await get('/api/providers');$('#view').innerHTML='<h1>Connect an AI model</h1>'
+   +'<p class=sub>Your agents need an AI model to do their work — Claude, ChatGPT/Codex, or both. You only need one to get started.</p>'
+   +'<div id=provnote class=muted style="margin:0 0 10px"></div><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill('connected','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)}</div>${p.connected?`<button onclick="provRemove('${p.slug}')">Disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Connect</button><button onclick="provAdd('${p.slug}','${esc(p.key_hint)}')">Use an API key</button></div>`}</div>`).join('')+'</div>'
+   +'<details style="margin-top:14px"><summary style="cursor:pointer;color:var(--mut)">Technical details</summary>'
+   +'<p class=muted style="margin-top:10px"><b>Connect</b> signs this machine into your Claude or ChatGPT account using the provider\'s own secure login (it opens a browser on this host and connects only once you\'re genuinely signed in, via <code>claude auth login</code> / <code>codex login</code>). Because it uses the machine\'s own sign-in, it connects the whole machine to one account — ideal for a self-hosted, single-operator setup. <b>Use an API key</b> connects with a key instead. Builds use your highest-priority connected model; with none connected, the platform default is used.</p></details>';},
  help:async()=>{const d=await get('/api/help/topics');$('#view').innerHTML=`<h1>Help</h1><p class=sub>Ask me anything about using agent-os.</p>
   <div class=card><div class=row><input id=hq aria-label="Ask a help question" placeholder="e.g. how do I add my Codex key?" onkeydown="if(event.key==='Enter')helpAsk()"><button class=pri onclick=helpAsk()>Ask</button></div><div id=hans style=margin-top:10px></div></div>
   <div class=card><h2>Topics</h2>`+(d.topics||[]).map(t=>`<div class=item><b>${esc(t.area||t.key||'')}</b> <span class=muted>${esc(t.desc||t.description||'')}</span></div>`).join('')+'</div>';},
@@ -764,32 +929,43 @@ function grow(t){if(!t)return;t.style.height='auto';t.style.height=Math.min(t.sc
 function taKey(e,fn){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();fn()}}   // ChatGPT/Claude: Enter sends, Shift+Enter inserts a newline
 function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus();grow(i)}}
 function ctlFill(t){const i=$('#cmsg');if(i){i.value=t;i.focus();grow(i)}}
-function ctlRender(msgs){const log=$('#clog');if(!log)return;
+function ctlRender(msgs,prog){const log=$('#clog');if(!log)return;
  const atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<40;
- log.innerHTML=(msgs||[]).map(m=>{const me=m.role==='user';const meta=m.meta||{};let extra='';
+ let html=(msgs||[]).map(m=>{const me=m.role==='user';const meta=m.meta||{};let extra='';
   if(meta.kind==='options'&&meta.options)extra='<div class=chips style="margin:8px 0">'+meta.options.map(o=>`<span class=chip-s onclick="ctlChoose(${o.id})">${esc(o.title||('Option '+o.id))}${o.recommended?' ★':''}</span>`).join('')+'</div>';
   else if(meta.kind==='plan'&&meta.plan)extra='<div class=tile style="margin:8px 0;text-align:left"><b>Plan: '+esc(meta.plan.name||'')+'</b> '+pill(meta.plan.kind||'')+'<div class=muted style=margin-top:4px>'+esc(meta.plan.charter||'')+'</div></div>';
   else if(meta.kind==='next_steps'&&meta.suggestions)extra='<div class=chips style="margin:8px 0">'+meta.suggestions.map(s=>`<span class=chip-s onclick="ctlFill('${s.replace(/'/g,"")}')">${esc(s)}</span>`).join('')+'</div>';
   return `<div class="msg ${me?'me':'ai'}" style="margin:8px 0"><div><span class=bubble>${md(m.content)}</span>${extra}</div></div>`;
  }).join('')||'<div class=muted>Describe what you want to build — I\'ll ask a few questions, then research it and bring you options.</div>';
+ // LIVE PROGRESS: while a job runs, render a working bubble (phase + elapsed + ETA + Stop) instead of a static line
+ if(prog){PROG=Object.assign({},prog);PROG._anchor=Date.now()-((prog.elapsed_s||0)*1000);html+=progressBubble(prog);}
+ else{PROG=null;stopTick();}
+ log.innerHTML=html;
+ if(prog)startTick();
  if(atBottom)log.scrollTop=log.scrollHeight;   // only re-pin if user was already at the bottom; don't yank scrollback
 }
 async function ctlSend(){
- if(CTLBUSY)return;const i=$('#cmsg');const m=(i?i.value:'').trim();if(!m)return;CTLBUSY=true;
- const btn=$('#ctlsend');if(btn)btn.disabled=true;if(i){i.value='';grow(i);i.disabled=true}
- const log=$('#clog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=ctltyping style="margin:8px 0"><div><span class=bubble><span class=muted>… thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
- $('#cnote').textContent='thinking…';
+ if(CTLBUSY)return;const i=$('#cmsg');const m=(i?i.value:'').trim();if(!m)return;
+ // GUIDED FIRST-RUN: never reject the first idea behind a gate — save it and walk them through the missing step
+ if(!PROVIDER_OK){PEND_IDEA=m;if(i){i.value='';grow(i)}const n=$('#cnote');if(n)n.innerHTML='Saved your idea ✓ — connect an AI model first and I\'ll start automatically.';go('providers');return;}
+ if(!CONSENT_OK){PEND_IDEA=m;if(i){i.value='';grow(i)}const n=$('#cnote');if(n)n.innerHTML='Saved your idea ✓ — tap <b>Approve AI use</b> above and I\'ll start automatically.';return;}
+ CTLBUSY=true;setSendMode(true);if(i){i.value='';grow(i);i.disabled=true}
+ const log=$('#clog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=ctltyping style="margin:8px 0"><div><span class=bubble><span class=spin></span> <span class=muted>thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
+ $('#cnote').textContent='Working… press Stop to cancel.';
+ CTLABORT=(typeof AbortController!=='undefined')?new AbortController():null;
  let r;
- try{r=await post('/api/controller/say',{org:ORG||0,message:m},90000);}
- finally{CTLBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false;i.focus()}}
+ try{const resp=await fetch('/api/controller/say',{method:'POST',headers:H(),body:JSON.stringify({org:ORG||0,message:m}),signal:CTLABORT?CTLABORT.signal:undefined});try{r=await resp.json()}catch(_){r={}}}
+ catch(e){r={error:(e&&e.name==='AbortError')?'stopped':'request failed'}}
+ finally{CTLBUSY=false;CTLABORT=null;setSendMode(false);if(i){i.disabled=false;i.focus()}}
  const t=$('#ctltyping');if(t)t.remove();
+ if(r&&r.error==='stopped'){$('#cnote').textContent='Stopped.';return;}   // ctlStop already parked the job + reloaded
  const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote').innerHTML=gateNote(cg);if(i){i.value=m;grow(i)}return;}   // friendly connect/consent prompt — keep their text
  if(r&&r.error){$('#cnote').textContent='✗ '+r.error+' — your message is in the box, press Send to retry.';if(i){i.value=m;grow(i)}return;}
  $('#cnote').textContent='';go('controller');
 }
 async function ctlChoose(oid){const r=await post('/api/controller/choose',{org:ORG||0,option_id:oid});const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote')&&($('#cnote').innerHTML=gateNote(cg));return;}go('controller');}
 async function orgNew(){const inp=$('#onm');const name=(inp?inp.value:'').trim();const note=$('#onote');
- if(!name){if(note)note.textContent='Enter a name for your org';if(inp)inp.focus();return}
+ if(!name){if(note)note.textContent='Enter a name for your company';if(inp)inp.focus();return}
  if(note)note.textContent='';
  const r=await post('/api/orgs/new',{name,vision:($('#ovis')||{}).value||''});
  if(r&&r.error){if(note)note.textContent='✗ '+r.error;return}
@@ -941,7 +1117,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(401, {"error": "sign up first"})
         q = parse_qs(u.query)
         if p in ORG_SCOPED_GET and not _owns(tid, int((q.get("org", ["0"])[0]) or 0)):
-            return self._json(403, {"error": "not your org"})
+            return self._json(403, {"error": "not your company"})
         try:
             self._json(200, fn(tid, q))
         except Exception as e:
@@ -975,11 +1151,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(401, {"error": "sign up first"})
         body = self._body()
         if p in ORG_SCOPED_POST and not _owns(tid, int(body.get("org") or 0)):
-            return self._json(403, {"error": "not your org"})
+            return self._json(403, {"error": "not your company"})
         if p == "/api/xorg/propose":
             for k in ("source", "target"):
                 if not _owns(tid, int(body.get(k) or 0)):
-                    return self._json(403, {"error": "not your org"})
+                    return self._json(403, {"error": "not your company"})
         try:
             self._json(200, fn(tid, parse_qs(u.query), body))
         except Exception as e:

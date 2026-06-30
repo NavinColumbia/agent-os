@@ -129,6 +129,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
       await p.fill('#su_pw', e2ePw);
       await p.fill('#su_pw2', e2ePw);        // confirm-password must match or signUp() rejects
       await p.click('#su_signup button.pri');           // "Create account"
+      // EMAIL VERIFICATION: self-host always issues a 6-digit code (shown in #ve_dev when no mailer is
+      // configured); enter it so the new user reaches the app.
+      await p.waitForSelector('#su_verify', { state: 'visible', timeout: 8000 }).catch(() => {});
+      if (await p.isVisible('#su_verify')) {
+        await sleep(400);
+        const code = await p.evaluate(() => (((document.querySelector('#ve_dev') || {}).textContent || '').match(/\d{6}/) || [''])[0]);
+        await p.fill('#ve_code', code);
+        await p.click('#su_verify button.pri');
+      }
       // a NEW user should land in the app WITHOUT being shown-and-vanished a token (the bug we just fixed)
     }
     // the app shell must become visible — via signup (new user) or seeded token (returning)

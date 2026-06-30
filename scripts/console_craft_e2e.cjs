@@ -34,6 +34,15 @@ const RAW_ENUMS = ['dead_letter', 'REQUEST-CHANGES', 'BLOCKED_AT_QA', 'request_h
     await p.fill('#su_pw', 'craft-password-123');
     await p.fill('#su_pw2', 'craft-password-123');
     await p.click('#su_signup button.pri');
+    // EMAIL VERIFICATION: self-host always issues a 6-digit code (shown in #ve_dev when no mailer is
+    // configured). Traverse it so the guard reaches the signed-in app.
+    await p.waitForSelector('#su_verify', { state: 'visible', timeout: 8000 }).catch(() => {});
+    if (await p.isVisible('#su_verify')) {
+      await sleep(400);
+      const code = await p.evaluate(() => (((document.querySelector('#ve_dev') || {}).textContent || '').match(/\d{6}/) || [''])[0]);
+      await p.fill('#ve_code', code);
+      await p.click('#su_verify button.pri');
+    }
     await p.waitForSelector('#app', { state: 'visible', timeout: 12000 });
     await sleep(2500);                               // let boot()'s one-time redirect settle
 

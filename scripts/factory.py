@@ -390,12 +390,22 @@ def _agent_codex(role, repo, prompt, codex_key, timeout=600):
 
 
 def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None,
-          tools: list = None, spawner: str = None) -> dict:
+          tools: list = None, spawner: str = None, light: bool = False) -> dict:
     """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry from the CALLEE's
     own estimate (pre-flight handshake). Model is pinned (reproducible) with --fallback-model on overload;
     low-stakes stages pass a cheaper model. A timeout no longer kills the stage (retry w/ backoff),
-    transient errors back off longer, a bad BYO key fails fast, exhausted retries escalate."""
-    model = model or BUILD_MODEL
+    transient errors back off longer, a bad BYO key fails fast, exhausted retries escalate.
+
+    LATENCY FAST PATH (light=True): for QUICK CONVERSATIONAL turns — the controller's clarify/say replies,
+    chit-chat, option discussion — where a ~30s cold-spawn of Opus + the FULL role charter + a pre-flight
+    estimate handshake is unacceptable next to a chat UI. light mode (a) defaults to the FAST model
+    (CHEAP_MODEL/haiku) instead of Opus, (b) sends a MINIMAL system preamble instead of role_brief's elite
+    charter (the caller's `task` already carries its own system+context+conversation, so the charter is pure
+    overhead here), and (c) SKIPS the estimate handshake (fixed short timeout, no retries) so there's only
+    ONE model round-trip. All the governance/consent/provider/budget/killswitch gates below still apply —
+    light only changes model + prompt weight + the pre-flight, never the safety chokepoints. Heavy work
+    (research/build/spec/review) leaves light=False and keeps the strong model + full charter."""
+    model = model or (CHEAP_MODEL if light else BUILD_MODEL)
     _apply_scale()                                    # dial capability (agents/rigor/depth) to the wallet
     # GOVERNANCE (can_spawn gate): the factory spawns this sub-agent ON BEHALF of the orchestrating role.
     # Thread the REAL requester (explicit arg > per-build _ctx.spawner > the controller that drives the
@@ -496,7 +506,14 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                                f"raise it with `budget.py set {product} <tokens>` or split the work"}
     # NB: no home-grown context handling — the agent CLI (claude/codex) manages its own context window
     # (agentic file search, on-demand reads, compaction) far better than a bolt-on retrieval layer would.
-    prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
+    if light:
+        # CONVERSATIONAL FAST PATH: the caller's `task` is already a self-contained system+context+conversation
+        # prompt (see loopcontroller._llm), so the heavyweight elite role charter is pure latency. Add only a
+        # one-line identity + a "be quick" instruction — a clarifying reply must feel near-instant.
+        prompt = (f"You are the {role}, replying live in a chat with a non-technical CEO. Be warm, concise, and "
+                  f"helpful; answer directly without preamble.\n\n{task}")
+    else:
+        prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
     # MULTI-PROVIDER: a tenant may have ONLY a Codex/OpenAI key (no Claude). Route them to Codex as the
     # PRIMARY engine (not just failover), on their own key. Default stays Claude.
     engine = (getattr(_ctx, "engine", None) or "claude").lower()
@@ -506,6 +523,11 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     key = getattr(_ctx, "api_key", None)
     if key:
         env = {**os.environ, "ANTHROPIC_API_KEY": key}
+    if light:                                        # fast path: NO estimate handshake (it's a 2nd claude
+        if timeout is None:                          # process — the very latency we're killing). Fixed short
+            timeout = int(os.environ.get("AOS_CHAT_TIMEOUT", "90"))   # budget; a quick chat reply is seconds.
+        if retries is None:
+            retries = 0
     if timeout is None or retries is None:
         with _AGENT_SEM:                             # the estimate is also a claude process — cap it too
             est_min, est_ret = _estimate_runtime(role, task, env)

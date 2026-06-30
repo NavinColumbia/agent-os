@@ -135,8 +135,9 @@ def _controller_state(tid, org_id):
             return a.state(tid)
         org_id = _home_org(tid)
         if not org_id:
-            return {"home": True, "messages": [],
-                    "error": "Create your first company to begin — tell me its name."}
+            # Brand-new tenant with 0 companies: a NON-error first-run state. The frontend turns this
+            # into a welcoming "create your first company" screen — never an error+retry card.
+            return {"home": True, "first_run": True, "messages": []}
     thread = loopcontroller.thread_for_org(tid, org_id)
     st = loopcontroller.state(thread)
     return {"org_id": org_id, "thread": thread, "phase": st.get("phase"), "awaiting": st.get("awaiting"),
@@ -344,6 +345,8 @@ input,select,textarea{width:100%;font-family:inherit;font-size:13.5px;color:var(
 input::placeholder,textarea::placeholder{color:var(--mut)}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);background:var(--panel);box-shadow:0 0 0 3px var(--asoft)}
 textarea{min-height:96px;resize:vertical}label{display:block;font-size:12px;font-weight:550;color:var(--tx2);margin:14px 0 5px}
+textarea.chatbox{min-height:76px;max-height:200px;resize:none;line-height:1.5;padding:11px 14px;border-radius:14px;overflow-y:auto}
+.composer{align-items:flex-end}
 table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);padding:0 10px 10px;border-bottom:1px solid var(--line2)}
 td{padding:11px 10px;color:var(--tx2);border-bottom:1px solid var(--line)}td:first-child{color:var(--tx);font-weight:500}tbody tr{transition:background .12s}tbody tr:hover{background:var(--hover)}tbody tr:last-child td{border-bottom:none}
 .muted{color:var(--mut)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:820px){html,body,.app{max-width:100%;overflow-x:hidden}.grid{grid-template-columns:1fr}.side{width:64px}.side .lbl,.side .nsec{display:none}.side .brand{font-size:0;justify-content:center;padding:4px 0 14px}.side .brand .mk{font-size:18px}.topbar{padding:0 12px;gap:8px;flex-wrap:wrap;height:auto;min-height:56px}.topbar .chip{padding:5px 9px;max-width:42vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.main{padding:18px 14px}}
@@ -408,6 +411,16 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
     <div style="margin-top:14px"><button type=submit id=si_btn class=pri style=width:100%>Sign in</button></div>
     <div id=si_note class="note muted" role=alert aria-live=polite style="margin-top:10px"></div>
     <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px"><button type=button class=linkbtn onclick="suTab('up')">← Create an account</button></p>
+  </form>
+  <form id=su_verify style=display:none onsubmit="verifyEmail();return false" novalidate>
+    <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Verify your email</h2>
+    <p class=muted id=ve_intro style="margin:0 0 10px">We sent a 6-digit code to your email — enter it below.</p>
+    <div id=ve_dev class=note style="display:none;background:var(--asoft);border:1px solid var(--line2);border-radius:10px;padding:10px 12px;margin:0 0 12px;color:var(--atext)"></div>
+    <label for=ve_code>6-digit code</label>
+    <input id=ve_code inputmode=numeric autocomplete=one-time-code maxlength=6 placeholder="123456" aria-describedby=ve_note>
+    <div style="margin-top:14px"><button type=submit id=ve_btn class=pri style=width:100%>Verify</button></div>
+    <div id=ve_note class="note muted" role=alert aria-live=polite style="margin-top:10px"></div>
+    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">Didn't get it? <button type=button class=linkbtn onclick=resendCode()>Resend code</button></p>
   </form></div>
 </div>
 <div class=app id=app style="display:none">
@@ -443,7 +456,7 @@ const NAV=[
 ];
 const LABEL={controller:'Assistant',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My orgs',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
-let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];let PROVIDER_OK=true;
+let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];let PROVIDER_OK=true;let PEND_EMAIL='';
 async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];
   if(ORG && !ORGS.some(o=>o.org_id==ORG)){ORG=0;localStorage.removeItem('aos_org');}   // stale/deleted org -> home (org=0)
   setOrgName();}catch(e){}}
@@ -467,7 +480,7 @@ function gateNote(e){
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none';if(!on){const up=($('#su_signup')||{}).style&&$('#su_signup').style.display!=='none';const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}}
 function resetSession(){localStorage.removeItem('aos_org');localStorage.removeItem('aos_email');ORG=0;ORGS=[];THREAD=null;PROVIDER_OK=true;CUR='controller'}
-function suTab(t){const up=t==='up';$('#su_signup').style.display=up?'block':'none';$('#su_signin').style.display=up?'none':'block';setNote(up?'su':'si','');const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}
+function suTab(t){const up=t==='up';$('#su_signup').style.display=up?'block':'none';$('#su_signin').style.display=up?'none':'block';const v=$('#su_verify');if(v)v.style.display='none';setNote(up?'su':'si','');const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}
 function emailOK(e){return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)}
 function aInv(id,on){const el=$('#'+id);if(el)el.setAttribute('aria-invalid',on?'true':'false')}
 function setNote(p,msg,kind){const n=$('#'+p+'_note');if(!n)return;n.textContent=msg||'';const err=kind==='err';n.classList.toggle('err',err);n.classList.toggle('muted',!err)}
@@ -496,9 +509,39 @@ async function signUp(){
  let r;try{r=await (await fetch('/api/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,email,password:pw})})).json()}
  catch(e){restore();setNote('su','Couldn\'t reach the server — is the console running?','err');return}
  if(r.error){restore();if(/already/.test(r.error)){aInv('su_email',true);$('#su_email').focus()}setNote('su',humanError(r.error,'signup'),'err');return}
+ if(r.pending_verification){restore();setNote('su','');showVerify(r.email||email,r.dev_code);return}   // email-verification gate: collect the 6-digit code before entering the app
  restore();setNote('su','');  // re-enable the button & clear the note so a later sign-out→sign-in isn't stuck disabled
  TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||email);
  showApp(true);boot();
+}
+function showVerify(email,devCode){
+ PEND_EMAIL=email;
+ $('#su_signup').style.display='none';$('#su_signin').style.display='none';$('#su_verify').style.display='block';
+ $('#ve_intro').innerHTML='We sent a 6-digit code to <b>'+esc(email)+'</b> — enter it below.';
+ const dev=$('#ve_dev');
+ if(devCode){dev.style.display='block';dev.innerHTML='Your code is <b>'+esc(devCode)+'</b><br><span class=muted>(self-hosted: no email service configured, so here\'s your code)</span>'}
+ else dev.style.display='none';
+ aInv('ve_code',false);setNote('ve','');const c=$('#ve_code');if(c){c.value='';setTimeout(()=>{try{c.focus()}catch(_){}},0)}
+}
+async function verifyEmail(){
+ const code=($('#ve_code').value||'').trim();const btn=$('#ve_btn');
+ if(!code){aInv('ve_code',true);setNote('ve','Enter the 6-digit code we emailed you.','err');$('#ve_code').focus();return}
+ aInv('ve_code',false);
+ const restore=pend(btn,'Verifying…');setNote('ve','Verifying…');
+ let r;try{r=await (await fetch('/api/verify-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:PEND_EMAIL,code})})).json()}
+ catch(e){restore();setNote('ve','Couldn\'t reach the server — is the console running?','err');return}
+ if(r.error){restore();aInv('ve_code',true);setNote('ve',r.error,'err');$('#ve_code').focus();return}
+ restore();setNote('ve','');
+ TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||PEND_EMAIL);
+ showApp(true);boot();
+}
+async function resendCode(){
+ setNote('ve','Sending a new code…');
+ let r;try{r=await (await fetch('/api/resend-code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:PEND_EMAIL})})).json()}
+ catch(e){setNote('ve','Couldn\'t reach the server — is the console running?','err');return}
+ if(r.error){setNote('ve',r.error,'err');return}
+ if(r.dev_code){const dev=$('#ve_dev');dev.style.display='block';dev.innerHTML='Your code is <b>'+esc(r.dev_code)+'</b><br><span class=muted>(self-hosted: no email service configured, so here\'s your code)</span>'}
+ setNote('ve','We sent a new code — check your email.');
 }
 async function signIn(){
  const email=($('#si_email').value||'').trim();const pw=$('#si_pw').value||'';const btn=$('#si_btn');
@@ -565,6 +608,15 @@ const VIEWS={
  controller:async()=>{
   if(!ORGS.length){try{await loadOrgs()}catch(e){}}
   try{await loadProviders()}catch(e){}   // keep the connect banner current right after a provider is added
+  if(!ORGS.length){   // brand-new 0-company tenant: a welcoming first-run screen, never an error+retry card
+   if(window.CTLPOLL){clearInterval(window.CTLPOLL);window.CTLPOLL=null;}
+   $('#view').innerHTML='<h1>Welcome to agent-os</h1>'
+    +'<p class=sub>'+pill('Get started','accent')+' You\'re the CEO of a company of AI agents that build and ship your software. Create your first company to begin.</p>'
+    +'<div class=card style="border-color:var(--accent)"><div class=empty><div class=ic>🏢</div><h3>Create your first company</h3>'
+    +'<p>Give it a name and a one-line vision. Each company gets its own controller, research, design and budget — your assistant takes it from there, asking you at each step.</p>'
+    +'<button class=pri onclick="go(\'orgs\')">Create your first company</button></div></div>';
+   return;
+  }
   const home=!ORG;const noOrgs=!ORGS.length;   // org=0 -> account-wide home / quick-build · org=N -> that company's controller
   let d={};try{d=await get('/api/controller/state?org='+(ORG||0))}catch(e){$('#view').innerHTML=errCard('controller',e.message);return}
   const gateErr=d&&d.error&&gateError(d.error);
@@ -575,12 +627,11 @@ const VIEWS={
   if(!home&&d.phase){const rawPhase=d.phase;const phase=rawPhase.charAt(0)+rawPhase.slice(1).toLowerCase();phaseLine=' · <b>'+esc(phase)+'</b>'+(d.awaiting?(' · waiting on '+esc(GATE[d.awaiting]||d.awaiting)):'');}
   const intro=home?'Your account-wide assistant — ask across all your companies, spin up a new one, or start a quick build. I route it to the right place.':'Tell this company\'s controller what to build. It researches, brings options, designs and ships — asking you at each step.';
   let h='<h1>Assistant</h1><p class=sub>'+pill(scope,home?'accent':'')+' '+esc(intro)+phaseLine+'</p>';
-  if(noOrgs)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Welcome</b> — create your first company to begin. Each company gets its own controller, research, design and budget.</span><button class=pri onclick="go(\'orgs\')">Create your first company</button></div></div>';
   if(!PROVIDER_OK)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span>⚡ Connect a model provider so your agents can run — use the Claude / ChatGPT account already signed in on this machine (no key) or an API key.</span><button class=pri onclick="go(\'providers\')">Connect a provider</button></div></div>';
   h+='<div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>';
   const CHIPS=home?['Create a new company','What needs my attention across all companies?','A quick throwaway prototype']:['Build a competitor to YouTube','An internal tool for my team','A booking page for my salon'];
   const ph=home?(noOrgs?'e.g. start a company called Acme that builds…':'e.g. start a new company, or ask about any of them…'):'e.g. build a competitor to YouTube';
-  h+='<div class=card><div class=chips>'+CHIPS.map(c=>`<span class=chip-s onclick="ctlFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div><div class=row><input id=cmsg aria-label="Message your assistant" placeholder="${ph}" onkeydown="if(event.key==='Enter')ctlSend()"><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
+  h+='<div class=card><div class=chips>'+CHIPS.map(c=>`<span class=chip-s onclick="ctlFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div><div class="row composer"><textarea id=cmsg class=chatbox rows=1 aria-label="Message your assistant" placeholder="${ph}" oninput="grow(this)" onkeydown="taKey(event,ctlSend)"></textarea><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
   $('#view').innerHTML=h;
   if(gateErr){$('#cnote').innerHTML=gateNote(d.error);ctlRender([]);}
   else if(d&&d.error){const log=$('#clog');if(log)log.innerHTML='<div class=muted>'+esc(d.error)+'</div>';}
@@ -613,7 +664,7 @@ const VIEWS={
   $('#view').innerHTML=`<h1>Direct your fleet</h1><p class=sub>Describe what you want in plain words. I'll ask questions, then build it — you approve.</p>
    <div class=chips>`+CHIPS.map(c=>`<span class=chip-s onclick="chipFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+`</div>
    <div class=card id=chatlog style="max-height:52vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>
-   <div class=card><div class=row><input id=msg aria-label="Describe your app idea" placeholder="e.g. I want an app to track my gym members…" onkeydown="if(event.key==='Enter')chatSend()"><button class=pri id=chatsend onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
+   <div class=card><div class="row composer"><textarea id=msg class=chatbox rows=1 aria-label="Describe your app idea" placeholder="e.g. I want an app to track my gym members…" oninput="grow(this)" onkeydown="taKey(event,chatSend)"></textarea><button class=pri id=chatsend onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
   await chatRender();
  },
  cockpit:async()=>{const d=await get('/api/cockpit?org='+ORG);const s=d.summary||{},b=d.budget||{};d.products=d.products||[];d.communications=d.communications||[];d.queue=d.queue||{};
@@ -709,8 +760,10 @@ async function chatRender(){
  if(atBottom)log.scrollTop=log.scrollHeight;   // only re-pin if user was already at the bottom; don't yank scrollback
  if(!window.CHATPOLL)window.CHATPOLL=setInterval(chatRender,5000);   // live updates as the controller reports back
 }
-function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus()}}
-function ctlFill(t){const i=$('#cmsg');if(i){i.value=t;i.focus()}}
+function grow(t){if(!t)return;t.style.height='auto';t.style.height=Math.min(t.scrollHeight,200)+'px'}   // auto-grow the composer up to its max, then it scrolls
+function taKey(e,fn){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();fn()}}   // ChatGPT/Claude: Enter sends, Shift+Enter inserts a newline
+function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus();grow(i)}}
+function ctlFill(t){const i=$('#cmsg');if(i){i.value=t;i.focus();grow(i)}}
 function ctlRender(msgs){const log=$('#clog');if(!log)return;
  const atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<40;
  log.innerHTML=(msgs||[]).map(m=>{const me=m.role==='user';const meta=m.meta||{};let extra='';
@@ -723,15 +776,15 @@ function ctlRender(msgs){const log=$('#clog');if(!log)return;
 }
 async function ctlSend(){
  if(CTLBUSY)return;const i=$('#cmsg');const m=(i?i.value:'').trim();if(!m)return;CTLBUSY=true;
- const btn=$('#ctlsend');if(btn)btn.disabled=true;if(i){i.value='';i.disabled=true}
+ const btn=$('#ctlsend');if(btn)btn.disabled=true;if(i){i.value='';grow(i);i.disabled=true}
  const log=$('#clog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=ctltyping style="margin:8px 0"><div><span class=bubble><span class=muted>… thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
  $('#cnote').textContent='thinking…';
  let r;
  try{r=await post('/api/controller/say',{org:ORG||0,message:m},90000);}
  finally{CTLBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false;i.focus()}}
  const t=$('#ctltyping');if(t)t.remove();
- const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote').innerHTML=gateNote(cg);if(i)i.value=m;return;}   // friendly connect/consent prompt — keep their text
- if(r&&r.error){$('#cnote').textContent='✗ '+r.error+' — your message is in the box, press Send to retry.';if(i)i.value=m;return;}
+ const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote').innerHTML=gateNote(cg);if(i){i.value=m;grow(i)}return;}   // friendly connect/consent prompt — keep their text
+ if(r&&r.error){$('#cnote').textContent='✗ '+r.error+' — your message is in the box, press Send to retry.';if(i){i.value=m;grow(i)}return;}
  $('#cnote').textContent='';go('controller');
 }
 async function ctlChoose(oid){const r=await post('/api/controller/choose',{org:ORG||0,option_id:oid});const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote')&&($('#cnote').innerHTML=gateNote(cg));return;}go('controller');}
@@ -754,18 +807,18 @@ async function markRead(id){await post('/api/notifications/read',{id});refreshTo
 async function markAllRead(){let d={};try{d=await get('/api/notifications')}catch(e){}const feed=(d&&d.feed)||[];for(const n of feed){if(!n.read)await post('/api/notifications/read',{id:n.id});}refreshTopbar();go('notifications');}
 async function chatSend(){
  if(CHATBUSY)return;const i=$('#msg');const m=(i?i.value:'').trim();if(!m)return;CHATBUSY=true;
- const btn=$('#chatsend');if(btn)btn.disabled=true;if(i){i.value='';i.disabled=true}
+ const btn=$('#chatsend');if(btn)btn.disabled=true;if(i){i.value='';grow(i);i.disabled=true}
  const log=$('#chatlog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=chattyping style="margin:8px 0"><div><span class=bubble><span class=muted>… thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
  $('#chatnote').textContent='thinking…';
  let r;
  try{r=await post('/api/chat/say',{thread:THREAD,message:m},90000);}
  finally{CHATBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false}}
- const cg=gateKey(r);if(r&&gateError(cg)){const t=$('#chattyping');if(t)t.remove();$('#chatnote').innerHTML=gateNote(cg);if(i){i.value=m;i.focus()}await chatRender();return;}   // gate (consent/provider) -> friendly CTA, keep their text
+ const cg=gateKey(r);if(r&&gateError(cg)){const t=$('#chattyping');if(t)t.remove();$('#chatnote').innerHTML=gateNote(cg);if(i){i.value=m;grow(i);i.focus()}await chatRender();return;}   // gate (consent/provider) -> friendly CTA, keep their text
  if(r&&r.error){   // never leave a silent spinner: surface a clear, retryable failure
   const t=$('#chattyping');if(t)t.remove();
   const em=r.error==='timeout'?'The assistant is taking too long to respond. Your message is still in the box — press Send to try again.':('✗ '+r.error+' — your message is still in the box, press Send to retry.');
   $('#chatnote').textContent=em;
-  if(i){i.value=m;i.focus()}
+  if(i){i.value=m;grow(i);i.focus()}
   if(log){log.insertAdjacentHTML('beforeend','<div class="msg ai" style="margin:8px 0"><div><span class=bubble><span class=muted>'+esc(em)+'</span></span></div></div>');log.scrollTop=log.scrollHeight}
   return;
  }
@@ -896,13 +949,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path); p = u.path
-        if p in ("/api/signup", "/api/login"):            # UNAUTHENTICATED: real email+password accounts
+        if p in ("/api/signup", "/api/login", "/api/verify-email", "/api/resend-code"):   # UNAUTHENTICATED: account + email-verification
             import auth
             b = self._body()
             try:
                 if p == "/api/signup":
                     r = auth.signup(b.get("email", ""), b.get("password", ""),
                                     (b.get("name") or "").strip()[:60] or None, b.get("plan", "free"))
+                elif p == "/api/verify-email":
+                    r = auth.verify_email(b.get("email", ""), b.get("code", ""))
+                elif p == "/api/resend-code":
+                    r = auth.resend_code(b.get("email", ""))
                 else:
                     r = auth.login(b.get("email", ""), b.get("password", ""))
                 return self._json(200 if not r.get("error") else 400, r)

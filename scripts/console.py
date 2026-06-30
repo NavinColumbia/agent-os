@@ -261,6 +261,8 @@ POSTS = {
     "/api/chat/confirm": lambda tid, q, b: orchestrator.confirm(tid, int(b.get("thread") or 0)),
     "/api/providers/add": lambda tid, q, b: tenantproviders.add_key(tid, b.get("provider", ""), b.get("key", "")),
     "/api/providers/connect": lambda tid, q, b: tenantproviders.connect(tid, b.get("provider", ""), b.get("mode", "api_key"), b.get("key")),
+    "/api/providers/subscription/start": lambda tid, q, b: tenantproviders.start_subscription_login(b.get("provider", "")),
+    "/api/providers/subscription/status": lambda tid, q, b: tenantproviders.subscription_status(b.get("provider", "")),
     "/api/providers/remove": lambda tid, q, b: tenantproviders.remove_key(tid, b.get("provider", "")),
     "/api/providers/priority": lambda tid, q, b: tenantproviders.set_priority(tid, b.get("order", [])),
     "/api/onboarding/advance": lambda tid, q, b: onboarding.advance(tid, b.get("step", "")),
@@ -459,7 +461,7 @@ function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);setOrgName();go
 function gateError(e){return e==='consent_required'||e==='provider_required';}
 function gateKey(r){return r?(r.error||r.blocked):'';}   // same gates surface as 'error' (front door) OR 'blocked' (controller/chat loop) — handle both
 function gateNote(e){
- if(e==='provider_required')return 'Connect a model provider to start — <button class=linkbtn onclick="go(\'providers\')">connect a provider</button>. Use your Claude / ChatGPT subscription login (no key needed) or an API key.';
+ if(e==='provider_required')return 'Connect a model provider to start — <button class=linkbtn onclick="go(\'providers\')">connect a provider</button>. Use the Claude / ChatGPT account already signed in on this machine (no key) or an API key.';
  if(e==='consent_required')return 'One-time setup: approve AI processing before your agents run — <button class=linkbtn onclick="go(\'settings\')">review AI consent</button>.';
  return esc(''+e);}
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
@@ -574,7 +576,7 @@ const VIEWS={
   const intro=home?'Your account-wide assistant — ask across all your companies, spin up a new one, or start a quick build. I route it to the right place.':'Tell this company\'s controller what to build. It researches, brings options, designs and ships — asking you at each step.';
   let h='<h1>Assistant</h1><p class=sub>'+pill(scope,home?'accent':'')+' '+esc(intro)+phaseLine+'</p>';
   if(noOrgs)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Welcome</b> — create your first company to begin. Each company gets its own controller, research, design and budget.</span><button class=pri onclick="go(\'orgs\')">Create your first company</button></div></div>';
-  if(!PROVIDER_OK)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span>⚡ Connect a model provider so your agents can run — use your Claude / ChatGPT subscription login (no key) or an API key.</span><button class=pri onclick="go(\'providers\')">Connect a provider</button></div></div>';
+  if(!PROVIDER_OK)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span>⚡ Connect a model provider so your agents can run — use the Claude / ChatGPT account already signed in on this machine (no key) or an API key.</span><button class=pri onclick="go(\'providers\')">Connect a provider</button></div></div>';
   h+='<div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>';
   const CHIPS=home?['Create a new company','What needs my attention across all companies?','A quick throwaway prototype']:['Build a competitor to YouTube','An internal tool for my team','A booking page for my salon'];
   const ph=home?(noOrgs?'e.g. start a company called Acme that builds…':'e.g. start a new company, or ask about any of them…'):'e.g. build a competitor to YouTube';
@@ -681,7 +683,7 @@ const VIEWS={
   <div class=card><h2>BYO API key</h2><div class=row>${d.byo_key_set?pill('key on file','ok'):pill('no key','warn')}</div><div style=margin-top:8px><input id=bk aria-label="API key" placeholder="sk-… (stored encrypted)"><button class=pri style=margin-top:6px onclick=saveKey()>save key</button></div><div id=bknote class=muted style=margin-top:8px></div></div>
   <div class=card><h2>Notification preferences</h2><table><tr><th>category</th><th>in-app</th><th>email</th><th>push</th></tr>`+(d.notification_prefs||[]).map(p=>`<tr><td>${esc(p.category)}</td><td><input type=checkbox ${p.in_app?'checked':''} onchange="pref('${p.category}',this.checked,null,null)"></td><td><input type=checkbox ${p.email?'checked':''} onchange="pref('${p.category}',null,this.checked,null)"></td><td><input type=checkbox ${p.push?'checked':''} onchange="pref('${p.category}',null,null,this.checked)"></td></tr>`).join('')+`</table></div>
   <div class=card><h2>Your data</h2><div class=row><button onclick=acctExport()>Export my data</button><button onclick=acctDelete() style="border-color:var(--r);color:var(--r)">Delete my account</button></div><div id=acctnote class=muted style=margin-top:8px></div></div>`;PREFS=d.notification_prefs;},
- providers:async()=>{const d=await get('/api/providers');$('#view').innerHTML='<h1>Model providers</h1><p class=sub>Run on Claude, on Codex, or both — you only need one. Use your subscription login (no per-token billing) OR bring an API key.</p><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill(p.auth_mode==='subscription'?'subscription login':'api key','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)} · runs on <b>${esc(p.engine)}</b></div>${p.connected?`<button onclick="provRemove('${p.slug}')">disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Use subscription login</button><button onclick="provAdd('${p.slug}','${esc(p.key_hint)}')">Use API key</button></div>`}</div>`).join('')+'</div><p class=muted>The build uses your highest-priority connected provider. Subscription login uses the Claude/ChatGPT account signed in on this machine; no key → platform default.</p>';},
+ providers:async()=>{const d=await get('/api/providers');$('#view').innerHTML='<h1>Model providers</h1><p class=sub>Run on Claude, on Codex, or both — you only need one. Sign in with your Claude/ChatGPT account on THIS machine (real OAuth via the host CLI, no per-token billing) OR bring an API key.</p><div id=provnote class=muted style="margin:0 0 10px"></div><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill(p.auth_mode==='subscription'?'host sign-in':'api key','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)} · runs on <b>${esc(p.engine)}</b></div>${p.connected?`<button onclick="provRemove('${p.slug}')">disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Sign in on this machine</button><button onclick="provAdd('${p.slug}','${esc(p.key_hint)}')">Use API key</button></div>`}</div>`).join('')+'</div><p class=muted>The build uses your highest-priority connected provider. "Sign in on this machine" launches the real Claude/ChatGPT OAuth via the host CLI (<code>claude auth login</code> / <code>codex login</code>) — it opens a browser on THIS host and connects only once the CLI is genuinely signed in. Note this signs the whole host into one account (subscription OAuth is first-party-CLI-only — no per-tenant token), so it suits a self-hosted single-operator box. No provider → platform default.</p>';},
  help:async()=>{const d=await get('/api/help/topics');$('#view').innerHTML=`<h1>Help</h1><p class=sub>Ask me anything about using agent-os.</p>
   <div class=card><div class=row><input id=hq aria-label="Ask a help question" placeholder="e.g. how do I add my Codex key?" onkeydown="if(event.key==='Enter')helpAsk()"><button class=pri onclick=helpAsk()>Ask</button></div><div id=hans style=margin-top:10px></div></div>
   <div class=card><h2>Topics</h2>`+(d.topics||[]).map(t=>`<div class=item><b>${esc(t.area||t.key||'')}</b> <span class=muted>${esc(t.desc||t.description||'')}</span></div>`).join('')+'</div>';},
@@ -794,8 +796,19 @@ async function ctl(p,a){await post('/api/control',{product:p,action:a});go('cock
 async function decide(kind,ref,verdict){await post('/api/approvals/decide',{kind,ref,verdict});go('approvals');}
 async function integ(act,slug){let secret=null;if(act=='connect')secret=prompt('API key / secret for '+slug+' (leave blank if OAuth):')||null;await post('/api/integrations/'+act,{slug,secret});go('integrations');}
 async function plan(p){await post('/api/billing/plan',{plan:p});go('billing');}
-async function provAdd(slug,hint){const k=prompt('Paste your '+slug+' API key ('+hint+'):');if(k===null)return;const r=await post('/api/providers/connect',{provider:slug,mode:'api_key',key:k});if(r&&r.error){alert('Could not connect '+slug+': '+r.error);return}go('providers');}
-async function provSub(slug){const r=await post('/api/providers/connect',{provider:slug,mode:'subscription'});if(r&&r.error){alert('Could not connect '+slug+': '+r.error);return}go('providers');}
+function provNote(msg,bad){const n=$('#provnote');if(!n){if(bad)alert(msg);return}n.style.color=bad?'var(--accent)':'';n.textContent=msg;}
+async function provAdd(slug,hint){const k=prompt('Paste your '+slug+' API key ('+hint+'):');if(k===null)return;provNote('Checking that key with '+slug+'…',false);const r=await post('/api/providers/connect',{provider:slug,mode:'api_key',key:k});if(r&&r.error){provNote('✗ '+r.error,true);return}go('providers');}   // validate the key for real before claiming connected; show the real reason inline if rejected
+async function provSub(slug){
+  // 1) If the host CLI is ALREADY signed in, connect for real (verified server-side) and we're done.
+  provNote('Checking this machine\'s '+slug+' sign-in…',false);
+  const r=await post('/api/providers/connect',{provider:slug,mode:'subscription'});
+  if(r&&!r.error){go('providers');return}
+  // 2) Not signed in -> TRIGGER the real provider OAuth on THIS host (opens a browser here), then offer Check connection.
+  const s=await post('/api/providers/subscription/start',{provider:slug});
+  if(s&&s.error){provNote('✗ '+s.error,true);return}
+  if(s&&s.already){const r2=await post('/api/providers/connect',{provider:slug,mode:'subscription'});if(r2&&!r2.error){go('providers');return}provNote('✗ '+((r2&&r2.error)||'sign-in not detected yet'),true);return}
+  const n=$('#provnote');if(n){n.style.color='';n.innerHTML=esc((s&&s.instruction)||('Sign in to '+slug+' in the browser on this machine, then check the connection.'))+' <button class=pri onclick="provSub(\''+slug+'\')">Check connection</button>';}
+}
 async function agentCreate(){const t=$('#at').value;const r=await post('/api/agents/create',{name:$('#an').value,instructions:$('#ai').value,role:$('#ar').value,trigger:t,interval_s:t==='recurring'?604800:0,output:'report'});$('#anote').textContent=r.error?('✗ '+r.error):'agent created';if(!r.error)go('agents');}
 async function agentRun(id){const r=await post('/api/agents/run',{id});const n=$('#anote');if(!n)return;if(r&&r.error&&gateError(r.error)){n.innerHTML=gateNote(r.error);return;}n.textContent=r&&r.error?('✗ '+r.error):'running — it\'ll report into your notifications';}
 async function agentToggle(id,en){await post('/api/agents/toggle',{id,enabled:en});go('agents');}

@@ -984,15 +984,47 @@ async function ctlSend(){
  const log=$('#clog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=ctltyping style="margin:8px 0"><div><span class=bubble><span class=spin></span> <span class=muted>thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
  $('#cnote').textContent='Working… press Stop to cancel.';
  CTLABORT=(typeof AbortController!=='undefined')?new AbortController():null;
- let r;
- try{const resp=await fetch('/api/controller/say',{method:'POST',headers:H(),body:JSON.stringify({org:ORG||0,message:m}),signal:CTLABORT?CTLABORT.signal:undefined});try{r=await resp.json()}catch(_){r={}}}
- catch(e){r={error:(e&&e.name==='AbortError')?'stopped':'request failed'}}
- finally{CTLBUSY=false;CTLABORT=null;setSendMode(false);if(i){i.disabled=false;i.focus()}}
+ let r=null,gotDelta=false,gotDone=false,streamFailed=false;
+ // PRIMARY: stream the reply token-by-token (SSE) so the bubble fills live. The whole turn is still
+ // persisted server-side by say(), so a closed tab / partial stream loses nothing — the reload reconciles.
+ try{
+  const resp=await fetch('/api/controller/stream',{method:'POST',headers:H(),body:JSON.stringify({org:ORG||0,message:m}),signal:CTLABORT?CTLABORT.signal:undefined});
+  if(!resp.ok||!resp.body||!resp.body.getReader){streamFailed=true;}
+  else{
+   const reader=resp.body.getReader();const dec=new TextDecoder();let buf='',acc='';
+   while(true){
+    const{value,done}=await reader.read();if(done)break;
+    buf+=dec.decode(value,{stream:true});let idx;
+    while((idx=buf.indexOf('\n\n'))>=0){
+     const chunk=buf.slice(0,idx);buf=buf.slice(idx+2);
+     const line=chunk.replace(/^data:\s?/,'').trim();if(!line)continue;
+     let ev;try{ev=JSON.parse(line)}catch(_){continue}
+     if(ev.delta!=null){gotDelta=true;acc+=ev.delta;ctlStreamInto(acc);}
+     else if(ev.error){r={error:ev.error};}
+     else if(ev.done){gotDone=true;if(ev.result)r=ev.result;}
+    }
+   }
+  }
+ }catch(e){
+  if(e&&e.name==='AbortError'){r={error:'stopped'};}
+  else if(!gotDelta){streamFailed=true;}   // never connected -> safe to fall back to the blocking path
+  // gotDelta but broke mid-stream: say() still finished + persisted server-side; the reload below reconciles
+ }
+ // FALLBACK: streaming unavailable (old server / proxy / connect error) -> the proven blocking POST.
+ if(streamFailed){
+  try{const resp=await fetch('/api/controller/say',{method:'POST',headers:H(),body:JSON.stringify({org:ORG||0,message:m}),signal:CTLABORT?CTLABORT.signal:undefined});try{r=await resp.json()}catch(_){r={}}}
+  catch(e){r={error:(e&&e.name==='AbortError')?'stopped':'request failed'}}
+ }
+ CTLBUSY=false;CTLABORT=null;setSendMode(false);if(i){i.disabled=false;i.focus()}
  const t=$('#ctltyping');if(t)t.remove();
  if(r&&r.error==='stopped'){$('#cnote').textContent='Stopped.';return;}   // ctlStop already parked the job + reloaded
  const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote').innerHTML=gateNote(cg);if(i){i.value=m;grow(i)}return;}   // friendly connect/consent prompt — keep their text
  if(r&&r.error){$('#cnote').textContent='✗ '+r.error+' — your message is in the box, press Send to retry.';if(i){i.value=m;grow(i)}return;}
  $('#cnote').textContent='';go('controller');
+}
+function ctlStreamInto(text){   // paint streamed tokens into the live assistant bubble (final reload re-renders via md())
+ const t=$('#ctltyping');if(!t)return;const b=t.querySelector('.bubble');if(b)b.textContent=text;
+ const log=$('#clog');if(log){const atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<60;if(atBottom)log.scrollTop=log.scrollHeight;}
 }
 async function ctlChoose(oid){const r=await post('/api/controller/choose',{org:ORG||0,option_id:oid});const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote')&&($('#cnote').innerHTML=gateNote(cg));return;}go('controller');}
 async function orgNew(){const inp=$('#onm');const name=(inp?inp.value:'').trim();const note=$('#onote');
@@ -1120,6 +1152,62 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _ctl_stream(self, tid, body):
+        """SSE: stream the controller's CONVERSATIONAL clarifying reply token-by-token so the chat bubble
+        fills live (first token in seconds) instead of a blocking turn that reveals the whole message at once.
+        Defers ALL logic to loopcontroller.say() (gates, persistence, block parsing, phase advance) — we only
+        pass an on_delta sink that writes `data: {...}` chunks and FLUSHES each. On done we send the say()
+        result so the browser can finalize (gate CTA / error / reload). The whole reply is also persisted by
+        say() exactly like the non-stream path, so a closed tab loses nothing. The frontend keeps the regular
+        POST /api/controller/say as a FALLBACK if this stream can't connect or errors before any token."""
+        org = int(body.get("org") or 0)
+        msg = (body.get("message") or "")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")          # defeat any proxy buffering of the token stream
+        self.send_header("Connection", "close")
+        self.end_headers()
+        st = {"dead": False, "suppress": False, "pending": ""}
+
+        def _write(obj):
+            if st["dead"]:
+                return
+            try:
+                self.wfile.write(("data: " + json.dumps(obj) + "\n\n").encode())
+                self.wfile.flush()
+            except Exception:
+                st["dead"] = True                            # client gone (Stop/disconnect) -> stop writing
+
+        def on_delta(text):
+            # Hide control markup from the wire: the controller's clarify/plan turns may END with a
+            # [[RESEARCH]]/[[PLAN]] block — once we see '[[' we suppress the rest (it's always trailing).
+            # A lone trailing '[' is held back so a block split across two deltas can't leak its first '['.
+            if st["suppress"] or st["dead"]:
+                return
+            s = st["pending"] + text
+            st["pending"] = ""
+            i = s.find("[[")
+            if i != -1:
+                visible = s[:i]
+                st["suppress"] = True
+            elif s.endswith("["):
+                st["pending"] = "["
+                visible = s[:-1]
+            else:
+                visible = s
+            if visible:
+                _write({"delta": visible})
+
+        thread = loopcontroller.thread_for_org(tid, org)
+        try:
+            r = loopcontroller.say(tid, thread, msg, on_delta=on_delta)
+        except Exception as e:
+            _write({"error": str(e)[:200]})
+            _write({"done": True})
+            return
+        _write({"done": True, "result": r})
+
     def do_GET(self):
         u = urlparse(self.path); p = u.path
         if p == "/":
@@ -1172,6 +1260,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200 if not r.get("error") else 400, r)
             except Exception as e:
                 return self._json(400, {"error": str(e)[:200]})
+        if p == "/api/controller/stream":                     # SSE: stream the controller's clarifying reply
+            tid = _tenant(self.headers.get("X-Tenant-Token"))
+            if tid is _TENANT_ERROR:
+                return self._json(503, {"error": "backend temporarily unavailable — reconnecting"})
+            if not tid:
+                return self._json(401, {"error": "sign up first"})
+            body = self._body()
+            if not _owns(tid, int(body.get("org") or 0)):
+                return self._json(403, {"error": "not your company"})
+            return self._ctl_stream(tid, body)
         fn = POSTS.get(p)
         if not fn:
             return self._json(404, {"error": "not found"})

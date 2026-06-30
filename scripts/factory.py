@@ -605,6 +605,182 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
             "failed": True, "attempts": retries + 1}
 
 
+def _chat_gates(spawner_role, role, repo, task):
+    """The SAME safety chokepoints agent() enforces inline (spawn / consent / provider / budget /
+    killswitch / runtime cost governor), factored out so the STREAMING conversational path (agent_stream)
+    can't bypass any of them. Returns a blocker dict (identical shape to agent()'s refusals) when a gate
+    denies, else None. Mirrors agent()'s fail-open-on-infra / fail-closed-on-clean-deny posture exactly."""
+    try:
+        manifest = governance.load_manifest(spawner_role)
+        if not manifest:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="spawn-gate-failopen",
+                         payload={"spawner": spawner_role, "reason": "manifest missing/unreadable"})
+        else:
+            governance.enforce(spawner_role, "spawn")
+    except PermissionError:
+        return {"rc": -1, "failed": True, "out": "spawn denied",
+                "blocker": f"role '{spawner_role}' is not permitted to spawn sub-agents (can_spawn is "
+                           f"false in its manifest) — escalate for an approval or role change"}
+    except Exception as e:
+        try:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="spawn-gate-failopen", payload={"spawner": spawner_role, "error": str(e)[:200]})
+        except Exception:
+            pass
+    _tenant = getattr(_ctx, "tenant", None)
+    if _tenant:
+        try:
+            import consent
+            _consented = consent.require_consent(_tenant)
+        except Exception:
+            _consented = True
+        if not _consented:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="consent-required", payload={"tenant": _tenant, "spawner": spawner_role})
+            return {"rc": -1, "failed": True, "out": "consent required", "blocker": "consent_required",
+                    "reason": "AI-processing consent is not on file for this tenant — accept it in Settings, then retry"}
+        try:
+            import auth
+            _resolved = auth.provider_resolved(_tenant)
+        except Exception:
+            _resolved = True
+        if not _resolved:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="provider-required", payload={"tenant": _tenant, "spawner": spawner_role})
+            return {"rc": -1, "failed": True, "out": "provider required", "blocker": "provider_required",
+                    "reason": "no model provider is connected for this tenant — connect a key or a "
+                              "subscription login in Providers, then retry"}
+    if BUDGET_USD and spent_usd() >= BUDGET_USD:
+        return {"rc": -1, "failed": True, "out": "budget exhausted",
+                "blocker": f"factory budget ${BUDGET_USD:.2f} exhausted (${spent_usd():.2f} spent) — raise AOS_BUDGET_USD or split the work"}
+    _halt = killswitch.is_halted(getattr(_ctx, "product", None) or "global")
+    if _halt.get("halted"):
+        return {"rc": -1, "failed": True, "out": "halted",
+                "blocker": f"fleet HALTED by operator (scope={_halt.get('scope')}): {_halt.get('reason')} — resume with killswitch.py resume"}
+    product = getattr(_ctx, "product", None)
+    if product:
+        est_tokens = len(task) // 4 + 8000
+        try:
+            import budget as _budget
+            allowed = _budget.allow_spend(product, est_tokens)
+        except Exception:
+            allowed = True
+        if not allowed:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="budget-denied", payload={"product": product, "est_tokens": est_tokens})
+            return {"rc": -1, "failed": True, "out": "token budget exhausted",
+                    "blocker": f"product '{product}' token budget exhausted (governor hard_stop) — "
+                               f"raise it with `budget.py set {product} <tokens>` or split the work"}
+    return None
+
+
+def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=None):
+    """Like _run_once but with `--output-format stream-json`: invokes on_delta(text) for each user-visible
+    text token as it arrives, then returns (rc, full_text, cost, tin, tout, used). Extended THINKING is
+    disabled (MAX_THINKING_TOKENS=0) so the FIRST visible token isn't stuck behind a hidden reasoning pass —
+    the whole point of a chat fast path. Same tool grant + governance disallow + manifest env as _run_once."""
+    cmd = ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
+           "--output-format", "stream-json", "--include-partial-messages", "--verbose",
+           "--model", model, "--fallback-model", FALLBACK_MODEL]
+    grant = tools if tools is not None else AGENT_TOOLS
+    if grant:
+        cmd += ["--allowedTools", *grant]
+    restr = governance.spawn_restrictions(role)
+    disallow = list(restr["disallowed_tools"]) + [f"Read({g})" for g in restr["deny_read"]]
+    if disallow:
+        cmd += ["--disallowedTools", *disallow]
+    mpath = ROLES / f"{role}.yaml"
+    genv = {**(env or os.environ), "MAX_THINKING_TOKENS": "0"}
+    if mpath.exists():
+        genv["CP_MANIFEST"] = str(mpath); genv["CP"] = str(CONTROL_PLANE)
+    parts, result_text, cost, tin, tout, used, rc = [], "", 0.0, 0, 0, model, 0
+    p = subprocess.Popen(cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         text=True, bufsize=1, env=genv)
+    timer = threading.Timer(timeout, p.kill); timer.start()   # hard wall-clock cap (mirrors _run_once timeout)
+    try:
+        for line in p.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            t = o.get("type")
+            if t == "stream_event":
+                e = o.get("event", {})
+                if e.get("type") == "content_block_delta" and (e.get("delta") or {}).get("type") == "text_delta":
+                    txt = e["delta"].get("text") or ""
+                    if txt:
+                        parts.append(txt)
+                        try:
+                            on_delta(txt)            # best-effort: a dead client (Stop/disconnect) never wedges the run
+                        except Exception:
+                            pass
+            elif t == "result":
+                result_text = o.get("result", "") or result_text
+                cost = float(o.get("total_cost_usd") or 0)
+                u = o.get("usage") or {}
+                tin = int(u.get("input_tokens", 0)) + int(u.get("cache_read_input_tokens", 0)) + int(u.get("cache_creation_input_tokens", 0))
+                tout = int(u.get("output_tokens", 0))
+                if o.get("is_error"):
+                    rc = 1
+    finally:
+        timer.cancel()
+        rc2 = p.wait()
+        if rc == 0:
+            rc = rc2
+    _govern_writes(role, repo)
+    full = "".join(parts) or result_text     # streamed deltas are authoritative; fall back to the result text
+    return rc, full, cost, tin, tout, used
+
+
+def agent_stream(role: str, repo: str, task: str, on_delta, timeout: int = None,
+                 tools: list = None, spawner: str = None) -> dict:
+    """STREAMING sibling of agent(light=True) for QUICK CONVERSATIONAL turns (the controller's clarify/scope/
+    plan-draft chat). Streams text tokens to on_delta(text) as they arrive (token-by-token, like ChatGPT/Claude)
+    and returns the SAME dict shape as agent() so the caller treats the result identically. Runs ALL the same
+    safety gates (via _chat_gates) and the FAST model + minimal preamble + no estimate handshake. Claude engine
+    only: a Codex tenant or ANY error returns a {failed:True} dict so the caller can FALL BACK to the blocking
+    agent() path — a streamed reply must never be worse than the proven non-stream one."""
+    model = CHEAP_MODEL
+    _apply_scale()
+    spawner_role = spawner or getattr(_ctx, "spawner", None) or "controller"
+    block = _chat_gates(spawner_role, role, repo, task)
+    if block:
+        return block
+    engine = (getattr(_ctx, "engine", None) or "claude").lower()
+    if engine == "codex":                                  # no token stream on the Codex path -> caller falls back
+        return {"rc": -1, "failed": True, "out": "", "reason": "stream unsupported on codex engine"}
+    env = None
+    key = getattr(_ctx, "api_key", None)
+    if key:
+        env = {**os.environ, "ANTHROPIC_API_KEY": key}
+    if timeout is None:
+        timeout = int(os.environ.get("AOS_CHAT_TIMEOUT", "90"))
+    prompt = (f"You are the {role}, replying live in a chat with a non-technical CEO. Be warm, concise, and "
+              f"helpful; answer directly without preamble.\n\n{task}")
+    t0 = time.time()
+    try:
+        with _AGENT_SEM:
+            rc, out_text, cost, tin, tout, used = _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools)
+    except Exception as e:
+        return {"rc": -1, "failed": True, "out": "", "reason": f"stream error: {str(e)[:160]}"}
+    dt = round(time.time() - t0, 1)
+    _add_spend(cost)
+    audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                 decision="executed", payload={"rc": rc, "stream": True, "cost_usd": cost, "model": used})
+    _trace("agent", role, prompt, out_text, rc, dt, cost, tin, tout, used)
+    if key and "Invalid API key" in out_text:
+        return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True, "reason": "invalid BYO key"}
+    if rc == 0 and out_text.strip():
+        return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost, "tokens_in": tin,
+                "tokens_out": tout, "attempts": 1, "model": used, "streamed": True}
+    return {"rc": rc or 1, "out": (out_text or "")[-1500:], "out_full": out_text or "",
+            "failed": True, "reason": "stream produced no output"}
+
+
 def _sandbox_config(repo: str) -> dict:
     """srt policy for running UNTRUSTED generated code: write only to the repo + /tmp, read allowed
     (so the venv/stdlib import), and NO network egress (empty allowedDomains). Full schema required."""

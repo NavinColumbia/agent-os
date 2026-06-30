@@ -343,7 +343,12 @@ def _apply_provider_ctx(r):
         factory._ctx.engine, factory._ctx.api_key, factory._ctx.codex_key = "claude", (r or {}).get("key"), None
 
 
-def say(tid, thread_id, msg, api_key=None):
+def say(tid, thread_id, msg, api_key=None, on_delta=None):
+    # on_delta (optional): a token sink the console's SSE endpoint passes in to STREAM the conversational
+    # reply live. It's threaded only into the free-text LLM turns (DISCOVER clarify, DEEP_DESIGN plan draft,
+    # generic answer); the fixed-string gate/status/affirmative branches never stream (nothing to stream) and
+    # behave exactly as before. The persisted thread, block parsing and phase advance are all unchanged —
+    # streaming is a pure live-preview overlay on top of the SAME say() control flow.
     _ensure()
     s = _st(thread_id)
     if not s:
@@ -411,7 +416,7 @@ def say(tid, thread_id, msg, api_key=None):
         sysp = ("You are a product controller scoping a build for a non-technical CEO. Ask ONE focused "
                 "clarifying question at a time. When you understand the goal well enough to research it, end "
                 "with EXACTLY:\n[[RESEARCH]]\n<the research question to investigate>\n[[/RESEARCH]]")
-        reply = _llm(tid, thread_id, sysp, s)
+        reply = _llm(tid, thread_id, sysp, s, on_delta=on_delta)
         rq = _parse_block(reply, "RESEARCH")
         clean = re.sub(r"\[\[RESEARCH\]\].*?\[\[/RESEARCH\]\]", "", reply, flags=re.S | re.I).strip()
         if rq:
@@ -450,7 +455,7 @@ def say(tid, thread_id, msg, api_key=None):
                 "plan: <bullets incl. the impact map, invariants/edge cases, parallelization, and done checks; one per line '- '>\n"
                 "agentic: <free-text: the agentic feature(s) the CEO wants + how each is invoked (button/event-async/"
                 "schedule), or 'none'>\ncharter: <2-4 sentences incl. the team/external surfaces to build in>\n[[/PLAN]]")
-        reply = _llm(tid, thread_id, sysp, s)
+        reply = _llm(tid, thread_id, sysp, s, on_delta=on_delta)
         pb = _parse_block(reply, "PLAN")
         clean = re.sub(r"\[\[PLAN\]\].*?\[\[/PLAN\]\]", "", reply, flags=re.S | re.I).strip()
         if pb:
@@ -488,7 +493,7 @@ def say(tid, thread_id, msg, api_key=None):
         _report(tid, thread_id, "When your provider is connected in Settings → Providers, say \"ready\".")
         return {"phase": phase}
 
-    _report(tid, thread_id, _llm(tid, thread_id, "Answer the CEO briefly.", s))
+    _report(tid, thread_id, _llm(tid, thread_id, "Answer the CEO briefly.", s, on_delta=on_delta))
     return {"phase": phase}
 
 
@@ -851,7 +856,7 @@ def _store_user(tid, thread_id, msg):
         c.commit()
 
 
-def _llm(tid, thread_id, sysp, s):
+def _llm(tid, thread_id, sysp, s, on_delta=None):
     # CONSENT/PROVIDER ON FILE (#3.4): _llm only ever runs AFTER say()'s consent + provider gates have BOTH
     # passed, so those prerequisites are satisfied right now. (a) Drop any stale resolved-gate messages from
     # the context so the model can't parrot an old "please accept consent / connect a provider" back at the
@@ -868,7 +873,19 @@ def _llm(tid, thread_id, sysp, s):
     # FAST model (haiku) with a minimal prompt and NO estimate handshake, so a reply feels near-instant instead
     # of blocking ~30s on a cold Opus + full charter. `task` already carries the system prompt + context, so we
     # lose nothing. Heavy work (research/build/QA/review) keeps calling factory.agent WITHOUT light.
-    r = factory.agent("research-growth", str(factory.PRODUCTS), task, tools=[], light=True)
+    # STREAMING fast path: when the caller supplies on_delta (the console's SSE endpoint), stream the reply
+    # token-by-token via factory.agent_stream so the chat bubble fills live instead of revealing the whole
+    # message after a blocking turn. agent_stream runs the SAME gates + fast model as agent(light=True); on
+    # ANY stream failure we fall back to the proven blocking path so a streamed reply is never worse. The
+    # console's on_delta hides leading control markup ([[RESEARCH]]/[[PLAN]]) from the wire — the FULL text
+    # returned here (incl. those blocks) is what we parse/persist below, identical to the non-stream path.
+    r = None
+    if on_delta is not None and hasattr(factory, "agent_stream"):
+        r = factory.agent_stream("research-growth", str(factory.PRODUCTS), task, on_delta, tools=[])
+        if r.get("failed") or r.get("rc") not in (0,) or not (r.get("out_full") or r.get("out")):
+            r = None    # stream errored/empty -> fall through to the blocking call (no double-stream risk)
+    if r is None:
+        r = factory.agent("research-growth", str(factory.PRODUCTS), task, tools=[], light=True)
     # Use the COMPLETE output (out_full) — never the tail-truncated 'out'. The controller's reply carries
     # leading control blocks ([[RESEARCH]]/[[PLAN]]); a >1500-char plan would lose its OPENING tag under
     # front-truncation, so _parse_block fails (plan never persists) and a dangling [[/PLAN]] leaks to chat.

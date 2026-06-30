@@ -131,12 +131,43 @@ def _job_clear(thread_id):
         c.commit()
 
 
+def _research_history_min(default=12):
+    """History-backed ETA (minutes) for a research run — the research analogue of estimate.py's median-of-
+    history approach, but research timing lives in `research_runs` (started_at/finished_at), not the build
+    `traces` estimate.py reads. We take the MEDIAN wall-clock duration of recent COMPLETED runs so the
+    promised ETA matches what we actually deliver. With no history we fall back to a REALISTIC default: a
+    research run fans out ~6-8 parallel web agents + a synthesis pass, so it takes ~10-14 min in practice —
+    NOT the old unrealistic 3. Always returns a positive int; never raises."""
+    try:
+        import statistics
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            # Only completed runs with a sane positive duration count (a still-running / mis-stamped row must
+            # not drag the median). Recent-first, capped, mirroring estimate.py's "median of similar past runs".
+            cur.execute("""SELECT EXTRACT(EPOCH FROM (finished_at - started_at)) / 60.0
+                           FROM research_runs
+                           WHERE status='done' AND started_at IS NOT NULL AND finished_at IS NOT NULL
+                             AND finished_at > started_at
+                           ORDER BY id DESC LIMIT 20""")
+            mins = [float(r[0]) for r in cur.fetchall() if r[0] and float(r[0]) > 0]
+        if mins:
+            return max(1, int(round(statistics.median(mins))))
+    except Exception:
+        pass
+    return max(1, int(default))
+
+
 def _estimate_runtime(phase, plan=None):
-    """Best-effort ETA (minutes) for an async phase. Build/design phases use estimate.py's history-backed
-    estimate for the plan's kind (a 'project' falls back to 'service'); a prototype is only a slice of the
-    full build. Research/QA use small sensible defaults. Always returns a positive int — never raises."""
+    """Best-effort ETA (minutes) for an async phase. RESEARCH uses a history-backed median of recent real
+    research_runs (else a realistic ~12-min default — it's a multi-agent fleet, not a 3-min call). Build/
+    design phases use estimate.py's history-backed estimate for the plan's kind (a 'project' falls back to
+    'service'); a prototype is only a slice of the full build. QA uses a small sensible default. Always
+    returns a positive int — never raises."""
     plan = plan or {}
-    base = {"RESEARCH": 3, "PROTOTYPE": 4, "IMPLEMENT": 12, "TESTQA": 3}
+    # Realistic point-estimate defaults (minutes). RESEARCH is the median wall-clock of a real research fleet
+    # (~6-8 web agents + synthesis), so ~12 — the old 3 promised "~3 min" and delivered in ~13.
+    base = {"RESEARCH": 12, "PROTOTYPE": 4, "IMPLEMENT": 12, "TESTQA": 3}
+    if phase == "RESEARCH":
+        return _research_history_min(default=base["RESEARCH"])
     if phase in ("PROTOTYPE", "IMPLEMENT"):
         try:
             import estimate
@@ -152,10 +183,19 @@ def _estimate_runtime(phase, plan=None):
     return base.get(phase, 5)
 
 
-def _ping(tid, title, body, category="build", level="standard"):
+def _ping(tid, title, body, category="build", level="urgent"):
     """Heads-up the tenant the moment async results LAND (options / prototype / build) — not only on
-    failure or final ship. Writes the in-app notification (fast, DB) and fires a best-effort push on a
-    daemon thread so a slow/down ntfy can never block the control loop. Never raises."""
+    failure or final ship — so a CEO who CLOSED THE TAB still gets told.
+
+    Two channels, both best-effort:
+      * IN-APP feed (notifications.send): the ALWAYS-AVAILABLE channel — the bell/badge lights up even with
+        no ntfy/email configured. We default to level='urgent' (NOT a silent/passive default) because that's
+        the taxonomy level whose contract includes a push and makes the feed unmistakable.
+      * PUSH (push.send on a daemon thread, high priority for urgent): reaches a closed tab / phone. HONEST
+        CAVEAT: on a self-host box this only actually delivers if ntfy is configured AND the tenant has a
+        push topic registered (email likewise needs SMTP); otherwise it's a no-op. The in-app feed above is
+        what we rely on always reaching the user.
+    The daemon thread keeps a slow/down ntfy from ever blocking the control loop. Never raises."""
     try:
         import notifications
         notifications.send(tid, category, title, (body or "")[:300], level=level)
@@ -558,9 +598,11 @@ def advance(thread_id, job_result=None):
         _report(tid, thread_id, "Here's what I found — pick a direction:",
                 {"kind": "options", "options": job_result.get("options", [])})
         _to(thread_id, "OPTIONS"); _set(thread_id, awaiting="user_approval")
-        # PING: research RESULTS landed — heads-up the CEO now (not only on failure/final ship).
-        _ping(tid, "Your options are ready",
-              "I finished researching and brought back a few directions — open the chat to pick one.")
+        # PING: research RESULTS landed — heads-up the CEO now (not only on failure/final ship). level=urgent
+        # so the in-app bell/feed lights up unmistakably AND a push fires (if ntfy/email are configured).
+        _ping(tid, "Your options are ready — review them",
+              "I finished researching and brought back a few directions. Open the chat to pick one.",
+              level="urgent")
         return
     if job_result and job_result.get("screens") is not None:        # prototype finished -> gate at IMPLEMENT
         _job_clear(thread_id)
@@ -568,9 +610,11 @@ def advance(thread_id, job_result=None):
                                 f"(cockpit / team / external) — review them in Design. Say \"approve\" to build it.",
                 {"kind": "prototype"})
         _to(thread_id, "IMPLEMENT"); _set(thread_id, awaiting="user_feedback")
-        # PING: a PROTOTYPE landed — heads-up the CEO to review + approve.
-        _ping(tid, "Your prototype is ready",
-              f"{job_result.get('screens', 0)} screens are ready to review — approve to build it.")
+        # PING: a PROTOTYPE landed — heads-up the CEO to review + approve. level=urgent so the bell/feed lights
+        # up unmistakably AND a push fires (if ntfy/email are configured).
+        _ping(tid, "Your prototype is ready — review it",
+              f"{job_result.get('screens', 0)} screens are ready to review. Approve in the chat to build it.",
+              level="urgent")
         return
     if job_result and (job_result.get("shipped") is not None or job_result.get("result")):  # build done
         _to(thread_id, "TESTQA"); advance(thread_id)
@@ -838,6 +882,12 @@ def sla_watchdog():
                 f"little more time; say \"retry\" to start it over or \"cancel\" to stop.",
                 {"kind": "sla_warning", "phase": phase, "job": jk, "elapsed_min": em, "eta_min": eta,
                  "actions": ["retry", "cancel"]}, urgent=True)
+        # The _report above only reaches an OPEN chat tab. Also light up the always-available in-app feed (and
+        # a push, if ntfy/email are configured) so a CEO who LEFT is told their run is overrunning — not left
+        # wondering whether it died. level=urgent -> the bell/feed is unmistakable + push fires high-priority.
+        _ping(tid, "Still working — taking longer than usual",
+              f"Your {(phase or 'current').lower()} step is still running ({em}m elapsed). I'll post the "
+              f"results in the chat the moment it's done.", level="urgent")
         audit.append(actor="loopcontroller", action="SLAWarn", resource=str(thread_id), decision=phase,
                      payload={"elapsed_min": em, "eta_min": eta})
         warned += 1
@@ -1067,6 +1117,11 @@ def _selftest():
                            AND content ~ '~[0-9]+ min'""", (th,))
             eta_msg = cur.fetchone()[0]
         eta_ok = isinstance(eta_min, int) and eta_min > 0 and eta_msg >= 1
+        # (1b) RESEARCH ETA REALISM: research is a multi-agent fleet (~10-14 min), so its promised ETA must be
+        # realistic (history-backed median of real research_runs when available, else a sane default) — never
+        # the old unrealistic ~3 min that under-promised and over-ran.
+        research_eta = _estimate_runtime("RESEARCH")
+        research_eta_ok = isinstance(research_eta, int) and research_eta >= 8
 
         # (3) PING: landing async results wrote a tenant notification (not only on failure/final ship).
         import notifications as _n
@@ -1129,12 +1184,13 @@ def _selftest():
 
         ok = (consent_gate_ok and opt and gate_held and in_design and plan_persisted and plan_card
               and no_tag_leak and proto and deliver and jobs >= 3
-              and eta_ok and ping_ok and live_cancel_ok
+              and eta_ok and research_eta_ok and ping_ok and live_cancel_ok
               and consent_reask_ok and sla_ok and status_honest_ok)
         print(f"consent_gate={consent_gate_ok} options={opt} gate_held={gate_held} design={in_design} "
               f"plan_persisted={plan_persisted} plan_card={plan_card} no_tag_leak={no_tag_leak} "
               f"prototype={proto} deliver={deliver} jobs_done={jobs}")
-        print(f"eta(kickoff ~min)={eta_ok}(est={eta_min}m) ping(results-land)={ping_ok} "
+        print(f"eta(kickoff ~min)={eta_ok}(est={eta_min}m) research_eta_realistic={research_eta_ok}"
+              f"(={research_eta}m) ping(results-land)={ping_ok} "
               f"live_progress={live_ok} no_false_done={no_false_done_running and no_false_done_after} "
               f"cancel(killswitch)={cancel_ok}")
         print(f"consent_reask_fixed={consent_reask_ok}(note={consent_note_ok},no_stale={no_stale_consent_ctx}) "

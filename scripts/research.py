@@ -102,13 +102,21 @@ def _run(run_id, question, api_key=None):
             report_text = Path(report_path).read_text()
         except Exception:
             report_text = ""
+        # Persist the report path WITHOUT flipping status yet: the controller/UI polls run_state() and the
+        # moment it sees status='done' it reads st['options'], so 'done' must NEVER be visible before the
+        # option cards exist. Distill options FIRST, confirm >=1 row was stored, THEN mark 'done' — so a
+        # 'done' status GUARANTEES the SELECTABLE cards are already queryable (no done-with-empty dead-end).
         with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""UPDATE research_runs SET report_path=%s, status='done', finished_at=now()
-                           WHERE id=%s""", (report_path, run_id))
+            cur.execute("UPDATE research_runs SET report_path=%s WHERE id=%s", (report_path, run_id))
             c.commit()
-        _extract_options(run_id, report_text)
+        n_opts = _extract_options(run_id, report_text)
+        if not n_opts:  # belt-and-suspenders: _extract_options always stores a fallback, but never flip
+            raise RuntimeError("option distillation produced zero cards")  # 'done' on an empty result set.
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("UPDATE research_runs SET status='done', finished_at=now() WHERE id=%s", (run_id,))
+            c.commit()
         audit.append(actor="research", action="ResearchRunDone", resource=str(run_id),
-                     decision="executed", payload={"report": report_path})
+                     decision="executed", payload={"report": report_path, "options": n_opts})
     except Exception as e:
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("UPDATE research_runs SET status='failed', finished_at=now() WHERE id=%s", (run_id,))
@@ -166,12 +174,19 @@ def _extract_options(run_id, report_text):
         "OPT: <short title> :: <one-sentence summary>\n"
         "Mark the single best option with a leading '*' (e.g. '* OPT: ...'). Do not write anything else.\n\n"
         f"REPORT:\n{report_text[:8000]}")
-    r = factory.agent("research-growth", str(repo), prompt, tools=[])
-    opts = _parse_options(r.get("out", "") or "")
-    if len(opts) < 2:                                  # parse miss -> one fallback option from the report head
+    try:
+        r = factory.agent("research-growth", str(repo), prompt, tools=[])
+        opts = _parse_options(r.get("out", "") or "")
+    except Exception:
+        # A distiller-agent failure must NOT throw away a completed (e.g. 13-min) research run: fall through
+        # to the report-head fallback below so the user still gets the research, never a blank dead-end.
+        opts = []
+    if len(opts) < 2:                                  # parse miss / distiller failure -> surface the report itself
         head = " ".join((report_text or "").split())[:200].strip()
-        opts = [{"title": "Proceed with research findings",
-                 "summary": head or "See the full report for details.", "recommended": True}]
+        opts = [{"title": "Read the research",
+                 "summary": (head + "…") if head else
+                            "Research is done — open the full report; it couldn't be auto-split into options.",
+                 "recommended": True}]
     if not any(o["recommended"] for o in opts):        # ensure exactly one recommended
         opts[0]["recommended"] = True
     seen_rec = False
@@ -268,6 +283,22 @@ def _selftest():
         opts = st["options"]
         recs = [o for o in opts if o["recommended"]]
         extracted_ok = st["status"] == "done" and len(opts) == 3 and len(recs) == 1
+        # INVARIANT: a 'done' run must NEVER expose zero options (the reordered _run flips 'done' only
+        # AFTER >=1 card is stored). Assert it directly on the run we just drove to completion.
+        done_implies_options = (st["status"] != "done") or len(opts) >= 1
+        # Fallback path: even when the distiller yields ZERO parseable OPT lines, a finished run must still
+        # reach 'done' with >=1 (fallback) option — never 'done' with an empty/blank dead-end.
+        factory.agent = lambda *a, **k: {"rc": 0, "out": "sorry, I have no idea\nnot an option line"}
+        fb_id = start(tid, "org-self", 1, "distiller returns junk")["run_id"]
+        dl2 = time.time() + 10
+        fst = run_state(tid, fb_id)
+        while fst["status"] not in ("done", "failed") and time.time() < dl2:
+            time.sleep(0.2)
+            fst = run_state(tid, fb_id)
+        fallback_ok = (fst["status"] == "done" and len(fst["options"]) >= 1
+                       and sum(1 for o in fst["options"] if o["recommended"]) == 1)
+        print(f"fallback run {fb_id}: status={fst['status']} options={len(fst['options'])} "
+              f"(zero-parse -> sensible fallback, done-implies-options={done_implies_options})")
         chosen = select(tid, run_id, opts[-1]["id"]) if opts else None
         chosen_ok = bool(chosen) and chosen["chosen"] and run_state(tid, run_id)["options"][-1]["chosen"]
         # Cross-tenant guard: another tenant can neither read this run nor flip its options (IDOR).
@@ -281,10 +312,11 @@ def _selftest():
         except ValueError:
             xselect_ok = True
         xtenant_ok = xread == [] and xselect_ok
-        ok = parse_ok and extracted_ok and chosen_ok and xtenant_ok and blocked_ok
+        ok = (parse_ok and extracted_ok and chosen_ok and xtenant_ok and blocked_ok
+              and done_implies_options and fallback_ok)
         print(f"run {run_id}: status={st['status']} options={len(opts)} recommended={len(recs)} "
               f"chosen={chosen['title'] if chosen else None} xtenant_guard={xtenant_ok} "
-              f"preconsent_block={blocked_ok}")
+              f"preconsent_block={blocked_ok} fallback_ok={fallback_ok}")
         print("PASS: research STATE+OPTIONS (async run -> 3 selectable cards -> select) ✅" if ok else "FAIL")
     finally:
         research_fleet.research, factory.agent = real_research, real_agent

@@ -69,7 +69,8 @@ def _ensure():
             ADD COLUMN IF NOT EXISTS job_started_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS job_eta_min INTEGER,
             ADD COLUMN IF NOT EXISTS job_status TEXT,
-            ADD COLUMN IF NOT EXISTS job_sla_warned BOOLEAN DEFAULT false""")
+            ADD COLUMN IF NOT EXISTS job_sla_warned BOOLEAN DEFAULT false,
+            ADD COLUMN IF NOT EXISTS pending_intent TEXT""")
         cur.execute("""CREATE TABLE IF NOT EXISTS controller_jobs (
             id BIGSERIAL PRIMARY KEY, thread_id BIGINT, tenant_id TEXT, phase TEXT, kind TEXT,
             status TEXT DEFAULT 'running', result JSONB,
@@ -80,13 +81,14 @@ def _ensure():
 def _st(thread_id):
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""SELECT thread_id, tenant_id, org_id, phase, brief, options, chosen_option, plan,
-                              research_run_id, product, awaiting FROM controller_state WHERE thread_id=%s""",
+                              research_run_id, product, awaiting, pending_intent
+                       FROM controller_state WHERE thread_id=%s""",
                     (thread_id,))
         r = cur.fetchone()
     if not r:
         return None
     keys = ["thread_id", "tenant_id", "org_id", "phase", "brief", "options", "chosen_option", "plan",
-            "research_run_id", "product", "awaiting"]
+            "research_run_id", "product", "awaiting", "pending_intent"]
     return dict(zip(keys, r))
 
 
@@ -445,12 +447,27 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         em, eta = ls.get("elapsed_min") or 0, ls.get("eta_min")
         doing = (ls.get("status") or "Working").rstrip("…").lower()
         eta_txt = f", usually ~{eta} min" if eta else ""
+        # MID-FLIGHT INTENT (#2.1 follow-up): the CEO can't tap a gate that hasn't appeared yet, but a real
+        # instruction typed now ("go with your recommendation and start building") must NOT be dropped on the
+        # floor — it used to be, so when results landed the thread re-parked on the approval gate and ignored a
+        # pre-authorized directive. QUEUE anything that isn't a pure status check as a pending_intent and apply
+        # it at the next gate (advance() honours it the instant results land). Bare "is it done yet?" pings
+        # still just get the honest live status, as before. No LLM turn here — status path stays free-form-safe.
+        queued = bool((msg or "").strip()) and not _is_status_query(msg)
+        if queued:
+            _set(thread_id, pending_intent=msg)
+            if _intent_auto_proceed(msg):
+                tail = (" Noted — the moment the results land I'll go with my recommended direction and tee up "
+                        "the plan for you, so you don't have to come back and tap.")
+            else:
+                tail = " Noted — I'll fold what you just said into the work as soon as the results are in."
+        else:
+            tail = " I'll post the results right here and ping you the moment they're ready."
         _report(tid, thread_id,
-                f"I'm already on it — {doing} ({em}m elapsed{eta_txt}). I'll post the results right here and "
-                f"ping you the moment they're ready. Say \"cancel\" to stop.",
+                f"I'm already on it — {doing} ({em}m elapsed{eta_txt}).{tail} Say \"cancel\" to stop.",
                 {"kind": "working", "phase": phase, "job": ls.get("job_kind"),
-                 "elapsed_min": em, "eta_min": eta})
-        return {"phase": phase, "awaiting": "fleet", "running": True}
+                 "elapsed_min": em, "eta_min": eta, "queued_intent": queued})
+        return {"phase": phase, "awaiting": "fleet", "running": True, "queued_intent": queued}
 
     if phase == "DISCOVER":
         sysp = ("You are a product controller scoping a build for a non-technical CEO. Ask ONE focused "
@@ -593,11 +610,50 @@ def advance(thread_id, job_result=None):
 
     # research job finished -> present options
     if job_result and job_result.get("run_id") and "options" in job_result:
-        _set(thread_id, research_run_id=job_result["run_id"], options=job_result.get("options", []))
+        opts = job_result.get("options", [])
+        _set(thread_id, research_run_id=job_result["run_id"], options=opts)
         _job_clear(thread_id)
-        _report(tid, thread_id, "Here's what I found — pick a direction:",
-                {"kind": "options", "options": job_result.get("options", [])})
         _to(thread_id, "OPTIONS"); _set(thread_id, awaiting="user_approval")
+
+        # PRE-AUTHORIZED INTENT (#2.1 follow-up): if the CEO told us mid-research to "go with the recommendation
+        # and start building", honour it NOW instead of silently re-parking on the approval gate. Auto-select
+        # the RECOMMENDED direction via the SAME path a chip-tap takes (-> DEEP_DESIGN feedback gate), so every
+        # downstream guard (plan draft, plan approval, spend gates) still holds — we never blast a human-gated
+        # build. If there's no recommended option we can't safely auto-pick, so we fall through and just ask.
+        pend = (s.get("pending_intent") or "").strip()
+        rec = next((o for o in opts if isinstance(o, dict) and o.get("recommended")), None)
+        if pend and rec and _intent_auto_proceed(pend):
+            _set(thread_id, pending_intent=None)
+            rid = rec.get("id")
+            chosen = {"option_id": rid}
+            try:
+                import research as _research
+                chosen = _research.select(tid, job_result["run_id"], rid) or chosen
+            except Exception:
+                pass
+            _set(thread_id, chosen_option=chosen, awaiting="user_feedback")
+            _to(thread_id, "DEEP_DESIGN")
+            _report(tid, thread_id,
+                    "Research is in — and as you asked, I went with my recommendation: "
+                    f"“{rec.get('title', 'the recommended direction')}”. I'll turn that into the "
+                    "technical plan next; say \"go ahead\" when you want me to draft it and start the build.",
+                    {"kind": "option_chosen", "auto_selected": rid, "title": rec.get("title")})
+            _ping(tid, "Research done — I picked your recommended direction",
+                  "As you asked, I went with the recommended option and I'm teeing up the plan. "
+                  "Open the chat to follow along.", level="urgent")
+            audit.append(actor="loopcontroller", action="IntentAutoApplied", resource=str(thread_id),
+                         decision="auto_select_recommended", payload={"option_id": rid})
+            return
+
+        # Otherwise present the options. If the CEO left a (non-directive) note mid-research, acknowledge it up
+        # front so it's never silently dropped — its substance also rides along in the transcript the plan reads.
+        if pend:
+            _set(thread_id, pending_intent=None)
+            intro = ("Here's what I found — pick a direction. (I saw the note you sent while I was working; "
+                     "I'll carry it into the plan once you choose.)")
+        else:
+            intro = "Here's what I found — pick a direction:"
+        _report(tid, thread_id, intro, {"kind": "options", "options": opts})
         # PING: research RESULTS landed — heads-up the CEO now (not only on failure/final ship). level=urgent
         # so the in-app bell/feed lights up unmistakably AND a push fires (if ntfy/email are configured).
         _ping(tid, "Your options are ready — review them",
@@ -961,6 +1017,29 @@ def _affirmative(msg):
                           (msg or "").lower()))
 
 
+def _is_status_query(msg):
+    # A pure "where are we?" check typed while a job runs — it only deserves the honest live status, NOT to be
+    # queued as a pending instruction. Keep this tight so real directives ("go with your rec") are NOT swallowed.
+    return bool(re.search(r"\b(is it done|done yet|are we (there|done)|there yet|ready yet|finished\??$"
+                          r"|how('?s| is| are)\s+(it|we|things|that)\s+(go|do|com|look)|how long|how much longer"
+                          r"|any (update|progress|news)|status\??$|where are we|eta\b|still (going|working|on it))\b",
+                          (msg or "").lower()))
+
+
+def _intent_auto_proceed(msg):
+    # A mid-flight directive that PRE-AUTHORIZES us to pick the recommended direction and keep moving once
+    # results land — "go with your recommendation", "you choose", "best option", "start building", "just build
+    # it", "don't wait for me", "proceed". Conservative on purpose: only an explicit hand-off auto-advances.
+    m = (msg or "").lower()
+    return bool(re.search(r"\b(your (recommendation|rec|pick|call|choice|judgement|judgment)"
+                          r"|you (choose|pick|decide|recommend)|whatever you (think|recommend|suggest)"
+                          r"|go with (the |your )?(recommend|rec|best|top|first|that)|recommended option"
+                          r"|best option|pick (the |a |one)?(recommend|best|top|for me)"
+                          r"|start build|start building|begin build|just build|build it"
+                          r"|don'?t (wait|ask)|no need to (ask|check)|proceed without|keep (going|moving)"
+                          r"|move forward|run with it|full speed)\b", m))
+
+
 def _option_ordinal(msg, options):
     """Map a TYPED option choice ('option 2', 'the first one', '#3') to that option's id.
     Returns the option id, or None if the message isn't an unambiguous ordinal pick."""
@@ -1165,6 +1244,29 @@ def _selftest():
             last_kind = cur.fetchone()[0]
         status_honest_ok = (r4.get("running") is True and len(tasks) == n_before and last_kind == "working")
 
+        # (2.1b) MID-FLIGHT PRE-AUTHORIZED INTENT: a real directive typed WHILE research runs must be QUEUED
+        # (not dropped, no LLM turn, gate held) and then APPLIED when results land — auto-selecting the
+        # recommended option into DEEP_DESIGN instead of silently re-parking on the user_approval gate.
+        th5 = start(tid, org)["thread_id"]
+        _to(th5, "RESEARCH"); _set(th5, awaiting="fleet", research_run_id=777)
+        _job_begin(th5, "research", 6, "Researching…")
+        n5 = len(tasks)
+        r5 = say(tid, th5, "go with your recommendation and start building it now")
+        intent_queued = (r5.get("queued_intent") is True and len(tasks) == n5
+                         and bool((_st(th5).get("pending_intent") or "")) and _st(th5)["awaiting"] == "fleet")
+        _set(th5, awaiting=None)                                   # worker clears the gate before advancing
+        advance(th5, {"run_id": 777, "options": [{"id": 1, "title": "A", "recommended": True}]})
+        s5 = _st(th5)
+        intent_applied = (s5["phase"] == "DEEP_DESIGN" and s5["awaiting"] == "user_feedback"
+                          and bool(s5.get("chosen_option")) and not (s5.get("pending_intent") or ""))
+        # a pure status ping must NOT be queued as an intent (stays a status reply, no pending_intent)
+        th5b = start(tid, org)["thread_id"]
+        _to(th5b, "RESEARCH"); _set(th5b, awaiting="fleet")
+        _job_begin(th5b, "research", 6, "Researching…")
+        rq = say(tid, th5b, "is it done yet?")
+        status_not_queued = (rq.get("queued_intent") is False and not (_st(th5b).get("pending_intent") or ""))
+        midflight_intent_ok = intent_queued and intent_applied and status_not_queued
+
         # (2) LIVE PROGRESS + (4) NO FALSE DONE + (5) CANCEL — on a fresh thread with a stamped in-flight job:
         th2 = start(tid, org)["thread_id"]
         _set(th2, awaiting="fleet", product="liveprod-" + os.urandom(2).hex())
@@ -1185,7 +1287,7 @@ def _selftest():
         ok = (consent_gate_ok and opt and gate_held and in_design and plan_persisted and plan_card
               and no_tag_leak and proto and deliver and jobs >= 3
               and eta_ok and research_eta_ok and ping_ok and live_cancel_ok
-              and consent_reask_ok and sla_ok and status_honest_ok)
+              and consent_reask_ok and sla_ok and status_honest_ok and midflight_intent_ok)
         print(f"consent_gate={consent_gate_ok} options={opt} gate_held={gate_held} design={in_design} "
               f"plan_persisted={plan_persisted} plan_card={plan_card} no_tag_leak={no_tag_leak} "
               f"prototype={proto} deliver={deliver} jobs_done={jobs}")
@@ -1195,6 +1297,8 @@ def _selftest():
               f"cancel(killswitch)={cancel_ok}")
         print(f"consent_reask_fixed={consent_reask_ok}(note={consent_note_ok},no_stale={no_stale_consent_ctx}) "
               f"sla_watchdog={sla_ok}(w1={w1},w2={w2},msgs={sla_msgs}) status_honest={status_honest_ok}")
+        print(f"midflight_intent={midflight_intent_ok}(queued={intent_queued},applied={intent_applied},"
+              f"status_not_queued={status_not_queued})")
         print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel"
               " + consent-reask/sla/status-honesty ✅" if ok else "FAIL")
     finally:

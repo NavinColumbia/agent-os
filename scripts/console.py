@@ -432,7 +432,9 @@ body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.55 "Inter",-apple
 .colmain{flex:1;display:flex;flex-direction:column;min-width:0}
 .topbar{display:flex;align-items:center;gap:12px;height:56px;padding:0 24px;background:rgba(15,17,23,.72);backdrop-filter:saturate(160%) blur(10px);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
 .topbar .sp{flex:1}.topbar .chip{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--tx2);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:5px 12px;cursor:pointer}
-.topbar .chip .dot{width:8px;height:8px;border-radius:50%}.dot.ok{background:var(--g)}.dot.warn{background:var(--y)}.dot.bad{background:var(--r)}
+.topbar .chip .dot{width:8px;height:8px;border-radius:50%}
+/* a11y: operational state is NOT carried by hue alone — each state also has a distinct SHAPE (ok=solid disc, warn=hollow ring, bad=square) so it reads for color-blind users; screen readers get a verdict aria-label set in JS. */
+.dot.ok{background:var(--g)}.dot.warn{background:radial-gradient(circle at 50% 50%,transparent 1.4px,var(--y) 1.9px)}.dot.bad{background:var(--r);border-radius:2px}
 .tbtn{position:relative;background:transparent;border:none;color:var(--tx2);font-size:16px;cursor:pointer;padding:6px 8px;border-radius:8px}.tbtn:hover{background:var(--hover);color:var(--tx)}
 .tbtn .nb{position:absolute;top:0;right:0;background:var(--r);color:#fff;border-radius:999px;font-size:9px;font-weight:700;min-width:15px;height:15px;padding:0 4px;display:inline-flex;align-items:center;justify-content:center}
 .main{flex:1;padding:26px 30px;max-width:1080px;width:100%;margin:0 auto}
@@ -453,7 +455,9 @@ h1{font-size:22px;font-weight:650;letter-spacing:-.02em;margin:0 0 3px}.sub{colo
 .item{border-top:1px solid var(--line);padding:12px 0}.item:first-child{border-top:none;padding-top:0}
 .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;background:rgba(255,255,255,.05);color:var(--tx2)}
 .pill.ok{background:var(--gsoft);color:var(--gtext)}.pill.bad{background:var(--rsoft);color:var(--rtext)}.pill.warn{background:var(--ysoft);color:var(--ytext)}.pill.accent{background:var(--asoft);color:var(--atext)}
-.stages{display:flex;gap:4px;margin:8px 0;max-width:280px}.st{flex:1;height:6px;border-radius:3px;background:#1c2733}.st.ok{background:var(--g)}.st.bad{background:var(--r)}
+.stages{display:flex;gap:4px;margin:8px 0;max-width:280px}.st{flex:1;height:6px;border-radius:3px;background:#1c2733}.st.ok{background:var(--g)}
+/* a11y: failed stage isn't red-only — it also carries a diagonal hatch texture so pass/fail is distinguishable without hue; each bar gets a "stage: passed/failed/pending" title+aria-label in stages(). */
+.st.bad{background:var(--r);background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.34) 0,rgba(0,0,0,.34) 1.5px,transparent 1.5px,transparent 3px)}
 button{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--line2);color:var(--tx);border-radius:10px;padding:8px 14px;cursor:pointer;font-size:13px;font-weight:550;line-height:1;transition:background .15s,border-color .15s,transform .05s}
 button:hover{background:var(--hover);border-color:#3a4150}button:active{transform:translateY(.5px)}
 button.pri{background:var(--accent);border:1px solid var(--accent);color:#0b0d12;font-weight:600;box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}button.pri:hover{background:var(--accent2);border-color:var(--accent2)}
@@ -498,6 +502,20 @@ code{font-family:var(--mono);font-size:12.5px;color:var(--atext);background:var(
 input[aria-invalid=true]{border-color:var(--r);box-shadow:0 0 0 3px var(--rsoft)}
 .spin{width:13px;height:13px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;display:inline-block;animation:sp .6s linear infinite;vertical-align:-2px}@keyframes sp{to{transform:rotate(360deg)}}
 button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
+.authwrap{display:grid;grid-template-columns:minmax(0,1fr) 412px;gap:38px;align-items:center}
+.hero{min-width:0}.hero .brand{font-size:20px;margin:0 0 18px}
+.heroh{font-size:31px;line-height:1.12;letter-spacing:-.022em;font-weight:680;color:var(--tx);margin:0 0 12px}
+.herosub{color:var(--tx2);font-size:15px;line-height:1.55;margin:0 0 24px;max-width:48ch}
+.steps{list-style:none;margin:0 0 22px;padding:0;display:flex;flex-direction:column;gap:15px}
+.steps li{display:flex;gap:12px;align-items:flex-start}
+.stepn{flex:none;width:26px;height:26px;border-radius:999px;background:var(--asoft);color:var(--atext);font-weight:700;font-size:13px;display:inline-flex;align-items:center;justify-content:center;margin-top:1px}
+.steps b{display:block;font-size:14px;font-weight:600;color:var(--tx);line-height:1.3}.steps span{display:block;color:var(--mut);font-size:13px;line-height:1.45;margin-top:2px}
+.example{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:0 0 18px;box-shadow:0 1px 2px rgba(0,0,0,.25)}
+.example .exhead{display:flex;align-items:center;gap:8px;margin-bottom:10px}.example .exh{font-size:13.5px;font-weight:600;color:var(--tx)}
+.exline{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--tx2);padding:3px 0}.exline .exok{color:var(--gtext);font-weight:700}.exline code{margin-left:auto}
+.trust{display:flex;flex-wrap:wrap;gap:8px;list-style:none;margin:0;padding:0}
+.trust li{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--tx2);background:var(--panel2);border:1px solid var(--line2);border-radius:999px;padding:5px 11px}.trust li .ic{color:var(--gtext);font-weight:700}
+@media(max-width:880px){#signin{max-width:440px!important}.authwrap{grid-template-columns:1fr;gap:24px}.heroh{font-size:25px}.herosub{margin-bottom:20px}.hero .example,.hero .trust{display:none}}
 .menubtn{display:none}.navscrim{display:none}
 @media(max-width:700px){
  .menubtn{display:inline-flex}
@@ -510,9 +528,31 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
 </style></head><body>
 <div id=splash style="display:none;position:fixed;inset:0;align-items:center;justify-content:center;flex-direction:column;gap:14px;background:var(--bg);z-index:50;color:var(--mut)">
   <div class=brand style="font-size:22px"><span class=mk>⬡</span> agent-os</div><div style="font-size:13px">Reconnecting…</div></div>
-<div id=signin style="display:none;max-width:440px;margin:11vh auto;padding:0 18px">
-  <div class=card><div class=brand style="padding-bottom:6px;font-size:20px"><span class=mk>⬡</span> agent-os</div>
-  <p class=muted style="margin:0 0 18px">Be the CEO of a company of AI agents that build &amp; ship your software.</p>
+<div id=signin style="display:none;max-width:920px;margin:8vh auto;padding:0 18px">
+ <div class=authwrap>
+  <div class=hero>
+   <div class=brand><span class=mk>⬡</span> agent-os</div>
+   <h1 class=heroh>Be the CEO of a company of AI agents.</h1>
+   <p class=herosub>Set the vision. Specialized agents plan, build, review, and ship your software — you approve the calls that matter, they do the work.</p>
+   <ol class=steps>
+    <li><span class=stepn aria-hidden=true>1</span><div><b>Describe what to build</b><span>Tell your agents the goal in plain English — no tickets or specs to write.</span></div></li>
+    <li><span class=stepn aria-hidden=true>2</span><div><b>Agents plan, build &amp; review</b><span>They write the code and check each other's work — you watch it happen live.</span></div></li>
+    <li><span class=stepn aria-hidden=true>3</span><div><b>You approve &amp; ship</b><span>Sign off on the big calls. It ships to your repo, on your stack.</span></div></li>
+   </ol>
+   <div class=example role=group aria-label="Example build: checkout-api, shipped">
+    <div class=exhead><span class=exh>checkout-api</span><span class="pill ok" style="margin-left:auto">shipped</span></div>
+    <div class=stages style="max-width:none;margin:0 0 10px"><span class="st ok"></span><span class="st ok"></span><span class="st ok"></span><span class="st ok"></span></div>
+    <div class=exline><span class=exok aria-hidden=true>✓</span> Spec &amp; plan approved <code>$0.04</code></div>
+    <div class=exline><span class=exok aria-hidden=true>✓</span> Built 14 files · tests passing <code>$0.21</code></div>
+    <div class=exline><span class=exok aria-hidden=true>✓</span> Reviewed &amp; merged to main <code>$0.07</code></div>
+   </div>
+   <ul class=trust>
+    <li><span class=ic aria-hidden=true>✓</span> No card to start</li>
+    <li><span class=ic aria-hidden=true>✓</span> Your code, your repo</li>
+    <li><span class=ic aria-hidden=true>✓</span> Every action logged &amp; costed</li>
+   </ul>
+  </div>
+  <div class=card>
   <form id=su_signup onsubmit="signUp();return false" novalidate>
     <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Create your account</h2>
     <p class=muted style="margin:0 0 10px">Free to start — no card needed. You'll create your companies (orgs) once you're in.</p>
@@ -547,11 +587,12 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
     <div id=ve_note class="note muted" role=alert aria-live=polite style="margin-top:10px"></div>
     <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">Didn't get it? <button type=button class=linkbtn onclick=resendCode()>Resend code</button></p>
   </form></div>
+ </div>
 </div>
 <div class=app id=app style="display:none">
 <div class=navscrim onclick="toggleNav(false)"></div>
 <div class=side><div class=brand><span class=mk>⬡</span> agent-os</div><div class=nav id=nav style=flex:1></div>
-  <a class=nav-foot id=statusfoot onclick="go('status')" style="display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;color:var(--tx2);cursor:pointer;font-size:13px;border-top:1px solid var(--line);margin-top:8px"><span class="dot ok" id=statusdot></span><span class=lbl>Status</span></a>
+  <a class=nav-foot id=statusfoot onclick="go('status')" style="display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;color:var(--tx2);cursor:pointer;font-size:13px;border-top:1px solid var(--line);margin-top:8px"><span class="dot ok" id=statusdot role=img title="Status" aria-label="Status"></span><span class=lbl>Status</span></a>
 </div>
 <div class=colmain>
   <div class=topbar><button class="tbtn menubtn" aria-label="Open menu" onclick="toggleNav()">☰</button><span class=title id=tbtitle>Cockpit</span>
@@ -564,7 +605,7 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
       </div>
     </span>
     <span class=sp></span>
-    <span class=chip id=spendchip onclick="go('billing')"><span class="dot ok" id=spenddot></span><span id=spendtxt>—</span></span>
+    <span class=chip id=spendchip onclick="go('billing')"><span class="dot ok" id=spenddot role=img title="Spend & quota" aria-label="Spend & quota"></span><span id=spendtxt>—</span></span>
     <button class=tbtn onclick="go('notifications')" title=Notifications>◔<span class=nb id=bellbadge style=display:none></span></button>
     <button class=tbtn onclick="go('help')" title=Help>?</button>
     <button class=tbtn onclick="toggleAcct()" title=Account>⋯</button>
@@ -717,12 +758,12 @@ async function refreshTopbar(){
  if(!TOK)return;
  try{const b=await get('/api/billing');const f=await get('/api/forecast').catch(()=>null);
    const lvl=f?(f.level==='over'?'bad':(f.level==='warn'?'warn':'ok')):'ok';
-   $('#spenddot').className='dot '+lvl;$('#spendtxt').textContent='$'+((b.usage&&b.usage.tokens!=null)?(b.invoice&&b.invoice.total!=null?b.invoice.total:'') : '')+(f?(' · '+f.pct_of_quota_projected+'% quota'):'');
+   const _sd=$('#spenddot');_sd.className='dot '+lvl;const _QV={ok:'within limits',warn:'approaching limit',bad:'over limit'};const _ql='Spend & quota — '+(f?f.pct_of_quota_projected+'% of quota projected, ':'')+(_QV[lvl]||'within limits');_sd.title=_ql;_sd.setAttribute('aria-label',_ql);$('#spendtxt').textContent='$'+((b.usage&&b.usage.tokens!=null)?(b.invoice&&b.invoice.total!=null?b.invoice.total:'') : '')+(f?(' · '+f.pct_of_quota_projected+'% quota'):'');
    if(!$('#spendtxt').textContent.trim()||$('#spendtxt').textContent==='$')$('#spendtxt').textContent=(b.plan||'')+(f?(' · '+f.pct_of_quota_projected+'%'):'');
  }catch(e){}
  try{const n=await get('/api/notifications');const bb=$('#bellbadge');if(n.unread>0){bb.style.display='inline-flex';bb.textContent=n.unread}else bb.style.display='none'}catch(e){}
  try{const ap=await get('/api/approvals');BADGES.approvals=(ap.items||[]).filter(i=>i.kind!=='consent').length;renderNav()}catch(e){}
- try{const s=await get('/api/status');$('#statusdot').className='dot '+({operational:'ok',degraded:'warn',major_outage:'bad'}[s.verdict]||'ok')}catch(e){}
+ try{const s=await get('/api/status');const _sv=({operational:'ok',degraded:'warn',major_outage:'bad'}[s.verdict]||'ok');const _SV={operational:'all systems operational',degraded:'degraded performance',major_outage:'major outage'};const _st=$('#statusdot');_st.className='dot '+_sv;const _sl='Status — '+(_SV[s.verdict]||s.verdict||'operational');_st.title=_sl;_st.setAttribute('aria-label',_sl)}catch(e){}
  loadProviders();   // keep PROVIDER_OK fresh so the Assistant connect-banner reflects the latest provider state
 }
 async function go(k){CUR=k;renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';toggleNav(false);$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
@@ -734,20 +775,29 @@ async function refreshView(){ // background poll: no skeleton flash, no nav/scro
  try{await VIEWS[k]()}catch(e){if(e.kind==='auth'){if(TOK)signOut();return}return}
  if(CUR===k&&!userBusy())window.scrollTo(sx,sy)}
 function kpis(arr){return '<div class=kpis>'+arr.map(a=>`<div class=kpi><b>${esc(a[1])}</b><span>${esc(a[0])}</span></div>`).join('')+'</div>'}
-function stages(ss){return '<div class=stages>'+ss.map(s=>`<div class="st ${s.done?(s.ok===false?'bad':'ok'):''}" title="${s.stage}"></div>`).join('')+'</div>'}
+function stages(ss){return '<div class=stages>'+ss.map(s=>{const cls=s.done?(s.ok===false?'bad':'ok'):'';const verdict=s.done?(s.ok===false?'failed':'passed'):'pending';const lab=`${s.stage}: ${verdict}`;return `<div class="st ${cls}" role=img title="${lab}" aria-label="${lab}"></div>`}).join('')+'</div>'}
 
 let THREAD=null;let CTLBUSY=false;let CHATBUSY=false;
-let CONSENT_OK=false;let PEND_IDEA='';let PROG=null;let CTLABORT=null;   // guided first-run + live-progress state
+let CONSENT_OK=false;let PROG=null;let CTLABORT=null;   // guided first-run + live-progress state
+let PEND_IDEA='';try{PEND_IDEA=localStorage.getItem('aos_pend')||''}catch(_){}   // the idea typed before setup is done — persisted so a full reload never silently drops it
+function setPend(t){PEND_IDEA=t||'';try{PEND_IDEA?localStorage.setItem('aos_pend',PEND_IDEA):localStorage.removeItem('aos_pend')}catch(_){}}   // single writer so the saved idea and its storage mirror never drift
 function firstRunSteps(){return [
  {k:'company',done:ORGS.length>0,label:'Create your company'},
  {k:'provider',done:PROVIDER_OK,label:'Connect an AI model'},
  {k:'consent',done:CONSENT_OK,label:'Approve AI use'},
  {k:'describe',done:false,label:'Describe your product'}];}
-function firstRunChecklist(steps){const cur=steps.findIndex(s=>!s.done);
- return '<div class=card><div class=row style="gap:10px;flex-wrap:wrap;align-items:center">'+steps.map((s,i)=>{
-   const ic=s.done?'✓':(i+1);const cls=s.done?'ok':(i===cur?'accent':'');
-   return '<span class=row style="gap:6px;align-items:center">'+pill(ic,cls)+'<span class="'+(s.done?'muted':'')+'" style="'+(i===cur?'font-weight:600':'')+'">'+esc(s.label)+'</span></span>';
- }).join('<span class=muted>›</span>')+'</div></div>';}
+// ONE checklist renderer for EVERY first-run surface (welcome, Assistant, providers detour, Cockpit).
+// Each step is a labelled list item so a screen reader announces "Connect an AI model — current step".
+function firstRunRow(steps){const cur=steps.findIndex(s=>!s.done);
+ return '<div class=row role=list aria-label="Setup checklist" style="gap:10px;flex-wrap:wrap;align-items:center">'+steps.map((s,i)=>{
+   const ic=s.done?'✓':(i+1);const cls=s.done?'ok':(i===cur?'accent':'');const st=s.done?'done':(i===cur?'current step':'upcoming');
+   return '<span class=row role=listitem aria-label="'+esc(s.label)+' — '+st+'" style="gap:6px;align-items:center">'+pill(ic,cls)+'<span aria-hidden=true class="'+(s.done?'muted':'')+'" style="'+(i===cur?'font-weight:600':'')+'">'+esc(s.label)+'</span></span>';
+ }).join('<span class=muted aria-hidden=true>›</span>')+'</div>';}
+function firstRunChecklist(steps){return '<div class=card>'+firstRunRow(steps)+'</div>';}
+// Map the server /api/onboarding step keys onto the SAME wording the Assistant's client checklist uses,
+// so the Cockpit banner and the Assistant can never label the same step differently.
+const OB_LABEL={welcome:'Create your company',provider:'Connect an AI model',consent:'Approve AI use',first_build:'Describe your product'};
+async function obSkip(){try{await post('/api/onboarding/skip',{})}catch(e){}go('cockpit');}
 async function firstRunCreate(){const nm=(($('#fr_nm')||{}).value||'').trim();const vis=(($('#fr_vis')||{}).value||'').trim();const note=$('#fr_note');
  if(!nm){if(note)note.textContent='Enter a name for your company';const f=$('#fr_nm');if(f)f.focus();return}
  if(note)note.textContent='Creating…';
@@ -755,7 +805,7 @@ async function firstRunCreate(){const nm=(($('#fr_nm')||{}).value||'').trim();co
  if(r&&r.error){if(note)note.textContent='✗ '+r.error;return}
  if(r.org_id){ORG=r.org_id;localStorage.setItem('aos_org',ORG);await loadOrgs();setOrgName();go('controller');}}   // advance the wizard to step 2 in place
 async function frConsent(){const r=await post('/api/settings/consent',{accept:true});if(r&&r.error){const n=$('#cnote');if(n)n.textContent='✗ '+r.error;else alert('Could not record consent: '+r.error);return}CONSENT_OK=true;go('controller');}
-async function frFlush(){if(PEND_IDEA&&PROVIDER_OK&&CONSENT_OK){const t=PEND_IDEA;PEND_IDEA='';const i=$('#cmsg');if(i){i.value=t;grow(i)}await ctlSend();}}   // auto-resume the saved idea once setup is done
+async function frFlush(){if(PEND_IDEA&&PROVIDER_OK&&CONSENT_OK){const t=PEND_IDEA;setPend('');const i=$('#cmsg');if(i){i.value=t;grow(i)}await ctlSend();}}   // auto-resume the saved idea once setup is done
 function setSendMode(busy){const b=$('#ctlsend');if(!b)return;if(busy){b.classList.remove('pri');b.textContent='Stop';b.title='Stop';b.onclick=ctlStop;}else{b.classList.add('pri');b.textContent='Send';b.title='Send';b.onclick=ctlSend;}}
 async function ctlStop(){
  if(CTLABORT){try{CTLABORT.abort()}catch(_){}}
@@ -803,16 +853,18 @@ const VIEWS={
   if(!setupDone){   // GUIDED FIRST-RUN · Steps 2-3: connect a model, then approve AI use — shown PROACTIVELY, not as a rejection
    h+=firstRunChecklist(firstRunSteps());
    if(!PROVIDER_OK)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Step 2 — Connect an AI model.</b> Your agents need an AI model to do the work. It takes one click.</span><button class=pri onclick="go(\'providers\')">Connect an AI model</button></div></div>';
-   else h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Step 3 — Approve AI use.</b> A one-time, revocable OK to let your AI model process what you type, so your agents can build.</span><button class=pri onclick=frConsent()>Approve AI use</button></div></div>';
+   else h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Step 3 — Approve AI use.</b> A one-time, revocable OK to let your AI model process what you type, so your agents can build.</span><button class=pri aria-label="Approve AI use and continue" onclick=frConsent()>Approve &amp; continue</button></div></div>';
   }
   h+='<div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>';
-  // CONTEXT-AWARE CHIPS: hide the generic starters once a build is in flight; after scoping swap for next-step suggestions
+  // CONTEXT-AWARE CHIPS: hide the generic starters once a build is in flight; once a scoping conversation is underway swap them for next-step suggestions
   const inFlight=(d.awaiting==='fleet')||!!d.progress;
   const ph0=(d.phase||'').toUpperCase();
+  const scoping=(d.messages||[]).length>0;   // any back-and-forth yet? then the generic starters are stale — go context-aware
   let CHIPS;
   if(inFlight||gateErr)CHIPS=[];
   else if(home)CHIPS=['Create a new company','What needs my attention across all companies?','A quick throwaway prototype'];
   else if(ph0&&ph0!=='DISCOVER')CHIPS=ctlNextChips(ph0);
+  else if(scoping)CHIPS=ctlNextChips('DISCOVER');   // mid-scoping: suggest how to move the conversation forward, not "Build a competitor to YouTube"
   else CHIPS=['Build a competitor to YouTube','An internal tool for my team','A booking page for my salon'];
   const ph=home?'e.g. start a new company, or ask about any of them…':'e.g. build a competitor to YouTube';
   h+='<div class=card>'+(CHIPS.length?'<div class=chips>'+CHIPS.map(c=>`<span class=chip-s onclick="ctlFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+'</div>':'')+`<div class="row composer"><textarea id=cmsg class=chatbox rows=1 aria-label="Message your assistant" placeholder="${ph}" oninput="grow(this)" onkeydown="taKey(event,ctlSend)"></textarea><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
@@ -861,7 +913,18 @@ const VIEWS={
   let ls={};try{const l=await get('/api/livestatus');(l.products||[]).forEach(p=>ls[p.product]=p)}catch(e){}
   let h='<h1>Cockpit</h1><p class=sub>Your whole company at a glance.</p>';
   if(co){const cm={healthy:'ok',attention:'warn',critical:'bad'}[co.verdict]||'ok';h+=`<div class=card><div class=row><span class="dot ${cm}" style="width:10px;height:10px;border-radius:50%"></span> <b>${esc(co.line||co.verdict)}</b></div></div>`;}
-  if(ob&&!ob.completed&&ob.step!=='done'){h+=`<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Get set up</b> — ${esc(ob.framing||'')} Next: <b>${esc(ob.step)}</b></span><span><button class=pri onclick="obContinue('${esc(ob.step)}')">continue</button> <button onclick="post('/api/onboarding/skip',{}).then(()=>go('cockpit'))">skip</button></span></div></div>`;}
+  if(ob&&!ob.completed){   // SINGLE SOURCE OF TRUTH: render the SAME checklist as the Assistant, driven by the server's real per-step status — never a second, divergent "next step"
+   const obSteps=(ob.steps||[]).map(s=>({done:!!s.done,label:OB_LABEL[s.key]||s.title||s.key}));
+   const nx=obSteps.find(s=>!s.done);
+   h+='<section class=card aria-label="Finish setting up your company" style="border-color:var(--accent)">'
+     +'<div class="row spread" style="gap:12px;flex-wrap:wrap;align-items:center">'
+       +'<span style="min-width:220px;flex:1"><b>Finish setting up</b>'+(nx?('<div class=muted style=margin-top:4px>Next: '+esc(nx.label)+'. Your Assistant walks you through it.</div>'):'')+'</span>'
+       +'<span class=row style="gap:8px;flex-wrap:wrap">'
+         +'<button class=pri onclick="go(\'controller\')" aria-label="'+(nx?('Continue setup: '+esc(nx.label)):'Continue setup in your Assistant')+'">Continue in Assistant →</button>'
+         +'<button onclick=obSkip() aria-label="Skip the setup checklist">Skip</button>'
+       +'</span>'
+     +'</div>'+(obSteps.length?('<div style=margin-top:10px>'+firstRunRow(obSteps)+'</div>'):'')
+   +'</section>';}
   h+=kpis([['Products',s.products||0],['Launched',s.launched||0],['Building',s.building||0],['Failed',s.failed||0],['Workers',s.live_workers||0],['Spend $',s.spend_usd||0]]);
   if(fc){const fcls=fc.level==='over'?'bad':(fc.level==='warn'?'warn':'ok');h+=`<div class=card><h2>Budget forecast</h2><div class="row spread"><span>${esc(fc.headline||'')}</span>${pill(fc.pct_of_quota_projected+'% projected',fcls)}</div><div class=meta>burn ~${fc.burn_tokens_per_day} tok/day · $${fc.burn_usd_per_day}/day${fc.eta_days_to_quota?(' · hits quota in ~'+fc.eta_days_to_quota+'d'):''}</div></div>`;}
   if(hl&&!hl.ok){let hi='';
@@ -919,8 +982,20 @@ const VIEWS={
   <div class=card><h2>BYO API key</h2><div class=row>${d.byo_key_set?pill('key on file','ok'):pill('no key','warn')}</div><div style=margin-top:8px><input id=bk aria-label="API key" placeholder="sk-… (stored encrypted)"><button class=pri style=margin-top:6px onclick=saveKey()>save key</button></div><div id=bknote class=muted style=margin-top:8px></div></div>
   <div class=card><h2>Notification preferences</h2><table><tr><th>category</th><th>in-app</th><th>email</th><th>push</th></tr>`+(d.notification_prefs||[]).map(p=>`<tr><td>${esc(p.category)}</td><td><input type=checkbox ${p.in_app?'checked':''} onchange="pref('${p.category}',this.checked,null,null)"></td><td><input type=checkbox ${p.email?'checked':''} onchange="pref('${p.category}',null,this.checked,null)"></td><td><input type=checkbox ${p.push?'checked':''} onchange="pref('${p.category}',null,null,this.checked)"></td></tr>`).join('')+`</table></div>
   <div class=card><h2>Your data</h2><div class=row><button onclick=acctExport()>Export my data</button><button onclick=acctDelete() style="border-color:var(--r);color:var(--r)">Delete my account</button></div><div id=acctnote class=muted style=margin-top:8px></div></div>`;PREFS=d.notification_prefs;},
- providers:async()=>{const d=await get('/api/providers');$('#view').innerHTML='<h1>Connect an AI model</h1>'
+ providers:async()=>{const d=await get('/api/providers');const connected=(d.providers||[]).some(p=>p.connected);PROVIDER_OK=connected;
+  let banner='';
+  if(PEND_IDEA){   // arrived here via the first-run gate (an idea was typed before a model was connected) — keep that thread visible and offer a one-tap way forward the moment a model connects
+   try{const sd=await get('/api/settings');CONSENT_OK=!!(sd.ai_consent&&sd.ai_consent.accepted)}catch(e){}   // keep the step bar honest about the consent step too
+   const idea=PEND_IDEA.length>160?esc(PEND_IDEA.slice(0,160))+'…':esc(PEND_IDEA);
+   banner=firstRunChecklist(firstRunSteps())
+    +'<div class=card style="border-color:var(--accent)" role=status aria-live=polite><div class="row spread" style="gap:12px;flex-wrap:wrap;align-items:center">'
+    +'<span style="min-width:220px;flex:1"><b>'+(connected?'Your idea is saved and ready ✓':'Your idea is waiting')+'</b><div class=muted style=margin-top:4px>“'+idea+'”</div>'+(connected?'':'<div class=muted style=margin-top:6px>Connect a model below and I\'ll pick this straight back up — nothing to retype.</div>')+'</span>'
+    +(connected?'<button class=pri onclick="go(\'controller\')" aria-label="Continue to describe your product">Continue → describe your product</button>':'<button disabled aria-disabled=true title="Connect a model first to continue" style="opacity:.5;cursor:not-allowed">Continue → describe your product</button>')
+    +'</div></div>';
+  }
+  $('#view').innerHTML='<h1>Connect an AI model</h1>'
    +'<p class=sub>Your agents need an AI model to do their work — Claude, ChatGPT/Codex, or both. You only need one to get started.</p>'
+   +banner
    +'<div id=provnote class=muted style="margin:0 0 10px"></div><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill('connected','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)}</div>${p.connected?`<button onclick="provRemove('${p.slug}')">Disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Connect</button><button onclick="provAdd('${p.slug}','${esc(p.key_hint)}')">Use an API key</button></div>`}</div>`).join('')+'</div>'
    +'<details style="margin-top:14px"><summary style="cursor:pointer;color:var(--mut)">Technical details</summary>'
    +'<p class=muted style="margin-top:10px"><b>Connect</b> signs this machine into your Claude or ChatGPT account using the provider\'s own secure login (it opens a browser on this host and connects only once you\'re genuinely signed in, via <code>claude auth login</code> / <code>codex login</code>). Because it uses the machine\'s own sign-in, it connects the whole machine to one account — ideal for a self-hosted, single-operator setup. <b>Use an API key</b> connects with a key instead. Builds use your highest-priority connected model; with none connected, the platform default is used.</p></details>';},
@@ -954,7 +1029,8 @@ function taKey(e,fn){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();fn()}} 
 function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus();grow(i)}}
 function ctlFill(t){const i=$('#cmsg');if(i){i.value=t;i.focus();grow(i)}}
 function ctlNextChips(phase){   // CONTEXT-AWARE CHIPS: after scoping, swap the generic starters for next-step suggestions tied to the phase
- const M={OPTIONS:['Go with the recommended option','Compare the options'],
+ const M={DISCOVER:['That covers it — show me options','Add a must-have detail','Who is it for?'],
+  OPTIONS:['Go with the recommended option','Compare the options'],
   DEEP_DESIGN:['Approve the plan','Change part of the plan'],
   PLAN_APPROVAL:['Approve the plan','Change part of the plan'],
   PROTOTYPE:['Approve the screens','Request design changes'],
@@ -978,8 +1054,8 @@ function ctlRender(msgs,prog){const log=$('#clog');if(!log)return;
 async function ctlSend(){
  if(CTLBUSY)return;const i=$('#cmsg');const m=(i?i.value:'').trim();if(!m)return;
  // GUIDED FIRST-RUN: never reject the first idea behind a gate — save it and walk them through the missing step
- if(!PROVIDER_OK){PEND_IDEA=m;if(i){i.value='';grow(i)}const n=$('#cnote');if(n)n.innerHTML='Saved your idea ✓ — connect an AI model first and I\'ll start automatically.';go('providers');return;}
- if(!CONSENT_OK){PEND_IDEA=m;if(i){i.value='';grow(i)}const n=$('#cnote');if(n)n.innerHTML='Saved your idea ✓ — tap <b>Approve AI use</b> above and I\'ll start automatically.';return;}
+ if(!PROVIDER_OK){setPend(m);if(i){i.value='';grow(i)}const n=$('#cnote');if(n)n.innerHTML='Saved your idea ✓ — connect an AI model first and I\'ll start automatically.';go('providers');return;}
+ if(!CONSENT_OK){setPend(m);if(i){i.value='';grow(i)}const n=$('#cnote');if(n)n.innerHTML='Saved your idea ✓ — tap <b>Approve &amp; continue</b> above and I\'ll start automatically.';return;}
  CTLBUSY=true;setSendMode(true);if(i){i.value='';grow(i);i.disabled=true}
  const log=$('#clog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=ctltyping style="margin:8px 0"><div><span class=bubble><span class=spin></span> <span class=muted>thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
  $('#cnote').textContent='Working… press Stop to cancel.';
@@ -1071,12 +1147,6 @@ async function chatConfirm(){
 }
 async function showEst(){const k=($('#bk')||{}).value||'lib';let e;try{e=await get('/api/estimate?kind='+k)}catch(_){return}if($('#est'))$('#est').textContent='Estimate: '+(e.note||('~$'+e.cost_usd_estimate+', ~'+e.minutes_estimate+' min'));}
 async function doBuild(){$('#bnote').textContent='submitting…';const r=await post('/api/build',{name:$('#bn').value,kind:$('#bk').value,charter:$('#bc').value});if(r&&r.error&&gateError(r.error)){$('#bnote').innerHTML=gateNote(r.error);return;}$('#bnote').textContent=r.error?('✗ '+r.error):('building '+r.product+' — see Cockpit');}
-async function obContinue(step){
- const SCREEN={welcome:'providers',provider:'providers',consent:'settings',first_build:'controller'};
- const NEXT={welcome:'provider',provider:'consent',consent:'first_build',first_build:'done'};
- await post('/api/onboarding/advance',{step:NEXT[step]||'done'});   // record progress past the current step
- go(SCREEN[step]||'controller');
-}
 async function buildTpl(slug){
  const r=await post('/api/build_template',{slug});
  if(r.error==='consent_required'){go('settings');return}

@@ -109,6 +109,11 @@ lenses:
     standard: null                                  # watchdog(detect)+responder(auto-restart) are the executable spec
     role: { file: devops-sre, keyword: heal }
     guard: "daemon supervision wired"               # every critical serving daemon is detected-down + auto-restarted
+  - id: acceptance-dogfood
+    status: enforced
+    standard: docs/STANDARDS-acceptance.md
+    role: { file: qa-security, keyword: acceptance }
+    guard: "acceptance dogfood wired"               # scripts/dogfood.py: rotating demanding-user pass -> files findings, scheduled weekly
 
   # --- deferred WITH REASON (a decision, not a silent gap) — revisit triggers stated ---
   - id: performance-load

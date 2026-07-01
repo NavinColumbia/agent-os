@@ -55,6 +55,41 @@ _GATE_LABEL = {"user_feedback": "Waiting on you", "user_approval": "Waiting for 
 # already did it (the 3.4 "re-asked for consent I already accepted" bug).
 _RESOLVED_GATE_KINDS = {"consent_required", "provider_required"}
 
+# CANONICAL per-phase ETA defaults (minutes) — the ONE source of truth for the coarse fallbacks, kept
+# NUMERICALLY RECONCILED with console.py:163 `_PHASE_ETA_MIN` so the console's own fallback bubble and the
+# controller's promised ETA never disagree (the #2 "~3 min then 13" bug came from two drifting constants —
+# loopcontroller said 3, console said 10). Build phases (PROTOTYPE/IMPLEMENT) prefer estimate.py's
+# history-backed median at dispatch and only fall back to these; RESEARCH prefers the research_runs median.
+_PHASE_ETA_DEFAULT = {"RESEARCH": 10, "PROTOTYPE": 6, "IMPLEMENT": 14, "TESTQA": 5}
+
+# Honest-range multipliers (mirror estimate.py's LOW_MULT/HIGH_MULT) so a promised ETA is a RANGE, not a
+# false-precision point — "~10-14 min", never a bare "~3 min" that over-runs. When a job overruns we RAISE
+# the point (sla_watchdog) so the range tracks reality instead of lying.
+_ETA_LOW_MULT, _ETA_HIGH_MULT = 0.6, 1.6
+# How long past a prior SLA warning before we WARN + PING AGAIN on a still-overrunning job (#2.6/#5 re-ping
+# on continued overrun) — a CEO who left the tab gets a fresh heads-up, not one-and-done silence.
+_SLA_REWARN_MIN = 5
+
+
+def _eta_range(mins):
+    """An honest (lo, hi) minute range around a point ETA, mirroring estimate.py's multipliers. Never
+    returns lo>hi or a zero floor. (mins None/<=0 -> (None, None) so callers show no range.)"""
+    try:
+        m = int(mins)
+    except (TypeError, ValueError):
+        return (None, None)
+    if m <= 0:
+        return (None, None)
+    lo = max(1, int(round(m * _ETA_LOW_MULT)))
+    hi = max(lo + 1, int(round(m * _ETA_HIGH_MULT)))
+    return (lo, hi)
+
+
+def _eta_phrase(mins):
+    """'~10-14 min' from a point ETA (honest range), or '' when there's nothing to promise."""
+    lo, hi = _eta_range(mins)
+    return f"~{lo}-{hi} min" if lo else ""
+
 
 def _ensure():
     with psycopg.connect(DB) as c, c.cursor() as cur:
@@ -70,6 +105,7 @@ def _ensure():
             ADD COLUMN IF NOT EXISTS job_eta_min INTEGER,
             ADD COLUMN IF NOT EXISTS job_status TEXT,
             ADD COLUMN IF NOT EXISTS job_sla_warned BOOLEAN DEFAULT false,
+            ADD COLUMN IF NOT EXISTS job_sla_warned_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS pending_intent TEXT""")
         cur.execute("""CREATE TABLE IF NOT EXISTS controller_jobs (
             id BIGSERIAL PRIMARY KEY, thread_id BIGINT, tenant_id TEXT, phase TEXT, kind TEXT,
@@ -133,7 +169,7 @@ def _job_clear(thread_id):
         c.commit()
 
 
-def _research_history_min(default=12):
+def _research_history_min(default=None):
     """History-backed ETA (minutes) for a research run — the research analogue of estimate.py's median-of-
     history approach, but research timing lives in `research_runs` (started_at/finished_at), not the build
     `traces` estimate.py reads. We take the MEDIAN wall-clock duration of recent COMPLETED runs so the
@@ -155,7 +191,7 @@ def _research_history_min(default=12):
             return max(1, int(round(statistics.median(mins))))
     except Exception:
         pass
-    return max(1, int(default))
+    return max(1, int(default if default is not None else _PHASE_ETA_DEFAULT["RESEARCH"]))
 
 
 def _estimate_runtime(phase, plan=None):
@@ -165,9 +201,10 @@ def _estimate_runtime(phase, plan=None):
     'service'); a prototype is only a slice of the full build. QA uses a small sensible default. Always
     returns a positive int — never raises."""
     plan = plan or {}
-    # Realistic point-estimate defaults (minutes). RESEARCH is the median wall-clock of a real research fleet
-    # (~6-8 web agents + synthesis), so ~12 — the old 3 promised "~3 min" and delivered in ~13.
-    base = {"RESEARCH": 12, "PROTOTYPE": 4, "IMPLEMENT": 12, "TESTQA": 3}
+    # Realistic point-estimate defaults (minutes) — the CANONICAL, console-reconciled `_PHASE_ETA_DEFAULT`
+    # (RESEARCH is a real ~6-8-agent fleet + synthesis, not a 3-min call). No more per-function magic numbers
+    # that drift out of sync with console.py and lie to the CEO.
+    base = _PHASE_ETA_DEFAULT
     if phase == "RESEARCH":
         return _research_history_min(default=base["RESEARCH"])
     if phase in ("PROTOTYPE", "IMPLEMENT"):
@@ -242,11 +279,20 @@ def live_status(thread_id):
     running = bool(awaiting == "fleet" and jk)
     out = {"thread_id": thread_id, "phase": phase, "awaiting": awaiting, "running": running, "done": False}
     if running:
-        em = int((elapsed or 0) // 60)
-        eta_txt = f", ~{eta} min" if eta else ""
-        out.update(job_kind=jk, elapsed_s=int(elapsed or 0), elapsed_min=em, eta_min=eta,
-                   status=js or _KIND_LABEL.get(jk, "Working…"),
-                   label=f"{js or _KIND_LABEL.get(jk, 'Working…')} ({em}m elapsed{eta_txt})")
+        es = int(elapsed or 0)
+        em = es // 60
+        lo, hi = _eta_range(eta)
+        # PROGRESS FRACTION (#2.3): a truthful time-based % of the expected ETA so the console can render a
+        # moving progress bar next to the elapsed timer — the CEO can tell PROGRESS from a STALL even while 6
+        # agents run in parallel. Capped at 99 while still running (never a premature 100/"done"); once we
+        # overrun the ETA it pins near-full and the copy flips to "taking longer than usual".
+        pct = min(99, int(round((es / (eta * 60)) * 100))) if eta else None
+        overrun = bool(eta and em >= eta)
+        eta_txt = (f", {'over the usual' if overrun else 'usually'} ~{lo}-{hi} min" if lo else "")
+        base_status = js or _KIND_LABEL.get(jk, "Working…")
+        out.update(job_kind=jk, elapsed_s=es, elapsed_min=em, eta_min=eta, eta_lo=lo, eta_hi=hi,
+                   progress_pct=pct, overrun=overrun, status=base_status,
+                   label=f"{base_status} ({em}m elapsed{eta_txt})")
     elif awaiting in _GATE_LABEL:
         out["status"] = out["label"] = _GATE_LABEL[awaiting]
     else:
@@ -289,7 +335,8 @@ def _dispatch(thread_id, kind, fn, eta_min=None, kickoff=None, status=None):
     _set(thread_id, awaiting="fleet")
     _job_begin(thread_id, kind, eta_min, status or _KIND_LABEL.get(kind, "Working…"))
     if kickoff:
-        eta_txt = f" (~{eta_min} min)" if eta_min else ""
+        rng = _eta_phrase(eta_min)
+        eta_txt = f" ({rng})" if rng else ""
         _report(s["tenant_id"], thread_id, kickoff + eta_txt,
                 {"kind": "working", "phase": s["phase"], "job": kind, "eta_min": eta_min})
 
@@ -395,7 +442,10 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
     s = _st(thread_id)
     if not s:
         return {"error": "no such controller thread"}
-    _store_user(tid, thread_id, msg)
+    # SUPPRESS DUPLICATE identical user messages (#2.1): a double-tapped send / retried request must not be
+    # stored twice (polluting the model transcript) nor earn a second identical reply. `dup` is True when this
+    # turn repeats the immediately-prior user message; _store_user no-ops the duplicate insert.
+    dup = not _store_user(tid, thread_id, msg)
     phase = s["phase"]
     factory._ctx.api_key = api_key
     factory._ctx.tenant = tid          # lets factory.agent enforce the consent gate as a backstop (defense-in-depth)
@@ -446,7 +496,13 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         ls = live_status(thread_id)
         em, eta = ls.get("elapsed_min") or 0, ls.get("eta_min")
         doing = (ls.get("status") or "Working").rstrip("…").lower()
-        eta_txt = f", usually ~{eta} min" if eta else ""
+        lo, hi = ls.get("eta_lo"), ls.get("eta_hi")
+        eta_txt = (f", {'over the usual' if ls.get('overrun') else 'usually'} ~{lo}-{hi} min" if lo else "")
+        # DEDUPE (#2.1): a CEO who taps send twice (or a client that retries) must NOT get a second identical
+        # status bubble. `dup` is True when this message repeats the immediately-prior user turn; on the fleet
+        # gate we already stated the live status, so just re-affirm running without re-posting a duplicate.
+        if dup:
+            return {"phase": phase, "awaiting": "fleet", "running": True, "duplicate": True}
         # MID-FLIGHT INTENT (#2.1 follow-up): the CEO can't tap a gate that hasn't appeared yet, but a real
         # instruction typed now ("go with your recommendation and start building") must NOT be dropped on the
         # floor — it used to be, so when results landed the thread re-parked on the approval gate and ignored a
@@ -462,7 +518,10 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
             else:
                 tail = " Noted — I'll fold what you just said into the work as soon as the results are in."
         else:
-            tail = " I'll post the results right here and ping you the moment they're ready."
+            # HONEST CHANNEL (#2.4): don't promise a "ping" we might not deliver — the always-on channel is the
+            # in-app notification bell; a phone push only fires if they've connected one.
+            tail = (" I'll post the results right here and light up your notifications (and push to your phone "
+                    "if you've set that up) the moment they're ready.")
         _report(tid, thread_id,
                 f"I'm already on it — {doing} ({em}m elapsed{eta_txt}).{tail} Say \"cancel\" to stop.",
                 {"kind": "working", "phase": phase, "job": ls.get("job_kind"),
@@ -909,35 +968,50 @@ def sla_watchdog():
     affordances the failure UI already understands), well BEFORE the 30-min crash-reaper — so the CEO is
     never left staring at a static "give me a little time" bubble wondering whether the job is dead.
 
-    Idempotent: warns AT MOST once per job (job_sla_warned, reset when the next job begins/clears), and the
-    'mark-warned' UPDATE is guarded on `awaiting='fleet' AND NOT job_sla_warned` so a racing tick — or a job
-    that finishes mid-sweep — can never double-post. The job keeps running untouched; this only narrates."""
+    Throttled RE-PING (#5): warns the FIRST time a job overruns its ETA, then AGAIN every _SLA_REWARN_MIN
+    minutes while it keeps overrunning — so a CEO who left the tab gets a fresh heads-up instead of one-and-
+    done silence — but never twice inside the same window. The claim UPDATE is guarded on `awaiting='fleet'`
+    + the re-warn throttle so a racing tick, or a job that finishes mid-sweep, can never double-post. Each
+    warn also RAISES the stored ETA (#2) to at least the current elapsed + a buffer, so the promised range
+    tracks reality (no more "~3 min" pinned under a 13-min run). The job keeps running untouched."""
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""SELECT thread_id, tenant_id, phase, job_kind, job_eta_min,
                               EXTRACT(EPOCH FROM (now()-job_started_at))::int
                        FROM controller_state
                        WHERE awaiting='fleet' AND job_started_at IS NOT NULL AND job_eta_min IS NOT NULL
-                         AND COALESCE(job_sla_warned, false) = false
-                         AND now() - job_started_at > make_interval(mins => job_eta_min)""")
+                         AND now() - job_started_at > make_interval(mins => job_eta_min)
+                         AND (job_sla_warned_at IS NULL
+                              OR now() - job_sla_warned_at > make_interval(mins => %s))""",
+                    (_SLA_REWARN_MIN,))
         rows = cur.fetchall()
     warned = 0
     for thread_id, tid, phase, jk, eta, elapsed in rows:
-        # Claim the warning atomically (still on its fleet gate + still un-warned) so a concurrent sweep or a
-        # job that just finished can't also post. 0 rows -> someone/something beat us; skip.
+        # Claim the warning atomically (still on its fleet gate + still outside the re-warn throttle) so a
+        # concurrent sweep or a job that just finished can't also post. In the SAME write, RAISE the stored
+        # ETA so the console's live range stops lying about "N min left". 0 rows -> beaten to it; skip.
         with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""UPDATE controller_state SET job_sla_warned=true, updated_at=now()
+            cur.execute("""UPDATE controller_state
+                           SET job_sla_warned=true, job_sla_warned_at=now(), updated_at=now(),
+                               job_eta_min = GREATEST(
+                                   COALESCE(job_eta_min, 0) + 1,
+                                   CEIL(EXTRACT(EPOCH FROM (now()-job_started_at)) / 60.0)::int + 2)
                            WHERE thread_id=%s AND awaiting='fleet'
-                             AND COALESCE(job_sla_warned, false) = false""", (thread_id,))
-            claimed = cur.rowcount; c.commit()
-        if not claimed:
+                             AND (job_sla_warned_at IS NULL
+                                  OR now() - job_sla_warned_at > make_interval(mins => %s))
+                           RETURNING job_eta_min""", (thread_id, _SLA_REWARN_MIN))
+            claim = cur.fetchone(); c.commit()
+        if not claim:
             continue
+        new_eta = claim[0]
         em = int((elapsed or 0) // 60)
+        again = eta and em >= eta + _SLA_REWARN_MIN     # a follow-up re-ping vs. the first overrun warning
+        lead = "It's still running" if again else "This is taking longer than usual — still running"
         _report(tid, thread_id,
-                f"⏳ This is taking longer than usual — still running ({em}m elapsed). It may just need a "
+                f"⏳ {lead} ({em}m elapsed; now expecting up to ~{new_eta} min total). It may just need a "
                 f"little more time; say \"retry\" to start it over or \"cancel\" to stop.",
-                {"kind": "sla_warning", "phase": phase, "job": jk, "elapsed_min": em, "eta_min": eta,
-                 "actions": ["retry", "cancel"]}, urgent=True)
+                {"kind": "sla_warning", "phase": phase, "job": jk, "elapsed_min": em, "eta_min": new_eta,
+                 "reping": bool(again), "actions": ["retry", "cancel"]}, urgent=True)
         # The _report above only reaches an OPEN chat tab. Also light up the always-available in-app feed (and
         # a push, if ntfy/email are configured) so a CEO who LEFT is told their run is overrunning — not left
         # wondering whether it died. level=urgent -> the bell/feed is unmistakable + push fires high-priority.
@@ -945,7 +1019,7 @@ def sla_watchdog():
               f"Your {(phase or 'current').lower()} step is still running ({em}m elapsed). I'll post the "
               f"results in the chat the moment it's done.", level="urgent")
         audit.append(actor="loopcontroller", action="SLAWarn", resource=str(thread_id), decision=phase,
-                     payload={"elapsed_min": em, "eta_min": eta})
+                     payload={"elapsed_min": em, "eta_min": new_eta, "reping": bool(again)})
         warned += 1
     return {"warned": warned}
 
@@ -956,10 +1030,19 @@ def _to(thread_id, phase):
 
 
 def _store_user(tid, thread_id, msg):
+    """Persist a user turn, SUPPRESSING a consecutive identical duplicate (a double-tapped send / client
+    retry). Returns True if it stored a new turn, False if it suppressed an exact repeat of the last user
+    message — so callers can also skip re-posting a duplicate reply."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""SELECT content FROM chat_messages WHERE thread_id=%s AND role='user'
+                       ORDER BY id DESC LIMIT 1""", (thread_id,))
+        last = cur.fetchone()
+        if last and last[0] == msg:
+            return False
         cur.execute("INSERT INTO chat_messages (thread_id, tenant_id, role, content) VALUES (%s,%s,'user',%s)",
                     (thread_id, tid, msg))
         c.commit()
+    return True
 
 
 def _llm(tid, thread_id, sysp, s, on_delta=None):
@@ -988,6 +1071,10 @@ def _llm(tid, thread_id, sysp, s, on_delta=None):
     r = None
     if on_delta is not None and hasattr(factory, "agent_stream"):
         r = factory.agent_stream("research-growth", str(factory.PRODUCTS), task, on_delta, tools=[])
+        if r.get("cancelled"):
+            # The CEO hit Stop (client gone). factory already terminated the worker; DISCARD this turn —
+            # raise so say() never persists a reply for it and never falls back to a fresh (billed) run.
+            raise factory.StreamStopped("conversational turn cancelled by user")
         if r.get("failed") or r.get("rc") not in (0,) or not (r.get("out_full") or r.get("out")):
             r = None    # stream errored/empty -> fall through to the blocking call (no double-stream risk)
     if r is None:
@@ -1189,13 +1276,19 @@ def _selftest():
             cur.execute("SELECT count(*) FROM controller_jobs WHERE thread_id=%s AND status='done'", (th,))
             jobs = cur.fetchone()[0]
 
-        # (1) ETA on kickoff: estimate.py-backed, positive, and surfaced as "~N min" in a kickoff message.
+        # (1) ETA on kickoff: estimate.py-backed, positive, and surfaced as an HONEST RANGE "~lo-hi min" in a
+        # kickoff message — never a false-precision point (#2). The _eta_range helper must bracket the point.
         eta_min = _estimate_runtime("IMPLEMENT", {"kind": "service", "charter": "auth billing dashboard api"})
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("""SELECT count(*) FROM chat_messages WHERE thread_id=%s AND role='assistant'
-                           AND content ~ '~[0-9]+ min'""", (th,))
+                           AND content ~ '~[0-9]+-[0-9]+ min'""", (th,))
             eta_msg = cur.fetchone()[0]
-        eta_ok = isinstance(eta_min, int) and eta_min > 0 and eta_msg >= 1
+        r_lo, r_hi = _eta_range(eta_min)
+        eta_range_ok = r_lo is not None and r_lo < eta_min < r_hi and _eta_phrase(eta_min) == f"~{r_lo}-{r_hi} min"
+        eta_ok = isinstance(eta_min, int) and eta_min > 0 and eta_msg >= 1 and eta_range_ok
+        # (1c) CONSTANTS RECONCILED with console.py:163 — the controller's coarse fallbacks equal the console's,
+        # so the two live-progress bubbles can never promise different numbers.
+        consts_ok = _PHASE_ETA_DEFAULT == {"RESEARCH": 10, "PROTOTYPE": 6, "IMPLEMENT": 14, "TESTQA": 5}
         # (1b) RESEARCH ETA REALISM: research is a multi-agent fleet (~10-14 min), so its promised ETA must be
         # realistic (history-backed median of real research_runs when available, else a sane default) — never
         # the old unrealistic ~3 min that under-promised and over-ran.
@@ -1224,12 +1317,25 @@ def _selftest():
                         (th3,))
             c.commit()
         w1 = sla_watchdog().get("warned", 0)
-        w2 = sla_watchdog().get("warned", 0)                 # second sweep must NOT re-warn the same job
+        with psycopg.connect(DB) as c, c.cursor() as cur:   # ETA must be RAISED past the elapsed time (#2)
+            cur.execute("SELECT job_eta_min FROM controller_state WHERE thread_id=%s", (th3,))
+            eta_after_warn = cur.fetchone()[0]
+        w2 = sla_watchdog().get("warned", 0)                 # immediate re-sweep must NOT re-warn (throttled)
+        # (5) RE-PING ON CONTINUED OVERRUN: after the re-warn window elapses and the job is STILL overrunning,
+        # the watchdog warns + pings AGAIN — not one-and-done silence. Backdate the last-warn + start so both
+        # the throttle and the (now-raised) ETA are exceeded, then a fresh sweep must re-warn exactly once.
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""UPDATE controller_state
+                           SET job_sla_warned_at=now()-interval '9 min',
+                               job_started_at=now()-interval '40 min' WHERE thread_id=%s""", (th3,))
+            c.commit()
+        w3 = sla_watchdog().get("warned", 0)                 # continued overrun -> re-ping fires again
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("""SELECT count(*) FROM chat_messages WHERE thread_id=%s AND role='assistant'
                            AND meta->>'kind'='sla_warning'""", (th3,))
             sla_msgs = cur.fetchone()[0]
-        sla_ok = w1 >= 1 and w2 == 0 and sla_msgs == 1
+        sla_ok = (w1 >= 1 and w2 == 0 and w3 >= 1 and sla_msgs == 2
+                  and isinstance(eta_after_warn, int) and eta_after_warn >= 9)
 
         # (2.1) STATUS HONESTY: a message typed WHILE a durable job is in flight must return the TRUE running
         # status (kind='working') and run NO free-form LLM turn — never a hallucinated "Done".
@@ -1267,13 +1373,34 @@ def _selftest():
         status_not_queued = (rq.get("queued_intent") is False and not (_st(th5b).get("pending_intent") or ""))
         midflight_intent_ok = intent_queued and intent_applied and status_not_queued
 
+        # (2.1c) DUPLICATE SUPPRESSION: a double-tapped identical message must NOT store a second user turn nor
+        # post a second identical status bubble — the first reply stands (flagged duplicate on the retry).
+        th6 = start(tid, org)["thread_id"]
+        _to(th6, "RESEARCH"); _set(th6, awaiting="fleet")
+        _job_begin(th6, "research", 6, "Researching…")
+        d1 = say(tid, th6, "how's it going?")
+        d2 = say(tid, th6, "how's it going?")                       # exact repeat -> suppressed
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT count(*) FROM chat_messages WHERE thread_id=%s AND role='user' "
+                        "AND content='how''s it going?'", (th6,))
+            dup_user_rows = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM chat_messages WHERE thread_id=%s AND role='assistant' "
+                        "AND meta->>'kind'='working'", (th6,))
+            dup_status_bubbles = cur.fetchone()[0]
+        dedupe_ok = (d1.get("duplicate") is not True and d2.get("duplicate") is True
+                     and dup_user_rows == 1 and dup_status_bubbles == 1)
+
         # (2) LIVE PROGRESS + (4) NO FALSE DONE + (5) CANCEL — on a fresh thread with a stamped in-flight job:
         th2 = start(tid, org)["thread_id"]
         _set(th2, awaiting="fleet", product="liveprod-" + os.urandom(2).hex())
         prod2 = _st(th2)["product"]
         _job_begin(th2, "build", 9, "Building…")
         ls = live_status(th2)
+        # progress_pct is an honest time-fraction of the ETA (0<pct<100 while running) so the console can draw a
+        # moving bar the CEO can tell from a stall (#3); eta_lo/eta_hi expose the honest range (#2).
         live_ok = (ls["running"] is True and ls["done"] is False and ls.get("eta_min") == 9
+                   and isinstance(ls.get("progress_pct"), int) and 0 <= ls["progress_pct"] < 100
+                   and ls.get("eta_lo") and ls.get("eta_hi") and ls["eta_lo"] < ls["eta_hi"]
                    and "elapsed" in (ls.get("label") or "").lower())
         no_false_done_running = (state(th2)["done"] is False and state(th2)["running"] is True)
         import killswitch as _k
@@ -1286,19 +1413,21 @@ def _selftest():
 
         ok = (consent_gate_ok and opt and gate_held and in_design and plan_persisted and plan_card
               and no_tag_leak and proto and deliver and jobs >= 3
-              and eta_ok and research_eta_ok and ping_ok and live_cancel_ok
-              and consent_reask_ok and sla_ok and status_honest_ok and midflight_intent_ok)
+              and eta_ok and research_eta_ok and consts_ok and ping_ok and live_cancel_ok
+              and consent_reask_ok and sla_ok and status_honest_ok and midflight_intent_ok and dedupe_ok)
         print(f"consent_gate={consent_gate_ok} options={opt} gate_held={gate_held} design={in_design} "
               f"plan_persisted={plan_persisted} plan_card={plan_card} no_tag_leak={no_tag_leak} "
               f"prototype={proto} deliver={deliver} jobs_done={jobs}")
-        print(f"eta(kickoff ~min)={eta_ok}(est={eta_min}m) research_eta_realistic={research_eta_ok}"
+        print(f"eta(kickoff range)={eta_ok}(est={eta_min}m,range={_eta_phrase(eta_min)}) "
+              f"consts_reconciled={consts_ok} research_eta_realistic={research_eta_ok}"
               f"(={research_eta}m) ping(results-land)={ping_ok} "
               f"live_progress={live_ok} no_false_done={no_false_done_running and no_false_done_after} "
               f"cancel(killswitch)={cancel_ok}")
         print(f"consent_reask_fixed={consent_reask_ok}(note={consent_note_ok},no_stale={no_stale_consent_ctx}) "
-              f"sla_watchdog={sla_ok}(w1={w1},w2={w2},msgs={sla_msgs}) status_honest={status_honest_ok}")
+              f"sla_watchdog={sla_ok}(w1={w1},w2={w2},w3={w3},msgs={sla_msgs},eta_raised={eta_after_warn}) "
+              f"status_honest={status_honest_ok}")
         print(f"midflight_intent={midflight_intent_ok}(queued={intent_queued},applied={intent_applied},"
-              f"status_not_queued={status_not_queued})")
+              f"status_not_queued={status_not_queued}) dedupe={dedupe_ok}")
         print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel"
               " + consent-reask/sla/status-honesty ✅" if ok else "FAIL")
     finally:

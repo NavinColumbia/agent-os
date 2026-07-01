@@ -582,10 +582,33 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
     <p class=muted id=ve_intro style="margin:0 0 10px">We sent a 6-digit code to your email — enter it below.</p>
     <div id=ve_dev class=note style="display:none;background:var(--asoft);border:1px solid var(--line2);border-radius:10px;padding:10px 12px;margin:0 0 12px;color:var(--atext)"></div>
     <label for=ve_code>6-digit code</label>
-    <input id=ve_code inputmode=numeric autocomplete=one-time-code maxlength=6 placeholder="123456" aria-describedby=ve_note>
+    <input id=ve_code inputmode=numeric autocomplete=one-time-code maxlength=6 placeholder="123456" oninput="otpInput(event)" aria-describedby=ve_note>
     <div style="margin-top:14px"><button type=submit id=ve_btn class=pri style=width:100%>Verify</button></div>
     <div id=ve_note class="note muted" role=alert aria-live=polite style="margin-top:10px"></div>
     <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">Didn't get it? <button type=button class=linkbtn onclick=resendCode()>Resend code</button></p>
+  </form>
+  <form id=su_reset_req style=display:none onsubmit="resetRequest();return false" novalidate>
+    <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Reset your password</h2>
+    <p class=muted style="margin:0 0 10px">Enter your email and we'll send you a 6-digit reset code.</p>
+    <label for=rr_email>Email</label><input id=rr_email type=email autocomplete=email placeholder="you@example.com" aria-describedby=rr_note>
+    <div style="margin-top:14px"><button type=submit id=rr_btn class=pri style=width:100%>Send reset code</button></div>
+    <div id=rr_note class="note muted" role=alert aria-live=polite style="margin-top:10px"></div>
+    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px"><button type=button class=linkbtn onclick="suTab('in')">← Back to sign in</button></p>
+  </form>
+  <form id=su_reset style=display:none onsubmit="resetPassword();return false" novalidate>
+    <h2 style="text-transform:none;font-size:16px;letter-spacing:0;color:var(--tx);margin:0 0 4px">Set a new password</h2>
+    <p class=muted id=rp_intro style="margin:0 0 10px">Enter the code we sent and choose a new password.</p>
+    <div id=rp_dev class=note style="display:none;background:var(--asoft);border:1px solid var(--line2);border-radius:10px;padding:10px 12px;margin:0 0 12px;color:var(--atext)"></div>
+    <label for=rp_code>6-digit code</label>
+    <input id=rp_code inputmode=numeric autocomplete=one-time-code maxlength=6 placeholder="123456" oninput="otpInput(event,'rp_pw')" aria-describedby=rp_note>
+    <label for=rp_pw>New password</label>
+    <div class=pwwrap><input id=rp_pw type=password autocomplete=new-password placeholder="at least 8 characters" oninput="pwStrengthR()" aria-describedby="rp_pwhint rp_note"><button type=button class=pwtoggle aria-label="Show password" aria-pressed=false onclick="pwToggle('rp_pw',this)">Show</button></div>
+    <div id=rp_pwhint class=pwhint aria-live=polite></div>
+    <label for=rp_pw2>Confirm new password</label>
+    <div class=pwwrap><input id=rp_pw2 type=password autocomplete=new-password placeholder="re-enter your password" aria-describedby=rp_note><button type=button class=pwtoggle aria-label="Show password" aria-pressed=false onclick="pwToggle('rp_pw2',this)">Show</button></div>
+    <div style="margin-top:14px"><button type=submit id=rp_btn class=pri style=width:100%>Reset password &amp; sign in</button></div>
+    <div id=rp_note class="note muted" role=alert aria-live=polite style="margin-top:10px"></div>
+    <p class=muted style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">Didn't get it? <button type=button class=linkbtn onclick=resetResend()>Resend code</button></p>
   </form></div>
  </div>
 </div>
@@ -647,16 +670,65 @@ function gateNote(e){
 function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none';if(!on){const up=($('#su_signup')||{}).style&&$('#su_signup').style.display!=='none';const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}}
 function resetSession(){localStorage.removeItem('aos_org');localStorage.removeItem('aos_email');ORG=0;ORGS=[];THREAD=null;PROVIDER_OK=true;CUR='controller'}
-function suTab(t){const up=t==='up';$('#su_signup').style.display=up?'block':'none';$('#su_signin').style.display=up?'none':'block';const v=$('#su_verify');if(v)v.style.display='none';setNote(up?'su':'si','');const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}
+function suTab(t){const up=t==='up';$('#su_signup').style.display=up?'block':'none';$('#su_signin').style.display=up?'none':'block';['su_verify','su_reset_req','su_reset'].forEach(id=>{const v=$('#'+id);if(v)v.style.display='none'});setNote(up?'su':'si','');const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}
 function emailOK(e){return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)}
 function aInv(id,on){const el=$('#'+id);if(el)el.setAttribute('aria-invalid',on?'true':'false')}
 function setNote(p,msg,kind){const n=$('#'+p+'_note');if(!n)return;n.textContent=msg||'';const err=kind==='err';n.classList.toggle('err',err);n.classList.toggle('muted',!err)}
 function pwToggle(id,btn){const el=$('#'+id);if(!el)return;const pos=el.selectionStart;const show=el.type==='password';el.type=show?'text':'password';btn.setAttribute('aria-pressed',show?'true':'false');btn.setAttribute('aria-label',show?'Hide password':'Show password');btn.textContent=show?'Hide':'Show';try{el.focus();el.setSelectionRange(pos,pos)}catch(_){}}
-function pwStrength(){const el=$('#su_pw');const hint=$('#su_pwhint');if(!el||!hint)return;const pw=el.value||'';const ok8=pw.length>=8;let s=0;if(ok8)s++;if(pw.length>=12)s++;if(/[0-9]/.test(pw))s++;if(/[^A-Za-z0-9]/.test(pw))s++;const lvl=pw.length===0?0:(s<=1?1:(s<=2?2:3));const L={1:'Weak',2:'Fair',3:'Strong'},C={1:'bad',2:'warn',3:'ok'};hint.innerHTML='<div class=pwbar><span class="'+(C[lvl]||'')+'" style="width:'+(lvl*33.4)+'%"></span></div><div class=pwreq><span class="'+(ok8?'met':'')+'">'+(ok8?'✓':'•')+' At least 8 characters</span>'+(lvl?'<span class=pwlvl>'+L[lvl]+' password</span>':'')+'</div>'}
+function pwMeter(el,hint){if(!el||!hint)return;const pw=el.value||'';const ok8=pw.length>=8;let s=0;if(ok8)s++;if(pw.length>=12)s++;if(/[0-9]/.test(pw))s++;if(/[^A-Za-z0-9]/.test(pw))s++;const lvl=pw.length===0?0:(s<=1?1:(s<=2?2:3));const L={1:'Weak',2:'Fair',3:'Strong'},C={1:'bad',2:'warn',3:'ok'};hint.innerHTML='<div class=pwbar><span class="'+(C[lvl]||'')+'" style="width:'+(lvl*33.4)+'%"></span></div><div class=pwreq><span class="'+(ok8?'met':'')+'">'+(ok8?'✓':'•')+' At least 8 characters</span>'+(lvl?'<span class=pwlvl>'+L[lvl]+' password</span>':'')+'</div>'}
+function pwStrength(){pwMeter($('#su_pw'),$('#su_pwhint'))}
+function pwStrengthR(){pwMeter($('#rp_pw'),$('#rp_pwhint'))}
+function otpInput(e,nextId){const el=(e&&e.target)||e;if(!el)return;let v=(el.value||'').replace(/\D/g,'').slice(0,6);el.value=v;if(v.length===6){if(nextId){const n=$('#'+nextId);if(n){try{n.focus()}catch(_){}}}else verifyEmail();}}
 function vEmail(p){const v=($('#'+p+'_email').value||'').trim();if(v&&!emailOK(v)){aInv(p+'_email',true);setNote(p,'That email doesn\'t look right — check for a typo.','err');return false}aInv(p+'_email',false);if(($('#'+p+'_note')||{}).classList&&$('#'+p+'_note').classList.contains('err'))setNote(p,'');return true}
 function vPw(){const v=$('#su_pw').value||'';if(v&&v.length<8){aInv('su_pw',true);setNote('su','Password must be at least 8 characters.','err');return false}aInv('su_pw',false);if($('#su_note').classList.contains('err'))setNote('su','');return true}
 function vPw2(){const a=$('#su_pw').value||'',b=$('#su_pw2').value||'';if(b&&a!==b){aInv('su_pw2',true);setNote('su','Passwords don\'t match.','err');return false}aInv('su_pw2',false);if($('#su_note').classList.contains('err'))setNote('su','');return true}
-function forgotPw(){setNote('si','Password reset isn\'t available yet — email support@agent-os.dev and we\'ll get you back in.');aInv('si_email',false);}
+function forgotPw(){   // real reset flow: request a code -> enter code + new password -> logged straight in
+ $('#su_signup').style.display='none';$('#su_signin').style.display='none';const v=$('#su_verify');if(v)v.style.display='none';$('#su_reset').style.display='none';
+ $('#su_reset_req').style.display='block';
+ const pre=($('#si_email').value||'').trim();const f=$('#rr_email');if(f){f.value=pre;setTimeout(()=>{try{f.focus()}catch(_){}},0)}
+ aInv('rr_email',false);setNote('rr','');
+}
+async function resetRequest(){
+ const email=($('#rr_email').value||'').trim();const btn=$('#rr_btn');
+ if(!email||!emailOK(email)){aInv('rr_email',true);setNote('rr','That email doesn\'t look right — check for a typo.','err');$('#rr_email').focus();return}
+ aInv('rr_email',false);
+ const restore=pend(btn,'Sending…');setNote('rr','Sending a reset code…');
+ let r;try{r=await (await fetch('/api/reset-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})})).json()}
+ catch(e){restore();setNote('rr','Couldn\'t reach the server — is the console running?','err');return}
+ restore();setNote('rr','');showReset(email,r.dev_code);   // don't reveal whether the account exists — always advance
+}
+function showReset(email,devCode){
+ PEND_EMAIL=email;
+ $('#su_reset_req').style.display='none';$('#su_reset').style.display='block';
+ $('#rp_intro').innerHTML='Enter the code we sent to <b>'+esc(email)+'</b> and choose a new password.';
+ const dev=$('#rp_dev');
+ if(devCode){dev.style.display='block';dev.innerHTML='Your reset code is <b>'+esc(devCode)+'</b><br><span class=muted>(self-hosted: no email service configured, so here\'s your code)</span>'}
+ else dev.style.display='none';
+ aInv('rp_code',false);setNote('rp','');const c=$('#rp_code');if(c){c.value='';setTimeout(()=>{try{c.focus()}catch(_){}},0)}
+}
+async function resetPassword(){
+ const btn=$('#rp_btn');if(btn&&btn.disabled)return;
+ const code=($('#rp_code').value||'').trim();const pw=$('#rp_pw').value||'';const pw2=$('#rp_pw2').value||'';
+ if(!code){aInv('rp_code',true);setNote('rp','Enter the 6-digit code we sent you.','err');$('#rp_code').focus();return}
+ if(pw.length<8){aInv('rp_pw',true);setNote('rp','Password must be at least 8 characters.','err');$('#rp_pw').focus();return}
+ if(pw!==pw2){aInv('rp_pw2',true);setNote('rp','Passwords don\'t match.','err');$('#rp_pw2').focus();return}
+ aInv('rp_code',false);aInv('rp_pw',false);aInv('rp_pw2',false);
+ resetSession();
+ const restore=pend(btn,'Resetting…');setNote('rp','Resetting your password…');
+ let r;try{r=await (await fetch('/api/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:PEND_EMAIL,code,password:pw})})).json()}
+ catch(e){restore();setNote('rp','Couldn\'t reach the server — is the console running?','err');return}
+ if(r.error){restore();aInv('rp_code',true);setNote('rp',r.error,'err');$('#rp_code').focus();return}
+ restore();setNote('rp','');
+ TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||PEND_EMAIL);
+ showApp(true);boot();
+}
+async function resetResend(){
+ setNote('rp','Sending a new code…');
+ let r;try{r=await (await fetch('/api/reset-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:PEND_EMAIL})})).json()}
+ catch(e){setNote('rp','Couldn\'t reach the server — is the console running?','err');return}
+ if(r.dev_code){const dev=$('#rp_dev');dev.style.display='block';dev.innerHTML='Your reset code is <b>'+esc(r.dev_code)+'</b><br><span class=muted>(self-hosted: no email service configured, so here\'s your code)</span>'}
+ setNote('rp','We sent a new code — check your email.');
+}
 function pend(btn,label){if(!btn)return ()=>{};const html=btn.innerHTML;btn.disabled=true;btn.innerHTML='<span class=spin></span>'+label;return ()=>{btn.disabled=false;btn.innerHTML=html}}
 function humanError(raw,ctx){const s=String(raw||'').toLowerCase();
  if(s.includes('already exists')||s.includes('already regist'))return 'This email is already registered — sign in instead.';
@@ -691,7 +763,8 @@ function showVerify(email,devCode){
  aInv('ve_code',false);setNote('ve','');const c=$('#ve_code');if(c){c.value='';setTimeout(()=>{try{c.focus()}catch(_){}},0)}
 }
 async function verifyEmail(){
- const code=($('#ve_code').value||'').trim();const btn=$('#ve_btn');
+ const btn=$('#ve_btn');if(btn&&btn.disabled)return;   // guard: auto-submit + an explicit click can't double-fire
+ const code=($('#ve_code').value||'').trim();
  if(!code){aInv('ve_code',true);setNote('ve','Enter the 6-digit code we emailed you.','err');$('#ve_code').focus();return}
  aInv('ve_code',false);
  const restore=pend(btn,'Verifying…');setNote('ve','Verifying…');
@@ -996,7 +1069,7 @@ const VIEWS={
   $('#view').innerHTML='<h1>Connect an AI model</h1>'
    +'<p class=sub>Your agents need an AI model to do their work — Claude, ChatGPT/Codex, or both. You only need one to get started.</p>'
    +banner
-   +'<div id=provnote class=muted style="margin:0 0 10px"></div><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill('connected','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)}</div>${p.connected?`<button onclick="provRemove('${p.slug}')">Disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Connect</button><button onclick="provAdd('${p.slug}','${esc(p.key_hint)}')">Use an API key</button></div>`}</div>`).join('')+'</div>'
+   +'<div id=provnote class=muted style="margin:0 0 10px"></div><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill('connected','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)}</div>${p.connected?`<button onclick="provRemove('${p.slug}')">Disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Connect</button><button onclick="provKeyForm('${p.slug}')">Use an API key</button></div><div id=pk_${p.slug} class=pkform style="display:none;margin-top:10px"><label for=pkin_${p.slug}>API key</label><div class=pwwrap><input id=pkin_${p.slug} type=password autocomplete=off spellcheck=false placeholder="${esc(p.key_hint||'paste your key')}" aria-label="${esc(p.name)} API key" onkeydown="if(event.key===\'Enter\')provKeySave('${p.slug}')"><button type=button class=pwtoggle aria-label="Show key" aria-pressed=false onclick="pwToggle('pkin_${p.slug}',this)">Show</button></div><div class=row style="margin-top:8px;justify-content:space-between"><button class=pri id=pkbtn_${p.slug} onclick="provKeySave('${p.slug}')">Connect with key</button>${keyUrl(p)?`<a href="${esc(keyUrl(p))}" target=_blank rel="noopener noreferrer" class=linkbtn>Get your key ↗</a>`:''}</div><div id=pkerr_${p.slug} class=note style="margin-top:6px"></div></div>`}</div>`).join('')+'</div>'
    +'<details style="margin-top:14px"><summary style="cursor:pointer;color:var(--mut)">Technical details</summary>'
    +'<p class=muted style="margin-top:10px"><b>Connect</b> signs this machine into your Claude or ChatGPT account using the provider\'s own secure login (it opens a browser on this host and connects only once you\'re genuinely signed in, via <code>claude auth login</code> / <code>codex login</code>). Because it uses the machine\'s own sign-in, it connects the whole machine to one account — ideal for a self-hosted, single-operator setup. <b>Use an API key</b> connects with a key instead. Builds use your highest-priority connected model; with none connected, the platform default is used.</p></details>';},
  help:async()=>{const d=await get('/api/help/topics');$('#view').innerHTML=`<h1>Help</h1><p class=sub>Ask me anything about using agent-os.</p>
@@ -1159,7 +1232,19 @@ async function decide(kind,ref,verdict){await post('/api/approvals/decide',{kind
 async function integ(act,slug){let secret=null;if(act=='connect')secret=prompt('API key / secret for '+slug+' (leave blank if OAuth):')||null;await post('/api/integrations/'+act,{slug,secret});go('integrations');}
 async function plan(p){await post('/api/billing/plan',{plan:p});go('billing');}
 function provNote(msg,bad){const n=$('#provnote');if(!n){if(bad)alert(msg);return}n.style.color=bad?'var(--accent)':'';n.textContent=msg;}
-async function provAdd(slug,hint){const k=prompt('Paste your '+slug+' API key ('+hint+'):');if(k===null)return;provNote('Checking that key with '+slug+'…',false);const r=await post('/api/providers/connect',{provider:slug,mode:'api_key',key:k});if(r&&r.error){provNote('✗ '+r.error,true);return}go('providers');}   // validate the key for real before claiming connected; show the real reason inline if rejected
+const KEY_URL={anthropic:'https://console.anthropic.com/settings/keys',openai:'https://platform.openai.com/api-keys'};
+function keyUrl(p){return (p&&p.key_url)||KEY_URL[p&&p.slug]||'';}
+function provKeyForm(slug){const f=$('#pk_'+slug);if(!f)return;const open=f.style.display==='none';f.style.display=open?'block':'none';if(open){const i=$('#pkin_'+slug);if(i)setTimeout(()=>{try{i.focus()}catch(_){}},0)}}
+async function provKeySave(slug){   // inline masked entry: paste-friendly, real server validation, inline error, no native prompt()
+ const i=$('#pkin_'+slug);const k=(i?i.value:'').trim();const err=$('#pkerr_'+slug);const btn=$('#pkbtn_'+slug);
+ if(!k){if(err){err.className='note err';err.textContent='Paste your API key first.'}if(i)i.focus();return}
+ if(err){err.className='note';err.textContent=''}
+ const restore=pend(btn,'Validating…');
+ const r=await post('/api/providers/connect',{provider:slug,mode:'api_key',key:k});
+ restore();
+ if(r&&r.error){if(err){err.className='note err';err.textContent='✗ '+r.error}if(i)i.focus();return}   // show the real reason inline; don't claim connected
+ PROVIDER_OK=true;   // server-confirmed connect -> clear the Assistant gate immediately, no waiting on the 15s poll
+ go('providers');}
 async function provSub(slug){
   // 1) If the host CLI is ALREADY signed in, connect for real (verified server-side) and we're done.
   provNote('Checking this machine\'s '+slug+' sign-in…',false);
@@ -1253,7 +1338,11 @@ class Handler(BaseHTTPRequestHandler):
             # Hide control markup from the wire: the controller's clarify/plan turns may END with a
             # [[RESEARCH]]/[[PLAN]] block — once we see '[[' we suppress the rest (it's always trailing).
             # A lone trailing '[' is held back so a block split across two deltas can't leak its first '['.
-            if st["suppress"] or st["dead"]:
+            if st["dead"]:
+                # Client gone (CEO hit Stop / tab closed). RAISE so factory terminates the streaming worker at
+                # once and discards the turn — instead of the run finishing and a late reply being persisted.
+                raise loopcontroller.factory.StreamStopped("client disconnected")
+            if st["suppress"]:
                 return
             s = st["pending"] + text
             st["pending"] = ""
@@ -1272,6 +1361,8 @@ class Handler(BaseHTTPRequestHandler):
         thread = loopcontroller.thread_for_org(tid, org)
         try:
             r = loopcontroller.say(tid, thread, msg, on_delta=on_delta)
+        except loopcontroller.factory.StreamStopped:
+            return               # CEO hit Stop — worker terminated, turn discarded upstream; nothing to send
         except Exception as e:
             _write({"error": str(e)[:200]})
             _write({"done": True})
@@ -1314,7 +1405,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path); p = u.path
-        if p in ("/api/signup", "/api/login", "/api/verify-email", "/api/resend-code"):   # UNAUTHENTICATED: account + email-verification
+        if p in ("/api/signup", "/api/login", "/api/verify-email", "/api/resend-code",
+                 "/api/reset-request", "/api/reset-password"):   # UNAUTHENTICATED: account + email-verification + password reset
             import auth
             b = self._body()
             try:
@@ -1325,6 +1417,12 @@ class Handler(BaseHTTPRequestHandler):
                     r = auth.verify_email(b.get("email", ""), b.get("code", ""))
                 elif p == "/api/resend-code":
                     r = auth.resend_code(b.get("email", ""))
+                elif p == "/api/reset-request":   # step 1: issue a reset code (name varies as auth.py lands: issue_reset|request_reset)
+                    fn = getattr(auth, "issue_reset", None) or getattr(auth, "request_reset", None)
+                    r = fn(b.get("email", "")) if fn else {"error": "password reset is not available"}
+                elif p == "/api/reset-password":  # step 2: verify code + set new password (verify_reset|reset_password)
+                    fn = getattr(auth, "verify_reset", None) or getattr(auth, "reset_password", None)
+                    r = fn(b.get("email", ""), b.get("code", ""), b.get("password", "")) if fn else {"error": "password reset is not available"}
                 else:
                     r = auth.login(b.get("email", ""), b.get("password", ""))
                 return self._json(200 if not r.get("error") else 400, r)

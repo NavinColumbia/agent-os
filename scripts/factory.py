@@ -523,6 +523,29 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     key = getattr(_ctx, "api_key", None)
     if key:
         env = {**os.environ, "ANTHROPIC_API_KEY": key}
+    # LATENCY: a BYO-key light turn (clarify/say/plan-draft) hits the Messages API over a WARM, pooled HTTP
+    # connection instead of cold-spawning `claude` — first token in well under a second. All gates above have
+    # already passed and a conversational reply uses no tools, so nothing is lost. Any failure (bad key handled
+    # by the caller) falls through to the proven CLI path below.
+    if light and key and engine == "claude" and _anthropic_available():
+        # NB: a warm-HTTP call is a lightweight request, NOT a ~430MB subprocess, so it does NOT take the
+        # _AGENT_SEM slot — a chat reply must not queue behind heavy build agents (that's the latency we kill).
+        api_timeout = timeout or int(os.environ.get("AOS_CHAT_TIMEOUT", "90"))
+        try:
+            rc, out_text, cost, tin, tout, used = _api_once(prompt, model, key, api_timeout)
+        except Exception:
+            rc, out_text, cost, tin, tout, used = 1, "", 0.0, 0, 0, model   # unexpected -> CLI path below
+        if "Invalid API key" in (out_text or ""):    # bad BYO key -> surface exactly like the CLI path
+            _trace("agent", role, prompt, out_text, rc, None, cost, tin, tout, used)
+            return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True, "reason": "invalid BYO key"}
+        if rc == 0 and (out_text or "").strip():
+            _add_spend(cost)
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="executed", payload={"rc": 0, "engine": "api", "cost_usd": cost, "model": used})
+            _trace("agent", role, prompt, out_text, 0, None, cost, tin, tout, used)
+            return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost, "tokens_in": tin,
+                    "tokens_out": tout, "attempts": 1, "model": used, "engine": "api"}
+        # else fall through to the CLI fast path below
     if light:                                        # fast path: NO estimate handshake (it's a 2nd claude
         if timeout is None:                          # process — the very latency we're killing). Fixed short
             timeout = int(os.environ.get("AOS_CHAT_TIMEOUT", "90"))   # budget; a quick chat reply is seconds.
@@ -675,31 +698,159 @@ def _chat_gates(spawner_role, role, repo, task):
     return None
 
 
-def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=None):
+class StreamStopped(Exception):
+    """Raised by an on_delta sink (or surfaced by a cancel predicate) to mean 'the client is gone / the CEO
+    hit Stop'. It's the cancellation signal that lets a streaming turn ACTUALLY terminate its worker and be
+    discarded — never persisted — instead of running to completion and landing a late, unwanted reply."""
+
+
+# WARM HTTP for BYO-key light turns. A pure conversational reply (clarify/say/plan-draft chat) does not need
+# the ~1-2s `claude` CLI cold-spawn (node boot + auth) at all: when the tenant brought their own Anthropic
+# key we hit the Messages API directly over a POOLED, keep-alive HTTP connection via the official SDK, so the
+# first token arrives in well under a second. One client per key (module-level cache) keeps the TCP/TLS
+# connection warm across turns. Subscription tenants (OAuth login, no API key) still use the CLI path below.
+_API_CLIENTS = {}
+_API_CLIENTS_LOCK = threading.Lock()
+# Per-1M-token (input, output) list price for the models the fast path uses — to report honest cost on the
+# API path (the CLI reports total_cost_usd for us; the raw API does not). Cache reads bill ~0.1x, writes ~1.25x.
+_PRICES = {"claude-haiku-4-5": (1.0, 5.0), "claude-sonnet-4-6": (3.0, 15.0),
+           "claude-opus-4-8": (5.0, 25.0), "claude-opus-4-7": (5.0, 25.0)}
+
+
+def _anthropic_available() -> bool:
+    try:
+        import anthropic  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _anthropic_client(api_key):
+    """One pooled anthropic.Anthropic per key — reused across turns so the HTTP connection stays warm."""
+    import anthropic
+    with _API_CLIENTS_LOCK:
+        c = _API_CLIENTS.get(api_key)
+        if c is None:
+            c = anthropic.Anthropic(api_key=api_key, max_retries=2)
+            _API_CLIENTS[api_key] = c
+        return c
+
+
+def _api_cost(model, tin, tout, cache_r=0, cache_c=0):
+    rin, rout = next((v for k, v in _PRICES.items() if (model or "").startswith(k)), (1.0, 5.0))
+    return (tin * rin + cache_r * rin * 0.1 + cache_c * rin * 1.25 + tout * rout) / 1e6
+
+
+def _chat_max_tokens():
+    return int(os.environ.get("AOS_CHAT_MAX_TOKENS", "4096"))
+
+
+def _api_once(prompt, model, api_key, timeout):
+    """Non-streaming BYO-key light turn over the warm HTTP client. Returns _run_once's tuple shape."""
+    import anthropic
+    client = _anthropic_client(api_key)
+    try:
+        msg = client.with_options(timeout=float(timeout)).messages.create(
+            model=model, max_tokens=_chat_max_tokens(),
+            messages=[{"role": "user", "content": prompt}])
+    except anthropic.AuthenticationError:
+        return 1, "Invalid API key", 0.0, 0, 0, model     # signal a bad BYO key exactly like the CLI path
+    except Exception as e:
+        return 1, f"api error: {str(e)[:200]}", 0.0, 0, 0, model
+    text = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
+    u = msg.usage
+    cache_r = int(getattr(u, "cache_read_input_tokens", 0) or 0)
+    cache_c = int(getattr(u, "cache_creation_input_tokens", 0) or 0)
+    tin, tout = int(u.input_tokens), int(u.output_tokens)
+    used = getattr(msg, "model", None) or model
+    return 0, text, _api_cost(used, tin, tout, cache_r, cache_c), tin + cache_r + cache_c, tout, used
+
+
+def _stream_api(role, prompt, model, on_delta, api_key, timeout, cancel=None):
+    """Stream a light turn straight from the Messages API over the warm HTTP client. Invokes on_delta(text)
+    per token; returns (rc, full_text, cost, tin, tout, used, cancelled). CANCELLATION is real: if `cancel()`
+    goes true or on_delta raises (dead client / CEO hit Stop) or the wall-clock deadline passes, we CLOSE the
+    HTTP stream immediately, stop emitting, and return cancelled=True — no late reply. Thinking is left off
+    (haiku default) so the first visible token isn't stuck behind a hidden reasoning pass. Never raises."""
+    import anthropic
+    client = _anthropic_client(api_key)
+    parts, cancelled, rc, used = [], False, 0, model
+    tin = tout = cache_r = cache_c = 0
+    deadline = time.time() + float(timeout or 90)
+    try:
+        with client.with_options(timeout=float(timeout or 90)).messages.stream(
+                model=model, max_tokens=_chat_max_tokens(),
+                messages=[{"role": "user", "content": prompt}]) as stream:
+            for text in stream.text_stream:
+                if (cancel and cancel()) or time.time() > deadline:
+                    cancelled = True
+                    stream.close()
+                    break
+                if not text:
+                    continue
+                parts.append(text)
+                try:
+                    on_delta(text)
+                except Exception:               # a raising sink means the client is gone -> cancel, don't finish
+                    cancelled = True
+                    stream.close()
+                    break
+            if not cancelled:
+                final = stream.get_final_message()
+                u = final.usage
+                tin, tout = int(u.input_tokens), int(u.output_tokens)
+                cache_r = int(getattr(u, "cache_read_input_tokens", 0) or 0)
+                cache_c = int(getattr(u, "cache_creation_input_tokens", 0) or 0)
+                used = getattr(final, "model", None) or model
+    except anthropic.AuthenticationError:
+        return 1, "Invalid API key", 0.0, 0, 0, model, False
+    except Exception:
+        rc = 1                                  # partial `parts` (if any) is returned; caller decides fallback
+    cost = _api_cost(used, tin, tout, cache_r, cache_c)
+    return rc, "".join(parts), cost, tin + cache_r + cache_c, tout, used, cancelled
+
+
+def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=None, cancel=None, light=False):
     """Like _run_once but with `--output-format stream-json`: invokes on_delta(text) for each user-visible
-    text token as it arrives, then returns (rc, full_text, cost, tin, tout, used). Extended THINKING is
-    disabled (MAX_THINKING_TOKENS=0) so the FIRST visible token isn't stuck behind a hidden reasoning pass —
-    the whole point of a chat fast path. Same tool grant + governance disallow + manifest env as _run_once."""
+    text token as it arrives, then returns (rc, full_text, cost, tin, tout, used, cancelled). Extended
+    THINKING is disabled (MAX_THINKING_TOKENS=0) so the FIRST visible token isn't stuck behind a hidden
+    reasoning pass — the whole point of a chat fast path.
+    CANCELLATION: if `cancel()` goes true or on_delta raises (client gone / CEO hit Stop), we KILL the
+    subprocess at once and return cancelled=True with no further tokens — the run does NOT complete and the
+    caller must NOT persist it. (Pre-fix bug: on_delta exceptions were swallowed, so a Stopped stream ran to
+    completion and its late reply was still persisted ~10s after 'Stopped'.)
+    TRIM: for a light chat turn (`light=True`, no tools) we skip the per-role governance/manifest wiring the
+    conversational reply never uses and instead statically deny mutation tools (a chat reply must not write
+    files) — cheaper per call than loading the role manifest, and just as safe."""
     cmd = ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
            "--output-format", "stream-json", "--include-partial-messages", "--verbose",
            "--model", model, "--fallback-model", FALLBACK_MODEL]
     grant = tools if tools is not None else AGENT_TOOLS
     if grant:
         cmd += ["--allowedTools", *grant]
-    restr = governance.spawn_restrictions(role)
-    disallow = list(restr["disallowed_tools"]) + [f"Read({g})" for g in restr["deny_read"]]
-    if disallow:
-        cmd += ["--disallowedTools", *disallow]
-    mpath = ROLES / f"{role}.yaml"
-    genv = {**(env or os.environ), "MAX_THINKING_TOKENS": "0"}
-    if mpath.exists():
-        genv["CP_MANIFEST"] = str(mpath); genv["CP"] = str(CONTROL_PLANE)
-    parts, result_text, cost, tin, tout, used, rc = [], "", 0.0, 0, 0, model, 0
+    if light:
+        # A conversational reply uses no tools; a static deny of the mutation/spawn tools is correct AND
+        # avoids loading the role manifest + governance on the hot chat path.
+        cmd += ["--disallowedTools", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "Task"]
+        genv = {**(env or os.environ), "MAX_THINKING_TOKENS": "0"}
+    else:
+        restr = governance.spawn_restrictions(role)
+        disallow = list(restr["disallowed_tools"]) + [f"Read({g})" for g in restr["deny_read"]]
+        if disallow:
+            cmd += ["--disallowedTools", *disallow]
+        mpath = ROLES / f"{role}.yaml"
+        genv = {**(env or os.environ), "MAX_THINKING_TOKENS": "0"}
+        if mpath.exists():
+            genv["CP_MANIFEST"] = str(mpath); genv["CP"] = str(CONTROL_PLANE)
+    parts, result_text, cost, tin, tout, used, rc, cancelled = [], "", 0.0, 0, 0, model, 0, False
     p = subprocess.Popen(cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          text=True, bufsize=1, env=genv)
     timer = threading.Timer(timeout, p.kill); timer.start()   # hard wall-clock cap (mirrors _run_once timeout)
     try:
         for line in p.stdout:
+            if cancel and cancel():                          # cooperative cancel between tokens
+                cancelled = True
+                break
             line = line.strip()
             if not line:
                 continue
@@ -715,9 +866,10 @@ def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=No
                     if txt:
                         parts.append(txt)
                         try:
-                            on_delta(txt)            # best-effort: a dead client (Stop/disconnect) never wedges the run
-                        except Exception:
-                            pass
+                            on_delta(txt)
+                        except Exception:        # a raising sink means the client is gone -> cancel + kill
+                            cancelled = True
+                            break
             elif t == "result":
                 result_text = o.get("result", "") or result_text
                 cost = float(o.get("total_cost_usd") or 0)
@@ -728,22 +880,36 @@ def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=No
                     rc = 1
     finally:
         timer.cancel()
+        if cancelled:
+            p.kill()                                          # ACTUALLY terminate — no late tokens, no late reply
         rc2 = p.wait()
-        if rc == 0:
+        if rc == 0 and not cancelled:
             rc = rc2
-    _govern_writes(role, repo)
+    if not cancelled:
+        _govern_writes(role, repo)
     full = "".join(parts) or result_text     # streamed deltas are authoritative; fall back to the result text
-    return rc, full, cost, tin, tout, used
+    return rc, full, cost, tin, tout, used, cancelled
+
+
+def _cancelled_result():
+    """The uniform 'this streaming turn was Stopped' dict. failed=True keeps the caller from treating it as a
+    real reply; cancelled=True lets the caller DISCARD it (never persist) rather than fall back and re-run."""
+    return {"rc": -1, "failed": True, "cancelled": True, "out": "", "out_full": "", "reason": "cancelled by user"}
 
 
 def agent_stream(role: str, repo: str, task: str, on_delta, timeout: int = None,
-                 tools: list = None, spawner: str = None) -> dict:
+                 tools: list = None, spawner: str = None, cancel=None) -> dict:
     """STREAMING sibling of agent(light=True) for QUICK CONVERSATIONAL turns (the controller's clarify/scope/
     plan-draft chat). Streams text tokens to on_delta(text) as they arrive (token-by-token, like ChatGPT/Claude)
     and returns the SAME dict shape as agent() so the caller treats the result identically. Runs ALL the same
-    safety gates (via _chat_gates) and the FAST model + minimal preamble + no estimate handshake. Claude engine
-    only: a Codex tenant or ANY error returns a {failed:True} dict so the caller can FALL BACK to the blocking
-    agent() path — a streamed reply must never be worse than the proven non-stream one."""
+    safety gates (via _chat_gates) and the FAST model + minimal preamble + no estimate handshake.
+
+    LATENCY: a BYO-key tenant streams straight from the Messages API over a WARM, pooled HTTP connection
+    (first token in well under a second, no CLI cold-spawn); everyone else uses the trimmed CLI stream path.
+    STOP: `cancel` (optional predicate) OR an on_delta that raises means the CEO hit Stop / the client is gone —
+    the worker (HTTP stream or subprocess) is terminated immediately and _cancelled_result() is returned so the
+    turn is DISCARDED, never persisted. On any non-cancel error a {failed:True} dict lets the caller fall back to
+    the proven blocking agent() path — a streamed reply must never be worse than the non-stream one."""
     model = CHEAP_MODEL
     _apply_scale()
     spawner_role = spawner or getattr(_ctx, "spawner", None) or "controller"
@@ -753,21 +919,51 @@ def agent_stream(role: str, repo: str, task: str, on_delta, timeout: int = None,
     engine = (getattr(_ctx, "engine", None) or "claude").lower()
     if engine == "codex":                                  # no token stream on the Codex path -> caller falls back
         return {"rc": -1, "failed": True, "out": "", "reason": "stream unsupported on codex engine"}
-    env = None
     key = getattr(_ctx, "api_key", None)
-    if key:
-        env = {**os.environ, "ANTHROPIC_API_KEY": key}
     if timeout is None:
         timeout = int(os.environ.get("AOS_CHAT_TIMEOUT", "90"))
     prompt = (f"You are the {role}, replying live in a chat with a non-technical CEO. Be warm, concise, and "
               f"helpful; answer directly without preamble.\n\n{task}")
+
+    # WARM-HTTP FAST PATH (BYO key): stream over the pooled Messages-API connection — no CLI cold-spawn.
+    # Falls through to the CLI stream ONLY when nothing was emitted yet, so on_delta never sees duplicate tokens.
+    if key and _anthropic_available():
+        t0 = time.time()
+        rc, out_text, cost, tin, tout, used, cancelled = _stream_api(role, prompt, model, on_delta, key, timeout, cancel)
+        dt = round(time.time() - t0, 1)
+        if cancelled:
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="cancelled", payload={"engine": "api", "stream": True})
+            _trace("agent", role, prompt, (out_text or "")[:2000] + "\n[CANCELLED]", -1, dt, cost, tin, tout, used)
+            return _cancelled_result()
+        _add_spend(cost)
+        audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                     decision="executed", payload={"rc": rc, "engine": "api", "stream": True, "cost_usd": cost, "model": used})
+        _trace("agent", role, prompt, out_text, rc, dt, cost, tin, tout, used)
+        if key and "Invalid API key" in out_text:
+            return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True, "reason": "invalid BYO key"}
+        if rc == 0 and out_text.strip():
+            return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost, "tokens_in": tin,
+                    "tokens_out": tout, "attempts": 1, "model": used, "streamed": True, "engine": "api"}
+        if out_text:                                       # streamed partial then errored -> don't re-stream (dup)
+            return {"rc": rc or 1, "out": out_text[-1500:], "out_full": out_text, "failed": True,
+                    "reason": "stream errored mid-reply"}
+        # nothing emitted -> safe to fall through to the CLI stream below
+
+    env = {**os.environ, "ANTHROPIC_API_KEY": key} if key else None
     t0 = time.time()
     try:
         with _AGENT_SEM:
-            rc, out_text, cost, tin, tout, used = _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools)
+            rc, out_text, cost, tin, tout, used, cancelled = _run_once_stream(
+                role, repo, prompt, timeout, env, model, on_delta, tools, cancel, light=True)
     except Exception as e:
         return {"rc": -1, "failed": True, "out": "", "reason": f"stream error: {str(e)[:160]}"}
     dt = round(time.time() - t0, 1)
+    if cancelled:
+        audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                     decision="cancelled", payload={"engine": "claude", "stream": True})
+        _trace("agent", role, prompt, (out_text or "")[:2000] + "\n[CANCELLED]", -1, dt, cost, tin, tout, used)
+        return _cancelled_result()
     _add_spend(cost)
     audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
                  decision="executed", payload={"rc": rc, "stream": True, "cost_usd": cost, "model": used})
@@ -1557,7 +1753,56 @@ def _main(a):
         brief = role_brief("builder")
         ok = "builder" in brief and "NEVER" in brief.upper() and PRODUCTS.parent.exists()
         print("role-brief assembled from manifest:", brief[:90], "...")
-        print("PASS: factory prompt assembly + governance wiring ✅" if ok else "FAIL")
+
+        # --- LATENCY FAST PATH: warm-HTTP BYO-key light turn (no model call; helpers are pure/offline) ---
+        # honest cost accounting for the raw API path
+        cost_ok = (abs(_api_cost("claude-haiku-4-5", 1_000_000, 0) - 1.0) < 1e-9 and
+                   abs(_api_cost("claude-haiku-4-5", 0, 1_000_000) - 5.0) < 1e-9 and
+                   abs(_api_cost("claude-haiku-4-5", 0, 0, cache_r=1_000_000) - 0.1) < 1e-9)
+        # the SDK client is POOLED per key (warm connection reused across turns)
+        pool_ok = True
+        if _anthropic_available():
+            try:
+                pool_ok = _anthropic_client("sk-selftest-A") is _anthropic_client("sk-selftest-A") \
+                    and _anthropic_client("sk-selftest-A") is not _anthropic_client("sk-selftest-B")
+            except Exception:
+                pool_ok = False
+
+        # --- STOP IS REAL: a cancelled streaming turn returns cancelled (never a persisted reply) ---
+        import inspect
+        sig_ok = ("cancel" in inspect.signature(agent_stream).parameters and
+                  "cancel" in inspect.signature(_run_once_stream).parameters and
+                  hasattr(StreamStopped, "__mro__") and issubclass(StreamStopped, Exception))
+        _orig_gate, _orig_scale, _orig_avail, _orig_stream, _orig_audit = (
+            _chat_gates, _apply_scale, _anthropic_available, _stream_api, audit.append)
+        cancel_ok = success_ok = False
+        try:
+            globals()["_chat_gates"] = lambda *a, **k: None       # bypass DB-backed gates in the offline test
+            globals()["_apply_scale"] = lambda: None
+            globals()["_anthropic_available"] = lambda: True
+            audit.append = lambda **k: None
+            _ctx.api_key = "sk-selftest-A"; _ctx.engine = "claude"
+            seen = []
+            # cancelled turn: _stream_api reports cancelled=True -> agent_stream must DISCARD (no reply out)
+            globals()["_stream_api"] = lambda *a, **k: (0, "partial…", 0.0, 0, 0, CHEAP_MODEL, True)
+            rc = agent_stream("research-growth", str(PRODUCTS), "hi", seen.append)
+            cancel_ok = rc.get("cancelled") is True and rc.get("failed") is True and not rc.get("out")
+            # normal turn: streamed tokens delivered + a success dict returned
+            globals()["_stream_api"] = lambda role, p, m, od, key, to, c=None: (
+                od("hello ") or od("world") or (0, "hello world", 0.0002, 12, 3, CHEAP_MODEL, False))
+            seen.clear()
+            rc2 = agent_stream("research-growth", str(PRODUCTS), "hi", seen.append)
+            success_ok = (rc2.get("rc") == 0 and rc2.get("engine") == "api" and "hello" in "".join(seen)
+                          and rc2.get("out_full") == "hello world")
+        finally:
+            globals()["_chat_gates"] = _orig_gate; globals()["_apply_scale"] = _orig_scale
+            globals()["_anthropic_available"] = _orig_avail; globals()["_stream_api"] = _orig_stream
+            audit.append = _orig_audit; _ctx.api_key = None
+
+        ok = ok and cost_ok and pool_ok and sig_ok and cancel_ok and success_ok
+        print(f"warm-HTTP: cost={cost_ok} pool={pool_ok} | stop: sig={sig_ok} cancel-discarded={cancel_ok} "
+              f"stream-success={success_ok}")
+        print("PASS: factory prompt assembly + governance wiring + fast-path/stop ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
 

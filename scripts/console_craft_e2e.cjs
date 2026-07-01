@@ -40,8 +40,8 @@ const RAW_ENUMS = ['dead_letter', 'REQUEST-CHANGES', 'BLOCKED_AT_QA', 'request_h
     if (await p.isVisible('#su_verify')) {
       await sleep(400);
       const code = await p.evaluate(() => (((document.querySelector('#ve_dev') || {}).textContent || '').match(/\d{6}/) || [''])[0]);
-      await p.fill('#ve_code', code);
-      await p.click('#su_verify button.pri');
+      await p.fill('#ve_code', code);   // filling the 6th digit auto-submits; the click is a harmless fallback
+      if (await p.isVisible('#su_verify')) { await p.click('#su_verify button.pri').catch(() => {}); }
     }
     await p.waitForSelector('#app', { state: 'visible', timeout: 12000 });
     await sleep(2500);                               // let boot()'s one-time redirect settle

@@ -35,12 +35,28 @@ PERSONAS = {
     "edge": "a user who breaks things: wrong password, bad code, expired session, empty/denied actions, a "
             "network blip, mobile (390px), keyboard-only. Does every dead-end give a guiding next step, not "
             "a scary error? Flag every rough edge vs best-in-class.",
+    # UX-research / product / feature-completeness personas — the lens the owner was forced to be (nobody
+    # was doing UX research or checking every feature is actually finished, e.g. a 'password reset not
+    # available yet' stub). These recur so half-built features + friction get caught before a user churns.
+    "feature-completeness": "audit EVERY feature/action across every screen: is each COMPLETE (works "
+            "end-to-end) or an INCOMPLETE stub — 'not available yet', 'coming soon', 'email support', a "
+            "dead/no-op button, a gated flow with no path? Password reset was one. Flag every incomplete feature.",
+    "ux-researcher": "a UX researcher applying Nielsen's 10 heuristics + task-flow friction analysis to "
+            "onboarding + the core tasks. Where is there friction, high cognitive load, unclear system "
+            "status, no error recovery, jargon, or an unnecessary step? Assume users bounce at the slightest "
+            "inconvenience — rank by churn risk vs ChatGPT/Linear/Stripe/Notion.",
+    "product-design": "a product designer: IA, visual hierarchy, consistency, affordances, empty/loading/"
+            "error states, microcopy tone. Does every screen feel finished + trustworthy, or unfinished/amateur?",
+    "accessibility": "accessibility + inclusive design: keyboard-only, focus order + visible focus, "
+            "screen-reader labels/roles/aria, contrast, color-only signals, target sizes, cognitive load. WCAG.",
 }
 _ORDER = list(PERSONAS)
 
 # Map a finding's area to the role that should own the fix (findings.py routes it to an active agent).
 _ROLE_FOR = {"first-run": "frontend-engineer", "async-wait": "backend-engineer", "latency": "backend-engineer",
-             "buyer": "backend-engineer", "edge": "frontend-engineer"}
+             "buyer": "backend-engineer", "edge": "frontend-engineer",
+             "feature-completeness": "frontend-engineer", "ux-researcher": "design-ux",
+             "product-design": "design-ux", "accessibility": "frontend-engineer"}
 
 
 def _next_persona() -> str:

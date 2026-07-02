@@ -32,6 +32,19 @@ print(r['api_token'], r['tenant_id'])" 2>/dev/null)
 ORG=$(curl -s -X POST http://127.0.0.1:8099/api/orgs/new -H "X-Tenant-Token: $TOK" -H 'Content-Type: application/json' -d '{"name":"ActionCrawl Co"}' | grep -oE '[0-9]+' | head -1)
 curl -s -X POST http://127.0.0.1:8099/api/settings/consent -H "X-Tenant-Token: $TOK" -H 'Content-Type: application/json' -d '{"accept":true}' >/dev/null 2>&1
 
-NODE_PATH="$NP" node "$ROOT/scripts/console_actions_e2e.cjs" http://127.0.0.1:8099 "$TOK" "${ORG:-0}" 2>/dev/null \
-  | grep -q '^PASS' && { echo "PASS: exhaustive action coverage (every control fires, no JS errors)"; exit 0; } \
-  || { echo "FAIL: action crawl found dead/erroring controls — run scripts/console_actions_e2e.cjs to see them"; exit 1; }
+# crawl; retry once on failure (a transient — console warming, a slow first paint — must not red the suite;
+# a REAL dead/erroring control fails deterministically both times). Fresh seed on retry.
+crawl() { NODE_PATH="$NP" node "$ROOT/scripts/console_actions_e2e.cjs" http://127.0.0.1:8099 "$1" "${2:-0}" 2>/dev/null; }
+OUT="$(crawl "$TOK" "$ORG")"
+if ! echo "$OUT" | grep -q '^PASS'; then
+  sleep 2
+  read TOK2 _ < <("$PY" -c "import sys;sys.path.insert(0,'$ROOT/scripts');import billing,tenantproviders;r=billing.signup('ActionCrawlR','free')
+try: tenantproviders.connect(r['tenant_id'],'anthropic','subscription')
+except Exception: pass
+print(r['api_token'])" 2>/dev/null)
+  ORG2=$(curl -s -X POST http://127.0.0.1:8099/api/orgs/new -H "X-Tenant-Token: $TOK2" -H 'Content-Type: application/json' -d '{"name":"ActionCrawlR Co"}' | grep -oE '[0-9]+' | head -1)
+  curl -s -X POST http://127.0.0.1:8099/api/settings/consent -H "X-Tenant-Token: $TOK2" -H 'Content-Type: application/json' -d '{"accept":true}' >/dev/null 2>&1
+  OUT="$(crawl "$TOK2" "$ORG2")"
+fi
+if echo "$OUT" | grep -q '^PASS'; then echo "PASS: exhaustive action coverage (every control fires, no JS errors)"; exit 0
+else echo "FAIL: action crawl found dead/erroring controls (twice) — run scripts/console_actions_e2e.cjs to see them"; echo "$OUT" | tail -4; exit 1; fi

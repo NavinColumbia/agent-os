@@ -22,8 +22,13 @@
 // COMMANDS
 //   {cmd:"goto",   url}                 -> {url, title, status}                navigate (domcontentloaded)
 //   {cmd:"state"}                       -> {url,title,screenshot,elements[],    the observation the AI reasons over
-//                                           console_errors[], recent_requests[]}
+//                                           settled:true,                        (snapshot taken AFTER the SPA settles —
+//                                           console_errors[], recent_requests[]}  no half-painted skeletons)
+//   {cmd:"settle", ms?}                 -> {settled,waited_ms}                   wait extra paint grace, then settle
+//                                                                                (used before RE-OBSERVING a late control)
 //   {cmd:"click",  selector|idx}        -> {clicked}                           idx refers to elements[] from last state
+//   {cmd:"clickByText", text, role?}    -> {clicked, matched, matchedRole,      click the control whose LABEL best
+//                                           score}                              matches text (exact>contains), role-filtered
 //   {cmd:"fill",   selector|idx, value} -> {filled,value}
 //   {cmd:"inject", script}              -> {result}                            run a statement block in the page
 //   {cmd:"eval",   expr}                -> {result}                            evaluate an expression, return value
@@ -39,7 +44,14 @@
 
 'use strict';
 
-const CMD_TIMEOUT_MS = 2500;         // hard per-command ceiling — nothing may hang the loop
+const CMD_TIMEOUT_MS = 2500;         // hard per-command ceiling for ACTIONS — nothing may hang the loop
+// `state`/`settle` SNAPSHOT the SPA only AFTER it stops painting, so they get a longer ceiling than an
+// action: settle can spend up to networkidle + the poll cap before we even screenshot.
+const STATE_TIMEOUT_MS = 9000;       // hard ceiling for state/settle (settle budget + screenshot + parse)
+const SETTLE_NETIDLE_MS = 2000;      // bounded, best-effort networkidle wait (a chatty SPA just times out)
+const SETTLE_MAX_MS = 3500;          // hard cap on the poll-until-stable loop (skeletons gone + DOM stable)
+const SETTLE_SAMPLE_MS = 250;        // gap between the two consecutive stability samples
+const SETTLE_REOBSERVE_MS = 700;     // extra paint grace when the loop explicitly re-observes a late control
 const SHOT_DIR = '/tmp/aos-qa';
 const MAX_REQUESTS = 25;             // ring buffer of recent network requests surfaced in `state`
 const MAX_CONSOLE = 25;
@@ -89,20 +101,50 @@ const COLLECT_ELEMENTS = `(() => {
     const isControl = /^(input|select|textarea|button)$/i.test(el.tagName);
     if (!isControl && r.width === 0 && r.height === 0) continue;
     el.setAttribute('data-aos-idx', String(i));
+    const aria = (el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim().slice(0, 140);
     const text = (el.innerText || el.value || el.getAttribute('placeholder') ||
-                  el.getAttribute('aria-label') || el.getAttribute('name') ||
+                  aria || el.getAttribute('name') ||
                   el.getAttribute('title') || '').replace(/\\s+/g, ' ').trim().slice(0, 140);
     out.push({
       idx: i,
       tag: el.tagName.toLowerCase(),
       type: (el.getAttribute('type') || '').toLowerCase(),
       text,
+      // the LABEL the AI targets by — surfaced explicitly so intent->control is unambiguous.
+      ariaLabel: aria,
+      role: (el.getAttribute('role') || '').toLowerCase(),
+      name: (el.getAttribute('name') || '').slice(0, 80),
+      placeholder: (el.getAttribute('placeholder') || '').slice(0, 80),
+      href: (el.getAttribute('href') || '').slice(0, 120),
       selector: '[data-aos-idx="' + i + '"]'
     });
     i++;
     if (i >= 300) break;
   }
   return out;
+})()`;
+
+// In-page settle probe: how many loading placeholders are still up, plus a cheap SIGNATURE of the
+// current interactive-element set. The bridge samples this twice ~250ms apart; when the page shows NO
+// skeletons AND the signature is identical across two samples, the SPA has stopped painting and it's
+// safe to snapshot. This is what stops us observing a half-rendered view (the RACE-CONDITION false
+// positive: seeing a loading skeleton and reporting "the composer never renders" while textarea#cmsg
+// is still ~0.6-1.2s from painting).
+const SETTLE_PROBE = `(() => {
+  const skeletons = document.querySelectorAll('.skel,.skeleton,[aria-busy="true"]').length;
+  const SEL = 'a,button,input,select,textarea,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="checkbox"],[onclick],[contenteditable="true"],summary,label';
+  const sig = [];
+  for (const el of document.querySelectorAll(SEL)) {
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) <= 0.05) continue;
+    let r; try { r = el.getBoundingClientRect(); } catch (_) { continue; }
+    const isControl = /^(input|select|textarea|button)$/i.test(el.tagName);
+    if (!isControl && r.width === 0 && r.height === 0) continue;
+    sig.push(el.tagName + '#' + (el.id || '') + '.' + (el.getAttribute('type') || '') +
+             '|' + (el.textContent || el.value || '').replace(/\\s+/g, ' ').trim().slice(0, 40));
+    if (sig.length >= 300) break;
+  }
+  return { skeletons, count: sig.length, sig: sig.join('~~') };
 })()`;
 
 class Bridge {
@@ -177,7 +219,44 @@ class Bridge {
     return { url: this.page.url(), title, status };
   }
 
+  // Wait for the SPA to STOP PAINTING before we observe it. Two bounded gates, so we return only the
+  // settled DOM (never a mid-render skeleton) yet can never hang:
+  //   1. networkidle — best-effort; many SPAs hold a socket open, so a timeout here is expected & fine.
+  //   2. poll-until-stable — loop until there are ZERO loading skeletons (.skel/.skeleton/[aria-busy])
+  //      AND the interactive-element signature is identical across two consecutive ~250ms samples.
+  // The whole thing is capped at SETTLE_MAX_MS so a perpetually-busy page still yields *something*.
+  // `extraMs` gives a late-painting control a bit more grace (used by the explicit `settle` command).
+  async settle(extraMs) {
+    try {
+      await this.page.waitForLoadState('networkidle', { timeout: SETTLE_NETIDLE_MS });
+    } catch (_) { /* chatty SPA / already idle — the poll below is the real gate */ }
+    if (extraMs && extraMs > 0) {
+      try { await this.page.waitForTimeout(Math.min(extraMs, 3000)); } catch (_) {}
+    }
+    const deadline = Date.now() + SETTLE_MAX_MS;
+    let prevSig = null;
+    while (Date.now() < deadline) {
+      let probe;
+      try { probe = await this.page.evaluate(SETTLE_PROBE); }
+      catch (_) { break; } // page navigated/closed mid-probe — stop; caller snapshots what's there
+      // settled == no skeletons AND element set unchanged since the previous sample.
+      if (probe.skeletons === 0 && prevSig !== null && probe.sig === prevSig) return;
+      prevSig = probe.sig;
+      try { await this.page.waitForTimeout(SETTLE_SAMPLE_MS); } catch (_) { break; }
+    }
+  }
+
+  // Explicit settle command: give the page extra paint grace, then settle. The Python loop calls this
+  // before RE-OBSERVING when an expected control is missing, so a late-painting control gets one more
+  // chance to appear before the evaluator judges it.
+  async settleCmd(msg) {
+    const extra = (msg && msg.ms !== undefined && msg.ms !== null) ? Number(msg.ms) : SETTLE_REOBSERVE_MS;
+    await this.settle(extra);
+    return { settled: true, waited_ms: Math.min(Math.max(extra || 0, 0), 3000) };
+  }
+
   async state() {
+    await this.settle();   // observe ONLY the settled DOM — never snapshot a half-painted view
     ensureDir(SHOT_DIR);
     const file = path.join(SHOT_DIR, 'state-' + Date.now() + '-' + Math.floor(Math.random() * 1e4) + '.png');
     let shotOk = false;
@@ -192,6 +271,7 @@ class Bridge {
       title,
       screenshot: shotOk ? file : null,
       elements,
+      settled: true,   // this snapshot was taken AFTER settle() — the DOM was done painting
       console_errors: this.consoleErrors.slice(-MAX_CONSOLE),
       recent_requests: this.requests.slice(-MAX_REQUESTS),
     };
@@ -202,6 +282,51 @@ class Bridge {
     if (!sel) throw new Error('click requires selector or idx');
     await this.page.click(sel, { timeout: CMD_TIMEOUT_MS - 200 });
     return { clicked: sel };
+  }
+
+  // Click the clickable element whose visible LABEL best matches `text` (optionally constrained to a
+  // `role`). Matching, in order of preference: exact (normalized, case-insensitive) label, then
+  // case-insensitive substring either way. Returns what was matched so the caller can VERIFY the
+  // intended control was actually actuated (not a blind index) — the anti-false-positive contract.
+  async clickByText(msg) {
+    const want = (msg.text === undefined || msg.text === null) ? '' : String(msg.text).trim();
+    if (!want) throw new Error('clickByText requires text');
+    const role = (msg.role || '').toString().trim().toLowerCase();
+    const found = await this.page.evaluate(({ want, role }) => {
+      const SEL = 'a,button,input,select,textarea,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="checkbox"],[onclick],[contenteditable="true"],summary,label';
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      const wl = norm(want).toLowerCase();
+      const labelOf = (el) => norm(el.innerText || el.value || el.getAttribute('aria-label') ||
+        el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') || '');
+      const roleOf = (el) => (el.getAttribute('role') || '').toLowerCase() || el.tagName.toLowerCase();
+      let best = null, bestScore = 0, bestLabel = '', bestRole = '';
+      for (const el of document.querySelectorAll(SEL)) {
+        const st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity) <= 0.05) continue;
+        let r; try { r = el.getBoundingClientRect(); } catch (_) { continue; }
+        const isControl = /^(input|select|textarea|button)$/i.test(el.tagName);
+        if (!isControl && r.width === 0 && r.height === 0) continue;
+        const er = roleOf(el);
+        if (role && er !== role) continue;
+        const label = labelOf(el);
+        const ll = label.toLowerCase();
+        let score = 0;
+        if (ll && ll === wl) score = 3;                              // exact
+        else if (ll && wl && (ll.includes(wl) || wl.includes(ll))) score = 2;  // contains
+        if (score > bestScore) { bestScore = score; best = el; bestLabel = label; bestRole = er; }
+      }
+      if (!best || bestScore === 0) return null;
+      best.setAttribute('data-aos-hit', '1');
+      return { label: bestLabel, role: bestRole, score: bestScore };
+    }, { want, role });
+    if (!found) return { clicked: false, matched: null, note: 'no clickable element matched "' + want + '"' };
+    const sel = '[data-aos-hit="1"]';
+    try {
+      await this.page.click(sel, { timeout: CMD_TIMEOUT_MS - 200 });
+    } finally {
+      try { await this.page.evaluate(() => { const e = document.querySelector('[data-aos-hit="1"]'); if (e) e.removeAttribute('data-aos-hit'); }); } catch (_) {}
+    }
+    return { clicked: true, matched: found.label, matchedRole: found.role, score: found.score };
   }
 
   async fill(msg) {
@@ -256,8 +381,10 @@ class Bridge {
       let out;
       switch (msg.cmd) {
         case 'goto':      out = await withTimeout(this.goto(msg), CMD_TIMEOUT_MS, 'goto'); break;
-        case 'state':     out = await withTimeout(this.state(), CMD_TIMEOUT_MS, 'state'); break;
+        case 'state':     out = await withTimeout(this.state(), STATE_TIMEOUT_MS, 'state'); break;
+        case 'settle':    out = await withTimeout(this.settleCmd(msg), STATE_TIMEOUT_MS, 'settle'); break;
         case 'click':     out = await withTimeout(this.click(msg), CMD_TIMEOUT_MS, 'click'); break;
+        case 'clickByText': out = await withTimeout(this.clickByText(msg), CMD_TIMEOUT_MS, 'clickByText'); break;
         case 'fill':      out = await withTimeout(this.fill(msg), CMD_TIMEOUT_MS, 'fill'); break;
         case 'inject':    out = await withTimeout(this.inject(msg), CMD_TIMEOUT_MS, 'inject'); break;
         case 'eval':      out = await withTimeout(this.eval(msg), CMD_TIMEOUT_MS, 'eval'); break;
@@ -319,9 +446,9 @@ async function runSelftest() {
   const assert = require('assert');
   const HTML = 'data:text/html,' + encodeURIComponent(
     '<html><body><h1>QA selftest</h1>' +
-    '<button id="go">Go</button>' +
+    '<button id="go" onclick="document.title=\'CLICKED GO\'">Go</button>' +
     '<input id="q" type="text" placeholder="search here">' +
-    '<a href="#next">Next link</a></body></html>');
+    '<a href="#next" role="link">Next link</a></body></html>');
 
   const child = spawn(process.execPath, [__filename], { env: process.env, stdio: ['pipe', 'pipe', 'inherit'] });
 
@@ -358,6 +485,13 @@ async function runSelftest() {
     assert.ok(s.elements.every((e) => typeof e.selector === 'string' && e.selector.includes('data-aos-idx')),
       'every element carries an actionable selector');
     assert.ok(Array.isArray(s.console_errors) && Array.isArray(s.recent_requests), 'state has console_errors+recent_requests arrays');
+    assert.strictEqual(s.settled, true, 'state was captured post-settle (SPA done painting)');
+
+    // explicit settle command: bounded, always resolves ok with the grace it waited.
+    const st = await send({ id: 20, cmd: 'settle', ms: 50 });
+    assert.strictEqual(st.ok, true, 'settle ok');
+    assert.strictEqual(st.settled, true, 'settle reports settled');
+    assert.ok(st.waited_ms >= 0, 'settle reports the paint grace it waited');
 
     // Exercise act-by-idx: fill the input, then read it back via eval.
     const inputEl = s.elements.find((e) => e.tag === 'input');
@@ -365,6 +499,23 @@ async function runSelftest() {
     assert.strictEqual(f.ok, true, 'fill ok');
     const ev = await send({ id: 4, cmd: 'eval', expr: "document.getElementById('q').value" });
     assert.strictEqual(ev.result, 'hello', 'eval reads back the filled value');
+
+    // clickByText: resolve the control by its visible LABEL (not a blind idx), case-insensitively, and
+    // actuate it — proven by the button's onclick effect (title change).
+    const cbt = await send({ id: 5, cmd: 'clickByText', text: 'go' });
+    assert.strictEqual(cbt.ok, true, 'clickByText ok');
+    assert.strictEqual(cbt.clicked, true, 'clickByText actuated a control');
+    assert.ok(/^go$/i.test((cbt.matched || '').trim()), 'clickByText matched the intended label "Go"');
+    const eff = await send({ id: 6, cmd: 'eval', expr: 'document.title' });
+    assert.strictEqual(eff.result, 'CLICKED GO', 'clicking "Go" by label fired its onclick (right control actuated)');
+    // role filter: constrain to role=link so ONLY the anchor matches (not the button).
+    const byRole = await send({ id: 7, cmd: 'clickByText', text: 'next link', role: 'link' });
+    assert.strictEqual(byRole.clicked, true, 'clickByText with role=link actuated the anchor');
+    assert.ok(/next link/i.test(byRole.matched || ''), 'role-filtered match hit the anchor label');
+    // a label that matches nothing must report clicked:false (NOT throw, NOT click something random).
+    const miss = await send({ id: 8, cmd: 'clickByText', text: 'this label does not exist anywhere' });
+    assert.strictEqual(miss.ok, true, 'clickByText miss still ok');
+    assert.strictEqual(miss.clicked, false, 'clickByText reports a miss rather than clicking a wrong control');
 
     const c = await send({ id: 9, cmd: 'close' });
     assert.strictEqual(c.ok, true, 'close ok');

@@ -1215,7 +1215,7 @@ async function ctlSend(){
  if(!CONSENT_OK){setPend(m);if(i){i.value='';grow(i)}const n=$('#cnote');if(n)n.innerHTML='Saved your idea ✓ — tap <b>Approve &amp; continue</b> above and I\'ll start automatically.';return;}
  CTLBUSY=true;setSendMode(true);if(i){i.value='';grow(i);i.disabled=true}
  const log=$('#clog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=ctltyping style="margin:8px 0"><div><span class=bubble><span class=spin></span> <span class=muted>thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
- $('#cnote').textContent='Working… press Stop to cancel.';
+ ($('#cnote')||{}).textContent='Working… press Stop to cancel.';
  CTLABORT=(typeof AbortController!=='undefined')?new AbortController():null;
  let r=null,gotDelta=false,gotDone=false,streamFailed=false;
  // PRIMARY: stream the reply token-by-token (SSE) so the bubble fills live. The whole turn is still
@@ -1250,10 +1250,10 @@ async function ctlSend(){
  }
  CTLBUSY=false;CTLABORT=null;setSendMode(false);if(i){i.disabled=false;i.focus()}
  const t=$('#ctltyping');if(t)t.remove();
- if(r&&r.error==='stopped'){$('#cnote').textContent='Stopped.';return;}   // ctlStop already parked the job + reloaded
+ if(r&&r.error==='stopped'){($('#cnote')||{}).textContent='Stopped.';return;}   // ctlStop already parked the job + reloaded
  const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote').innerHTML=gateNote(cg);if(i){i.value=m;grow(i)}return;}   // friendly connect/consent prompt — keep their text
- if(r&&r.error){$('#cnote').textContent='✗ '+r.error+' — your message is in the box, press Send to retry.';if(i){i.value=m;grow(i)}return;}
- $('#cnote').textContent='';go('controller');
+ if(r&&r.error){($('#cnote')||{}).textContent='✗ '+r.error+' — your message is in the box, press Send to retry.';if(i){i.value=m;grow(i)}return;}
+ ($('#cnote')||{}).textContent='';go('controller');
 }
 function ctlStreamInto(text){   // paint streamed tokens into the live assistant bubble (final reload re-renders via md())
  const t=$('#ctltyping');if(!t)return;const b=t.querySelector('.bubble');if(b)b.textContent=text;
@@ -1298,7 +1298,7 @@ async function chatSend(){
  if(CHATBUSY)return;const i=$('#msg');const m=(i?i.value:'').trim();if(!m)return;CHATBUSY=true;
  const btn=$('#chatsend');if(btn)btn.disabled=true;if(i){i.value='';grow(i);i.disabled=true}
  const log=$('#chatlog');if(log){log.insertAdjacentHTML('beforeend','<div class="msg me" style="margin:8px 0"><div><span class=bubble>'+esc(m)+'</span></div></div><div class="msg ai" id=chattyping style="margin:8px 0"><div><span class=bubble><span class=muted>… thinking</span></span></div></div>');log.scrollTop=log.scrollHeight}
- $('#chatnote').textContent='thinking…';
+ ($('#chatnote')||{}).textContent='thinking…';
  let r;
  try{r=await post('/api/chat/say',{thread:THREAD,message:m},90000);}
  finally{CHATBUSY=false;if(btn)btn.disabled=false;if(i){i.disabled=false}}
@@ -1306,18 +1306,18 @@ async function chatSend(){
  if(r&&r.error){   // never leave a silent spinner: surface a clear, retryable failure
   const t=$('#chattyping');if(t)t.remove();
   const em=r.error==='timeout'?'The assistant is taking too long to respond. Your message is still in the box — press Send to try again.':('✗ '+r.error+' — your message is still in the box, press Send to retry.');
-  $('#chatnote').textContent=em;
+  ($('#chatnote')||{}).textContent=em;
   if(i){i.value=m;grow(i);i.focus()}
   if(log){log.insertAdjacentHTML('beforeend','<div class="msg ai" style="margin:8px 0"><div><span class=bubble><span class=muted>'+esc(em)+'</span></span></div></div>');log.scrollTop=log.scrollHeight}
   return;
  }
  if(i)i.focus();
- $('#chatnote').textContent='';await chatRender();
+ ($('#chatnote')||{}).textContent='';await chatRender();
 }
 async function chatConfirm(){
- $('#chatnote').textContent='starting build…';const r=await post('/api/chat/confirm',{thread:THREAD});
+ ($('#chatnote')||{}).textContent='starting build…';const r=await post('/api/chat/confirm',{thread:THREAD});
  const cg=gateKey(r);if(r&&gateError(cg)){$('#chatnote').innerHTML=gateNote(cg);return;}
- $('#chatnote').textContent=r.error?('✗ '+r.error):('building '+r.product+' — see Cockpit');
+ ($('#chatnote')||{}).textContent=r.error?('✗ '+r.error):('building '+r.product+' — see Cockpit');
 }
 async function showEst(){const k=($('#bk')||{}).value||'lib';let e;try{e=await get('/api/estimate?kind='+k)}catch(_){return}if($('#est'))$('#est').textContent='Estimate: '+(e.note||('~$'+e.cost_usd_estimate+', ~'+e.minutes_estimate+' min'));}
 async function doBuild(){$('#bnote').textContent='submitting…';const r=await post('/api/build',{name:$('#bn').value,kind:$('#bk').value,charter:$('#bc').value});if(r&&r.error&&gateError(r.error)){$('#bnote').innerHTML=gateNote(r.error);return;}$('#bnote').textContent=r.error?('✗ '+r.error):('building '+r.product+' — see Cockpit');}

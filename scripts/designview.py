@@ -4,7 +4,7 @@ other *view.py read/decide surfaces). The design fleet (design_fleet.py) prototy
 screens (cockpit / team / external); designview lists them for the org and lets a human approve or
 send one back to draft. Everything is org-scoped: you only ever see/decide YOUR org's artifacts.
 
-    designview.py gallery <tenant_id> <org_id>                       # [{id, surface, title, html_path, status}]
+    designview.py gallery <tenant_id> <org_id>                       # reviewable artifacts (html + preview + desc)
     designview.py decide <tenant_id> <org_id> <artifact_id> <status> # status -> approved | draft | review
     designview.py surfaces                                           # the three audiences + one-liners
     designview.py selftest
@@ -46,15 +46,76 @@ def _ensure():
         c.commit()
 
 
+_PREVIEW_CHARS = 4000   # cap the inlined content so the gallery payload stays sane for many artifacts
+
+
+def _load_artifact(html_path, surface, title, product):
+    """Turn a stored html_path into something a human can actually REVIEW. The design fleet writes each
+    prototype as a self-contained HTML file on disk (inline CSS/JS, no network), so the reviewable
+    content IS that file. Read it back and return the renderable body plus a plain-text preview; if the
+    file is missing/unreadable, fall back to a description of the surface so the row is never a dead
+    link the user 'can't click to review'."""
+    surface_desc = _SURFACES.get(surface, "")
+    p = Path(html_path) if html_path else None
+    if p and p.exists() and p.is_file():
+        try:
+            html = p.read_text(errors="replace")
+        except OSError as e:
+            html = None
+            err = str(e)
+        else:
+            err = None
+        if html is not None:
+            # strip tags for a quick text preview the console can show even without an HTML renderer
+            import re
+            text = re.sub(r"<[^>]+>", " ", html)
+            text = re.sub(r"\s+", " ", text).strip()
+            return {
+                "reviewable": True,
+                "render": "html",
+                "html": html,                                   # full self-contained doc -> iframe/srcdoc
+                "preview_text": text[:600],                     # tag-stripped snippet for text-only views
+                "truncated_html": len(html) > _PREVIEW_CHARS,
+                "html_excerpt": html[:_PREVIEW_CHARS],          # bounded slice for cheap previews
+                "bytes": len(html),
+                "surface_description": surface_desc,
+                "description": (f"{title} — a self-contained prototype screen for the {surface} audience "
+                                f"({surface_desc}). Open/render the html field to review the design."),
+            }
+        # file exists but couldn't be read
+        return {
+            "reviewable": False, "render": "none", "html": None,
+            "surface_description": surface_desc,
+            "description": (f"{title} — prototype for the {surface} audience ({surface_desc}), but its "
+                            f"file could not be read: {err}. Path: {html_path}"),
+        }
+    # no file on disk (e.g. metadata-only row): return the fullest description we can so it's reviewable
+    return {
+        "reviewable": False, "render": "none", "html": None,
+        "surface_description": surface_desc,
+        "description": (f"{title} — a planned prototype screen for the {surface} audience "
+                        f"({surface_desc}). No rendered file is available at {html_path or '(none)'}; "
+                        f"this artifact describes the surface to review rather than a rendered mock."),
+    }
+
+
 def gallery(tenant_id: str, org_id: str) -> list:
-    """Every design artifact for the (tenant, org), newest first: [{id, surface, title, html_path,
-    status}]. Scoped by tenant_id AND org_id so a tenant never reads another tenant's artifacts."""
+    """Every design artifact for the (tenant, org), newest first — each entry carries enough to actually
+    REVIEW the design, not just a title + status. Alongside {id, surface, title, html_path, status} we
+    include the renderable prototype content (html), a tag-stripped preview_text, a human description of
+    the surface, and a `reviewable` flag, by reading the self-contained HTML the design fleet wrote to
+    disk. Scoped by tenant_id AND org_id so a tenant never reads another tenant's artifacts."""
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT id, surface, title, html_path, status FROM design_artifacts
+        cur.execute("""SELECT id, surface, title, html_path, status, product FROM design_artifacts
                        WHERE tenant_id=%s AND org_id=%s ORDER BY id DESC""", (tenant_id, org_id))
-        return [{"id": r[0], "surface": r[1], "title": r[2], "html_path": r[3], "status": r[4]}
-                for r in cur.fetchall()]
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        art = {"id": r[0], "surface": r[1], "title": r[2], "html_path": r[3], "status": r[4]}
+        art.update(_load_artifact(r[3], r[1], r[2], r[5]))
+        out.append(art)
+    return out
 
 
 def decide(tenant_id: str, org_id: str, artifact_id, status: str) -> dict:
@@ -86,17 +147,34 @@ def _selftest():
     """Insert three fake artifacts for a throwaway org (design_artifacts.org_id is just text — no real
     org row needed), then prove gallery() lists them, decide() flips one to approved with ownership
     enforced, and surfaces() returns the three audiences. Cleans up the rows in finally."""
+    import shutil
+    import tempfile
     import uuid
     _ensure()
     tenant_id = "t-selftest-" + uuid.uuid4().hex[:8]
     org_id = "o-selftest-" + uuid.uuid4().hex[:8]
+    workdir = Path(tempfile.mkdtemp(prefix="designview-selftest-"))
     ok = False
     try:
+        # Two artifacts with a REAL self-contained html file on disk (the reviewable prototype), plus
+        # one metadata-only row whose file is missing — to prove gallery() returns reviewable content
+        # for real prototypes AND a full description (never a dead link) when no file exists.
+        real = {}
         with psycopg.connect(DB) as c, c.cursor() as cur:
-            for s in ("cockpit", "team", "external"):
+            for s in ("cockpit", "team"):
+                fp = workdir / f"{s}.html"
+                fp.write_text(f"<!doctype html><html><head><title>demo {s}</title></head>"
+                              f"<body><h1>{s} prototype</h1><p>reviewable content for {s}</p>"
+                              f"</body></html>")
+                real[s] = str(fp)
                 cur.execute("""INSERT INTO design_artifacts (tenant_id, org_id, product, surface,
                                  title, html_path, status) VALUES (%s,%s,'demo',%s,%s,%s,'review')""",
-                            (tenant_id, org_id, s, f"demo — {s} screen", f"/tmp/{org_id}-{s}.html"))
+                            (tenant_id, org_id, s, f"demo — {s} screen", str(fp)))
+            # metadata-only: file intentionally absent
+            cur.execute("""INSERT INTO design_artifacts (tenant_id, org_id, product, surface,
+                             title, html_path, status) VALUES (%s,%s,'demo',%s,%s,%s,'review')""",
+                        (tenant_id, org_id, "external", "demo — external screen",
+                         str(workdir / "missing.html")))
             c.commit()
 
         g = gallery(tenant_id, org_id)
@@ -109,8 +187,19 @@ def _selftest():
         after = next(x for x in gallery(tenant_id, org_id) if x["id"] == target)
         sfc = surfaces()
 
+        base_keys = {"id", "surface", "title", "html_path", "status"}
+        review_keys = {"reviewable", "render", "html", "surface_description", "description"}
+        # every entry is reviewable: renderable html for real files, full description for the missing one
+        rendered = [x for x in g if x["surface"] in ("cockpit", "team")]
+        metaonly = next(x for x in g if x["surface"] == "external")
         ok = (len(g) == 3
-              and all(set(x) == {"id", "surface", "title", "html_path", "status"} for x in g)
+              and all(base_keys | review_keys <= set(x) for x in g)               # base + review payload
+              and len(rendered) == 2
+              and all(x["reviewable"] is True and x["render"] == "html"
+                      and "prototype" in (x["html"] or "") and x["preview_text"]
+                      and x["surface_description"] and x["description"] for x in rendered)
+              and metaonly["reviewable"] is False and metaonly["html"] is None
+              and metaonly["surface_description"] and metaonly["description"]     # still reviewable text
               and flip.get("ok") is True
               and after["status"] == "approved"
               and guard.get("ok") is False
@@ -119,15 +208,18 @@ def _selftest():
               and bad.get("ok") is False
               and len(sfc) == 3
               and {x["surface"] for x in sfc} == {"cockpit", "team", "external"})
-        print(f"gallery={len(g)} decide={flip.get('ok')} approved={after['status']} "
+        print(f"gallery={len(g)} rendered={len(rendered)} metaonly_reviewable={metaonly['reviewable']} "
+              f"decide={flip.get('ok')} approved={after['status']} "
               f"guard={guard.get('ok')} xtenant={xtenant.get('ok')} xtenant_read={len(xtenant_read)} "
               f"bad_status={bad.get('ok')} surfaces={len(sfc)}")
-        print("PASS: designview gallery + tenant/org-scoped decide + surfaces ✅" if ok else "FAIL")
+        print("PASS: designview reviewable gallery + tenant/org-scoped decide + surfaces ✅"
+              if ok else "FAIL")
     finally:
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("DELETE FROM design_artifacts WHERE tenant_id=%s AND org_id=%s",
                         (tenant_id, org_id))
             c.commit()
+        shutil.rmtree(workdir, ignore_errors=True)
     sys.exit(0 if ok else 1)
 
 

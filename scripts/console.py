@@ -89,7 +89,7 @@ def _owns(tid, org_id):
 
 
 # Routes that carry a client-supplied org id — gated through _owns() before they ever touch a module.
-ORG_SCOPED_GET = {"/api/controller/state", "/api/design",
+ORG_SCOPED_GET = {"/api/controller/state", "/api/controller/research", "/api/design",
                   "/api/cockpit", "/api/projects", "/api/fleet",
                   "/api/health", "/api/company", "/api/comms_graph"}
 ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/controller/cancel",
@@ -284,6 +284,54 @@ def _ctl_choose(tid, org_id, option_id):
     return loopcontroller.choose(tid, loopcontroller.thread_for_org(tid, org_id), option_id)
 
 
+def _ctl_research(tid, org_id):
+    """The research report markdown behind the current options, so the Assistant can show a
+    'Read the full research' panel BEFORE the CEO commits to a direction. Defers to
+    loopcontroller.research(tid, thread) (or assistant.research at home); always returns {report:str}
+    so a not-yet-ready report renders as an honest empty panel rather than an error card."""
+    if not org_id:
+        a = _assistant()
+        if a is not None and hasattr(a, "research"):
+            try:
+                r = a.research(tid)
+            except Exception as e:
+                return {"report": "", "error": str(e)[:160]}
+            return {"report": (r or {}).get("report", "") if isinstance(r, dict) else str(r or "")}
+        org_id = _home_org(tid)
+        if not org_id:
+            return {"report": ""}
+    thread = loopcontroller.thread_for_org(tid, org_id)
+    fn = getattr(loopcontroller, "research", None)
+    if not callable(fn):
+        return {"report": ""}
+    try:
+        r = fn(tid, thread)
+    except Exception as e:
+        return {"report": "", "error": str(e)[:160]}
+    if isinstance(r, dict):
+        return {"report": r.get("report") or r.get("markdown") or r.get("body") or ""}
+    return {"report": str(r or "")}
+
+
+def _notifs_read_build(tid):
+    """Mark the tenant's unread build/controller notifications read — called when the CEO opens the
+    Assistant or acts on an artifact (choose/plan/design), so the bell badge doesn't stick after
+    they've already responded. Scoped to the 'build' category (the controller's own channel)."""
+    n = 0
+    try:
+        for it in notifications.feed(tid, unread_only=True):
+            if it.get("category") == "build" and not it.get("read"):
+                notifications.mark_read(tid, it["id"])
+                n += 1
+    except Exception:
+        pass
+    try:
+        unread = notifications.unread_count(tid)
+    except Exception:
+        unread = 0
+    return {"read": n, "unread": unread}
+
+
 def _system_agents():
     """Tier-A system roles — the standing org hierarchy, surfaced READ-ONLY in the Agents view. Sourced
     from the real role manifest (orgview.ORG); 'controller' is the sole spawner
@@ -362,6 +410,7 @@ GETS = {
     "/api/agentfeatures": lambda tid, q: {"features": agentfeatures.catalog(), "categories": agentfeatures.categories(), "triggers": agentfeatures.triggers()},
     "/api/agentfeatures/recommend": lambda tid, q: agentfeatures.recommend(q.get("need", [""])[0]),
     "/api/controller/state": lambda tid, q: _controller_state(tid, int(q.get("org", ["0"])[0] or 0)),
+    "/api/controller/research": lambda tid, q: _ctl_research(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/xorg": lambda tid, q: {"ops": crossorg.list_ops(tid)},
     "/api/team": lambda tid, q: _team(tid),
     "/api/settings": lambda tid, q: settingsview.settings(tid),
@@ -407,6 +456,7 @@ POSTS = {
     "/api/settings/pref": lambda tid, q, b: settingsview.set_pref(tid, b.get("category"), b.get("in_app", True), b.get("email", True), b.get("push", False)),
     "/api/settings/consent": lambda tid, q, b: settingsview.set_consent(tid, b.get("accept", True)),
     "/api/notifications/read": lambda tid, q, b: {"read": notifications.mark_read(tid, b.get("id"))},
+    "/api/notifications/read_build": lambda tid, q, b: _notifs_read_build(tid),
     "/api/byok": lambda tid, q, b: ({"ok": bool(b.get("key"))} if not b.get("key") else
                                     (vault.put_secret("byo_llm_key", f"tenant:{tid}", "prod", ["builder", "factory"], b["key"]) or {"ok": True})),
 }
@@ -850,7 +900,7 @@ async function refreshView(){ // background poll: no skeleton flash, no nav/scro
 function kpis(arr){return '<div class=kpis>'+arr.map(a=>`<div class=kpi><b>${esc(a[1])}</b><span>${esc(a[0])}</span></div>`).join('')+'</div>'}
 function stages(ss){return '<div class=stages>'+ss.map(s=>{const cls=s.done?(s.ok===false?'bad':'ok'):'';const verdict=s.done?(s.ok===false?'failed':'passed'):'pending';const lab=`${s.stage}: ${verdict}`;return `<div class="st ${cls}" role=img title="${lab}" aria-label="${lab}"></div>`}).join('')+'</div>'}
 
-let THREAD=null;let CTLBUSY=false;let CHATBUSY=false;
+let THREAD=null;let CTLBUSY=false;let CHATBUSY=false;let DESIGN_FOCUS=null;   // artifact id to scroll/highlight when deep-linked from the Assistant
 let CONSENT_OK=false;let PROG=null;let CTLABORT=null;   // guided first-run + live-progress state
 let PEND_IDEA='';try{PEND_IDEA=localStorage.getItem('aos_pend')||''}catch(_){}   // the idea typed before setup is done — persisted so a full reload never silently drops it
 function setPend(t){PEND_IDEA=t||'';try{PEND_IDEA?localStorage.setItem('aos_pend',PEND_IDEA):localStorage.removeItem('aos_pend')}catch(_){}}   // single writer so the saved idea and its storage mirror never drift
@@ -945,6 +995,7 @@ const VIEWS={
   if(gateErr){$('#cnote').innerHTML=gateNote(d.error);ctlRender([]);}
   else if(d&&d.error){const log=$('#clog');if(log)log.innerHTML='<div class=muted>'+esc(d.error)+'</div>';}
   else ctlRender(d.messages||[],d.progress);
+  markCtlNotifs();   // opening the Assistant IS a response — clear the controller's build notifications so the bell doesn't stick
   if(PEND_IDEA&&setupDone)frFlush();   // auto-resume the idea they typed before setup was finished
   if(!window.CTLPOLL)window.CTLPOLL=setInterval(async()=>{if(!TOK||CUR!=='controller'){clearInterval(window.CTLPOLL);window.CTLPOLL=null;stopTick();return}if(CTLBUSY)return;try{const s=await get('/api/controller/state?org='+(ORG||0));if(!(s&&s.error))ctlRender(s.messages||[],s.progress)}catch(e){}},5000);
  },
@@ -965,9 +1016,15 @@ const VIEWS={
   h+='<div class=grid>'+(d.features||[]).map(f=>`<div class=tile><div class="row spread"><b>${esc(f.name)}</b>${pill(f.audience,f.audience=='external'?'accent':'')}</div><div class=muted style=margin:6px_0>${esc(f.blurb)}</div><div class=muted>${pill('trigger: '+(f.trigger||f.surface),f.trigger=='event'?'warn':'')} ${esc(f.surface)} · ${esc(f.category)}</div></div>`).join('')+'</div>';
   $('#view').innerHTML=h;},
  design:async()=>{if(!ORG){$('#view').innerHTML='<div class=card>'+emptyB('🎨','No company selected','Pick or create a company first — then your prototypes and screens will show up here.','<button class=pri onclick="go(\'orgs\')">Go to My companies</button>')+'</div>';return}const d=await get('/api/design?org='+ORG);
-  let h='<h1>Design</h1><p class=sub>Prototype screens your fleet drafted — for your cockpit, your team, and your external users.</p>';
-  const g=d.gallery||[];h+='<div class=grid>'+(g.length?g.map(s=>`<div class=tile><div class="row spread"><b>${esc(s.surface||'')}</b>${pill(s.status,s.status=='approved'?'ok':'')}</div><div class=muted style=margin:6px_0>${esc(s.title||'')}</div>${s.status!='approved'?`<button class=pri onclick="designOk(${s.id})">approve</button>`:''}</div>`).join(''):emptyB('🎨','No prototypes yet','When your controller reaches the design phase, screens appear here.'))+'</div>';
-  $('#view').innerHTML=h;},
+  let h='<h1>Design</h1><p class=sub>Prototype screens your fleet drafted — for your cockpit, your team, and your external users. Review each, then approve.</p>';
+  const g=d.gallery||[];h+='<div class=grid>'+(g.length?g.map(s=>{
+   const img=s.image||s.thumbnail||s.screenshot||'';const url=s.preview_url||s.url||'';
+   const prev=img?`<img src="${esc(img)}" alt="${esc(s.title||s.surface||'preview')}" style="width:100%;border-radius:8px;margin:6px 0;display:block">`
+    :(s.preview_html?`<div style="border:1px solid var(--bd);border-radius:8px;margin:6px 0;padding:8px;max-height:220px;overflow:auto">${s.preview_html}</div>`:'');
+   return `<div class=tile data-did="${esc(''+s.id)}"><div class="row spread"><b>${esc(s.surface||'')}</b>${pill(s.status,s.status=='approved'?'ok':'')}</div><div class=muted style=margin:6px_0>${esc(s.title||'')}</div>${prev}<div class=row style="flex-wrap:wrap;gap:8px;margin-top:6px">${url?`<a href="${esc(url)}" target=_blank rel="noopener noreferrer" class=linkbtn>Open preview ↗</a>`:''}${s.status!='approved'?`<button class=pri onclick="designOk(${s.id})">Approve design</button>`:''}</div></div>`;
+  }).join(''):emptyB('🎨','No prototypes yet','When your controller reaches the design phase, screens appear here.'))+'</div>';
+  $('#view').innerHTML=h;
+  if(DESIGN_FOCUS!=null){const el=document.querySelector('#view .tile[data-did="'+DESIGN_FOCUS+'"]');if(el){el.style.outline='2px solid var(--accent)';el.style.outlineOffset='2px';try{el.scrollIntoView({block:'center',behavior:'smooth'})}catch(_){}}DESIGN_FOCUS=null;}},
  chat:async()=>{
   if(!THREAD){const r=await post('/api/chat/new',{});THREAD=r.thread}
   const CHIPS=['Track my gym members','An invoice generator','A URL shortener','A booking page for my salon','An internal tool for my team'];
@@ -1112,8 +1169,35 @@ function ctlNextChips(phase){   // CONTEXT-AWARE CHIPS: after scoping, swap the 
 function ctlRender(msgs,prog){const log=$('#clog');if(!log)return;
  const atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<40;
  let html=(msgs||[]).map(m=>{const me=m.role==='user';const meta=m.meta||{};let extra='';
-  if(meta.kind==='options'&&meta.options)extra='<div class=chips style="margin:8px 0">'+meta.options.map(o=>`<span class=chip-s onclick="ctlChoose(${o.id})">${esc(o.title||('Option '+o.id))}${o.recommended?' ★':''}</span>`).join('')+'</div>';
-  else if(meta.kind==='plan'&&meta.plan)extra='<div class=tile style="margin:8px 0;text-align:left"><b>Plan: '+esc(meta.plan.name||'')+'</b> '+pill(meta.plan.kind||'')+'<div class=muted style=margin-top:4px>'+esc(meta.plan.charter||'')+'</div></div>';
+  if(meta.kind==='options'&&meta.options){
+   // OPTIONS: an expandable REVIEW card per option — title + full summary/detail, a link to the full
+   // research report, and a SEPARATE explicit commit button. Clicking the card body never chooses.
+   extra='<div class=optcards style="margin:8px 0">'+meta.options.map(o=>{
+    const tt=esc(o.title||('Option '+o.id));const summ=(o.summary||o.detail||'').trim();const det=(o.detail||'').trim();
+    return '<div class=tile style="margin:8px 0;text-align:left">'
+     +'<div class="row spread"><b>'+tt+'</b>'+(o.recommended?pill('recommended','ok'):'')+'</div>'
+     +(summ?'<div class=muted style="margin:6px 0;white-space:pre-wrap;line-height:1.5">'+md(summ)+'</div>':'')
+     +((det&&det!==summ)?'<details style="margin:6px 0"><summary style="cursor:pointer;color:var(--accent)">Show full detail</summary><div class=muted style="margin-top:6px;white-space:pre-wrap;line-height:1.5">'+md(det)+'</div></details>':'')
+     +'<div class=row style="margin-top:8px;flex-wrap:wrap;gap:8px"><button onclick="ctlResearch()">Read the full research</button><button class=pri onclick="ctlChoose('+o.id+')">Choose this direction →</button></div>'
+     +'</div>';
+   }).join('')+'</div>';
+  }
+  else if(meta.kind==='plan'&&meta.plan){
+   // PLAN: charter one-liner PLUS an expandable that renders the complete [[PLAN]] body (scope/steps) with md().
+   const pl=meta.plan;const full=(pl.full||pl.body||'').trim();
+   extra='<div class=tile style="margin:8px 0;text-align:left"><div class="row spread"><b>Plan: '+esc(pl.name||'')+'</b>'+(pl.kind?pill(pl.kind):'')+'</div>'
+    +(pl.charter?'<div class=muted style="margin:6px 0">'+esc(pl.charter)+'</div>':'')
+    +(full?'<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--accent)">View full plan</summary><div class=muted style="margin-top:8px;white-space:pre-wrap;line-height:1.5">'+md(full)+'</div></details>':'<div class=muted style="margin-top:4px;font-size:12px">Full plan detail will appear here once it\'s ready.</div>')
+    +'</div>';
+  }
+  else if(meta.kind==='design'||meta.kind==='prototype'){
+   // DESIGN/PROTOTYPE READY: a review card that deep-links into the Design screen at the artifact.
+   const dz=meta.design||{};const did=(dz.id!=null&&dz.id!=='')?dz.id:null;
+   extra='<div class=tile style="margin:8px 0;text-align:left"><div class="row spread"><b>'+esc(dz.title||(meta.kind==='prototype'?'Prototype ready to review':'Design ready to review'))+'</b>'+pill('design','accent')+'</div>'
+    +((dz.surface||dz.summary)?'<div class=muted style="margin:6px 0;white-space:pre-wrap">'+esc([dz.surface,dz.summary].filter(Boolean).join(' · '))+'</div>':'')
+    +'<div class=row style="margin-top:8px"><button class=pri onclick="goDesign('+(did===null?'':did)+')">Review the design →</button></div>'
+    +'</div>';
+  }
   else if(meta.kind==='next_steps'&&meta.suggestions)extra='<div class=chips style="margin:8px 0">'+meta.suggestions.map(s=>`<span class=chip-s onclick="ctlFill('${s.replace(/'/g,"")}')">${esc(s)}</span>`).join('')+'</div>';
   return `<div class="msg ${me?'me':'ai'}" style="margin:8px 0"><div><span class=bubble>${md(m.content)}</span>${extra}</div></div>`;
  }).join('')||'<div class=muted>Describe what you want to build — I\'ll ask a few questions, then research it and bring you options.</div>';
@@ -1175,14 +1259,31 @@ function ctlStreamInto(text){   // paint streamed tokens into the live assistant
  const t=$('#ctltyping');if(!t)return;const b=t.querySelector('.bubble');if(b)b.textContent=text;
  const log=$('#clog');if(log){const atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<60;if(atBottom)log.scrollTop=log.scrollHeight;}
 }
-async function ctlChoose(oid){const r=await post('/api/controller/choose',{org:ORG||0,option_id:oid});const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote')&&($('#cnote').innerHTML=gateNote(cg));return;}go('controller');}
+async function ctlChoose(oid){const r=await post('/api/controller/choose',{org:ORG||0,option_id:oid});const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote')&&($('#cnote').innerHTML=gateNote(cg));return;}markCtlNotifs();go('controller');}
+// ---- Assistant artifact review: research panel, design deep-link, notification hygiene ----
+function ctlModal(title,html){closeModal();
+ const o=document.createElement('div');o.id='ctlmodal';
+ o.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px';
+ o.onclick=e=>{if(e.target===o)closeModal()};
+ o.innerHTML='<div class=card style="max-width:720px;width:100%;max-height:82vh;overflow:auto;text-align:left"><div class="row spread" style="align-items:center;margin-bottom:8px"><h2 style=margin:0>'+esc(title)+'</h2><button aria-label="Close" onclick=closeModal()>Close</button></div><div id=ctlmodalbody style="white-space:pre-wrap;line-height:1.55">'+html+'</div></div>';
+ document.body.appendChild(o);
+ document.addEventListener('keydown',_modalEsc);}
+function _modalEsc(e){if(e.key==='Escape')closeModal();}
+function closeModal(){const m=$('#ctlmodal');if(m)m.remove();document.removeEventListener('keydown',_modalEsc);}
+async function ctlResearch(){   // open the full research report BEHIND the current options, so the CEO can read before committing
+ ctlModal('Research report','<div class=muted>Loading the research…</div>');
+ let d;try{d=await get('/api/controller/research?org='+(ORG||0))}catch(e){const b=$('#ctlmodalbody');if(b)b.innerHTML='<div class=muted>✗ '+esc(e.message)+'</div>';return}
+ const rep=((d&&d.report)||'').trim();const b=$('#ctlmodalbody');if(!b)return;
+ b.innerHTML=rep?md(rep):'<div class=muted>The research report isn\'t ready yet — it\'ll appear here once your fleet finishes researching this direction.</div>';}
+function goDesign(id){DESIGN_FOCUS=(id===undefined||id===null||id==='')?null:id;markCtlNotifs();go('design');}
+async function markCtlNotifs(){try{await post('/api/notifications/read_build',{});}catch(e){}try{refreshTopbar()}catch(e){}}
 async function orgNew(){const inp=$('#onm');const name=(inp?inp.value:'').trim();const note=$('#onote');
  if(!name){if(note)note.textContent='Enter a name for your company';if(inp)inp.focus();return}
  if(note)note.textContent='';
  const r=await post('/api/orgs/new',{name,vision:($('#ovis')||{}).value||''});
  if(r&&r.error){if(note)note.textContent='✗ '+r.error;return}
  if(r.org_id)switchOrg(r.org_id);}
-async function designOk(id){await post('/api/design/decide',{org:ORG,id,status:'approved'});go('design');}
+async function designOk(id){await post('/api/design/decide',{org:ORG,id,status:'approved'});markCtlNotifs();go('design');}
 async function recAgentic(){
  const i=$('#recneed');const need=(i?i.value:'').trim();const out=$('#recout');if(!out)return;
  if(!need){out.innerHTML='<span class=muted>Describe what you need first.</span>';if(i)i.focus();return}

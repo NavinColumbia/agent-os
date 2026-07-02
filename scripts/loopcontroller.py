@@ -13,6 +13,7 @@ process) — resume_stalled() (run from the scheduler) recovers a killed worker 
     loopcontroller.py say <tenant> <thread_id> "<msg>"
     loopcontroller.py choose <tenant> <thread_id> <option_id>
     loopcontroller.py state <thread_id>
+    loopcontroller.py research <tenant> <org_id>         # the current research run's report markdown (+ options)
     loopcontroller.py live <thread_id>                   # live progress: phase + elapsed + ETA + status
     loopcontroller.py cancel <tenant> <thread_id> [reason]  # halt the in-flight run (kill-switch) + park it
     loopcontroller.py resume
@@ -432,6 +433,98 @@ def _apply_provider_ctx(r):
         factory._ctx.engine, factory._ctx.api_key, factory._ctx.codex_key = "claude", (r or {}).get("key"), None
 
 
+def _research_report_for_run(tid, run_id):
+    """The synthesized research REPORT markdown (+ status + option cards) for a specific run — the raw doc
+    behind the distilled option chips, so the console can show "what the research actually found", not just
+    the titles. Reads research_runs.report_path off disk; best-effort, never raises. Empty report string if
+    the run hasn't written its doc yet (or the file is gone)."""
+    report, status, options = "", None, []
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT status, report_path FROM research_runs WHERE id=%s AND tenant_id=%s",
+                        (run_id, tid))
+            r = cur.fetchone()
+        if r:
+            status, path = r
+            if path:
+                try:
+                    report = Path(path).read_text()
+                except Exception:
+                    report = ""
+    except Exception:
+        pass
+    try:
+        import research as _research
+        options = (_research.run_state(tid, run_id) or {}).get("options", []) or []
+    except Exception:
+        options = []
+    return {"run_id": run_id, "status": status, "report": report, "options": options}
+
+
+def research_report(tid, org):
+    """EXPOSE THE RESEARCH DOC (console surface): the CURRENT research run's report markdown for an org's
+    controller thread — so the UI can render the full research document, not only the option cards. Returns
+    {run_id, status, report, options}; `report` is the markdown ('' if not written yet). Best-effort; never
+    raises. (Distinct from the distilled option summaries — this is the whole synthesized report.)"""
+    _ensure()
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT research_run_id FROM controller_state
+                           WHERE tenant_id=%s AND org_id=%s AND research_run_id IS NOT NULL
+                           ORDER BY thread_id DESC LIMIT 1""", (tid, org))
+            row = cur.fetchone()
+    except Exception as e:
+        return {"run_id": None, "status": None, "report": "", "options": [], "error": str(e)[:200]}
+    if not row or not row[0]:
+        return {"run_id": None, "status": None, "report": "", "options": []}
+    return _research_report_for_run(tid, row[0])
+
+
+def _enrich_options(opts, report_text=""):
+    """Guarantee EVERY option card carries a non-empty summary/detail so the console renders CONTENT, not a
+    bare title (#2). Research options already ship a `summary`; for any that don't, backfill from the
+    option's own rationale/detail/description, else a snippet of the research report — never a blank card."""
+    head = " ".join((report_text or "").split())[:240].strip()
+    out = []
+    for o in opts:
+        if not isinstance(o, dict):
+            out.append(o)
+            continue
+        o = dict(o)
+        if not (o.get("summary") or "").strip():
+            o["summary"] = ((o.get("rationale") or o.get("detail") or o.get("description") or "").strip()
+                            or ((head + "…") if head else "")
+                            or "See the full research report for details.")
+        out.append(o)
+    return out
+
+
+def _answer_at_options(tid, thread_id, s, msg, on_delta=None):
+    """ELABORATE at OPTIONS (#1): the CEO typed a QUESTION about the options/research instead of picking —
+    answer it directly from the research report + option cards (compare, explain, recommend), never force a
+    pick. Routes through _llm (fast model) with the report + options threaded in as context."""
+    opts = s.get("options") or []
+    report = ""
+    if s.get("research_run_id"):
+        try:
+            report = (_research_report_for_run(tid, s["research_run_id"]).get("report") or "")[:6000]
+        except Exception:
+            report = ""
+    opt_lines = []
+    for i, o in enumerate(opts, 1):
+        if isinstance(o, dict):
+            rec = " (recommended)" if o.get("recommended") else ""
+            opt_lines.append(f"{i}. {o.get('title', '')}{rec} — {o.get('summary', '')}")
+    sysp = ("The CEO is looking at the research-backed OPTIONS below and asked a question ABOUT them (to "
+            "compare, understand, or dig into the research) — answer it directly and concretely FROM the "
+            "research, in a few sentences. Do NOT choose for them unless they explicitly ask you to pick. "
+            "End by gently reminding them they can tap an option (or say e.g. \"option 2\") whenever they're "
+            "ready — no pressure.\n\n"
+            f"OPTIONS:\n{chr(10).join(opt_lines) or '(no options)'}\n\n"
+            f"RESEARCH REPORT (excerpt):\n{report or '(report not available; answer from the options above)'}")
+    return _llm(tid, thread_id, sysp, s, on_delta=on_delta)
+
+
 def say(tid, thread_id, msg, api_key=None, on_delta=None):
     # on_delta (optional): a token sink the console's SSE endpoint passes in to STREAM the conversational
     # reply live. It's threaded only into the free-text LLM turns (DISCOVER clarify, DEEP_DESIGN plan draft,
@@ -576,6 +669,12 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         clean = re.sub(r"\[\[PLAN\]\].*?\[\[/PLAN\]\]", "", reply, flags=re.S | re.I).strip()
         if pb:
             plan = _parse_plan(pb)
+            # EXPOSE THE FULL PLAN (#3): carry the COMPLETE plan text (impact map, invariants, parallelization,
+            # done checks — everything the model wrote), not just the one-line charter, so the console can show
+            # and explain the whole thing. `full` is the human-readable composed body; `body` keeps the raw
+            # block for anything that wants it verbatim.
+            plan["full"] = _plan_full_text(plan, pb)
+            plan["body"] = pb.strip()
             _set(thread_id, plan=plan)
             _report(tid, thread_id, (clean or "Here's the plan.") + "\n\nDoes this look right? Say \"looks good\" "
                                     "to lock it in, or tell me what to change.", {"kind": "plan", "plan": plan})
@@ -584,14 +683,24 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         return {"phase": phase}
 
     if phase == "OPTIONS":
-        # Options only move via choose() (a chip tap). If the CEO TYPES instead of tapping,
-        # don't run the generic affirmative branch — it would clear the gate and call advance(),
-        # which is a no-op at OPTIONS, stalling the thread. Try to map a typed ordinal to a chip;
-        # otherwise nudge them to tap. Never clear `awaiting`.
+        # Options MOVE only via choose() (a chip tap) or a typed ordinal — never clear `awaiting` here (the
+        # generic affirmative branch would call advance(), a no-op at OPTIONS, stalling the thread). But a
+        # typed message that ISN'T a pick is a REVIEW question, not a mis-tap: don't force ("tap one above").
+        # Map an ordinal -> choose(); an EMPTY/whitespace message -> gently nudge to pick; ANYTHING ELSE ->
+        # ELABORATE — answer their question about the options/research (fast model, report+options as
+        # context), then remind they can pick when ready (#1). The gate is HELD throughout.
         oid = _option_ordinal(msg, s.get("options") or [])
         if oid is not None:
             return choose(tid, thread_id, oid)
-        _report(tid, thread_id, "Tap one of the options above to pick a direction.")
+        if not (msg or "").strip():
+            _report(tid, thread_id,
+                     "Tap one of the options above to pick a direction — or ask me anything about them "
+                     "(e.g. \"tell me more about option 2\" or \"which is cheaper?\") and I'll dig into the "
+                     "research for you.", {"kind": "options_nudge", "options": s.get("options") or []})
+            return {"phase": phase}
+        reply = _answer_at_options(tid, thread_id, s, msg, on_delta=on_delta)
+        _report(tid, thread_id, reply, {"kind": "options_qa", "options": s.get("options") or [],
+                                        "research_run_id": s.get("research_run_id")})
         return {"phase": phase}
 
     if s["awaiting"] in ("user_feedback", "user_approval"):
@@ -669,7 +778,14 @@ def advance(thread_id, job_result=None):
 
     # research job finished -> present options
     if job_result and job_result.get("run_id") and "options" in job_result:
-        opts = job_result.get("options", [])
+        # ENRICH the option cards so each carries a real summary/detail (not just a title) — backfilling from
+        # the research report for any that lack one (#2), so the console renders CONTENT on every card.
+        report_text = ""
+        try:
+            report_text = _research_report_for_run(tid, job_result["run_id"]).get("report", "") or ""
+        except Exception:
+            report_text = ""
+        opts = _enrich_options(job_result.get("options", []), report_text)
         _set(thread_id, research_run_id=job_result["run_id"], options=opts)
         _job_clear(thread_id)
         _to(thread_id, "OPTIONS"); _set(thread_id, awaiting="user_approval")
@@ -712,7 +828,8 @@ def advance(thread_id, job_result=None):
                      "I'll carry it into the plan once you choose.)")
         else:
             intro = "Here's what I found — pick a direction:"
-        _report(tid, thread_id, intro, {"kind": "options", "options": opts})
+        _report(tid, thread_id, intro, {"kind": "options", "options": opts,
+                                        "research_run_id": job_result["run_id"], "report_available": True})
         # PING: research RESULTS landed — heads-up the CEO now (not only on failure/final ship). level=urgent
         # so the in-app bell/feed lights up unmistakably AND a push fires (if ntfy/email are configured).
         _ping(tid, "Your options are ready — review them",
@@ -721,9 +838,13 @@ def advance(thread_id, job_result=None):
         return
     if job_result and job_result.get("screens") is not None:        # prototype finished -> gate at IMPLEMENT
         _job_clear(thread_id)
+        # SURFACE THE DESIGN (#4): reference the design artifact in the meta (org + a flag + the product +
+        # the surfaces) so the console can link straight to "Review the design" instead of a dead-end bubble.
         _report(tid, thread_id, f"I've drafted {job_result.get('screens', 0)} prototype screens "
                                 f"(cockpit / team / external) — review them in Design. Say \"approve\" to build it.",
-                {"kind": "prototype"})
+                {"kind": "prototype", "design_ready": True, "org": s.get("org_id"),
+                 "product": s.get("product"), "screens": job_result.get("screens", 0),
+                 "surfaces": job_result.get("surfaces")})
         _to(thread_id, "IMPLEMENT"); _set(thread_id, awaiting="user_feedback")
         # PING: a PROTOTYPE landed — heads-up the CEO to review + approve. level=urgent so the bell/feed lights
         # up unmistakably AND a push fires (if ntfy/email are configured).
@@ -1096,6 +1217,22 @@ def _parse_plan(body):
             "charter": f("charter", "Build a small, well-tested product.")}
 
 
+def _plan_full_text(plan, raw=""):
+    """Compose the COMPLETE, human-readable plan text from the parsed fields (#3) so the console can render
+    the whole plan — title, charter, the full bullet list, and the agentic feature — not a one-line charter.
+    Falls back to the raw [[PLAN]] block body if the parsed fields are somehow empty."""
+    parts = [f"**{plan.get('name', 'app')}** ({plan.get('kind', 'service')})"]
+    if plan.get("charter"):
+        parts.append(plan["charter"].strip())
+    if plan.get("plan"):
+        parts.append("Plan:\n" + plan["plan"].strip())
+    ag = (plan.get("agentic") or "").strip()
+    if ag and ag.lower() != "none":
+        parts.append("Agentic feature: " + ag)
+    full = "\n\n".join(p for p in parts if p).strip()
+    return full or (raw or "").strip()
+
+
 def _affirmative(msg):
     # Includes the recovery words the failure UI tells the CEO to type ("retry" etc.) so the instructed
     # word actually clears the gate and re-dispatches the parked phase via advance() — not a no-op.
@@ -1255,7 +1392,24 @@ def _selftest():
         consent.record(tid)                                       # CEO accepts AI-processing consent in Settings
         say(tid, th, "I want a YouTube competitor")               # DISCOVER->RESEARCH->OPTIONS
         opt = wait(th, "OPTIONS", "user_approval")
-        gate_held = (say(tid, th, "hmm") or True) and _st(th)["phase"] == "OPTIONS"   # OPTIONS only moves via choose()
+        # (#1) OPTIONS ELABORATES, doesn't force: a typed QUESTION about the options runs an LLM answer (a new
+        # task) and the gate is HELD (still OPTIONS/user_approval) — never advances, never a bare "tap one".
+        n_opt = len(tasks)
+        say(tid, th, "which option is cheaper and why?")
+        options_elaborate_ok = (len(tasks) > n_opt and _st(th)["phase"] == "OPTIONS"
+                                and _st(th)["awaiting"] == "user_approval")
+        # an EMPTY/whitespace message just NUDGES to pick — no LLM turn, gate still held.
+        n_opt2 = len(tasks)
+        say(tid, th, "   ")
+        options_nudge_ok = (len(tasks) == n_opt2 and _st(th)["phase"] == "OPTIONS")
+        # (#2) EXPOSE THE RESEARCH DOC + option summaries: research_report() returns the report+options for the
+        # org, and every presented option card carries a non-empty summary (not a bare title).
+        rr = research_report(tid, org)
+        opts_now = _st(th).get("options") or []
+        research_report_ok = (isinstance(rr, dict) and "report" in rr and isinstance(rr.get("options"), list)
+                              and bool(opts_now)
+                              and all((o.get("summary") or "").strip() for o in opts_now if isinstance(o, dict)))
+        gate_held = _st(th)["phase"] == "OPTIONS"                  # OPTIONS only moves via choose()/an ordinal
         choose(tid, th, 1)                                         # ->DEEP_DESIGN
         in_design = _st(th)["phase"] == "DEEP_DESIGN"
         say(tid, th, "go ahead")                                  # draft PLAN (awaiting feedback)
@@ -1268,8 +1422,21 @@ def _selftest():
             pc, pm = cur.fetchone()
         plan_card = isinstance(pm, dict) and pm.get("kind") == "plan"
         no_tag_leak = "[[" not in (pc or "")
+        # (#3) EXPOSE THE FULL PLAN: the plan meta carries the COMPLETE plan text (meta.plan.full), not just a
+        # one-line charter — persisted to state AND on the plan card — so the console can show & explain it.
+        plan_full_ok = (bool((_st(th).get("plan") or {}).get("full"))
+                        and isinstance(pm, dict) and bool(((pm.get("plan") or {}).get("full")))
+                        and "Plan:" in ((_st(th).get("plan") or {}).get("full") or ""))
         say(tid, th, "looks good")                                # approve plan -> PLAN_APPROVAL -> PROTOTYPE
         proto = wait(th, "IMPLEMENT", "user_feedback")            # prototype done -> gated at IMPLEMENT for approval
+        # (#4) SURFACE THE DESIGN: the prototype message meta references the design artifact (org + a flag) so
+        # the console can link "Review the design".
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT meta FROM chat_messages WHERE thread_id=%s AND role='assistant'
+                           AND meta->>'kind'='prototype' ORDER BY id DESC LIMIT 1""", (th,))
+            _pr = cur.fetchone()
+        design_surface_ok = (bool(_pr) and isinstance(_pr[0], dict) and _pr[0].get("design_ready") is True
+                             and _pr[0].get("org") == org)
         say(tid, th, "approve")                                   # -> build -> TESTQA -> DELIVER
         deliver = wait(th, "DELIVER")
         with psycopg.connect(DB) as c, c.cursor() as cur:
@@ -1414,7 +1581,9 @@ def _selftest():
         ok = (consent_gate_ok and opt and gate_held and in_design and plan_persisted and plan_card
               and no_tag_leak and proto and deliver and jobs >= 3
               and eta_ok and research_eta_ok and consts_ok and ping_ok and live_cancel_ok
-              and consent_reask_ok and sla_ok and status_honest_ok and midflight_intent_ok and dedupe_ok)
+              and consent_reask_ok and sla_ok and status_honest_ok and midflight_intent_ok and dedupe_ok
+              and options_elaborate_ok and options_nudge_ok and research_report_ok and plan_full_ok
+              and design_surface_ok)
         print(f"consent_gate={consent_gate_ok} options={opt} gate_held={gate_held} design={in_design} "
               f"plan_persisted={plan_persisted} plan_card={plan_card} no_tag_leak={no_tag_leak} "
               f"prototype={proto} deliver={deliver} jobs_done={jobs}")
@@ -1428,6 +1597,9 @@ def _selftest():
               f"status_honest={status_honest_ok}")
         print(f"midflight_intent={midflight_intent_ok}(queued={intent_queued},applied={intent_applied},"
               f"status_not_queued={status_not_queued}) dedupe={dedupe_ok}")
+        print(f"options_elaborate={options_elaborate_ok} options_nudge={options_nudge_ok} "
+              f"research_report={research_report_ok} plan_full={plan_full_ok} "
+              f"design_surface={design_surface_ok}")
         print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel"
               " + consent-reask/sla/status-honesty ✅" if ok else "FAIL")
     finally:
@@ -1453,6 +1625,8 @@ def _main(a):
         print(json.dumps(choose(a[1], int(a[2]), int(a[3]))))
     elif a[0] == "state" and len(a) > 1:
         print(json.dumps(state(int(a[1])), indent=2))
+    elif a[0] == "research" and len(a) > 2:
+        print(json.dumps(research_report(a[1], int(a[2])), indent=2))
     elif a[0] == "live" and len(a) > 1:
         print(json.dumps(live_status(int(a[1])), indent=2))
     elif a[0] == "cancel" and len(a) > 2:
@@ -1462,7 +1636,8 @@ def _main(a):
     elif a[0] == "watchdog":
         print(json.dumps(sla_watchdog()))
     else:
-        sys.exit("usage: loopcontroller.py start|say|choose|state|live|cancel|resume|watchdog|selftest ...")
+        sys.exit("usage: loopcontroller.py "
+                 "start|say|choose|state|research|live|cancel|resume|watchdog|selftest ...")
 
 
 if __name__ == "__main__":

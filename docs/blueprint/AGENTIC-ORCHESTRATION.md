@@ -67,6 +67,22 @@ Implementation implication: a real **async message bus + per-actor inbox** on to
 "handle incoming messages," and supervisors subscribing to their children's event streams — replacing the
 current `parallel()`-barrier fan-in for these fleets.
 
+## Recursive, elastic org scaling (the tree grows itself)
+The hierarchy is NOT fixed-depth — it is recursive and self-scaling, like a real company growing:
+- **Any supervisor can spawn sub-supervisors**, which spawn their own children — arbitrary depth and
+  width. Example: a `fintech` super-supervisor over a **Pay team** and a **Wallet team**, each with a
+  head (Head of Pay, Head of Wallet) over its own devs; add a **Payments-Fraud team** later and the
+  fintech supervisor just spawns another head. An IC can become a lead; a lead can spin up a team.
+- **Org-structure decision at EVERY prompt/decision point** (an AI call): *"is the current team structure
+  sufficient for this scope, or do we need to expand — a new supervisor, a new sub-team, more agents?"*
+  **Bias toward expansion/scalability** when uncertain (cost is not a constraint).
+- **Escalation + events work at every level** (§ execution model): IC → team-head → domain-supervisor →
+  controller → human. A blocker or correction routes up only as far as needed and resolves there.
+- **No fixed depth or width.** The system decomposes a large vision (e.g. "Google-scale fintech suite")
+  into a deep tree of domains → teams → devs, elastically, and restructures as functionality grows.
+- Goal restated: **one prompt (a vision) → a full, working, bug-free app** — a self-organizing org of
+  agents that scales itself to whatever the vision demands.
+
 ## Design principles
 - Every state decision = an AI call (maximally agentic; cost is not a constraint).
 - Supervisors are recursive: a child can itself become a supervisor for a sub-decomposition.

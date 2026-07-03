@@ -266,6 +266,16 @@ def _fmt_elements(elements, limit=80):
                 parts.append(f"{k}={e[k]}")
         if e.get("disabled"):
             parts.append("(disabled)")
+        # SEMANTIC STATE from the DOM (aria-pressed/aria-selected/aria-expanded/checked/value): the
+        # ground truth for selected/active/checked judgements. Screenshots also carry hover/focus/
+        # transition styling — pixels alone must never decide state (a cursor resting on a button is
+        # not a selection; three QA rounds false-positived on exactly that).
+        for k, tag in (("pressed", "aria-pressed"), ("selectedState", "aria-selected"),
+                       ("expanded", "aria-expanded"), ("checked", "checked")):
+            if e.get(k) is not None and str(e.get(k)).strip() != "":
+                parts.append(f"{tag}={e[k]}")
+        if e.get("value") is not None and str(e.get("value")).strip() != "":
+            parts.append(f"value={json.dumps(str(e['value'])[:60])}")
         lines.append(" ".join(str(p) for p in parts))
     return "\n".join(lines) or "(no interactable elements found)"
 
@@ -481,6 +491,12 @@ CONTRACT — apply IN THIS ORDER:
    is blank" from a transient loading state: if `settled` is true and the expected control is genuinely
    absent, that is a real defect; if it IS present in the settled after-state, it rendered fine (a slow
    paint is not a bug). Never turn an observation race into an app bug.
+   STATE GUARD: for selected/active/checked/expanded judgements the DOM semantics in
+   INTERACTABLE_ELEMENTS (aria-pressed / aria-selected / aria-expanded / checked / value) are the ground
+   truth. Pixels alone NEVER decide state: hover/focus/mid-transition styling in a screenshot is not a
+   selection (a cursor resting on a button is not "active"). Only call a state bug when the DOM
+   semantics themselves are wrong, or a control visibly claims a state its semantics contradict AND the
+   styling is clearly the selected treatment (not hover/focus).
 3. If it behaved as expected, verdict "pass".
 
 Reply with ONLY a JSON object, no prose:

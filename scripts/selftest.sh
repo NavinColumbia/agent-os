@@ -176,9 +176,25 @@ ckp "enforcement-layer consistency (gov==hook)" "$PY scripts/test_enforcement_co
 ckp "governance controls wired"              "$PY scripts/test_governance_wired.py | grep -q PASS"
 ckp "quality-lens triad wired"               "$PY scripts/test_quality_lenses_wired.py | grep -q PASS"
 ckp "daemon supervision wired"               "$PY scripts/test_supervision_wired.py | grep -q PASS"
+ckp "sentinel silent-failure observer"       "$PY scripts/sentinel.py selftest | grep -q PASS"
 ckp "acceptance dogfood wired"               "$PY scripts/dogfood.py selftest | grep -q PASS"
 ckp "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ckp "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"
+
+sect "quality engine (agentic QA — REBUILD-PLAN C1)"
+# The five scripts/qa/* offline selftests (deterministic: AI calls + browser stubbed, no network/spend)
+# + the real-browser bridge protocol selftest. Tight grep patterns on purpose: qa output legitimately
+# contains the word "PASSED" in verdict strings, so a bare `grep -q PASS` could green a FAIL run.
+ckp "qa story generation (offline)"          "$PY scripts/qa/story_gen.py selftest | grep -q 'PASS: story_gen'"
+ckp "qa explorer (blame/settle contracts)"   "$PY scripts/qa/qa_explorer.py 2>&1 | grep -q 'qa_explorer selftest: PASS'"
+ckp "qa dev-fix loop (plan/spawn/judge)"     "$PY scripts/qa/dev_loop.py selftest | grep -q 'PASS: dev-fix loop wired'"
+ckp "qa grounded report (md+json verdict)"   "$PY scripts/qa/qa_report.py selftest | grep -q 'PASS: qa_report'"
+ckp "qa autonomous loop (rounds/fix/reset)"  "$PY scripts/qa/qa_run.py selftest | grep -q 'qa_run selftest: PASS'"
+ckp "qa browser bridge (real browser proto)" "NODE_PATH=\$HOME/projects/products/noupload/node_modules node scripts/qa/browser_bridge.js selftest | grep -q '\"selftest\":\"PASS\"'"
+# Wiring guard (STANDARDS-verification: probe the mechanism, never the claim): FAILS if factory's QA
+# stage / gate_check LAUNCH / loopcontroller TESTQA stop consuming the qa verdict JSON (passed,
+# blocking_open==0, stories>0), or if a self-grading `qa_run` shadow reappears in factory.py.
+ckp "QA ship-gate wired (verdict JSON consumed)" "$PY scripts/test_qa_gate_wired.py | grep -q '^PASS'"
 
 # Fire the bounded concurrent pool for everything enqueued above.
 run_pool
@@ -197,7 +213,12 @@ ck "research state+options"                 "$PY scripts/research.py selftest | 
 ck "CLOSED-LOOP controller (discover->deliver)" "$PY scripts/loopcontroller.py selftest | grep -q PASS"
 
 echo "=== integration: standing Controller ==="
-ck "controller full lifecycle -> LAUNCHED"  "rm -rf ~/projects/products/st-demo; dbexec \"DELETE FROM dbos.workflow_status\" >/dev/null 2>&1 || true; sg docker -c \"docker exec -e PGPASSWORD=$PW agentos-postgres psql -U agentos -d agentos_dbos_sys -c \\\"DELETE FROM dbos.workflow_status WHERE workflow_uuid='prod-st-demo'\\\"\" >/dev/null 2>&1; $PY scripts/controller.py run st-demo | grep -q LAUNCHED"
+# C1: the Controller NEVER seeds the QA verdict for itself. Without docs/QA-VERDICT.json the lifecycle
+# must BLOCK honestly at the REVIEW gate (naming the missing verdict); with a real machine verdict
+# present (here: a green fixture shaped exactly like qa_run.write_verdict output) it reaches LAUNCHED.
+wipe_wf(){ dbexec "DELETE FROM dbos.workflow_status" >/dev/null 2>&1 || true; sg docker -c "docker exec -e PGPASSWORD=$PW agentos-postgres psql -U agentos -d agentos_dbos_sys -c \"DELETE FROM dbos.workflow_status WHERE workflow_uuid='prod-st-demo'\"" >/dev/null 2>&1; }
+ck "controller: no QA verdict -> honest REVIEW block" "rm -rf ~/projects/products/st-demo; wipe_wf; $PY scripts/controller.py run st-demo 2>&1 | grep -q 'QA-VERDICT'"
+ck "controller lifecycle -> LAUNCHED (verdict present)" "$PY -c \"import json,time,pathlib; p=pathlib.Path.home()/'projects/products/st-demo/docs/QA-VERDICT.json'; p.parent.mkdir(parents=True,exist_ok=True); p.write_text(json.dumps({'schema':'aos.qa.verdict/1','product':'st-demo','passed':True,'stories':3,'blocking_open':0,'open_bugs':0,'verdict':'ALL 3 STORIES PASSED','report_md':'/tmp/aos-qa/report-st-demo.md','report_json':'/tmp/aos-qa/report-st-demo.json','producer':'qa_run','generated_at':time.time()}))\"; wipe_wf; $PY scripts/controller.py run st-demo | grep -q LAUNCHED"
 
 rm -f /tmp/st.$$
 echo

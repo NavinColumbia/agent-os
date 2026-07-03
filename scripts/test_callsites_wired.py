@@ -39,6 +39,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "qa"))   # the agentic QA engine (qa_run/qa_report seams)
 
 # ---------------------------------------------------------------------------
 # 1. Curated INTEGRATION-SEAM targets: module -> {leaf function names}
@@ -55,6 +56,11 @@ TARGETS = {
     "vault":        {"get_secret"},
     "orgs":         {"get"},
     "cockpit":      {"cockpit", "control", "health", "company_summary", "comms_graph"},
+    # C1 ship-gate seams: factory's QA stage + loopcontroller TESTQA + gate_check all hang off these —
+    # a signature drift here silently unwires the LAUNCH gate, exactly the bug-class this guard kills.
+    "qa_run":       {"qa_run", "write_verdict"},
+    "qa_report":    {"build_report"},
+    "factory":      {"run_grounded_qa", "run_independent_qa", "run_agentic_web_qa"},
 }
 
 

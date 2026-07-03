@@ -113,7 +113,7 @@ lenses:
     status: enforced
     standard: docs/STANDARDS-acceptance.md
     role: { file: qa-security, keyword: acceptance }
-    guard: "acceptance dogfood wired"               # scripts/dogfood.py: rotating demanding-user pass -> files findings, scheduled weekly
+    guard: "acceptance dogfood wired"               # scripts/dogfood.py: rotating personas DRIVE the live console via qa_explorer -> findings + blocking alerts, scheduled daily
 
   # --- deferred WITH REASON (a decision, not a silent gap) — revisit triggers stated ---
   - id: performance-load

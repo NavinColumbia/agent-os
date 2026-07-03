@@ -116,6 +116,14 @@ const COLLECT_ELEMENTS = `(() => {
       name: (el.getAttribute('name') || '').slice(0, 80),
       placeholder: (el.getAttribute('placeholder') || '').slice(0, 80),
       href: (el.getAttribute('href') || '').slice(0, 120),
+      // SEMANTIC STATE — the evaluator must judge selected/checked/disabled from the DOM, never from
+      // pixels alone (hover/focus/transition styling in a screenshot is not state).
+      pressed: el.getAttribute('aria-pressed') || undefined,
+      selectedState: el.getAttribute('aria-selected') || undefined,
+      expanded: el.getAttribute('aria-expanded') || undefined,
+      checked: isControl && (el.type === 'checkbox' || el.type === 'radio') ? String(!!el.checked) : undefined,
+      disabled: (el.disabled || el.getAttribute('aria-disabled') === 'true') ? 'true' : undefined,
+      value: isControl && !/^(password)$/i.test(el.type || '') ? String(el.value || '').slice(0, 60) : undefined,
       selector: '[data-aos-idx="' + i + '"]'
     });
     i++;
@@ -257,6 +265,11 @@ class Bridge {
 
   async state() {
     await this.settle();   // observe ONLY the settled DOM — never snapshot a half-painted view
+    // PARK THE MOUSE before observing: after a click the cursor rests on the clicked control, so its
+    // :hover style bleeds into the state screenshot and the AI evaluator misreads hover as "selected"
+    // (a real false-positive bug class: three QA rounds flagged a tip-preset as 'still active' when the
+    // pixels showed only the hover treatment). State snapshots must capture STATE, not cursor incident.
+    try { await this.page.mouse.move(0, 0); await this.page.waitForTimeout(120); } catch (_) {}
     ensureDir(SHOT_DIR);
     const file = path.join(SHOT_DIR, 'state-' + Date.now() + '-' + Math.floor(Math.random() * 1e4) + '.png');
     let shotOk = false;

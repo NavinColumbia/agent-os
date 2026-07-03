@@ -51,7 +51,7 @@ PRODUCTS = Path.home() / "projects" / "products"
 STAGE_PLAN = {
     "SPEC":   {"artifacts": ["docs/SPEC.md", "docs/adr/0001-arch.md"], "action": ("Edit", {"path": "docs/SPEC.md"})},
     "BUILD":  {"artifacts": ["src/app.py"],                            "action": ("Edit", {"path": "src/app.py"})},
-    "QA":     {"artifacts": ["docs/QA-REPORT.md"],                     "action": ("Bash", {"cmd": "python -m pytest -q"})},
+    "QA":     {"artifacts": ["docs/QA-VERDICT.json"],                  "action": ("Bash", {"cmd": "python -m pytest -q"})},
     "REVIEW": {"artifacts": ["docs/REVIEW.md"],                        "action": ("Bash", {"cmd": "git log -1"})},
     "LAUNCH": {"artifacts": ["docs/LAUNCH-CHECKLIST.md"],              "action": ("Bash", {"cmd": "git status"})},
 }
@@ -168,12 +168,14 @@ def stage_step(product: str, stage: str) -> str:
         agent_worker.run_agent(str(repo), "Implement the spec in src/. Edit/create files under src/ only.")
     for rel in STAGE_PLAN[stage]["artifacts"]:
         # The Controller must NOT author its own gate evidence (findings #37/#45/#46): if the actor
-        # the gate checks is the same one fabricating SPEC.md/ADR/QA-REPORT.md/src, the gate proves
+        # the gate checks is the same one fabricating SPEC.md/ADR/QA-VERDICT.json/src, the gate proves
         # nothing and the lifecycle advances on stubs. gate_check now validates artifact CONTENT, so
         # such stubs are rejected anyway — and we stop fabricating gate-enforced artifacts entirely.
         # Real gate artifacts come from the responsible agent/human (BUILD agent for src/; pm/tech-lead
-        # /qa for SPEC/ADR/QA-REPORT) or seeded inputs; absent ones correctly BLOCK the next gate.
-        if rel in ("docs/SPEC.md", "docs/QA-REPORT.md") or rel.startswith("docs/adr/") or rel.startswith("src/"):
+        # for SPEC/ADR; an ACTUAL qa_run execution for the QA verdict) or seeded inputs; absent ones
+        # correctly BLOCK the next gate.
+        if rel in ("docs/SPEC.md", "docs/QA-REPORT.md", "docs/QA-VERDICT.json") \
+                or rel.startswith("docs/adr/") or rel.startswith("src/"):
             continue
         p = repo / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -197,16 +199,19 @@ def run_product(product: str) -> str:
 
 def _seed(product):
     """A product enters with a charter PLUS the upstream roles' real gate artifacts (pm's SPEC,
-    tech-lead's ADR, qa's QA-REPORT, builder's src). The Controller deliberately does NOT author
-    its own gate evidence (findings #37/#45/#46) — it only advances the lifecycle, enforcing each
-    content-checked gate against artifacts the responsible roles produced. Here those role outputs
-    are seeded as real, filled, *passing* inputs (gate_check's own golden artifacts), so the gates
-    have genuine evidence to verify rather than fabricated stubs."""
+    tech-lead's ADR, builder's src). The Controller deliberately does NOT author its own gate
+    evidence (findings #37/#45/#46) — it only advances the lifecycle, enforcing each content-checked
+    gate against artifacts the responsible roles produced.
+
+    THE QA VERDICT IS NEVER SEEDED (REBUILD-PLAN C1): docs/QA-VERDICT.json is the LAUNCH artifact and
+    it may only come from an ACTUAL qa_run execution against the running build (agent-os
+    scripts/qa/qa_run.py) — the builder never grades its own homework, and the Controller never
+    fabricates the launch report for itself. A product without that verdict fails the REVIEW/LAUNCH
+    gate HONESTLY (gate_check says exactly why), which is the correct outcome."""
     repo = _repo(product)
     seeds = {
         "docs/SPEC.md":            gate_check._REAL_SPEC,
         "docs/adr/0001-arch.md":   gate_check._REAL_ADR,
-        "docs/QA-REPORT.md":       gate_check._REAL_QA,
         "src/app.js":              gate_check._REAL_SRC,
     }
     for rel, content in seeds.items():

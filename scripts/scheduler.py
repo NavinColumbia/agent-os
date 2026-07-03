@@ -48,9 +48,10 @@ DEFAULT_SCHEDULES = [
     ("resume-sweep",      f"{VENV_PY} {SCRIPTS / 'factory.py'} resume-sweep", 600),
     ("tasksweep",         f"{VENV_PY} {SCRIPTS / 'tasksweep.py'} run", 600),
     ("reap-orphans",      f"{VENV_PY} {SCRIPTS / 'reap.py'} run", 600),
-    # Standing acceptance/dogfood pass: a rotating demanding-user persona judges the live product vs
-    # best-in-class and FILES findings to an owner — so the owner stops being the only one applying that lens.
-    ("acceptance-dogfood", f"{VENV_PY} {SCRIPTS / 'dogfood.py'} run", 604800),
+    # Standing acceptance/dogfood pass (DAILY): a rotating demanding-user persona DRIVES the live
+    # console through the qa explorer on the real journeys and FILES findings (blockers alert at once).
+    # `cron` detaches the real run so JOB_TIMEOUT can't guillotine a long browser pass.
+    ("acceptance-dogfood", f"{VENV_PY} {SCRIPTS / 'dogfood.py'} cron", 86400),
 ]
 
 

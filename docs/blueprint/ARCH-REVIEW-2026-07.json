@@ -218,5 +218,748 @@
   "QA declares a round 'clean' with three non-blocking bugs 'noted' in a /tmp markdown file nobody reads or routes \u2014 the CEO is the one who finds all three, violating the core promise in the north star's own words.",
   "A blocking bug is 'fixed': the judge was told residual=[] ('empty means the story now passes') without any re-observation and 'FILES CHANGED' was the plan's wish-list \u2014 the CEO re-hits the same bug an hour later and watches the system claim it was fixed.",
   "A frustrated user churns on Monday over an onboarding dead-end; the acceptance dogfood pass that would flag it runs the following week, as a curl-based text audit, under a persona rotation that is stuck on 'first-run' because the selftest polluted the audit counter."
+ ],
+ "full": [
+  {
+   "domain": "CEO experience surface \u2014 scripts/console.py shell + cockpit/orgview/designview/billingview/integrationsview/crossorgview/projectsview/traceview/dashboard",
+   "verdicts": [
+    {
+     "mechanism": "Console shell: single-file server + string-concat SPA (nav, routing, polling)",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The entire product UI for 100k CEOs is one Python BaseHTTPRequestHandler serving a single inline HTML string (console.py:464-1392) with innerHTML-built views. There is ZERO URL routing \u2014 no pushState/hash anywhere (grep: 0 hits), so the browser back button exits the app, refresh loses your place, and nothing is deep-linkable or shareable. Views update by 5-6s/15s setInterval polls (console.py:1000,1376-1377), not push. Inline-style hacks like style=margin:6px_0 (console.py:1005,1016,1076) are invalid CSS that silently drops the margin \u2014 visible slop in the orgs/agents/agentic tiles. ThreadingHTTPServer on 127.0.0.1 with a synchronous psycopg connect per request is a dev toy, not a commercial front end.",
+     "action": "Rebuild the front-of-house as a real SPA (any modern framework) with URL routing, server push (SSE/WebSocket) for live state, and an API server that isn't http.server. Keep the JSON view-module contract \u2014 it's the one salvageable layer.",
+     "files": "scripts/console.py:464-1392, 1000, 1376-1377, 1395-1560"
+    },
+    {
+     "mechanism": "Assistant / controller chat (streaming, first-run wizard, options/plan cards)",
+     "verdict": "FALLS_SHORT",
+     "why": "Genuinely the best-crafted surface: SSE token streaming with blocking fallback (console.py:1220-1250, 1411-1471), saved-idea persistence across the provider gate (console.py:905-931), option/plan/design review cards (console.py:1172-1200). But it is ONE flat thread per company with a single anonymous 'assistant' \u2014 no named agents, no delegation ('ask the CTO', '@security'), no parallel workstreams. The live-progress ETA is a HARDCODED table (_PHASE_ETA_MIN, console.py:163-164) \u2014 'IMPLEMENT: 14 min' \u2014 and when it's wrong the bubble says 'taking a little longer than usual' forever (console.py:216-217,225-226). North star says every decision is agentic, not hardcoded; a CEO staring at a fake countdown that never resolves is a churn moment. assistant.py (the org=0 home router) doesn't even exist yet \u2014 org=0 silently falls back to the first company (console.py:111-127).",
+     "action": "Keep the streaming/gate UX. Replace the flat thread with a multi-thread inbox of named agents (per project/department), make ETAs come from the controller's real plan, and ship assistant.py so 'All companies' is a real account-wide brain, not a fallback.",
+     "files": "scripts/console.py:111-127, 159-164, 198-228, 947-1001, 1211-1261"
+    },
+    {
+     "mechanism": "Cockpit (company at a glance: KPIs, health, projects, comms, queue)",
+     "verdict": "FALLS_SHORT",
+     "why": "It is an honest tenant-scoped rollup (cockpit.py:110-152) with a plain-language verdict line (cockpit.py:244-306) \u2014 good bones. But the 'company' is a build queue: a hardcoded 5-stage pipeline PIPELINE=['SPEC','BUILD','QA','REVIEW','LAUNCH'] (cockpit.py:37), products shown as machine slugs like 'abc123-app' (console.py:363-364 generates them), and 'Communications' is a 15-row table of truncated intents (cockpit.py:123-127) with NO way to read what any agent actually said. comms_graph() \u2014 the one thing that could make the org feel alive \u2014 is fully implemented server-side (cockpit.py:309-338) and NEVER fetched by the frontend (grep '/api/comms_graph' in the PAGE JS: 0). The view issues ~8 sequential awaited fetches per render (console.py:1037-1043). No revenue, no users, no customer signal \u2014 a CEO of a multi-billion-dollar company sees token counts.",
+     "action": "Render the comms graph and make every communication clickable through to the full conversation. Replace stage bars with a live activity narrative ('QA found 3 issues, builder is fixing #2'). Add business KPIs (users, revenue, uptime of shipped products) next to spend. Batch the fetches into one payload.",
+     "files": "scripts/cockpit.py:37, 110-152, 309-338; scripts/console.py:1037-1070"
+    },
+    {
+     "mechanism": "Org visibility (orgview.py org chart + console 'Org chart'/Team view)",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The north star is 'elastic recursive orgs... tens of thousands of employees'. The actual org chart is a STATIC Python list of 9 roles, one level deep, all reporting to 'controller' (orgview.py:35-45), overlaid with a 15-minute liveness window. The console renders it as two flat card lists ('Controller' + 'Reports', console.py:1103-1107) \u2014 not even a tree. The Team view shows a 'Seats' table containing your own tenant id as the only member plus the literal string 'Multi-seat RBAC is on the roadmap (Team tier).' shipped to the user (console.py:352, 1102). A skeptical CEO opens 'Org chart' expecting a living company and finds nine hardcoded job titles and a roadmap apology \u2014 this is the single biggest illusion-break in the product.",
+     "action": "Build a real dynamic org: agents as first-class entities with names, tenure, current assignment, history and reporting lines derived from actual spawn/delegation data; a zoomable tree/graph that grows as the controller hires; click any agent to see their work and message them. Delete the static ORG list and the 'roadmap' copy.",
+     "files": "scripts/orgview.py:35-45, 71-89; scripts/console.py:344-353, 1099-1108"
+    },
+    {
+     "mechanism": "Design view (prototype gallery + approval)",
+     "verdict": "FALLS_SHORT",
+     "why": "Broken by a field-name mismatch \u2014 the classic declared-not-wired bug: designview.gallery() returns html / html_excerpt / preview_text (designview.py:73-84), but the console looks for s.image||s.thumbnail||s.screenshot, s.preview_url||s.url and s.preview_html (console.py:1021-1023) \u2014 none exist. Result: every prototype card renders title + status + 'Approve design' with NO preview. The CEO is asked to approve designs they literally cannot see \u2014 a trust-killer at the exact moment the product should astonish. Worse, the dead preview_html branch injects raw HTML into the console DOM unsandboxed (console.py:1023) \u2014 if ever wired as-is, agent-generated HTML executes in the console origin (stored XSS by design).",
+     "action": "Wire the real fields: render gallery html in a sandboxed iframe srcdoc, show preview_text as fallback, add side-by-side compare and request-changes with a comment (not just approve/back-to-draft).",
+     "files": "scripts/console.py:1018-1027; scripts/designview.py:52-118"
+    },
+    {
+     "mechanism": "Billing view + topbar spend chip",
+     "verdict": "FALLS_SHORT",
+     "why": "change_plan() is 'intentionally money-free' \u2014 it flips a DB column with no payment (billingview.py:57-75), and the UI tells the user so: 'Real payment is gated (BYO Stripe).' (console.py:1093). The commercial bar (hundreds of millions, hundreds of thousands of paying users) is unreachable with zero payment rails. The topbar spend chip logic is broken-by-inspection: it builds '$' + (tokens!=null ? invoice.total : '') and needs a second fallback when it renders a bare '$' (console.py:884-885). Usage is shown as raw token counts \u2014 meaningless to a CEO. No invoice history, no receipts, no per-company cost allocation.",
+     "action": "Integrate a real payment provider (Stripe subscriptions + metered usage), show cost per company/project in dollars with trends, and rewrite the topbar chip to one deliberate format.",
+     "files": "scripts/billingview.py:57-75; scripts/console.py:880-891, 1093"
+    },
+    {
+     "mechanism": "Integrations marketplace",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "Sixteen hardcoded catalog entries where connect() for 'oauth' items (Stripe, GitHub, Slack, Salesforce, Google Analytics) performs NO oauth \u2014 it just writes status='connected' with no credential and no verification (integrationsview.py:101-120). The console collects api_key secrets via a NATIVE BROWSER prompt(): \"prompt('API key / secret for '+slug+' (leave blank if OAuth):')\" (console.py:1333). So a CEO 'connects' Salesforce, sees a green 'connected' pill, and nothing works \u2014 the system lied. For a user base that already distrusts AI, a fake green checkmark is fatal. Compare: the Providers view right next to it does real validated key entry (console.py:1339-1358) \u2014 the team knows how, this surface just never got it.",
+     "action": "Real OAuth flows per provider, validated key entry using the Providers-view pattern, a post-connect verification ping ('we listed your 3 Slack channels'), and per-integration health status. Never show 'connected' without a verified credential.",
+     "files": "scripts/integrationsview.py:101-137; scripts/console.py:1092, 1333"
+    },
+    {
+     "mechanism": "Portfolio / cross-org view",
+     "verdict": "FALLS_SHORT",
+     "why": "crossorgview.py is honest and tenant-scoped (portfolio/analytics/failures, crossorgview.py:67-167), but 'everything across all your companies' amounts to a 5-column table of counts and one success-rate percentage. No revenue per company, no trend lines, no comparative performance, no drill-down. The cross-org OPS layer (steal_feature proposals, /api/xorg + /api/xorg/propose, console.py:414,446) has ZERO frontend callers (grep: 0) \u2014 the most CEO-like capability in the codebase (make my companies learn from each other) is invisible. crossorgview.analytics/failures are polled in the portfolio view but recommendations() (crossorgview.py:170-176) is never surfaced.",
+     "action": "Wire /api/xorg into the Portfolio view as a real 'cross-company moves' panel (propose/approve feature transfers), add per-company sparklines and recommendations, and put the portfolio verdict line at the top of the org=0 home.",
+     "files": "scripts/crossorgview.py:67-176; scripts/console.py:406-414, 446, 1007-1012"
+    },
+    {
+     "mechanism": "Notifications, briefings and escalation (notifications view + digest.py)",
+     "verdict": "FALLS_SHORT",
+     "why": "North star bullet #1 is 'The CEO is briefed'. There is no briefing anywhere in the tenant product. notifications.py is a flat feed with prefs; email is a stub that print()s when no emailer is configured (notifications.py:61-69) and the 'push' pref column drives nothing tenant-facing. digest.py \u2014 the one real 'founder's digest' \u2014 is platform-operator-only (portfolio.py P&L, ntfy to the owner's phone), not tenant-scoped, not in the console. 'Mark all read' fires one POST per notification in a loop (console.py:1296). The feed has no grouping, no 'while you were away', no priority triage beyond a level pill. A CEO returns after a weekend and gets a raw reverse-chron list.",
+     "action": "Build a tenant-scoped daily/weekly CEO brief (what shipped, what's blocked, decisions waiting, spend vs plan, recommended next moves) rendered as the org=0 home landing AND delivered via email/push. Add a bulk-read endpoint.",
+     "files": "scripts/notifications.py:61-122; scripts/digest.py:1-40; scripts/console.py:1094-1098, 1296"
+    },
+    {
+     "mechanism": "Approvals inbox",
+     "verdict": "FALLS_SHORT",
+     "why": "The concept (consent, hire_request, dead_letter, blocked_build in one inbox) is right, but the console's decide() is fire-and-forget: await post(...); go('approvals') \u2014 errors are swallowed silently and the item just... stays (console.py:1332). Decisions carry a one-line 'detail' string with no attached evidence: no diff, no cost impact, no agent's argument for/against, no link to the artifact being approved. A real CEO approval comes with a memo; this is a button next to a sentence. There is also no notion of 'consulted on the calls that matter' \u2014 no thresholds, no delegation rules ('auto-approve hires under $X').",
+     "action": "Attach full context to each approval (artifact link, cost, the requesting agent's rationale, what happens on deny), surface decide() failures inline, and add CEO-settable auto-approval policies so the inbox only contains calls that genuinely matter.",
+     "files": "scripts/console.py:1091, 1332; scripts/approvals.py"
+    },
+    {
+     "mechanism": "Observability/Activity (traceview) + dead views",
+     "verdict": "FALLS_SHORT",
+     "why": "traceview implements runs() and a step-by-step replay() (traceview.py:102-138) \u2014 exactly the 'watch your org work' feature \u2014 and the frontend never calls either (/api/runs, /api/replay: 0 callers). Same for /api/project detail, /api/versions + rollback, /api/budgets, /api/quality/product (all 0 callers) \u2014 snapshot/rollback and per-project budget caps are fully built server-side and unreachable by any user. Four whole views (fleet, observability, chat, build) exist in VIEWS but appear in no NAV entry and no go() call (console.py:691-695 vs 947+) \u2014 dead code shipped in the page. The Activity view shows raw error snippets as <code> to a CEO (console.py:1087) with no triage narrative. This is the memory-noted 'declared-not-wired' bug-class at product scale.",
+     "action": "Wire project detail (click a project \u2192 stages, versions, budget, quality verdict, run replay in one screen), delete the four dead views, and translate errors into incident narratives ('QA caught a failing checkout test; builder is on fix #2') instead of stack snippets.",
+     "files": "scripts/traceview.py:102-138; scripts/console.py:380-402 (unwired routes), 691-697, 1082-1090; scripts/versions.py; scripts/projbudget.py"
+    },
+    {
+     "mechanism": "Onboarding + provider gate (first-run funnel)",
+     "verdict": "FALLS_SHORT",
+     "why": "The guided first-run (save-the-idea, checklist parity between Assistant and Cockpit, console.py:905-931, 1046-1057) is thoughtfully engineered. But step 2 shatters the fantasy: 'Connect an AI model' requires the CEO to bring their own Anthropic/OpenAI key or run a CLI login that 'connects the whole machine to one account \u2014 ideal for a self-hosted, single-operator setup' (console.py:1131, shipped verbatim in the Technical details). A skeptical first-time user is asked to fetch API keys before seeing ANY magic. There is no demo company, no pre-provisioned trial inference, nothing astonishing before the paywall-shaped chore. The hero promises 'Be the CEO of a company of AI agents' (console.py:585) and the first task is DevOps.",
+     "action": "Ship platform-provided trial inference (metered free tier) so the first build starts within 60 seconds of signup, and/or an interactive demo company with live agents visible pre-signup. Move BYO-key to a cost-saving option, never a gate.",
+     "files": "scripts/console.py:585, 905-931, 976-979, 1115-1131"
+    }
+   ],
+   "missing": [
+    "A CEO briefing of any kind in the tenant product \u2014 no morning brief, no 'while you were away', no weekly review; digest.py exists but is operator-only ntfy, never tenant-scoped or in the console (north star bullet #1 is entirely absent)",
+    "Any real-time feel: no WebSocket/SSE for views (only the one chat stream); the 'living org' is 5-15s polling of tables \u2014 no activity ticker, no agents visibly working, no motion",
+    "Delegation ergonomics beyond one chat thread: cannot message a specific agent/role, no @-mention, no task assignment, no 'ask my CTO'; dashboard.py has two-way agent messaging but it is operator-only and token-gated",
+    "Business KPIs: no revenue, users, growth, or product-health metrics anywhere tenant-facing \u2014 the CEO of 'multi-billion-dollar companies' sees only token spend and build counts",
+    "URL routing / deep links / browser history \u2014 nothing in the app is linkable or navigable with back/forward",
+    "Multi-seat and roles: single-owner only, with 'RBAC is on the roadmap' shipped as UI copy (console.py:352)",
+    "Human-pattern comms: no status reports, no disagreement/escalation threads, no post-mortems or incident narratives surfaced to the CEO (incident.py exists backend-side, unwired)",
+    "Scale affordances: nothing handles or conveys more than ~5 products / ~9 agents \u2014 no search, no command palette, no pagination, no aggregation for '10,000s of employees'",
+    "Real payments (Stripe checkout/metering) \u2014 plans switch by flipping a DB column",
+    "Mobile/notification delivery for the tenant: push pref exists in settings but no tenant push channel; email is a print() stub without an emailer",
+    "Demo/trial magic before the BYO-key gate \u2014 nothing astonishes a skeptic in the first 5 minutes",
+    "Real OAuth for the 5+ integrations labeled 'oauth' in the catalog"
+   ],
+   "churn_moments": [
+    "Minute 3 of first run: 'Be the CEO of AI agents' \u2192 'Step 2: paste your own Anthropic API key' (and the Technical details admit the login binds the whole machine to one account) \u2014 the skeptic closes the tab before any magic happens (console.py:976-979, 1131)",
+    "Opening 'Org chart' to meet your company and finding 9 hardcoded job titles in a flat list plus 'Multi-seat RBAC is on the roadmap (Team tier).' (orgview.py:35-45, console.py:352)",
+    "The Design phase asks you to APPROVE screens that render with no preview at all \u2014 the console reads fields (image/preview_url/preview_html) the backend never returns (console.py:1021-1023 vs designview.py:73-84)",
+    "Clicking Connect on Stripe/Salesforce pops a native browser prompt() for a secret, then shows a green 'connected' pill without validating anything \u2014 the first discovered lie ends the relationship (console.py:1333, integrationsview.py:101-120)",
+    "The progress bubble promises 'about 14 min left' from a hardcoded table, then degrades to 'taking a little longer than usual \u2014 still working' with no ceiling, forever (console.py:163-164, 216-217)",
+    "Pressing the browser back button exits the app; refreshing loses your place; nothing is shareable \u2014 no routing exists (grep pushState/hash: 0 hits)",
+    "Your companies' products are named 'abc123-app' machine slugs in every list (console.py:363-364)",
+    "Billing page says 'Real payment is gated (BYO Stripe)' and usage is raw token counts \u2014 reads as a hobby project, not a platform handling millions of dollars (console.py:1093)",
+    "The 'Communications' panel shows your employees talking (from \u2192 to \u2192 intent) but you can never read a single message they exchanged (cockpit.py:123-127, console.py:1068)"
+   ],
+   "headline": "We promised the cockpit of a multi-billion-dollar AI conglomerate and shipped a competently-plumbed localhost admin panel: one chat thread, nine hardcoded employees, design approvals you can't see, integrations that lie about connecting, and not a single briefing \u2014 no skeptic pays for this, let alone nine figures."
+  },
+  {
+   "domain": "Orchestration / intelligence core \u2014 loopcontroller.py, scripts/orchestra/* (actor.py, bus.py, supervisor.py, org_decider.py, orchestra.py), factory.py, project.py, orchestrator.py, dispatcher.py, fleet.py",
+   "verdicts": [
+    {
+     "mechanism": "loopcontroller.py \u2014 the live product brain (one durable state machine per org: DISCOVER->...->DELIVER)",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "This is the ONLY orchestration actually wired to the console (console.py:44,142), and it is the literal opposite of 'every decision agentic'. The next-action layer is a fixed 9-phase waterfall (loopcontroller.py:42-43) whose every decision is regex, not AI: _affirmative (1236-1241) matches bare \\bgood\\b, \\bready\\b, \\bdo it\\b \u2014 a CEO typing 'hmm, that's not good' or 'ready in what sense?' at the approval gate (say():706-710, 641-644) silently APPROVES a build; _is_status_query (1244-1250), _intent_auto_proceed (1253-1264) and _option_ordinal (1267-1285) are more regex gates on multi-thousand-dollar decisions. One product lifecycle per company: thread_for_org returns the single thread (393-402), and after DELIVER the phase never resets \u2014 say() falls through to a generic 'Answer the CEO briefly' LLM turn (721-722), so 'great, now build the mobile app' can never build again. RUNNING_TIMEOUT_MIN=30 (993) reaps any still-'running' job as crashed (1056-1065); only research returns the 'pending' sentinel \u2014 a healthy 35-minute IMPLEMENT/qualityloop build is falsely declared failed to the CEO, and when it actually finishes the guarded terminal write (365-370) discards the successful result. Jobs are daemon threads in whatever process called say() (374), so an API-server restart drops in-flight work until the scheduler sweep. Context is a 12-turn window (1176) \u2014 the controller of a 'multi-billion-dollar company' has goldfish memory. The ops hygiene (durable controller_jobs, SLA watchdog 1086-1145, honest live status 267-302, pending_intent queueing 599-621) is genuinely good and should survive.",
+     "action": "Keep the durability substrate (controller_jobs, live-status, SLA watchdog, gates) and replace the decision layer wholesale: an agentic controller (the orchestra Controller pattern, for real) that holds the company's persistent state/memory, decides next action / escalation / notification via model calls, classifies CEO intent with the model (kill every regex intent gate), supports many concurrent workstreams per company and a continuous post-ship life (v2s, ops, incidents), and distinguishes 'job is slow' from 'worker is dead' by heartbeat instead of a flat 30-min guillotine.",
+     "files": "scripts/loopcontroller.py:42,365-374,706-721,993,1056-1065,1236-1285; scripts/console.py:44,142"
+    },
+    {
+     "mechanism": "scripts/orchestra/* \u2014 the 'new event-driven actor core' (actor.py, bus.py, supervisor.py, orchestra.py)",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "It is a parallel toy, full stop. grep across the entire repo: NOTHING outside scripts/orchestra imports any of it \u2014 zero production callers; orchestra.py's only entry points are 'selftest' and 'demo' (orchestra.py:432-438), and the demo's 'AI decisions' are a canned stub storyline of hardcoded JSON strings (_make_demo_agent, orchestra.py:287-336). Worse, it is THREE redundant, mutually incompatible actor implementations: actor.py+bus.py (LocalBus/MessageBus, dict messages, JSON directives), supervisor.py (its own Bus/Event/Actor/Worker/Supervisor), and orchestra.py (TeamWorker/TeamSupervisor subclasses). The 'durable' Postgres bus (bus.py) is explicitly NOT used by the orchestra controller \u2014 it runs on supervisor.py's in-memory deque 'because it makes the demo deterministic' (orchestra.py:10-12). The reactor is single-threaded: Bus.pump (supervisor.py:94-104) delivers events one at a time and Worker.act() makes its AI call INLINE \u2014 the 'elastic recursive org' executes one agent at a time, serially. All org state lives in Python objects; a crash loses the entire company. No tenancy, no consent/provider/budget gates, no cancellation, no UI surface. actor.py._ai reads r.get('out') \u2014 the tail-truncated 1500-char preview (actor.py:240) \u2014 the exact truncation bug loopcontroller documents fixing at :1203-1206. Base Supervisor._escalate marks the blocked child done (supervisor.py:356-358) so an escalated worker is silently collapsed for aggregation instead of parked-and-resumed (only the demo subclass fixes this).",
+     "action": "Build ONE durable actor runtime instead of three demos: actors and org trees as Postgres rows (like controller_jobs), events on the persisted bus, real parallel execution (the existing task queue + worker pool), all factory gates enforced per actor, resumable across process death \u2014 and make it THE engine loopcontroller dispatches into. Delete the other two implementations.",
+     "files": "scripts/orchestra/orchestra.py:10-12,287-336,432-438; scripts/orchestra/supervisor.py:69-104,356-358; scripts/orchestra/actor.py:240; scripts/orchestra/bus.py (unused by its own controller)"
+    },
+    {
+     "mechanism": "org_decider.py \u2014 plan_org / should_expand, the 'elastic-scaling brain'",
+     "verdict": "FALLS_SHORT",
+     "why": "The one place where org shape IS a real AI decision \u2014 and it is called by nobody. should_expand ('called at EVERY decision point', org_decider.py:9-14) has ZERO callers anywhere in the repo; plan_org is called only by the unwired orchestra.py demo. So the north star's 'org expansion is an intelligent AI decision' exists as a well-tested library function that the product never consults. Its bias-to-expand-on-ambiguity default (129-162) means an unparseable model reply spawns MORE paid agents by design ('cost is NOT a constraint', :95) \u2014 directly contradicting the tenant-billed, budget-governed reality of factory.py:480-506 it would run inside. The prompt-and-normalize engineering itself is solid.",
+     "action": "Wire it: loopcontroller/project should call plan_org to shape the build org from the vision, and supervisors should call should_expand on live signals (blocked children, backlog) \u2014 with the expansion decision made budget-aware (pass the tenant's remaining budget as a signal) instead of pretending cost doesn't exist.",
+     "files": "scripts/orchestra/org_decider.py:9-14,95,129-162; zero callers repo-wide"
+    },
+    {
+     "mechanism": "factory.py \u2014 agent() primitive + build_product() line",
+     "verdict": "FALLS_SHORT",
+     "why": "agent() is the best code in the domain: layered gates (governance spawn, consent, provider, budget, killswitch, token governor, factory.py:410-506), retry/backoff, Codex failover (599-620), BYO-key routing, light/fast path \u2014 a real governed primitive. But the build 'process' around it is a hardcoded script, not an org: SPEC->BUILD->DESIGN->QA->REVIEW is a fixed function with fixed roles and fixed prompts (1358-1466+), verdicts parsed by string-matching 'CRAFT: PASS' out of a markdown tail (1458-1462), and rework bounded by MAX_FIX=3 (:90) regardless of stakes. No AI ever decides WHICH stages, roles, or rigor a given product needs. And the scale ceiling is a single Python semaphore: _AGENT_SEM = BoundedSemaphore(AOS_MAX_AGENTS=8) (:94) caps ALL agents for ALL tenants on one box \u2014 CEO #2's company queues behind CEO #1's build. The out/out_full truncation trap (587-591) has now bitten two separate callers (orchestrator.py:181, actor.py:240) after being fixed once in loopcontroller \u2014 the API design invites the bug.",
+     "action": "Keep agent() as the governed primitive. Make the line agentic: a planner decides the stage graph/roles/rigor per product (the org_decider pattern), verdicts returned as structured JSON not magic strings, per-tenant concurrency quotas instead of one global semaphore, and rename/remove tail-truncated 'out' so no future caller can parse the wrong field.",
+     "files": "scripts/factory.py:90,94,410-506,587-591,1358-1466"
+    },
+    {
+     "mechanism": "project.py \u2014 build_complex, the recursive multi-component engine",
+     "verdict": "FALLS_SHORT",
+     "why": "The most credible 'complex things' capability in the repo: architect->DAG with interface contracts, cycle validation (77-105), recursion via decompose (361-369), parallel exploration + judge (199-225), component-level resume (240-245), fail-closed verification (396-408). But it is exactly the fan-out->wait-for-ALL barrier model the orchestra blueprint declares obsolete: hard 'BARRIER between layers' (:372) means one slow/stuck component stalls the entire layer; a blocked component just returns a blocker string upward (291-292) \u2014 no escalation, no resolution, no resume, the run simply ends BLOCKED_AT_COMPONENTS and the CEO gets 'retry or tell me what to change'. Shape is hardcoded: '4-8 components' in the architect prompt (:143), MAX_DEPTH=2 (:46), 5 workers (:371). It builds Python-only products ('ONE Python codebase', :142) \u2014 a 'YouTube competitor' org that can only emit stdlib Python is a punchline.",
+     "action": "Fold it into the (real) actor runtime: components as actors under a supervisor so a blocker escalates and resumes instead of killing the run; let the architect (not env vars) decide depth/width/stack; drop the layer barrier for dependency-triggered starts.",
+     "files": "scripts/project.py:39-46,142-143,291-292,361-394"
+    },
+    {
+     "mechanism": "orchestrator.py \u2014 the second chat brain (clarify->propose->confirm quick-build)",
+     "verdict": "FALLS_SHORT",
+     "why": "A duplicate, weaker brain living beside loopcontroller \u2014 same consent/provider gates, same [[BLOCK]] parsing, its own confirm path \u2014 which docs/blueprint/REDESIGN-unified-controller.md:50 already sentences to demotion, yet it still ships. It reads the tail-truncated r.get('out') (orchestrator.py:181), the exact bug loopcontroller documents at :1203-1206: a reply over 1500 chars can lose text (and the front of a large [[BUILD]] block), silently degrading proposals. It replays the ENTIRE thread history into every turn with no window (:174), and _run_and_report's outcome messaging is fire-and-forget daemon threads (:275) with none of loopcontroller's durable-job recovery \u2014 a process restart eats the report and the CEO never hears back.",
+     "action": "Execute the REDESIGN doc: keep chat_messages persistence as shared infra, delete the parallel propose/confirm brain, route everything through the (rewritten) controller. Fix out_full at :181 immediately if it survives another week.",
+     "files": "scripts/orchestrator.py:174,181,201-255,275; docs/blueprint/REDESIGN-unified-controller.md:50"
+    },
+    {
+     "mechanism": "dispatcher.py \u2014 the activation loop (task queue -> wake agents)",
+     "verdict": "FALLS_SHORT",
+     "why": "Queue hygiene is genuinely production-grade: FOR UPDATE SKIP LOCKED claims (:54-66), lease heartbeat so long-running live workers aren't reaped (:78-108), linear backoff + dead-letter with paging (:117-139), circuit-breaker defer for paused apps (:161-181). But the throughput story is a toy: MAX_PER_TICK=2 (:33) \u2014 two tasks per scheduler tick, one process, one box. At 'hundreds of thousands of users each launching millions of dollars of business' this is a bicycle courier for a logistics empire. There is no worker pool, no horizontal scaling, no per-tenant fairness \u2014 a burst from one tenant starves the queue for everyone (compounded by factory's global 8-agent semaphore).",
+     "action": "Keep the claim/lease/dead-letter semantics; run N long-lived workers pulling continuously (the Postgres queue already supports it \u2014 project.py:45 even name-checks 'the cloud worker-pool path' that doesn't exist), with per-tenant concurrency quotas and priority aging.",
+     "files": "scripts/dispatcher.py:33,54-66,78-139,161-208"
+    },
+    {
+     "mechanism": "fleet.py \u2014 fleet visibility",
+     "verdict": "FALLS_SHORT",
+     "why": "The 'ambient visibility into what the whole agent fleet is doing' is a pgrep-based ANSI terminal snapshot for the box owner (fleet.py:30-56): five hardcoded process patterns, emoji dots, last-14 audit rows, a while/sleep watch loop. Zero tenancy \u2014 it shows every tenant's activity to whoever runs the script. As an operator devtool it is fine; as the fleet-visibility story for a CEO who 'is briefed like a real CEO' it does not exist (the CEO-facing surfaces live elsewhere in console/cockpit, but nothing here shows an org chart, who is working on what, or per-company activity).",
+     "action": "Keep as an ops devtool but stop calling it fleet visibility; the real deliverable is a per-tenant, per-company live org view (agents as durable entities with current task/status) fed by the actor runtime \u2014 which requires the runtime to exist first.",
+     "files": "scripts/fleet.py:30-56,58-89"
+    }
+   ],
+   "missing": [
+    "An agentic decision layer in the LIVE path: not one production decision \u2014 next phase, approval interpretation, escalation, notification, org expansion, hiring \u2014 is made by a model. Everything the CEO actually touches is regex + if/else (loopcontroller) or a fixed script (factory/project). The north star's core sentence is simply not implemented.",
+    "Company life after DELIVER: the org ships one product and the controller thread becomes a dumb Q&A bot forever (no phase reset, no second product, no v2, no ops). 'FAANG-grade internal processes \u2014 support, incident response, post-mortems, planning, review cycles \u2014 run autonomously' has no orchestration home at all; a company here is a one-shot build funnel.",
+    "Concurrent workstreams within one company: controller_state holds exactly one phase, one job, one product per org. A real company builds, markets, and operates simultaneously; this one can do exactly one thing at a time.",
+    "Cross-company orchestration for the multi-company CEO: nothing allocates capacity, priorities, or attention across a CEO's several orgs \u2014 companies just contend blindly for one global 8-slot semaphore (factory.py:94) and a 2-task tick (dispatcher.py:33).",
+    "Horizontal scale of any kind: every agent is a subprocess/daemon-thread in one Python process on one WSL box. No worker pool, no distributed execution, no per-tenant isolation of compute. The 'cloud worker-pool path' is a comment (project.py:45), not code.",
+    "Durable agents as entities: 'hiring' and 'org growth' can't be AI decisions because there is nothing to hire \u2014 agents are stateless subprocess invocations with no identity, memory, or tenure. The recursive org exists only as in-memory Python objects inside an unwired demo.",
+    "Long-term company memory for the controller: 12-turn chat window (loopcontroller.py:1176) plus a context_brief; no accumulated knowledge of decisions, preferences, or product history that a real chief-of-staff would carry.",
+    "Mid-build steering: a CEO who changes requirements during IMPLEMENT can only cancel (kill-switch) and restart; pending_intent queues text for the NEXT gate but nothing re-plans in-flight work.",
+    "The bridge from orchestra to product: no migration plan, no feature flag, no callsite. The blueprint's centerpiece (event-driven escalate/resolve/resume/broadcast) has been proven only against stubbed models in offline selftests \u2014 it has never made a single real decision."
+   ],
+   "churn_moments": [
+    "The plan card appears; the CEO types 'hmm, this is not good \u2014 the pricing model is wrong' \u2014 _affirmative's \\bgood\\b regex (loopcontroller.py:1239) reads that as approval and launches the paid build with the wrong pricing model. Same for 'ready in what sense?' and 'don't do it yet' ('do it').",
+    "A perfectly healthy 35-minute build crosses RUNNING_TIMEOUT_MIN=30 (loopcontroller.py:993): the sweeper marks it crashed, the CEO gets '\u26a0\ufe0f The IMPLEMENT step hit a problem and stopped: worker timed out / crashed' while agents are still spending their money \u2014 and when the build finishes green, the guarded write (loopcontroller.py:365-370) throws the successful result away.",
+    "First product ships; the CEO says 'amazing \u2014 now build the companion mobile app.' Phase is parked at DELIVER forever, so the reply comes from the generic 'Answer the CEO briefly' fall-through (loopcontroller.py:721) and nothing is ever built again. The suggested next step is literally 'Start another org' (loopcontroller.py:984).",
+    "The CEO runs two companies and kicks off builds in both: both funnel into one global BoundedSemaphore(8) (factory.py:94) and a dispatcher that processes 2 tasks per tick (dispatcher.py:33). Company B's 'elite AI workforce' is a queue position.",
+    "An investor asks to see the 'elastic recursive org that grows itself': the only runnable demonstration is `orchestra.py demo`, whose every AI decision is a hardcoded JSON string in _make_demo_agent (orchestra.py:287-336) \u2014 a canned puppet show, discoverable in one glance at the source.",
+    "One component of a complex build hits a missing credential: project.py has no escalation path \u2014 the whole run ends BLOCKED_AT_COMPONENTS (project.py:392-394) and the multi-billion-dollar company asks its CEO to go fix it and type 'retry'.",
+    "The CEO asks the quick-build orchestrator for something ambitious; the model writes a long reply and orchestrator.py:181 parses the tail-truncated 'out' \u2014 the proposal silently loses its front, a bug the sibling controller fixed and documented months ago (loopcontroller.py:1203-1206) but that still lives in two other callers (orchestrator.py:181, orchestra/actor.py:240)."
+   ],
+   "headline": "We sold 'every decision is AI' and shipped a nine-phase regex waterfall that approves builds when the CEO says 'not good', kills healthy builds at minute 30, goes mute after shipping one product per company \u2014 while the actual AI org engine sits in a demo folder with zero production callers, running canned JSON puppet strings one agent at a time."
+  },
+  {
+   "domain": "Agent skill/quality \u2014 roles, role_brief, model/effort routing, agent tools, customagents, skills/extensions, memory/learning",
+   "verdicts": [
+    {
+     "mechanism": "92 role manifests (control-plane/roles/*.yaml)",
+     "verdict": "FALLS_SHORT",
+     "why": "The prose is genuinely good (backend-engineer.yaml's verify-first responsibilities, visa-travel-advisor's cite-the-primary-source discipline), but this is a library of essays, not employees. (1) Only ~6 of 92 roles are ever dispatched by the pipeline (product-manager, builder, design-ux, reviewer, tech-lead + 'qa-security' which is just a trace label on a deterministic script \u2014 factory.py:1361-1596); grep across scripts/ shows ~60 roles referenced by exactly 1 file (the catalog itself). (2) Declared-not-wired, the repo's own known bug-class: `definition_of_done`, `flags_to`, and `ownership` are consumed by ZERO code \u2014 governance.py reads tools/paths/caps, role_brief() reads summary/responsibilities/must_never/communicates_via (factory.py:171-176) and silently drops the DoD and the entire escalation routing table the yamls so carefully specify. (3) The manifests are internally impossible: backend-engineer's DoD demands 'migrations run up and down on a real DB with output attached' while the factory never grants Bash (see tools verdict). (4) Sloppy caps a due-diligence buyer would flag: visa-travel-advisor.yaml has `can_read_secrets: true` and `can_modify_code: true` for an advisory role. (5) 71/92 share the identical copy-pasted must_never block; 33 share the identical tools line. (6) The tenant-facing org chart (orgview.py:35-46) lists 'planner', 'qa', 'security', 'devops' \u2014 roles that don't even have manifests \u2014 so the org the CEO sees and the org that governs don't agree.",
+     "action": "Fix: (a) wire definition_of_done into the agent prompt AND into a machine-checked hand-off gate (agent must attach evidence per DoD item; factory rejects hand-off without it); (b) wire flags_to into real routing \u2014 when an agent emits a flag, spawn/notify the named role; (c) reconcile orgview.ORG with the manifests; (d) audit caps (can_read_secrets) across all 92; (e) either dispatch the specialist roles from the pipeline (frontend work \u2192 frontend-engineer, migrations \u2192 database-admin) or delete them \u2014 a catalog of 86 never-hired employees is inventory fraud against the north star.",
+     "files": "/home/swami/projects/control-plane/roles/backend-engineer.yaml; /home/swami/projects/control-plane/roles/visa-travel-advisor.yaml:5-6; /home/swami/projects/agent-os/scripts/factory.py:160-196,1361-1596; /home/swami/projects/agent-os/scripts/orgview.py:35-46"
+    },
+    {
+     "mechanism": "factory.role_brief() \u2014 the 'elite employee' system prompt",
+     "verdict": "FALLS_SHORT",
+     "why": "One static f-string per role: a 'top hire at Jane Street, Google, or McKinsey' pep talk + responsibilities + must_never (factory.py:177-196). Motivational prose is not skill. It injects: no definition_of_done, no flags_to routing (the agent is told to 'raise it via org_channel' \u2014 a string, not a mechanism), no skills/playbooks, no examples of prior accepted work, no company/tenant context, no memory of previous builds, no output contract. Every spawn is a cold `claude -p` amnesiac that has never met the company it works for. The light/chat path (factory.py:509-514) drops even the role charter \u2014 reasonable for latency, but it means the CEO's live conversation is with a one-line persona on Haiku.",
+     "action": "Rebuild the brief as a layered context pack: (1) role charter incl. DoD as an explicit output contract; (2) the role's skill playbooks (progressive disclosure \u2014 see skills verdict); (3) tenant/company memory file (past decisions, product context, lessons); (4) concrete flags_to routing with the actual mechanism to invoke; (5) 1-2 exemplars of accepted work for the role. Cache the static prefix (prompt caching) so cost stays flat.",
+     "files": "/home/swami/projects/agent-os/scripts/factory.py:160-196,509-514"
+    },
+    {
+     "mechanism": "Model/effort routing",
+     "verdict": "FALLS_SHORT",
+     "why": "Routing is a two-knob static env config: BUILD_MODEL=claude-opus-4-8 for heavy stages, CHEAP_MODEL=claude-haiku-4-5 for 'low-stakes' (factory.py:96-98). But look at what got labeled low-stakes: the REVIEWER whose REQUEST-CHANGES verdict is load-bearing for launch runs on Haiku (factory.py:1527), the design-quality craft gate runs on Haiku (1457), and the LAUNCH docs run on Haiku (1596). The cheapest model in the lineup is the ship/no-ship judge \u2014 a skeptical CEO paying for a 'FAANG-grade review cycle' is getting a $0.002 rubber stamp. There is no effort routing at all: the CLI's effort control is never touched, and extended thinking is actively DISABLED on the streaming path (MAX_THINKING_TOKENS=0, factory.py:835,842) including for non-chat stage work routed through _run_once_stream. The pre-flight 'estimate handshake' burns a full extra Haiku subprocess per spawn just to guess a timeout (factory.py:210-230) \u2014 the API's task-budget/effort primitives do this natively. Credit where due: model IDs and the _PRICES table (factory.py:716-717) are current and correct, fallback chains (opus\u2192sonnet, claude\u2192codex) are real, and per-tenant BYO-key isolation is properly threaded.",
+     "action": "Build a per-stage capability matrix: reviewer and security verification on BUILD_MODEL at high/xhigh effort (non-negotiable \u2014 the gate must be smarter than the builder, or at least as smart); builder at high effort with adaptive thinking ON for build stages (keep thinking off only for chat); chat/notifications on Haiku. Replace the estimate-handshake subprocess with effort + task-budget parameters. Make the matrix data (roles\u00d7stages\u2192model,effort) a governed config, not env vars.",
+     "files": "/home/swami/projects/agent-os/scripts/factory.py:96-98,210-230,835,842,1457,1527,1596"
+    },
+    {
+     "mechanism": "Tools available to agents (web, code exec, integrations)",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The factory grants agents exactly two tools: WebSearch and WebFetch (AGENT_TOOLS, factory.py:104), plus file edits via --permission-mode acceptEdits (factory.py:302-309). Bash \u2014 which every build prompt ('make `python -m pytest -q` pass', factory.py:1434-1436) and every engineering role's DoD depends on \u2014 is NEVER granted by the factory. The only reason agents can execute anything today is that the operator's personal ~/.claude/settings.json contains allow:[Bash,Edit,Write,...] with defaultMode bypassPermissions, which spawned `claude` subprocesses inherit. The platform's core capability rides on a dev dotfile: deploy this on any other machine and every builder goes limp mid-task while the prompts keep demanding test output. research_fleet.py:81 even admits the inversion in a comment ('it has Write even with tools=[]'). The role manifests' positive `tools:` list is consumed only to compute DENIALS (governance.spawn_restrictions) \u2014 never grants. Beyond that: zero MCP servers, zero SaaS integrations (no email, Slack, GitHub, CRM, ads platforms, analytics, payments), no browser automation for agents (playwright exists only in the QA harness), no document/spreadsheet tooling. The north star says 'all possible skills and extensions available'; the actual surface is 'can Google and can type'.",
+     "action": "Rewrite the grant layer: derive --allowedTools from the role manifest's tools list (explicit, versioned, per-role), sandbox Bash properly (the srt sandbox already exists for QA \u2014 extend it to agent Bash), and stop depending on user-level settings (spawn with an isolated CLAUDE_CONFIG_DIR / explicit settings file). Then build the integration tier: MCP servers per capability (GitHub, email/calendar, Slack, analytics, ads) wired to roles via the manifest, with governance deny-rules as the second layer. Without this, 80 of the 92 roles physically cannot do their stated jobs.",
+     "files": "/home/swami/projects/agent-os/scripts/factory.py:104,301-322,1434-1436; /home/swami/projects/agent-os/scripts/research_fleet.py:81; ~/.claude/settings.json (the accidental capability source)"
+    },
+    {
+     "mechanism": "customagents.py \u2014 tenant-defined standing agents",
+     "verdict": "FALLS_SHORT",
+     "why": "The tenancy engineering is genuinely solid: ownership checks on every mutation, injection scan + untrusted-envelope on instructions, tenant-key routing, scheduler wiring, read-only system tier with sole-spawner invariant, and a selftest that actually proves the guards (customagents.py:90-357). But as a product capability it's a toy: a tenant 'hires' from a hardcoded allowlist of FOUR roles (ALLOWED_ROLES, line 51) out of the 92 advertised; the agent's entire output surface is a markdown file dropped into a repo plus a passive changelog notification (lines 153-171); there is no update/edit path for instructions (define/toggle/delete only), no conversation with the agent, no tool configuration, no memory across runs, no report quality gate \u2014 whatever the model wrote lands in the feed unreviewed, from a role whose charter promises 'traceable to a named authoritative source' with nobody checking.",
+     "action": "Fix: expand the allowlist to every advisory-safe governed role; add an edit path and a per-agent conversation thread; give recurring agents a memory file so week 5's market update knows what week 4 said; run outputs through the same review gate products get before they reach the CEO's feed; let the tenant attach integrations (their GA4, their repo) per agent.",
+     "files": "/home/swami/projects/agent-os/scripts/customagents.py:51,90-183"
+    },
+    {
+     "mechanism": "skills.py \u2014 capability/skills registry",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The docstring claims 'Roles query this so an agent KNOWS its capabilities' \u2014 no agent ever queries it. The catalog is a static Python list seeded into a DB whose only consumer is orchestrate.nearest_role() doing keyword substring matching to pick a role name (orchestrate.py:100-113). It is never injected into role_brief, never surfaced in any agent prompt, and most entries with engine 'claude' are literally the statement 'Claude does it natively' \u2014 i.e., the skill IS the absence of a skill. There are no actual skill packages: no per-role playbooks, no SKILL.md-style progressive-disclosure documents, no procedures an agent loads when the task calls for it. Against 'extremely skilled agents with ALL possible skills and extensions', this is an aspirational spreadsheet.",
+     "action": "Replace with a real skills system: per-capability playbook packages (procedure, checklists, examples, tool bindings) stored in control-plane, mapped to roles in the manifest, and loaded into the agent's context on demand (description in the brief, full playbook read when relevant \u2014 the pattern Claude Code skills already prove). The tool-engine rows (ffmpeg, playwright, blender) should become executable tool grants, not catalog rows.",
+     "files": "/home/swami/projects/agent-os/scripts/skills.py:37-60; /home/swami/projects/agent-os/scripts/orchestrate.py:100-113"
+    },
+    {
+     "mechanism": "Agent memory / learning from past work",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "Elite employees compound; these agents are goldfish. The OS records plenty \u2014 full I/O traces (factory.py:43-59), build_outcomes via qualityloop.py, a recommender over them (recommend.py) \u2014 but not one byte of it ever re-enters an agent's context. recommend.py's output goes to the tenant UI ('add a security pass'), not to the agents who would act on it. There is no lessons store, no post-mortem-updates-the-charter loop, no per-tenant company memory, and the librarian role (librarian.yaml exists) is never invoked by anything. The improve.py/qualityloop.py loops iterate a PRODUCT toward a bar, but the ORG learns nothing: the builder that shipped the same manifest.json bug in March will ship it again in July, in front of a CEO who fired human employees for less. The north-star claim 'gets smarter as builds accumulate' (recommend.py docstring) is true only of a dashboard widget.",
+     "action": "Build the memory spine: (1) per-tenant company memory file(s) injected into every agent brief (decisions, product context, preferences); (2) per-role lessons store \u2014 post-mortem after every BLOCKED/fix-loop build distills a lesson, librarian-role agent curates it, role_brief loads the top-N for that role+kind; (3) feed recommend.py's strategy output into build_product's stage parameters, not just the UI. The traces DB you already have is the raw material \u2014 it's just write-only today.",
+     "files": "/home/swami/projects/agent-os/scripts/factory.py:43-59; /home/swami/projects/agent-os/scripts/recommend.py:1-30; /home/swami/projects/agent-os/scripts/qualityloop.py:1-50; /home/swami/projects/control-plane/roles/librarian.yaml (never invoked)"
+    },
+    {
+     "mechanism": "eval of agent quality (eval_factory.py)",
+     "verdict": "FALLS_SHORT",
+     "why": "Right instinct ('only a claim until you have a number', eval_factory.py:1-11), wrong scale: the benchmark is ~6 trivial specs (tempconv, csvstats, a color picker, a notes app) exercising exactly one role-chain. There is zero evaluation of the other ~86 roles \u2014 the tax-advisor, visa-advisor, and compliance roles that make factual claims to a CEO have no groundedness/citation eval at all, despite charters demanding 'zero unsourced assertions'. pass@1 on a temperature converter tells an acquirer nothing about whether the org is elite.",
+     "action": "Grow the bench along the product surface: per-role eval suites (advisory roles: citation-groundedness checks against fetched sources; engineering roles: graduated difficulty incl. multi-file/service builds; review roles: seeded-bug catch rate). Gate role-manifest and prompt changes on eval regression, the way code is gated on tests.",
+     "files": "/home/swami/projects/agent-os/scripts/eval_factory.py:26-40"
+    }
+   ],
+   "missing": [
+    "A designed capability-grant layer: agent tool permissions currently inherit from the developer's personal ~/.claude/settings.json (allow Bash/Edit/Write, defaultMode bypassPermissions) \u2014 the single most deployment-breaking accident in the domain; on any other host every engineering agent loses code execution",
+    "MCP/integration tier: no email, calendar, Slack, GitHub, CRM, payments, ads, or analytics access for any agent \u2014 the CMO/CFO/support roles have no hands; 'all possible skills and extensions' is currently WebSearch+WebFetch",
+    "Persistent memory: no per-tenant company memory, no per-role lessons store, no cross-run agent memory of any kind; traces and build_outcomes are collected but never re-enter any agent's context",
+    "Real skill packages: no playbooks/SKILL.md-style procedures per role; skills.py is an unconsumed catalog",
+    "Learning loop: no post-mortem\u2192charter/prompt update cycle; the org never gets better at being an org, only individual products get improve.py'd",
+    "flags_to escalation routing: every role yaml specifies who to flag to; no mechanism exists to deliver a flag to that role \u2014 inter-agent 'communication' in the build line is two hardcoded delegate/done rows written by the factory for the dashboard (_log_comm), not agent-to-agent messages",
+    "Dynamic org growth: north star demands 'elastic recursive orgs that grow themselves'; can_spawn is false for every role except controller, can_request_hire is consumed at exactly one gate in orchestrate.py, and the 15 engineering specialists are never hired by the line \u2014 the org cannot actually expand to meet work",
+    "Effort/extended-thinking utilization: no effort parameter anywhere, thinking explicitly disabled (MAX_THINKING_TOKENS=0) on streamed runs \u2014 the platform pays for Opus and then lobotomizes it",
+    "definition_of_done enforcement: DoD exists in 92 manifests and is enforced nowhere \u2014 no evidence-attached hand-off gate",
+    "Per-role evals for the 86 non-engineering roles, especially factual-grounding checks for advisory roles that promise cited, dated, authoritative sources"
+   ],
+   "headline": "We're selling a 92-role elite workforce, but 86 of the badges are props, the six real workers can only run code because the founder's laptop settings accidentally allow it, the ship/no-ship reviewer is the cheapest model in the catalog, and not one agent remembers anything it learned yesterday.",
+   "churn_moments": [
+    "The CEO deploys anywhere but the founder's WSL box and every 'engineer' silently loses Bash: builders write tests they can never run, claim done anyway, and the QA loop burns 3 fix attempts on failures the agent literally cannot reproduce \u2014 the CEO watches a $50 build flail on what looks like incompetence (factory.py:104 grants only WebSearch/WebFetch; capability comes from ~/.claude/settings.json)",
+    "The CEO opens the Agents view expecting to staff their company, sees a 92-role org, tries to hire \u2014 and gets a dropdown of 4 roles whose entire work-product is a markdown file and a passive notification (customagents.py:51,153-171). That's the moment 'indistinguishable from a real multi-billion-dollar company' dies",
+    "The CEO asks the visa/tax advisor a real question with money on the line; the charter promises named-source, date-checked citations, but no eval, no reviewer, and no verification ever checks a single claim before it lands in their feed \u2014 the first confidently wrong fee or deadline is the last question they ask",
+    "Week 4: the same builder ships the same category of bug it shipped in week 1, and the 'org' shows zero sign of having learned \u2014 a human employee would have been managed out; an AI employer that can't learn confirms every skeptic's prior",
+    "A board member's technical diligence reads factory.py and finds the launch-blocking code review runs on Haiku while the code was written by Opus (factory.py:1527 vs 96) \u2014 the review theater unravels the entire 'FAANG-grade process' pitch in one file",
+    "The CEO messages their 'Backend Engineer' expecting the accountable owner described in its charter and gets a cold-spawned amnesiac that has never seen their company, their prior builds, or its own definition of done"
+   ]
+  },
+  {
+   "domain": "FAANG internal-process coverage (alerts, incidents, digest, approvals, findings, help/support, forecast, experiments, improve, accountability, chaos, dogfood, intel + scheduler/watchdog/responder wiring)",
+   "verdicts": [
+    {
+     "mechanism": "alerts.py \u2014 agent-to-agent alerting with dedup + owner routing",
+     "verdict": "FALLS_SHORT",
+     "why": "The code is competent (UNIQUE partial index dedup, route-on-new via orchestrate.request_collaborator) but it is DEAD CODE: grep across scripts/ shows zero importers and zero CLI callers \u2014 watchdog.py, responder.py, and the dashboard all page the owner's ntfy phone directly and never raise an owned alert. The docstring's 'escalatable' is fiction: there is no escalation sweep, no severity-based SLA, no re-route when an owner ignores an alert. This is the repo's own documented 'declared-not-wired' bug-class, again.",
+     "action": "Wire it: make watchdog.tick() and responder escalations raise alerts.raise_alert() instead of (not in addition to) raw ntfy, add an age-based escalation sweep (like findings.sweep) registered in scheduler.DEFAULT_SCHEDULES, and surface open alerts in the tenant console. Until something calls it, delete it from the capability story.",
+     "files": "/home/swami/projects/agent-os/scripts/alerts.py:2-17 (docstring promises), grep: no callers; /home/swami/projects/agent-os/scripts/watchdog.py:126-150 (pages ntfy directly, never raises an alert)"
+    },
+    {
+     "mechanism": "incident.py \u2014 LLM incident commander / RCA",
+     "verdict": "FALLS_SHORT",
+     "why": "It IS wired (watchdog.py:145 calls incident.investigate for novel crit issues), but the diagnosis context is a joke for the bar: last 12 lines of 5 HARDCODED dev log paths \u2014 including '/tmp/factory-splitbill2.log', a leftover from one specific dev build (incident.py:26) \u2014 plus 12 audit rows. The docstring claims 'the recommended action is only executed if it falls in the responder's safe allowlist' (incident.py:6-8); NOTHING parses or executes the '## Recommended next action' section \u2014 grep finds no consumer. RCAs are loose .md files in docs/incidents/ with no DB record, no severity, no timeline, no action items filed to findings.py, no tenant-facing comms, and no postmortem review loop.",
+     "action": "Store incidents in Postgres with severity/status/timeline; gather context dynamically (logs discovered from the process table, audit filtered to the affected resource, recent deploys); actually parse the recommended action and hand it to responder's allowlist or file it via findings.file() so it has an owner; auto-publish a tenant-facing incident + postmortem via notifications/statuspage.",
+     "files": "/home/swami/projects/agent-os/scripts/incident.py:6-8,26,53-87; /home/swami/projects/agent-os/scripts/watchdog.py:141-147"
+    },
+    {
+     "mechanism": "digest.py \u2014 CEO daily/weekly brief",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "This would end a demo on the spot. daily() HARDCODES 'real paying users: 0 \u2014 no product is deployed/sold yet' (digest.py:88) and a canned market take about pomodoro apps \u2014 'a tier-a commodity\u2026 per the intel report' (digest.py:93-94) \u2014 into EVERY tenant's brief forever, regardless of their actual business. recommendations() is a five-branch if/else template (digest.py:19-43), the opposite of the north star's 'every decision agentic'. It is owner-facing single-user (notify.send to one ntfy topic), not per-tenant. And despite the docstring 'Schedule it weekly', it is scheduled NOWHERE \u2014 not in scheduler.DEFAULT_SCHEDULES (scheduler.py:43-54), no cron, no boot script. The founder's standing brief never arrives.",
+     "action": "Rebuild as a per-tenant agentic chief-of-staff brief: an agent reads that tenant's real portfolio, builds, spend, open approvals, incidents, and findings, writes a prioritized brief with reasoning, delivered via notifications.send(tid,...) on a registered schedule. Zero hardcoded business commentary.",
+     "files": "/home/swami/projects/agent-os/scripts/digest.py:19-43,88,93-94,124; /home/swami/projects/agent-os/scripts/scheduler.py:43-54 (absent)"
+    },
+    {
+     "mechanism": "approvals.py \u2014 tenant decisions inbox",
+     "verdict": "FALLS_SHORT",
+     "why": "The best-wired piece (console.py:386,452 exposes inbox+decide; a real selftest exercises all five kinds). But it has an acquisition-killing cross-tenant hole: _hire_requests() (approvals.py:97-102) and _dead_letters() (approvals.py:105-112) have NO tenant filter \u2014 every tenant sees every other tenant's hire requests and dead-task titles/errors (the selftest even admits 'global, surfaces in every tenant's inbox', line 262) \u2014 and decide() applies a hire_request approval with no ownership check (approvals.py:216-219), so paying tenant A can approve/deny tenant B's hires. blocked_build has an ownership check (line 222); the others don't. Also purely pull: nothing notifies the CEO that a decision is waiting.",
+     "action": "Tenant-scope hire_requests and dead_letters at the schema level (add tenant_id, filter in queries, enforce in decide() for every kind, not just blocked_build); fire notifications.send(tid, ...) when an item enters the inbox; add per-item context/recommendation so the CEO decides in one glance.",
+     "files": "/home/swami/projects/agent-os/scripts/approvals.py:97-112,216-219,222; /home/swami/projects/agent-os/scripts/console.py:386,452"
+    },
+    {
+     "mechanism": "findings.py \u2014 governed, owned review findings",
+     "verdict": "FALLS_SHORT",
+     "why": "Architecturally the right idea (file \u2192 route via orchestrate.request_collaborator \u2192 taskboard \u2192 resolve, no silent drops) and the routing/re-route logic is real. But the SLA guarantee is fake: findings.sweep \u2014 'a finding cannot quietly rot' (findings.py:109) \u2014 is called by NOTHING; it's not in scheduler.DEFAULT_SCHEDULES and no cron exists, so an unresolved finding rots silently forever. No dedup either: the weekly dogfood pass will re-file the same 'password reset missing' finding every rotation, inflating the backlog. Escalation is a ntfy to the owner's phone, not a re-route to a different agent.",
+     "action": "Register 'findings-sweep' in DEFAULT_SCHEDULES (hourly); add a signature-based dedup like alerts.py's UNIQUE partial index; on SLA breach, escalate agentically (re-route to a senior role / raise priority) instead of only pinging the human.",
+     "files": "/home/swami/projects/agent-os/scripts/findings.py:47-83,108-121; /home/swami/projects/agent-os/scripts/scheduler.py:43-54 (no findings job)"
+    },
+    {
+     "mechanism": "helpagent.py \u2014 in-app support assistant",
+     "verdict": "FALLS_SHORT",
+     "why": "Wired to the console (console.py:403,440) and the GOTO validation is tidy, but as 'support' for a CEO product it's a static 13-entry FAQ (KNOWLEDGE dict, helpagent.py:31-104) with an LLM paraphraser. It's hand-maintained Python \u2014 guaranteed to drift from the real UI. It takes tid as a parameter and IGNORES it: it cannot answer 'why is MY build stuck', 'what did I spend yesterday', or anything about the user's actual state. No conversation memory, no ticket/escalation path when it can't help, no feedback loop into findings. A skeptical CEO asks one real question, gets a brochure answer, and files this under toy.",
+     "action": "Ground the assistant in live tenant state (portfolio, cockpit, approvals, forecast, recent incidents \u2014 the modules already exist) with tool access; auto-generate the screen map from the console nav definition; add 'escalate to support' that files a tracked ticket (findings.file) when confidence is low.",
+     "files": "/home/swami/projects/agent-os/scripts/helpagent.py:31-104,120-149; /home/swami/projects/agent-os/scripts/console.py:403,440"
+    },
+    {
+     "mechanism": "forecast.py \u2014 predictive budget burn alerts",
+     "verdict": "FALLS_SHORT",
+     "why": "The math, idempotent thresholds, re-arm, and send-before-mark failure handling are genuinely good, and it's per-tenant via notifications.send. But the whole point \u2014 pre-emptive alerts firing WITHOUT the user asking \u2014 never happens: the docstring claims 'A scheduler job runs check_alerts across tenants' (forecast.py:8), yet no scheduler job exists (scheduler.py:43-54) and nothing calls sweep(). Only the read-side forecast() is consumed (cockpit.py:257, console.py:389). The #1 CEO anxiety the file names ('am I about to blow my budget?') is answered only if the CEO happens to look. Also naive: straight-line 30-day projection with no burst handling.",
+     "action": "One line of real fix: register ('forecast-sweep', forecast.py sweep, 3600) in DEFAULT_SCHEDULES and add a selftest asserting it (the repo already has test_callsites_wired.py for exactly this bug-class). Then improve the projection with recent-window weighting.",
+     "files": "/home/swami/projects/agent-os/scripts/forecast.py:8,118-124; /home/swami/projects/agent-os/scripts/scheduler.py:43-54; /home/swami/projects/agent-os/scripts/cockpit.py:257"
+    },
+    {
+     "mechanism": "experiments.py \u2014 experiment tracking (ADR 0004 K6)",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "A 63-line checkbox. No _ensure()/CREATE TABLE anywhere in the repo \u2014 it assumes an 'experiments' table someone made by hand. Zero product callers: no build stage, no agent, no loop ever calls log_run/compare/best. And the CLI is broken in the dumbest possible way: line 63 reads `_demo() if (len(sys.argv) > 1 and sys.argv[1] == \"demo\") else _demo()` \u2014 EVERY invocation, args or not, inserts fake 'yt-clone' recommender rows into the production database. There is also no user-facing experimentation at all (A/B tests, rollouts) anywhere in scripts/, which is what a real company means by 'experiments'.",
+     "action": "Delete this file. Build experimentation that serves the product loop: (a) platform-level A/B + feature-flag rollout for tenant-facing changes (flags.py exists \u2014 connect it), with metrics.py as the outcomes ledger and automatic promote/rollback; (b) if agent-tuning experiments are wanted, integrate them into qualityloop/eval_factory where runs actually happen.",
+     "files": "/home/swami/projects/agent-os/scripts/experiments.py:23-29,63; grep: no CREATE TABLE experiments, no callers"
+    },
+    {
+     "mechanism": "improve.py \u2014 continuous improvement with safe-deploy gate",
+     "verdict": "FALLS_SHORT",
+     "why": "Actually wired (qualityloop.py:163 calls improve_once inside the quality loop, which loopcontroller.py:952-953 drives), and promote-on-pass/revert-on-fail is a real gate. But 'safe deploy' is one agent run judged by one verify() pass \u2014 a flaky verifier either ships a regression or throws away good work, with no second opinion and no record of WHAT changed (audit payload is just {rigor, focus}, improve.py:58-59). Snapshot/rollback is shutil.copytree to /tmp instead of a git commit \u2014 no diff, no history, no review of the improvement. No lock: an improve round concurrent with a build or a second improve on the same repo silently corrupts the tree. Focus is a hardcoded string, not driven by production telemetry, user findings, or metrics.",
+     "action": "Make each round a git branch + commit with the diff attached to the audit/finding; gate on verify PLUS the product's own test suite and a reviewer-agent pass; take a per-product advisory lock shared with factory.py; pick focus from open findings/metrics instead of the hardcoded 'robustness, quality and performance'.",
+     "files": "/home/swami/projects/agent-os/scripts/improve.py:28-39,42-65; /home/swami/projects/agent-os/scripts/qualityloop.py:163; /home/swami/projects/agent-os/scripts/loopcontroller.py:952"
+    },
+    {
+     "mechanism": "accountability.py \u2014 dropped-ball detection + reliability scores",
+     "verdict": "FALLS_SHORT",
+     "why": "The detection is real (request/resolve intent matching over conversations, grace window, per-agent reliability) and the selftest proves it. But the payoff is severed: sweep() \u2014 'so the FLEET catches breakdowns itself' (accountability.py:9,109) \u2014 is scheduled NOWHERE and called by nothing; escalation is a ntfy ping to the one human phone, not a re-route of the dropped task to another agent; and reliability scores drive NOTHING \u2014 orchestrate.request_collaborator picks assignees purely by queue depth (orchestrate.py:185-193), so a 0.2-reliability agent keeps receiving work forever. That's a perf-review process that never affects staffing. Also full-table Python scan per call \u2014 fine today, dead at 100k tenants.",
+     "action": "Register the sweep in DEFAULT_SCHEDULES; on a dropped handoff, agentically re-route the original task (findings.file or orchestrate re-request to a different instance) instead of paging the human; feed reliability into request_collaborator's instance choice and into hire/retire decisions; push the matching into SQL.",
+     "files": "/home/swami/projects/agent-os/scripts/accountability.py:9,108-122; /home/swami/projects/agent-os/scripts/orchestrate.py:185-193; /home/swami/projects/agent-os/scripts/scheduler.py:43-54"
+    },
+    {
+     "mechanism": "chaos.py \u2014 fault injection / resilience proof",
+     "verdict": "FALLS_SHORT",
+     "why": "65 lines, TWO scenarios (kill dashboard, kill api on hardcoded localhost ports), manual-only \u2014 never scheduled, not in any regression gate. The kill mechanism is pgrep -f pattern matching (chaos.py:29-30,45-49), which on any shared/multi-tenant host is a loaded gun. It never touches the failures that actually hurt: Postgres outage, provider 429/timeout storms, a factory build SIGKILLed mid-stage, disk-full during snapshot, a wedged dispatcher queue, ntfy down (silent paging failure). 'Proves the self-healing actually works' currently means 'proves two dev daemons restart'.",
+     "action": "Expand to a scenario matrix covering DB down, provider-error injection (fault flag in factory.agent), mid-build kill + resume-sweep recovery, disk pressure, and queue wedge, each with a recovery-time SLO; register a periodic game-day run in the scheduler and gate releases on the scorecard; target PIDs from the daemon registry, not pgrep patterns.",
+     "files": "/home/swami/projects/agent-os/scripts/chaos.py:23-26,29-30,41-61"
+    },
+    {
+     "mechanism": "dogfood.py \u2014 standing acceptance pass (rotating demanding personas)",
+     "verdict": "FALLS_SHORT",
+     "why": "The right instinct \u2014 9 skeptic personas filing findings to owners, actually registered in the scheduler and selftested against that registration (dogfood.py:123-125). But the cadence destroys it: interval 604800s means ONE persona per WEEK (scheduler.py:53), so a full lap of the 9 personas takes NINE WEEKS \u2014 the north star says one frustration = churn, and 'feature-completeness' gets checked six times a year. Worse, the personas can't do their jobs: the agent is told to 'curl the HTML/JSON routes' (dogfood.py:84-85) \u2014 the accessibility, mobile-390px, keyboard-only, latency, and streaming personas are physically impossible over curl. No dedup, so each pass re-files the same findings into an already-unswept backlog.",
+     "action": "Run daily (all personas or a fast rotation); drive a real browser (the repo already has console_e2e.cjs / playwright-style harnesses) with screenshots for the UX/accessibility/latency personas; dedup findings by signature before filing.",
+     "files": "/home/swami/projects/agent-os/scripts/dogfood.py:20,84-89,123-125; /home/swami/projects/agent-os/scripts/scheduler.py:53"
+    },
+    {
+     "mechanism": "intel.py \u2014 market/competitor intelligence",
+     "verdict": "FALLS_SHORT",
+     "why": "A one-shot 'run an agent, write MARKET.md' wrapper with no process around it: never scheduled, no freshness/refresh policy, no verification of the cited data, doesn't feed planning or the build loop \u2014 its only product-loop presence is the digest hardcoding a stale conclusion about one report ('per the intel report', digest.py:93-94) and telling the CEO to go run a CLI command (digest.py:42). The selftest is theater: it checks that a role YAML file exists at a hardcoded path in ~/projects/control-plane (intel.py:50-51) and asserts nothing about behavior.",
+     "action": "Make it a standing per-product process: scheduled refresh with staleness tracking, diffs against the previous report, and recommendations filed as findings/taskboard items so intel actually changes what gets built; replace the selftest with a mocked-agent behavioral test like helpagent's.",
+     "files": "/home/swami/projects/agent-os/scripts/intel.py:19-40,50-51; /home/swami/projects/agent-os/scripts/digest.py:42,93-94"
+    }
+   ],
+   "missing": [
+    "Planning cycles: no planning process at all \u2014 no goal/OKR decomposition, no roadmap, no weekly/quarterly planning or prioritization ritual; taskboard.py is a flat list. 'Planning' is one of the north star's named processes and it simply does not exist.",
+    "Post-mortem process: incident.py writes an RCA .md and stops. No blameless review, no action items filed to owners (findings.py exists and is not called), no 'did we fix the class of bug' follow-up, no incident database or trend analysis.",
+    "Performance management / hiring consequences: accountability.reliability() computes scores nobody consumes; there is no eval of a newly hired agent, no derating, retraining, or retiring of unreliable agents, no promotion of strong ones. Hiring is a status flip on hire_requests.",
+    "Real customer support: no ticketing system, no support SLA, no human-escalation path, no per-tenant support history. helpagent is a static FAQ; a CEO with a real problem has nowhere to go.",
+    "Security as a process: security_scan.py is a regex self-scan of the platform tree, invoked only via risk.py on demand \u2014 no schedule, no dependency/CVE scanning of the products the factory ships to customers, no secrets rotation, no pen-test cadence.",
+    "Tenant-facing incident communication: watchdog/responder/incident all page ONE owner ntfy topic; statuspage.py binds 127.0.0.1; affected tenants are never told their build/provider is degraded, and no postmortem is ever published to them.",
+    "On-call/escalation policy: a single human phone is the pager for every tenant and every severity \u2014 at 'hundreds of thousands of users' this is one person drinking from a firehose; no rotation, no severity-based routing, no agentic first-responder tiers for product issues.",
+    "Retro cadence: metrics.py promises KPIs 'surfaced in the daily digest / monthly retro' \u2014 no retro job, command, or document generator exists anywhere.",
+    "User-facing experimentation: no A/B testing, no staged rollouts, no cohort analysis for the products tenants launch \u2014 'experiments.py' is an ML-run logger with no callers.",
+    "Comms/PR and legal/compliance review processes: nothing (launch_kit generates marketing assets, but there is no review/comms process)."
+   ],
+   "churn_moments": [
+    "The CEO's 'daily digest' tells every tenant, every day, 'real paying users: 0 \u2014 no product is deployed/sold yet' plus a hardcoded hot-take about pomodoro apps, regardless of their actual business (digest.py:88,93-94) \u2014 instant credibility death.",
+    "Tenant A opens Approvals and sees tenant B's hire requests and dead-task error messages \u2014 and can approve tenant B's hires (approvals.py:97-112,216-219). One screenshot of that kills the acquisition.",
+    "A CEO blows 100% of their token budget with zero warning because forecast's alert sweep \u2014 the file's entire reason to exist \u2014 was never scheduled; the wall the docstring promised to prevent is exactly what they hit.",
+    "A blocker-severity dogfood finding ('password reset is a stub') sits open for months: findings.sweep is unscheduled, so the 'no finding can rot' SLA never runs, and the 9-week persona rotation won't even re-check for two months.",
+    "CEO asks the help assistant 'why is my build stuck?' and gets a generic 'Open Cockpit to watch workers' brochure line, because the support agent ignores tenant state entirely.",
+    "An incident RCA cites /tmp/factory-splitbill2.log \u2014 a hardcoded artifact of the developer's own test build \u2014 as diagnostic context in a paying customer's incident."
+   ],
+   "headline": "You've written the docstrings of a FAANG company and the wiring of a weekend project \u2014 half these 'processes' (alerts, forecast sweeps, findings SLAs, accountability, the digest itself) are never invoked by anything, and the one screen that is wired leaks other tenants' data."
+  },
+  {
+   "domain": "Human-pattern communication: commfabric.py, notifications.py, askuser.py, alerts.py, digest.py, loopcontroller._ping/_report/say, and the Assistant chat voice",
+   "verdicts": [
+    {
+     "mechanism": "commfabric.py \u2014 durable ask-await 'communication fabric'",
+     "verdict": "REWRITE_COMPLETELY",
+     "files": "/home/swami/projects/agent-os/scripts/commfabric.py:5-13,25-26,77,89",
+     "why": "This is not a fabric; it is a proof-of-concept selftest wearing the fabric's name. The docstring says 'Proof choreography', the question is hardcoded ('is SendGrid v2 still supported?', line 77), the reply is hardcoded (line 89), the workflow id is handed between processes via /tmp/commfabric_wf_id (line 25), and the awaited party is the literal string 'responder'. Zero production callers: grep shows it referenced only in comments (orchestrate.py:15, bus.py:40) and a skills-catalog string. Worse, the typed message envelope it was supposed to carry \u2014 messaging.py with its FIPA intents including ESCALATE, PROPOSE, CLARIFY \u2014 has ZERO importers anywhere in the repo. The entire 'agents communicate like an elite org' vocabulary is declared, never wired (the owner's known declared-not-wired bug-class, again).",
+     "action": "Build the real thing the demo proves is possible: a production ask/await service where any agent (and the CEO surface) sends a typed messaging.Message over DBOS send/recv, with reply_by enforced, escalation on breach wired to accountability.overdue_waits(), and the wait-graph feeding deadlock detection. Delete the /tmp choreography or move it to tests/. Until orchestrate/fleet/loopcontroller actually import messaging.Message, the ADR-0005 layer is fiction."
+    },
+    {
+     "mechanism": "notifications.py \u2014 tenant notification taxonomy (silent/passive/standard/urgent)",
+     "verdict": "FALLS_SHORT",
+     "files": "/home/swami/projects/agent-os/scripts/notifications.py:61-68,83-88",
+     "why": "The feed/badge/prefs mechanics are sound, but two of its three channels are theater. Email: _email() imports 'emailer' (line 64) \u2014 emailer.py does not exist anywhere in the repo \u2014 so every 'email' delivery is a print() to stdout, forever, while send() happily reports the channel worked or silently degrades. Urgent: every tenant's urgent notification pages THE FOUNDER's personal ntfy phone (line 87, notify.send) \u2014 at the north-star's 100,000 users, the escalation architecture is one developer's phone; and push.py falls back to paging the founder too when a tenant has no topic. Finally, the level is chosen by hardcoded call sites, not intelligence: loopcontroller._ping defaults level='urgent' (loopcontroller.py:226) and every single ping in the file passes urgent \u2014 when everything is urgent, the taxonomy communicates nothing.",
+     "action": "Ship a real email transport (SMTP/provider) or delete the email column; sever the tenant-urgent\u2192founder-pager coupling (founder gets platform incidents only); and move level selection out of call sites into an attention-manager decision (the north star explicitly says 'every notification decision is an intelligent AI decision, not hardcoded flow'). Add quiet hours, batching, and per-org channel routing."
+    },
+    {
+     "mechanism": "askuser.py \u2014 pause-loop-and-ask-the-CEO primitive",
+     "verdict": "REWRITE_COMPLETELY",
+     "files": "/home/swami/projects/agent-os/scripts/askuser.py:52-57,75-81",
+     "why": "Dead code duplicating two other mechanisms. Its only repo consumer is selftest.sh. It polls a table (is_answered, line 75) \u2014 the exact anti-pattern commfabric's durable recv exists to kill \u2014 and its 'surface to the user' step is a try/except-pass import of agent_request (lines 52-57) that swallows every failure, so a question like 'approve this charge' or 'paste the 2FA code' can be filed into a table no UI reads and no one is ever told about. No deadline, no reminder, no escalation if the CEO doesn't answer, no priority, no notification fired. A real org that needs a decision from the CEO follows up; this files a row and hopes.",
+     "action": "Delete it. Fold the ask-the-human primitive into ONE mechanism: agent_request (which the console actually surfaces) backed by commfabric's durable suspend, with a mandatory reply_by, a notifications.send at standard/urgent based on what's blocked, automatic reminder escalation as the deadline approaches, and 'N decisions waiting on you' aggregated into the CEO's brief."
+    },
+    {
+     "mechanism": "alerts.py \u2014 agent-to-agent alerting with dedup and ownership",
+     "verdict": "FALLS_SHORT",
+     "files": "/home/swami/projects/agent-os/scripts/alerts.py:47-48,51-77",
+     "why": "The route-to-owner + open-signature dedup design is genuinely right, but three gaps make it a toy at scale. (1) The dedup key is sha256 of the first 80 chars of free text (line 48): 'disk 91% full on node-7' vs 'disk 92% full on node-7' are different signatures, so the flapping-storm problem it exists to solve returns the moment a metric value is in the message. (2) severity is stored and never used \u2014 a 'critical' and a 'warn' get identical treatment: no faster routing, no founder page, no CEO surface, ever; open_alerts() ages in minutes but nothing consumes the age (no escalate-on-unowned, no re-route when the owner sits on it). (3) One consumer in the whole repo (osq.py) \u2014 the 'monitoring agent watching the fleet' in the docstring doesn't exist.",
+     "action": "Make signature a caller-supplied structured key (source+condition+resource, never message text); wire an aging sweep into scheduler.py that escalates unacknowledged criticals up the chain (owner \u2192 controller \u2192 CEO notification); actually emit alerts from monitor.py/appguard/incident so the mechanism has producers."
+    },
+    {
+     "mechanism": "digest.py \u2014 the CEO's standing brief",
+     "verdict": "REWRITE_COMPLETELY",
+     "files": "/home/swami/projects/agent-os/scripts/digest.py:87-94,124; /home/swami/projects/agent-os/scripts/scheduler.py:43-54",
+     "why": "This is the single most important artifact for the 'proactive briefing' bar and it fails on every axis. (1) It is never sent: DEFAULT_SCHEDULES in scheduler.py has no digest job \u2014 the 'schedule it weekly' in the docstring is an instruction to a human that nobody executed. (2) It goes to the wrong person: delivery is notify.send \u2192 the FOUNDER's ntfy topic; a paying tenant-CEO has no briefing surface at all. (3) It lies: daily() hardcodes the literal strings 'real paying users: 0 \u2014 no product is deployed/sold yet' (line 87) and a canned lecture that pomodoro is 'a tier-a commodity' (lines 93-94) \u2014 every user, every business, every day, forever, would read the same dev-notes-as-prose. (4) It's truncated to 1500 chars for ntfy (line 124). A skeptical CEO reading 'your company: pomodoro is a commodity' about their fintech startup churns instantly.",
+     "action": "Build the chief-of-staff brief: per-tenant, per-org, LLM-composed from real state (portfolio, open decisions, alerts, spend, in-flight jobs, overdue waits), delivered on a cadence the CEO sets, into the in-app feed + email, with a 'decisions waiting on you' section that deep-links to the gates. Zero hardcoded prose. Schedule it in DEFAULT_SCHEDULES per tenant."
+    },
+    {
+     "mechanism": "loopcontroller._ping/_report/say \u2014 the live conversation loop",
+     "verdict": "FALLS_SHORT",
+     "files": "/home/swami/projects/agent-os/scripts/loopcontroller.py:1239-1241,706-712,226,933-939",
+     "why": "This is the best-engineered piece of the domain \u2014 honest ETA ranges, SLA re-warn, mid-flight intent queueing, duplicate suppression, status honesty during fleet runs are all real and CEO-grade in intent. But it contains the domain's worst churn bomb: _affirmative (line 1239) matches bare '\\bgood\\b', '\\bready\\b', '\\bdo it\\b', '\\bperfect\\b' \u2014 I verified: 'this does not look good', \"don't do it\", 'I am not ready yet', and 'this is far from perfect' ALL parse as approval and advance() \u2014 a CEO's explicit REJECTION locks the plan and fires a paid build. Second: at the generic user_feedback gate (line 706-712) a substantive change request ('make the team page read-only') gets the fixed string 'Got it \u2014 I'll fold that in.' \u2014 but nothing re-plans; IMPLEMENT dispatches from the stored plan JSONB (line 933-939), so the feedback is acknowledged and then silently discarded. Third: every _ping is urgent (line 226 default), flattening the taxonomy.",
+     "action": "Replace the affirmative/intent regexes with a cheap LLM intent classifier (approve / reject / revise / question / status) \u2014 the module already has a fast-model path (_llm light=True); on 'revise' at any gate, actually mutate the plan and confirm the diff back. Vary ping levels by event weight (ship=urgent, options-ready=standard)."
+    },
+    {
+     "mechanism": "Assistant chat voice \u2014 the persona the CEO talks to",
+     "verdict": "REWRITE_COMPLETELY",
+     "files": "/home/swami/projects/agent-os/scripts/loopcontroller.py:386-387,625-627,721,737-738; /home/swami/projects/agent-os/scripts/console.py:111-124; /home/swami/projects/agent-os/scripts/helpagent.py:124-126",
+     "why": "There is no assistant. console.py:113 admits it: 'module (assistant.py); until it does\u2026' \u2014 assistant.py does not exist; org=0 falls back to the first company's build thread. The 'voice' is a scatter of per-phase hardcoded strings ('I'm your controller. Tell me what you want to build', line 386) and per-branch system prompts ('You are a product controller scoping a build for a non-technical CEO', line 625), with the catch-all being literally 'Answer the CEO briefly.' (line 721). No persistent persona, no name, no memory of the CEO across sessions or companies, no proactivity (it only ever speaks when spoken to or when a job lands), no disagreement ('Got it \u2014 I'll fold that in' is the only response to pushback), no negotiation, no 'your VP of Eng needs a decision' \u2014 no executive exists to need one. helpagent is a separate keyword-grounded FAQ bot. The north-star interaction \u2014 being briefed and consulted by an elite org \u2014 is architecturally absent: today it is exactly what the prompt feared, API events + toasts with a build-wizard bolted on.",
+     "action": "Build the chief-of-staff agent as a first-class module: one persistent account-level persona with memory (CEO preferences, standing decisions, risk tolerance), a proactive turn loop (it initiates: morning brief, decision chase-ups, anomaly flags), an executive cast (comms attributed to named role-agents: 'Priya, your Head of Research, recommends option 2 \u2014 I disagree, here's why'), and a policy of principled pushback sourced from real data. Route ALL user-facing copy through it so fixed strings die."
+    }
+   ],
+   "missing": [
+    "A chief-of-staff layer, entirely: no per-tenant scheduled briefing, no 'decisions waiting on you' aggregation across companies, no follow-up when the CEO ignores a decision request. The only scheduled comms job in DEFAULT_SCHEDULES (scheduler.py:43-54) is the SLA watchdog.",
+    "Named executive personas and attribution: every message comes from 'the controller'; nothing can say 'your VP of Eng needs a decision' because no role-agent ever addresses the CEO \u2014 orchestrate/fleet agents are invisible to the human.",
+    "Disagreement and negotiation: no code path anywhere pushes back on a CEO instruction with evidence, proposes an alternative, or negotiates scope/budget/timeline \u2014 the vocabulary for it (messaging.Intent.PROPOSE/ESCALATE/REJECT) exists with zero importers.",
+    "Intelligent attention management: the north star says every notification/escalation decision is an AI decision; today level/priority/channel are hardcoded at every call site and effectively always 'urgent'. No quiet hours, no batching, no interruption budget, no learning what this CEO wants to hear about.",
+    "Real delivery channels for tenants: no email transport exists (emailer.py is imported but absent), push requires a self-registered self-hosted ntfy topic, and both silently fall back \u2014 a CEO who closes the tab is reachable only by luck.",
+    "Cross-company CEO view: notifications, alerts, digests and asks are all per-tenant/org threads; nothing composes the multi-company picture the north star is named after.",
+    "Escalation etiquette upward from the fleet: agent_alerts and accountability dropped-ball detection never reach the tenant CEO \u2014 accountability.sweep() pages the platform founder (accountability.py:116-119) and isn't even scheduled.",
+    "Cadence rituals: no weekly business review, no post-ship retro to the CEO, no board-pack; the closest thing (digest.daily) is unscheduled, founder-only, and partially hardcoded fiction.",
+    "Acknowledgment tracking: nothing knows whether the CEO saw a decision request; no read-receipt-driven re-escalation anywhere."
+   ],
+   "churn_moments": [
+    "The CEO reviews the plan and types 'this does not look good' \u2014 _affirmative (loopcontroller.py:1239) matches '\\bgood\\b', the gate clears, and a paid build fires against the rejected plan. Same for \"don't do it\", 'I am not ready yet', 'far from perfect' (verified by running the regex).",
+    "At the prototype gate the CEO says 'change the pricing page to annual billing' \u2014 gets 'Got it \u2014 I'll fold that in.' (loopcontroller.py:711), then says 'approve', and IMPLEMENT builds the original stored plan verbatim; the instruction was acknowledged and discarded.",
+    "The CEO's 'daily brief' \u2014 if anyone ever scheduled it \u2014 opens with 'real paying users: 0 \u2014 no product is deployed/sold yet' and a canned riff on pomodoro apps (digest.py:87-94) regardless of what their business is; and it arrives on the developer's phone, not theirs.",
+    "Every event lands as URGENT (loopcontroller._ping defaults, line 226) \u2014 options ready, prototype ready, overrun warning, ship \u2014 so within a day the bell means nothing and the one real emergency drowns.",
+    "An agent needs the CEO to 'approve this charge' via askuser.ask(); the surfacing hook is a swallowed try/except (askuser.py:52-57), no notification fires, no deadline exists \u2014 the loop waits forever and the CEO never knows they were asked.",
+    "A security-critical urgent for tenant #83,000 pages the founder's personal ntfy phone (notifications.py:87) while the tenant themself gets a print() to stdout because emailer.py doesn't exist."
+   ],
+   "headline": "You promised me an executive team that briefs its CEO, and you shipped a build wizard that reads 'this does not look good' as approval, files my decisions into a table nobody watches, and sends my daily brief \u2014 hardcoded to say I have zero customers \u2014 to the developer's own phone."
+  },
+  {
+   "domain": "scale / performance / tenancy",
+   "headline": "This is a single-laptop appliance wearing a SaaS costume: one Python http.server behind a Tailscale tunnel, no payment processor, no connection pool, no rate limiting, app-level-only tenant isolation, and a single global advisory lock that serializes every audited action across all tenants on earth \u2014 it dies at ~50 concurrent users and cannot bill a dollar.",
+   "verdicts": [
+    {
+     "mechanism": "Web tier: console.py ThreadingHTTPServer on 127.0.0.1:8099",
+     "files": "scripts/console.py:1607, :21, :1395-1560",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The entire CEO-facing app is one Python process using stdlib http.server ThreadingHTTPServer, GIL-bound, one OS thread per connection, bound to 127.0.0.1 and exposed only via `tailscale serve` from a single WSL box (recover.sh:30). There is no reverse proxy, no worker pool, no process manager, no horizontal instances, no load balancer, no keep-alive (SSE sends Connection: close). A single SSE chat stream (console.py:1411-1471) blocks a whole thread for the entire model turn. At ~100 concurrent CEOs this is 100 GIL-contending threads on one box; at 10k it is a joke. A board member asked to 'run several multi-billion-dollar companies' is running them on your laptop over a VPN tunnel.",
+     "action": "Replace with a real ASGI app (FastAPI/uvicorn+gunicorn or equivalent) behind nginx/Envoy, stateless app instances behind a load balancer, TLS terminated at the edge, autoscaling on a container platform (k8s/ECS). The HTTP layer must be horizontally scalable and hold zero in-process state."
+    },
+    {
+     "mechanism": "Database access: fresh psycopg.connect() per operation, no pooling",
+     "files": "426 call sites across scripts/*.py; cockpit.py (8), loopcontroller.py (33); postgres/docker-compose.yml:12 (127.0.0.1:5433, single container, local volume)",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "Every handler opens brand-new Postgres connections (TCP+auth+TLS handshake) per call \u2014 and a single cockpit render opens many (cockpit.py:113 plus nested), loopcontroller opens 33 distinct connect sites. Postgres default max_connections\u2248100. Even 30-50 concurrent users triggering cockpit exhausts connections and everything 500s. There is no pgbouncer/pool, no read replica, no HA, no off-box backup (just local .aosnap snapshots), single docker container on a local volume. This is a laptop database pretending to be a fleet backend.",
+     "action": "Introduce a real connection pool (pgbouncer + app-side pool), move to a managed/replicated Postgres (primary + read replicas), route read-heavy views to replicas, and cap per-request connection count to 1. Add HA + PITR backups off-box."
+    },
+    {
+     "mechanism": "Global hash-chained audit log with a single advisory lock",
+     "files": "scripts/audit.py:60-75 (pg_advisory_xact_lock(742042) + SELECT entry_hash ORDER BY id DESC LIMIT 1); called from factory AgentRun, billing, auth, watchdog everywhere",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "audit.append() takes ONE global advisory lock (742042) and reads the latest row to chain prev_hash before every insert. Every AgentRun, login, billing op, and governance decision platform-wide funnels through this single serialized mutex on one shared table. Two tenants on opposite sides of the planet block each other on every logged action. This is a hard, tenant-agnostic throughput ceiling that also makes audit_log an unbounded, unpartitioned, ever-growing single table (billions of rows) with only a ts index. It will be the first thing to melt under load.",
+     "action": "Make the audit chain PER-TENANT (or per-shard) so locks don't cross tenants, or switch to an append-only design that batches/streams to an external immutable store (e.g. per-tenant Merkle segments). Partition audit_log by tenant+time; never take a global lock on a hot write path."
+    },
+    {
+     "mechanism": "Auth: bearer token = plaintext DB lookup, no cache, no rate limiting, no lockout",
+     "files": "scripts/tenancy.py:31-35 (SELECT tenant_id WHERE api_token=%s), scripts/auth.py (no throttle), scripts/console.py:1494 (_tenant per request)",
+     "verdict": "FALLS_SHORT",
+     "why": "The API token is stored in cleartext in tenants.api_token \u2014 a single DB dump compromises every tenant. Every authenticated request does a synchronous DB round-trip to resolve token->tenant (no cache/JWT), adding load and latency to 100% of traffic. Login/signup/verify/reset endpoints (console.py:1509) have ZERO rate limiting, no failed-attempt lockout, no captcha: password brute-force is wide open, and the 6-digit email code (auth.py:86, 1M space, 15-min window) is brute-forceable with unlimited attempts (verify_email has no attempt counter).",
+     "action": "Hash tokens at rest (store only a hash, compare by hash); issue signed stateless sessions (JWT) to avoid per-request DB lookups; add per-IP/per-account rate limiting + exponential lockout on login/verify/reset; cap email-code attempts (e.g. 5) and rotate on failure."
+    },
+    {
+     "mechanism": "Tenant isolation: application-level WHERE clauses only, no Postgres RLS",
+     "files": "scripts/tenancy.py:1-5 (docstring: 'at cloud scale, add row-level security'), postgres/initdb/12-tenancy.sql (no RLS), console.py:79-96 (_owns manual IDOR guard on a hardcoded route set)",
+     "verdict": "FALLS_SHORT",
+     "why": "Isolation depends entirely on every query remembering to append `WHERE tenant_id=%s` / `product = ANY(prods)`. There is no Postgres row-level security \u2014 the schema comment literally defers it. One forgotten filter in any of 150 modules = silent cross-tenant data leak (a CEO seeing a competitor's fleet). The IDOR guard (_owns) is a hardcoded allow-list (ORG_SCOPED_GET/POST, console.py:92-96); any current or future route with a client-supplied id NOT in that set is unguarded, and _owns itself costs an extra query per request.",
+     "action": "Enable Postgres RLS with a per-connection tenant GUC (set_config('app.tenant_id', ...)) so the database enforces isolation regardless of app bugs; make tenant scoping structural, not per-query discipline. Add automated tests that fail if any query touches a tenant table without the RLS/tenant predicate."
+    },
+    {
+     "mechanism": "Billing: no payment processor; in-app plan change is free",
+     "files": "scripts/billing.py:32-36 (PLANS dict), scripts/billingview.py:57-69 (change_plan just UPDATEs plan column, docstring admits 'money-free, Stripe OUT OF SCOPE')",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The product is pitched as 'sellable for hundreds of millions' but cannot collect a single dollar: there is no Stripe/card capture, no checkout, no dunning, no invoicing delivery. change_plan lets any tenant set themselves to 'enterprise' for free by hitting POST /api/billing/plan. Metering exists (settle/invoice) but nothing charges the card. This is a billing simulation, not a business.",
+     "action": "Integrate a real payment provider (Stripe): card capture at signup/upgrade, subscription + usage-based metering pushed to Stripe, webhook-driven plan state (never client-driven), failed-payment dunning + suspension. change_plan must require a completed payment intent, not a column flip."
+    },
+    {
+     "mechanism": "Build/job execution: in-process daemon threads, not a durable queue",
+     "files": "scripts/console.py:367 (threading.Thread(frontdoor._run_build, daemon=True)), scripts/frontdoor.py:310, scripts/loopcontroller.py:251/374 (_work daemon threads)",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "Builds and controller jobs run as daemon threads INSIDE the web process. If console.py restarts \u2014 watchdog relaunch (watchdog.py:39), deploy, OOM, crash \u2014 every in-flight build/job dies silently mid-run, orphaning the CEO's 'building\u2026' spinner. A durable SKIP-LOCKED queue exists for dispatcher tasks (dispatcher.py:59) but frontdoor builds and loopcontroller jobs BYPASS it and live in-memory. There is no separation between the web tier and the compute tier, so scaling either means scaling both, and a busy build starves HTTP threads.",
+     "action": "Move all builds/controller jobs onto the durable Postgres SKIP-LOCKED queue (or a real broker), executed by a SEPARATE, horizontally-scalable worker fleet. The web tier only enqueues; workers claim, checkpoint, and are crash-recoverable. Nothing long-running runs in the request process."
+    },
+    {
+     "mechanism": "Compute scaling + supervision: ~30-agent single-box ceiling, pgrep-based watchdog",
+     "files": "scripts/scale.py:11/20 (SINGLE_BOX_AGENT_CEIL=30, 'cloud-pool' is a label with no impl), factory.py:94 (AOS_MAX_AGENTS default 8 semaphore, ~430MB per claude subprocess), watchdog.py:37-39/85-87 (pgrep -fc on local box), responder.py:43-65 (local bash relaunch)",
+     "verdict": "FALLS_SHORT",
+     "why": "scale.py openly admits the whole platform shares a ~30-concurrent-agent ceiling on one box (default semaphore of 8), and 'cloud-pool mode' is a returned string with no worker pool behind it. So ALL tenants combined share 8 heavyweight claude subprocesses; 100 CEOs each wanting a build means multi-hour queues. Supervision is single-box: watchdog counts local processes with pgrep and responder relaunches via local bash \u2014 there is no orchestrator, no health-based routing, no multi-instance failover. If the one box dies, the platform dies, and the watchdog dies with it.",
+     "action": "Implement the actual distributed worker pool the docstring promises (autoscaling worker nodes pulling the SKIP-LOCKED queue), with per-tenant fairness/quotas on compute. Replace pgrep supervision with a real orchestrator (k8s liveness/readiness probes, replicas, PodDisruptionBudgets) and off-box health checks."
+    }
+   ],
+   "missing": [
+    "Payment processing entirely (no Stripe/card capture/dunning) \u2014 cannot collect revenue despite the 'hundreds of millions' bar",
+    "Connection pooling / pgbouncer \u2014 every request cold-opens Postgres connections; connection exhaustion at ~50 concurrent users",
+    "Postgres row-level security \u2014 isolation is app-level WHERE clauses only; one missed filter leaks cross-tenant data",
+    "Rate limiting / brute-force protection / account lockout on login, signup, email-code verification, and password reset",
+    "Horizontal scalability \u2014 single http.server process, single box, single Postgres container, exposed via one Tailscale tunnel; no load balancer, no app replicas, no read replicas, no DB HA/replication/off-box backups",
+    "Durable build/job queue for the front-door build path and loopcontroller jobs \u2014 they run as in-process daemon threads that vanish on restart",
+    "Token hashing at rest \u2014 api_token stored cleartext; a DB dump compromises every tenant",
+    "A real distributed worker pool \u2014 'cloud-pool mode' is a label; actual concurrency is capped to ~8-30 agents on one box shared across ALL tenants",
+    "Platform-level observability/APM and per-tenant compute quotas (only build-count/token quotas exist, no CPU/RAM/agent fairness across tenants)",
+    "Audit-log partitioning + per-tenant chains \u2014 the global advisory lock + single unbounded table is a hard cross-tenant throughput ceiling and an ever-growing hot table"
+   ],
+   "churn_moments": [
+    "A skeptical CEO opens devtools and sees the app is served from 127.0.0.1 over a personal Tailscale tunnel \u2014 'this is running on someone's laptop' \u2014 instant credibility collapse",
+    "Second concurrent demo user logs in and the whole console starts throwing 500/503s as Postgres connections exhaust",
+    "Trying to actually pay: clicks Upgrade, plan silently flips to Enterprise with no card ever charged \u2014 a serious buyer realizes there is no billing and walks",
+    "A build is mid-flight when the box hiccups/redeploys; the 'building\u2026' bubble spins forever and the work is silently lost",
+    "An attacker (or a nervous security reviewer) points a login brute-forcer at the API and nothing stops them \u2014 no rate limit, no lockout"
+   ]
+  },
+  {
+   "domain": "trust for skeptics \u2014 spend controls, approvals, audit visibility, explainability, blast-radius containment",
+   "headline": "\"We have beautifully-engineered locks on the doors \u2014 but the two that matter most, the money circuit-breaker and the human-approval gate, are wired to nothing and never actually fire in production.\"",
+   "verdicts": [
+    {
+     "mechanism": "audit.py \u2014 HMAC hash-chain (tamper-evident log)",
+     "verdict": "FALLS_SHORT",
+     "why": "The chain's integrity rests on a SINGLE symmetric secret (AUDIT_HMAC_KEY) sitting in .env.local on the same box as the Postgres it protects (audit.py:40-43). It is tamper-evident ONLY against an actor who lacks the key \u2014 but every agent process, the enforce_manifest hook (it shells the venv python that reads .env.local), and anyone with host access CAN read it, so an insider/compromised-agent can forge or rewrite the entire history undetectably. There is no external anchor (no notary, no WORM, no periodic hash publication, no asymmetric signature), so 'even an actor with Postgres write access' \u2014 the threat the docstring claims to defend \u2014 is NOT actually defended if they also have the box. verify() is real and well-built, and reseal()'s fail-closed self-consistency (audit.py:82-144) is genuinely good, but verify() only runs inside selftest.sh \u2014 it is on NO schedule, so tampering is never detected between manual runs.",
+     "action": "Move to per-tenant asymmetric signing (Ed25519, private key in an HSM/KMS the app server cannot exfiltrate) OR anchor the chain externally: append each block hash to an append-only external store (S3 Object-Lock WORM / a transparency log) on a schedule, and register `audit.py verify` as a DEFAULT_SCHEDULE job (every 5-10 min) that pages on BROKEN. Publish the head hash to the CEO daily so integrity is provable to a skeptic, not asserted.",
+     "files": "scripts/audit.py:40-43,147-163; scripts/selftest.sh:72; scripts/scheduler.py:43-53 (no verify job)"
+    },
+    {
+     "mechanism": "governance.require_approval \u2014 hash-pinned, single-use, fail-closed human-approval gate",
+     "verdict": "FALLS_SHORT",
+     "why": "This is the single most important trust control for 'the AI is about to spend real money / touch prod' \u2014 and it is DECLARED-NOT-WIRED. governance.require_approval() (governance.py:165-220) is a genuinely excellent gate (hash-pins the exact payload, expires, consumes single-use, fails closed on any error). But a repo-wide grep finds ZERO callers outside its own selftest. No deploy site, no spend site, no secret-read site calls it. factory.py calls governance.enforce(spawner_role,'spawn') for spawn (factory.py:427) but NOTHING calls require_approval before any high-blast-radius action. approval_required_for(controller) lists 'deploy' \u2014 a paper list that gates nothing. A skeptical CEO told 'deploys need your approval' would discover the approval is never actually demanded.",
+     "action": "Wire require_approval() at EVERY high-blast-radius action site: production deploy, raising a spend cap, vault PROD-secret read, cross-tenant action, org expansion. It must be the mandatory choke-point, with the approval_id flowing from the console/phone decision. Add a wiring guard test (like test_governance_wired.py) that FAILS if any capability in approval_required_for has no call site invoking require_approval.",
+     "files": "scripts/governance.py:143-220; scripts/factory.py:427 (enforce wired, require_approval NOT); grep: zero external callers of require_approval"
+    },
+    {
+     "mechanism": "approval_gate.py \u2014 DBOS durable human-in-the-loop gate",
+     "verdict": "FALLS_SHORT",
+     "why": "Elegant durable-workflow design (suspends at zero token cost, survives crash, phone reply \u2192 DBOS.recv), but it is a DEMO, not a system: it has zero importers/callers anywhere in the codebase, `resolve` explicitly 'stands in for' the real phone bridge (approval_gate.py:6-8), and it duplicates yet a THIRD parallel approval mechanism (alongside governance.require_approval and verify_approval.py) with none of them agreeing on which is canonical. Three half-wired approval systems is worse than one wired one \u2014 nobody can answer 'how does an approval actually work here'.",
+     "action": "Pick ONE approval spine. Make approval_gate.py's durable workflow the runtime gate, have it verify via verify_approval.py's hash-pin, and have governance.require_approval delegate to it. Wire the real reply_listener path (not the `resolve` stand-in) end to end and delete the other two implementations.",
+     "files": "scripts/approval_gate.py (no callers); scripts/governance.py:165; control-plane/scripts/verify_approval.py \u2014 three disjoint approval systems"
+    },
+    {
+     "mechanism": "appguard.py \u2014 per-app financial circuit-breaker (spend cap + loss-limit auto-pause)",
+     "verdict": "FALLS_SHORT",
+     "why": "Two fatal wiring/economics bugs. (1) The sweep that ACTUALLY auto-pauses bleeders \u2014 appguard.guard()/evaluate() \u2014 is scheduled NOWHERE: it is absent from scheduler.DEFAULT_SCHEDULES, ticker.sh, and any cron; only selftest calls it. The dispatcher reads paused_apps() STATE (dispatcher.py:154) but nothing SETS that state on a cadence, so in the live loop the circuit-breaker never trips unless a human manually runs `appguard.py guard`. The docstring says 'run on a schedule' \u2014 that schedule does not exist. (2) revenue is HARDCODED 0.0 (appguard.py:72), so profit = -spend for every app; any real earning product that spends past its $20 default loss_limit would be auto-paused-as-a-bleeder the moment the sweep did run \u2014 a self-inflicted outage on your best products. RATE_PER_1K is also a fixed 0.003 proxy, not real model pricing.",
+     "action": "Register `appguard.py guard` as a DEFAULT_SCHEDULE job at a tight cadence (60-120s). Replace revenue=0.0 with real billing attribution before loss-limit logic can mean anything, or disable the loss_limit branch until revenue is wired (keep only the hard spend cap). Derive $/token from live model pricing, not a constant.",
+     "files": "scripts/appguard.py:72,95-107,123-126; scripts/scheduler.py:43-53 (no appguard job); scripts/dispatcher.py:148-156 (reads state nobody writes)"
+    },
+    {
+     "mechanism": "budget.py \u2014 runtime token cost governor",
+     "verdict": "FALLS_SHORT",
+     "why": "It caps TOKENS, not dollars, and the call site fails OPEN: factory.py:497-501/688-693 wraps allow_spend in try/except with allowed=True on ANY error, so a transient budgets-DB hiccup silently removes the cap (comment even admits 'we fail OPEN'). est_tokens is a crude len(text)//4 + 8000 heuristic (factory.py:495) \u2014 an agent that reads large files or loops mid-run blows past the estimate with no mid-flight check. The CEO never sees a real-dollar number or a forecast at the moment of decision; a token integer is not a trust signal a skeptic accepts for 'millions of dollars of business'.",
+     "action": "Cap in DOLLARS with live pricing; enforce a per-run AND per-window (hourly/daily) dollar ceiling that re-checks mid-run, not just once pre-dispatch. On governor-infra error, fail CLOSED for high-cost dispatches (the soft USD cap is not a substitute). Surface remaining budget in dollars + burn-rate forecast in the console before every consequential action.",
+     "files": "scripts/budget.py:44-53; scripts/factory.py:495-505,686-696 (fail-open + crude estimate)"
+    },
+    {
+     "mechanism": "manifest_policy.py \u2014 canonical role/path/tool permission decision (blast-radius containment)",
+     "verdict": "MEETS_BAR",
+     "why": "This is the strongest thing in the domain. One source of truth consumed by BOTH the spawn-time --disallowedTools layer (governance.spawn_restrictions) and the deterministic PreToolUse hook (enforce_manifest.evaluate), so the two layers cannot diverge by construction. Hard-deny ALWAYS wins and is case-insensitive (closes the APFS/HFS '.ENV' bypass), '..' parent-traversal is denied for every role, the '**' write scope correctly refuses the control-plane governance surface (blocks manifest self-escalation and hook self-disable), Bash write-target extraction routes shell write vectors through the SAME is_denied_path predicate, and both selftests are thorough. This is real, defensible containment.",
+     "action": "Keep. Only caveat: the Bash egress/write denylists are honestly documented as best-effort tripwires (enforce_manifest.py:75-96) \u2014 the REAL egress control (sandbox network policy / egress-allowlist proxy) is named but NOT implemented anywhere in-repo. Ship the runtime sandbox so a Bash-capable agent genuinely cannot exfiltrate; until then blast-radius on egress is unproven.",
+     "files": "control-plane/hooks/manifest_policy.py:178-285; control-plane/hooks/enforce_manifest.py:222-291,75-96"
+    },
+    {
+     "mechanism": "consent.py \u2014 mandatory named-provider AI-consent gate",
+     "verdict": "MEETS_BAR",
+     "why": "Correctly names the provider (Anthropic Claude), versions the disclosure to force re-consent on material change, is revocable, and is genuinely wired into the real entry points (frontdoor.py:301, orchestrator.py:140/264, research.py:65, onboarding.py:80, approvals.py:149). This is one of the few controls that is both built AND consumed. Meets the regulatory bar it targets.",
+     "action": "None required. Minor: the DB connection string is parsed at import from .env.local with no failure handling (consent.py:28-29) \u2014 a malformed env would crash import; harden if you want import-time robustness.",
+     "files": "scripts/consent.py:31-91; wired: scripts/frontdoor.py:301, scripts/orchestrator.py:140,264"
+    },
+    {
+     "mechanism": "verify_approval.py \u2014 file-based hash-pinned approval store",
+     "verdict": "FALLS_SHORT",
+     "why": "The hash-pin/expiry/consume logic is sound, but it is a parallel, disconnected approval world: approvals live as JSON files under approvals/ (not the tamper-evident audit chain, not the DB), read-modify-write with no locking (TOCTOU on concurrent check/consume), and the actual user-facing approval path \u2014 console /api/approvals/decide \u2192 approvals.decide() (console.py:452, approvals.py:198) \u2014 is a COMPLETELY DIFFERENT mechanism that does NOT hash-pin anything: it just flips a status and re-launches a build. So the strong hash-pinned gate a skeptic would want is not the one the CEO actually clicks.",
+     "action": "Unify: make the console approve button create/approve a verify_approval record whose payload_hash pins the EXACT action to be taken, persist approvals in the DB + audit chain (not loose JSON files), and add row-level locking on consume. approvals.decide must call the hash-pinned verifier, not bypass it.",
+     "files": "control-plane/scripts/verify_approval.py:85-100; scripts/approvals.py:198-252; scripts/console.py:452"
+    }
+   ],
+   "missing": [
+    "A wired production-DEPLOY gate. The can_deploy capability and approval_required_for:['deploy'] exist, but there is NO deploy action site in the codebase that calls governance.enforce('deploy') or require_approval before shipping to prod \u2014 the entire 'deploys need approval' story gates nothing (grep for deploy action sites returns only voice_guard regex and comments).",
+    "Real-dollar spend visibility and forecast at the decision moment. Budgets are token integers; appguard revenue is hardcoded $0. A CEO handling 'millions of dollars of business' is never shown 'this action will cost ~$X, you have $Y of $Z left, projected burn $W/day' before approving.",
+    "'Why did the AI do X' explainability tied to the audit chain. audit_log stores actor/action/decision but no human-readable causal rationale, no parent-decision linkage, and nothing surfaces a plain-English 'the agent chose this because\u2026' trail to the CEO. Trust for skeptics REQUIRES this and it is absent.",
+    "A runtime network sandbox. enforce_manifest explicitly says the regex egress denylist is a tripwire and 'the REAL control is the runtime sandbox network policy' \u2014 which is not implemented. A Bash-capable agent's exfiltration blast-radius is therefore unbounded in practice.",
+    "External anchoring / independent verifiability of the audit chain (WORM store, transparency log, or asymmetric signatures + published head hash). Today integrity is provable only to someone holding the same secret that could forge it.",
+    "Scheduled enforcement runners: appguard.guard() and audit.verify() both exist but neither is on any schedule \u2014 the circuit-breaker and the tamper detector are dormant in the live system.",
+    "Spend-velocity anomaly detection / rate limiting. Nothing detects an agent suddenly 10x-ing its burn or looping; the only backstop is a static cap that (a) fails open and (b) whose enforcer isn't scheduled.",
+    "Per-tenant audit-key isolation and secret rotation. One global HMAC key protects all tenants' audit history; compromise of one box compromises everyone's tamper-evidence, and there is no rotation path."
+   ],
+   "churn_moments": [
+    "CEO is told 'nothing risky happens without your approval' (console approvals subtitle), then learns the hash-pinned approval gate (require_approval) is called by nothing and 'deploy' approval gates no actual deploy \u2014 the promise is theater.",
+    "A profitable production app gets auto-paused as a 'bleeder' because revenue is hardcoded $0 in the profit math \u2014 the CEO watches their best product get a 'we paused this app' page for making money.",
+    "\u2026except it wouldn't even pause, because the appguard sweep is on no schedule \u2014 so in the OTHER failure mode a runaway app quietly bleeds money for hours because the circuit-breaker never runs until someone manually invokes it.",
+    "A skeptical auditor asks 'prove this audit log wasn't edited' and the honest answer is 'trust the secret in the .env file that every agent process can also read' \u2014 the tamper-evidence collapses under one pointed question.",
+    "The budgets DB hiccups for 30 seconds and the token cap silently disappears (fail-open), so the one moment the governor was needed it waved everything through.",
+    "CEO asks 'why did my agent do that?' and the system can show WHAT happened (audit rows) but not WHY \u2014 no rationale, no causal chain \u2014 which reads as an opaque black box exactly when trust is being decided."
+   ]
+  },
+  {
+   "domain": "Quality engine \u2014 scripts/qa/* (story_gen, qa_explorer, dev_loop, qa_run, qa_report), dogfood.py, findings.py, selftest.sh guards, docs/STANDARDS-*.md, and the actual ship gates (factory.py QA, gate_check.py, loopcontroller TESTQA)",
+   "verdicts": [
+    {
+     "mechanism": "Wiring: is the agentic qa/ stack a mandatory gate on fleet builds?",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "It is standalone dead weight. Zero callers exist outside scripts/qa/: grep across scripts/, tests/, platform/ finds no import of qa_run/qa_explorer/dev_loop/story_gen/qa_report. The name collision is damning \u2014 factory.py:1474 defines a LOCAL lambda `qa_run` (pytest/node-tests/smoke) that shadows the real engine, so the ship path never touches it. loopcontroller.py:964 gates DELIVER on verify.verify(rigor=2) (tests + static grep security \u2014 the adversarial tier only exists at rigor 3, never used on the customer path). scheduler.py:43-54 schedules no QA job. Runtime evidence: /tmp/aos-qa contains only 'console-smoke' reports (agent-os testing its own console today); audit shows RestartTarget=0, DevSelfQA=7, FixBugAttempt=7 \u2014 the engine has NEVER run against a fleet-shipped product build.",
+     "action": "Build instead: make qa_run() the producer of the LAUNCH artifact. loopcontroller TESTQA and factory's QA stage must call qa_run(target_url, vision, ...) on the running build; gate_check must consume its machine-readable JSON verdict (report['passed'], blocking_open==0), not a prose file. No build reaches DELIVER without a clean agentic round. Delete the shadowing local lambda name in factory.py.",
+     "files": "/home/swami/projects/agent-os/scripts/factory.py:1474, /home/swami/projects/agent-os/scripts/loopcontroller.py:959-971, /home/swami/projects/agent-os/scripts/scheduler.py:43-54"
+    },
+    {
+     "mechanism": "Factory ship-gate QA (run_tests / run_js_tests / run_web_qa / run_ext_qa) \u2014 what actually gates every shipped build",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The builder grades its own homework: run_tests (factory.py:987) and run_js_tests (factory.py:1035) execute tests the BUILDER wrote \u2014 STANDARDS-verification.md rule 5 ('no agent grades its own homework') is violated by the primary gate itself. run_web_qa (factory.py:1058-1091) = 'loads in headless browser without console errors + screenshot' \u2014 a smoke-load the verification standard itself calls theatre. run_ext_qa (factory.py:1094) is admittedly static-only ('does not exercise runtime behaviour'). No journey coverage, no expected-vs-actual against the vision, no human-pace/dwell, no story enumeration \u2014 for products sold to paying CEOs.",
+     "action": "Replace the QA stage's verification body with the agentic stack: story_gen coverage set from the product charter, qa_explorer runs against the served build, dev_loop fixes blocking bugs, gate on the grounded verdict. Keep builder tests as a fast pre-gate, never as the gate.",
+     "files": "/home/swami/projects/agent-os/scripts/factory.py:987-1146,1472-1510"
+    },
+    {
+     "mechanism": "gate_check.py LAUNCH gate + controller.py seeding",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The 'no launch without QA' gate parses PROSE: _v_qa (gate_check.py:~116-135) checks QA-REPORT.md contains the string 'recommend: launch' and no \u274c \u2014 any agent that writes those words passes. Worse, controller.py:199-216 _seed() writes gate_check's OWN golden passing artifacts (gate_check._REAL_QA) into every product repo at run start \u2014 the gate is satisfied by a canned passing QA report the platform seeds for itself, so selftest.sh's 'gate_check blocks LAUNCH w/o QA' check (selftest.sh:83) proves nothing about real builds.",
+     "action": "Bind the gate to machine-verifiable evidence: gate on qa_report's JSON (passed=true, blocking_open=0, stories>0) written by an actual qa_run execution, hash-linked to the run's screenshots/records and signed by the QA actor (identity.py exists). Kill _v_qa string matching and the golden-artifact seeding on real products.",
+     "files": "/home/swami/projects/control-plane/scripts/gate_check.py:116-135, /home/swami/projects/agent-os/scripts/controller.py:199-216"
+    },
+    {
+     "mechanism": "qa_explorer.py \u2014 the state-based AI explorer",
+     "verdict": "FALLS_SHORT",
+     "why": "The best-engineered piece in the domain: the blame contract (qa_explorer.py:543), retry-on-miss (625-634), settle/re-observe race guard (642-654), and label-over-idx targeting are real anti-false-positive engineering with pinned selftests. But: (1) it violates the repo's OWN REQUIRED standard \u2014 STANDARDS-qa.md mandates human-pace typing + 8-12s idle dwell 'for every verification step'; browser_bridge.js contains zero delay/dwell/pressSequentially code, so the leaked-timer bug class that motivated the standard sails straight through the flagship explorer; (2) throughput: the real smoke report shows 3 steps took 5m53s (~2min/step, 2 full CLI agent spawns per step) with stories run strictly serially in qa_run._run_round \u2014 an 'exhaustive' 40-story run is days, with no wall-clock or cost budget anywhere; (3) qa_explorer.py:44 hardcodes NODE_PATH to ~/projects/products/noupload/node_modules \u2014 the QA engine parasitizes one product's playwright install.",
+     "action": "Add dwell/human-pace verbs to the bridge and make the decide-prompt schedule them per STANDARDS-qa.md; parallelize stories across explorer instances; add a run budget (wall-clock + $) with graceful triage; give the bridge its own pinned playwright dependency.",
+     "files": "/home/swami/projects/agent-os/scripts/qa/qa_explorer.py:44,543,606-708, /home/swami/projects/agent-os/scripts/qa/browser_bridge.js"
+    },
+    {
+     "mechanism": "story_gen.py \u2014 'exhaustive' coverage enumeration",
+     "verdict": "FALLS_SHORT",
+     "why": "'Complete coverage \u2014 not a sample' is one LLM completion (story_gen.py:191). A single reply physically caps at a few dozen stories for an arbitrarily complex product. The iterative-expansion hook (`existing` param, line 168) has ZERO callers. No coverage set is persisted, versioned, or traced to spec acceptance criteria; there is no coverage measure at all, so nobody can ever say what fraction of the product was exercised. On agent failure it returns [] and qa_run proceeds to a 0-story run (qa_report at least says NO VERDICT).",
+     "action": "Make enumeration a loop: generate \u2192 self-critique for gaps per surface/persona/category \u2192 expand via `existing` until a coverage-judge call says saturated; persist the story corpus per product in Postgres so it grows across releases and fixed bugs pin permanent regression stories.",
+     "files": "/home/swami/projects/agent-os/scripts/qa/story_gen.py:126-205"
+    },
+    {
+     "mechanism": "dev_loop.py \u2014 fix-on-blocking-bug + dev-as-first-QA",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The judge is systematically fed fabricated evidence. (1) qa_run.py:239 calls fix_bug WITHOUT target_url/stories/restart_cmd, so residual=[] always, and the judge prompt (dev_loop.py:262-263) explicitly says 'empty means the story now passes' \u2014 the principal-engineer judge confirms fixes with zero fresh observation. (2) 'FILES CHANGED by the dev agents' (dev_loop.py:261) is the PLAN's file list, never verified \u2014 factory._changed_paths exists and is unused; _spawn_fix_agents (dev_loop.py:225-227) discards factory.agent's return entirely, so a crashed/refused dev agent is indistinguishable from a successful fix. (3) restart_target's pkill -f on argv[-1] (dev_loop.py:105) can kill unrelated processes ('npm start' \u2192 pkill -f npm). (4) dev_self_qa \u2014 the owner-mandated 'dev is the first QA' \u2014 has zero callers in the fleet; no builder ever self-QAs before handoff. That mandate is fiction.",
+     "action": "Build instead: fix_bug must always restart + re-explore the failing story (make target_url/stories mandatory), judge on a real git diff of changed files, fail an attempt when a spawned agent returns rc!=0, and pkill by tracked PID not pattern. Wire dev_self_qa into factory's BUILD stage as a hard pre-handoff gate.",
+     "files": "/home/swami/projects/agent-os/scripts/qa/dev_loop.py:105,209-240,251-270, /home/swami/projects/agent-os/scripts/qa/qa_run.py:239"
+    },
+    {
+     "mechanism": "qa_run.py \u2014 the top-level autonomous loop",
+     "verdict": "FALLS_SHORT",
+     "why": "The loop shape (rounds, fix-and-rerun-all, early stop on blocking) is right, and the offline selftest genuinely pins the state machine. But it contradicts the north star by design: a 'clean' round means no BLOCKING bug (qa_run.py:222) \u2014 non-blocking bugs are 'noted' in a /tmp markdown file and shipped ('ship-with-known-issues is a real, honest outcome', qa_report.py:95) with NO findings.py filing, so every non-blocking bug reaches a human by architecture. Reports and screenshots live only in /tmp/aos-qa (qa_report.py OUT_DIR) \u2014 a reboot erases all QA history. report['passed'] gates nothing. No round/wall-clock budget accounting is surfaced to anyone.",
+     "action": "On clean-with-open-bugs, file every open bug through findings.py (routed owner, SLA) instead of a /tmp note; persist runs to Postgres + object store; emit the verdict to the gate and to the CEO's quality view; treat 'zero open bugs' \u2014 not 'zero blocking' \u2014 as the ship bar, with an explicit governed override for known-issue ships.",
+     "files": "/home/swami/projects/agent-os/scripts/qa/qa_run.py:213-277, /home/swami/projects/agent-os/scripts/qa/qa_report.py:52,94-96"
+    },
+    {
+     "mechanism": "selftest.sh \u2014 the 'dev self-tests exhaustively' guard",
+     "verdict": "FALLS_SHORT",
+     "why": "~110 checks of impressive breadth, but grep 'qa' over selftest.sh returns NOTHING: not one of the five scripts/qa/* selftests is registered, and tests/test_core.py doesn't import them either \u2014 the quality engine is the only subsystem with no guard, so a regression in the explorer/blame-contract ships silently. Worse, the guard corrupts production state: dogfood.py's selftest (run by selftest.sh:179) calls run_once with a stubbed agent but REAL audit.append (dogfood.py:111), so every selftest.sh run writes a fake DogfoodPass row \u2014 the DB shows 13 DogfoodPass rows, ALL persona=first-run, ALL found=1/filed=1 (the stub's canned values), which both fakes acceptance-coverage history and breaks _next_persona rotation (keyed on that same audit count, dogfood.py:62-69). Also there is no git repo and no CI hook \u2014 nothing forces selftest.sh to run before a change lands.",
+     "action": "Register all five qa/* selftests as ckp lines; make dogfood._selftest stub audit.append (or tag selftest audit rows and exclude them from count); put agent-os under version control with selftest.sh as a mandatory pre-merge hook.",
+     "files": "/home/swami/projects/agent-os/scripts/selftest.sh:70-181, /home/swami/projects/agent-os/scripts/dogfood.py:62-69,111,116-137"
+    },
+    {
+     "mechanism": "dogfood.py \u2014 the standing demanding-user acceptance pass",
+     "verdict": "REWRITE_COMPLETELY",
+     "why": "The 'astonish a skeptic' lens runs WEEKLY (scheduler.py:53, 604800s) with ONE persona per tick \u2014 a full 9-persona rotation takes 9 weeks, for users who churn at one frustration. The 'demanding user' never opens a browser: the prompt tells a 'research-growth' agent to 'curl the HTML/JSON routes' (dogfood.py:83-84) \u2014 judging a SPA's UX, latency, and rendering by curling HTML, while a full browser-driving explorer sits unused one directory away. Blocker severity is silently downgraded to 'high' (dogfood.py:104). And the production evidence says it has never worked: findings table has 0 rows ever (all 75 FindingFiled audit rows are self-cleaning selftests), and every recorded DogfoodPass is the selftest stub.",
+     "action": "Build instead: daily (or per-deploy) multi-persona pass that drives the LIVE console through qa_explorer with the persona brief as the vision, on real journeys (signup\u2192build\u2192wait\u2192review\u2192pay), filing every finding with true severity; alert the fleet on any blocker within minutes, not weeks.",
+     "files": "/home/swami/projects/agent-os/scripts/dogfood.py:23-113, /home/swami/projects/agent-os/scripts/scheduler.py:53"
+    },
+    {
+     "mechanism": "findings.py \u2014 the no-finding-ever-dropped loop",
+     "verdict": "FALLS_SHORT",
+     "why": "The routing spine is genuinely good (owner via directory, taskboard visibility, SLA sweep, audit). But closure is on the honor system: resolve() (findings.py:86-94) flips status on any caller's say-so with zero verification \u2014 no re-run of the failing scenario, no evidence requirement, directly violating STANDARDS-verification.md rule 6 ('reproduce the exact complaint, re-run the original repro after the fix'). sweep() (findings.py:108-121) only sends a notification on SLA breach \u2014 no escalation ladder, no re-route, no CEO-visible aging. And in production it has processed zero real findings \u2014 the whole loop is selftested but unexercised.",
+     "action": "Gate resolve() on a verification artifact: re-run the originating story/persona check and require a passing record id before status='resolved'; escalate overdue findings by re-routing to a senior role and surfacing on the cockpit, not just an ntfy ping.",
+     "files": "/home/swami/projects/agent-os/scripts/findings.py:86-121"
+    },
+    {
+     "mechanism": "docs/STANDARDS-qa.md / STANDARDS-verification.md / STANDARDS-acceptance.md",
+     "verdict": "FALLS_SHORT",
+     "why": "The standards are excellent diagnoses \u2014 and largely unenforced (the repo's own documented 'declared-not-wired' bug class). STANDARDS-verification.md names 'scripts/test_artifact_review.py (and the growing seeded e2e)' as THE standing gate \u2014 that file does not exist anywhere in the repo. STANDARDS-qa.md declares human-pace + idle-dwell REQUIRED 'for every verification step on an interactive surface' \u2014 it is implemented only in console_e2e.cjs for agent-os's own console; the factory's product QA (web_smoke.cjs, no waits at all) and the flagship qa_explorer both test at machine speed. Rule 5's verifier-of-the-verifier exists in prose only for the agentic stack \u2014 nobody audits qa_run's greens.",
+     "action": "Every REQUIRED standard gets a named enforcement check in selftest.sh that greps/probes the actual mechanism (the test_quality_lenses_wired.py pattern already exists \u2014 extend it); delete or build test_artifact_review.py; add a dwell-compliance check that fails any QA path lacking idle-dwell coverage.",
+     "files": "/home/swami/projects/agent-os/docs/STANDARDS-verification.md:33-36, /home/swami/projects/agent-os/docs/STANDARDS-qa.md:38-58, /home/swami/projects/agent-os/scripts/web_smoke.cjs"
+    },
+    {
+     "mechanism": "qa_report.py \u2014 grounded verdict + narrative",
+     "verdict": "MEETS_BAR",
+     "why": "The one mechanism designed exactly right for a trust-critical system: pass/fail/blocking tallies are computed deterministically (qa_report.py:56-102), zero-story runs fail closed ('NO VERDICT', passed=False, line 107), and the AI call only WRITES the sentence, explicitly forbidden from changing the verdict ('GROUNDED VERDICT (authoritative \u2014 do not contradict)', line 140) with a deterministic fallback. This is how every AI-facing verdict in the platform should be built.",
+     "action": "Keep the design; fix its placement (persist beyond /tmp, feed the gate) as covered under qa_run.",
+     "files": "/home/swami/projects/agent-os/scripts/qa/qa_report.py:56-146"
+    }
+   ],
+   "missing": [
+    "A mandatory pre-ship invocation of the agentic QA on EVERY fleet build \u2014 the single most important wire in the domain does not exist; today's real gates are builder-authored tests + a console-error smoke-load.",
+    "Production error telemetry loop: no crash/error capture from live tenant products feeding findings.py \u2014 'zero bugs reach a human' requires catching what QA missed in prod before the user notices; nothing exists (no Sentry-equivalent, no client error beacon, no log-anomaly \u2192 finding).",
+    "Persistent regression corpus: stories are regenerated from scratch each run and fixed bugs pin no permanent regression test; a bug fixed in round 2 can silently return next release with no memory of it.",
+    "Verifier-of-the-verifier for the agentic stack: STANDARDS-verification.md rule 5 demands an independent agent audit every green; qa_run's greens are audited by no one.",
+    "Version control + CI: /home/swami/projects/agent-os is not a git repo and nothing forces selftest.sh (or the qa/* selftests) to run on change \u2014 'dev self-tests exhaustively' has no trigger.",
+    "Human-pace/dwell capability in the QA browser bridge (typing delays, 8-12s idle assertions, session-expiry transits) \u2014 the documented bug class that reached the owner remains structurally invisible to every product QA path.",
+    "Non-functional QA on shipped products: no latency/SLO budget checks, no load beyond factory's 200-request /health probe, no accessibility or mobile-viewport pass, no data-durability (restart round-trip) checks in the agentic engine.",
+    "Cross-story/exploratory security QA on the running product (auth bypass, tenant isolation, IDOR) \u2014 'qa-security' is a role name; the explorer's prompts mention security but no story category or check enforces it.",
+    "QA visibility to the CEO-user: run reports live in /tmp with no console surface, so the paying CEO can never see WHAT was tested on their product \u2014 fatal for skeptics who trust AI less than humans.",
+    "Cost/duration accounting and parallelism for QA runs: 2 agent spawns per step, serial stories, no budget \u2014 'exhaustive' is economically and temporally undefined."
+   ],
+   "headline": "You built a genuinely clever self-testing QA robot and then never plugged it into the assembly line \u2014 every product we ship is still approved by the builder grading its own tests against a launch report the platform seeds for itself, and the weekly 'demanding user' has never filed a single real finding.",
+   "churn_moments": [
+    "A CEO's first shipped product passes 'QA' (its own builder-written node tests + a renders-without-console-errors smoke) and their first real customer clicks a dead button the idle explorer would have caught \u2014 the flagship QA engine has run only against agent-os's own console smoke, never a tenant build.",
+    "The CEO opens docs/QA-REPORT.md to check what was verified before LAUNCH and a diligent one discovers it's the platform's own canned golden artifact (controller.py _seed writes gate_check._REAL_QA) \u2014 instant, unrecoverable trust collapse for a user who already trusts AI less than humans.",
+    "The CEO pauses mid-typing on a form in their shipped product and a leaked timer bounces them \u2014 the exact bug class STANDARDS-qa.md documents as having reached the owner, still untestable because no product QA path types at human pace or dwells.",
+    "QA declares a round 'clean' with three non-blocking bugs 'noted' in a /tmp markdown file nobody reads or routes \u2014 the CEO is the one who finds all three, violating the core promise in the north star's own words.",
+    "A blocking bug is 'fixed': the judge was told residual=[] ('empty means the story now passes') without any re-observation and 'FILES CHANGED' was the plan's wish-list \u2014 the CEO re-hits the same bug an hour later and watches the system claim it was fixed.",
+    "A frustrated user churns on Monday over an onboarding dead-end; the acceptance dogfood pass that would flag it runs the following week, as a curl-based text audit, under a persona rotation that is stuck on 'first-run' because the selftest polluted the audit counter."
+   ]
+  }
  ]
 }

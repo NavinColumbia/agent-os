@@ -958,16 +958,7 @@ def advance(thread_id, job_result=None):
 
     if phase == "TESTQA":
         product = s.get("product")
-        def _do_qa():
-            import verify
-            try:
-                v = verify.verify(product, rigor=2)
-                return {"qa_ok": bool(v.get("passed", True)) if isinstance(v, dict) else True}
-            except Exception:
-                # FAIL-CLOSED: if verification cannot run, we have NO evidence the build is good, so we
-                # must not let it ship. Treat an unverifiable build as a QA failure (gate blocks DELIVER).
-                return {"qa_ok": False}
-        _dispatch(thread_id, "qa", _do_qa, eta_min=_estimate_runtime("TESTQA", s.get("plan")),
+        _dispatch(thread_id, "qa", lambda: qa_gate(product), eta_min=_estimate_runtime("TESTQA", s.get("plan")),
                   kickoff="Running QA on the build…", status="Testing…")
         return
 
@@ -988,6 +979,34 @@ def advance(thread_id, job_result=None):
     # OPTIONS waits for choose(); the prototype->IMPLEMENT gate is handled by the proto-finished branch.
     if phase == "OPTIONS":
         return
+
+
+def qa_gate(product) -> dict:
+    """TESTQA's verification body (REBUILD-PLAN C1): run the AGENTIC QA stack against the RUNNING build
+    and consume the SAME machine verdict the LAUNCH gate reads (docs/QA-VERDICT.json: passed==true,
+    blocking_open==0, stories>0). The build is brought up via devserve (web/service get a stable dev
+    URL; non-servable kinds fall through to factory's independent qa-security verification inside
+    run_grounded_qa). The builder never grades its own homework, and verify.verify's static tiers are
+    no longer the ship gate. FAIL-CLOSED: an unverifiable build is a QA failure — DELIVER stays blocked."""
+    try:
+        target = None
+        try:
+            import devserve
+            up = devserve.up(product)                 # idempotent: reuses a live instance + stable port
+            target = up.get("url")
+        except Exception:
+            target = None                             # not servable / didn't come up -> independent path
+        v = factory.run_grounded_qa(product, target_url=target)
+        # ONE ship condition, shared with the factory QA stage and gate_check's LAUNCH validator:
+        # passed==true AND blocking_open==0 AND stories>0 (fail-closed on missing/garbled facts).
+        qa_ok = factory.qa_verdict_ok(v)
+        return {"qa_ok": qa_ok, "stories": (v or {}).get("stories"),
+                "blocking_open": (v or {}).get("blocking_open"),
+                "verdict": (v or {}).get("verdict"), "verdict_json": (v or {}).get("verdict_json")}
+    except Exception as e:
+        # FAIL-CLOSED: if verification cannot run, we have NO evidence the build is good, so we
+        # must not let it ship. Treat an unverifiable build as a QA failure (gate blocks DELIVER).
+        return {"qa_ok": False, "error": str(e)[:200]}
 
 
 RUNNING_TIMEOUT_MIN = 30  # a job still 'running' past this is presumed crashed (its worker died mid-run)
@@ -1344,8 +1363,8 @@ def _selftest():
     tid = billing.signup("loopctl-selftest", "free")["tenant_id"]
     org = _orgs.create(tid, "Test Org", "a test")["org_id"]
     real_agent = factory.agent
-    import research as _r, design_fleet as _d, qualityloop as _q, verify as _v
-    real = (_r.start, _r.run_state, _r.select, _d.prototype, _q.run, _v.verify)
+    import research as _r, design_fleet as _d, qualityloop as _q
+    real = (_r.start, _r.run_state, _r.select, _d.prototype, _q.run, factory.run_grounded_qa)
 
     tasks = []                                          # every prompt _llm hands the model (for #3.4 checks)
 
@@ -1369,7 +1388,12 @@ def _selftest():
     _r.select = lambda t, rid, oid: {"option_id": oid, "title": "A"}
     _d.prototype = lambda t, o, p, pl, **k: {"screens": 3, "surfaces": ["cockpit", "team", "external"]}
     _q.run = lambda product, **k: {"run_id": 1, "status": "shipped", "shipped": True, "rounds": 1}
-    _v.verify = lambda product, **k: {"passed": True}
+    # TESTQA consumes the machine qa verdict (C1): stub the grounded-QA seam with a GREEN verdict shaped
+    # exactly like factory.run_grounded_qa's contract (passed / blocking_open / stories / verdict_json).
+    _green_gq = lambda product, **k: {
+        "passed": True, "blocking_open": 0, "stories": 3,
+        "verdict": "ALL 3 STORIES PASSED", "verdict_json": "/tmp/aos-qa/selftest-verdict.json"}
+    factory.run_grounded_qa = _green_gq
     try:
         import tenantproviders; tenantproviders.connect(tid, "anthropic", "subscription")
     except Exception:
@@ -1578,8 +1602,25 @@ def _selftest():
         _k.resume(prod2); _k.resume(f"thread-{th2}")               # lift the test halt (as a 'retry' would)
         live_cancel_ok = live_ok and no_false_done_running and cancel_ok and no_false_done_after
 
+        # (C1) TESTQA GATE HONESTY: qa_gate consumes the machine verdict JSON facts — the green stub
+        # passes; a zero-story 'pass', an open-blocking verdict, and a crashed verifier all FAIL CLOSED
+        # (qa_ok=False -> DELIVER stays blocked). The DELIVER wait above already proved the green path
+        # end-to-end through the TESTQA dispatch.
+        g = qa_gate("qa-gate-selftest-nonexistent")            # devserve can't serve it -> stubbed verdict
+        qa_green = g.get("qa_ok") is True and g.get("stories") == 3 and g.get("blocking_open") == 0
+        factory.run_grounded_qa = lambda product, **k: {"passed": True, "blocking_open": 0, "stories": 0}
+        qa_zero_story = qa_gate("x").get("qa_ok") is False
+        factory.run_grounded_qa = lambda product, **k: {"passed": True, "blocking_open": 2, "stories": 5}
+        qa_blocking = qa_gate("x").get("qa_ok") is False
+        def _gq_boom(product, **k):
+            raise RuntimeError("verifier down")
+        factory.run_grounded_qa = _gq_boom
+        qa_crash = qa_gate("x").get("qa_ok") is False
+        factory.run_grounded_qa = _green_gq                    # back to green for anything downstream
+        qa_gate_ok = qa_green and qa_zero_story and qa_blocking and qa_crash
+
         ok = (consent_gate_ok and opt and gate_held and in_design and plan_persisted and plan_card
-              and no_tag_leak and proto and deliver and jobs >= 3
+              and no_tag_leak and proto and deliver and jobs >= 3 and qa_gate_ok
               and eta_ok and research_eta_ok and consts_ok and ping_ok and live_cancel_ok
               and consent_reask_ok and sla_ok and status_honest_ok and midflight_intent_ok and dedupe_ok
               and options_elaborate_ok and options_nudge_ok and research_report_ok and plan_full_ok
@@ -1600,11 +1641,13 @@ def _selftest():
         print(f"options_elaborate={options_elaborate_ok} options_nudge={options_nudge_ok} "
               f"research_report={research_report_ok} plan_full={plan_full_ok} "
               f"design_surface={design_surface_ok}")
+        print(f"qa_gate(C1 verdict-consumed)={qa_gate_ok}(green={qa_green},zero_story={qa_zero_story},"
+              f"blocking={qa_blocking},crash_fail_closed={qa_crash})")
         print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel"
               " + consent-reask/sla/status-honesty ✅" if ok else "FAIL")
     finally:
         factory.agent = real_agent
-        _r.start, _r.run_state, _r.select, _d.prototype, _q.run, _v.verify = real
+        _r.start, _r.run_state, _r.select, _d.prototype, _q.run, factory.run_grounded_qa = real
         with psycopg.connect(DB) as c, c.cursor() as cur:
             for t in ("controller_jobs", "controller_state", "chat_messages", "chat_threads", "orgs",
                       "tenant_providers", "tenant_products", "ai_consent", "notifications", "push_targets",

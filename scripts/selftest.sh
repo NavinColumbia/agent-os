@@ -26,7 +26,14 @@ dbexec(){ sg docker -c "docker exec -e PGPASSWORD=$PW agentos-postgres psql -U a
 PAR_NAMES=(); PAR_CMDS=(); PAR_SECT=()
 SECTION=""
 sect(){ SECTION="$1"; }
-ckp(){ PAR_NAMES+=("$1"); PAR_CMDS+=("$2"); PAR_SECT+=("$SECTION"); }
+# HEAVY checks (real browser drives + real claude-build selftests) take minutes and, under concurrent
+# scheduler-build load, can wedge the whole gate. AOS_FAST_GATE=1 skips them for the fast incremental-commit
+# gate; the FULL suite (default, and what a release must pass) still runs everything. Heavy = name matches.
+_HEAVY='real browser|action coverage|autonomous factory|full lifecycle|product craft|acceptance|dogfood|console click'
+ckp(){
+  if [ -n "${AOS_FAST_GATE:-}" ] && printf '%s' "$1" | grep -qiE "$_HEAVY"; then return; fi
+  PAR_NAMES+=("$1"); PAR_CMDS+=("$2"); PAR_SECT+=("$SECTION");
+}
 
 run_one(){ # $1=index $2=results-dir  — runs in a background subshell
   local i="$1" RD="$2" name="${PAR_NAMES[$i]}" cmd="${PAR_CMDS[$i]}"

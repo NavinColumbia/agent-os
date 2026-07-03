@@ -210,10 +210,39 @@ def _selftest():
           "deduped progress ping, boot notice) ✅")
 
 
+def report():
+    """One-look answer to 'is the fleet alive and what is it costing?': live agent processes, real
+    trace-level spend/tokens (which the workflow token meter does NOT see), and workflow freshness."""
+    print("── live agent processes ──")
+    procs = _agent_procs()
+    for pid, age, cmd in procs:
+        print(f"  {pid}  {round(age)}m  {cmd[:76]}")
+    print(f"  ({len(procs)} running)")
+    print("── real agent runs + spend (traces, last 6h — factory work the workflow meter misses) ──")
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT count(*), coalesce(sum(cost_usd),0), coalesce(sum(tokens_in),0),
+                                  coalesce(sum(tokens_out),0), count(*) FILTER (WHERE rc<>0)
+                           FROM traces WHERE kind='agent' AND ts > now()-interval '6 hours'""")
+            n, usd, tin, tout, bad = cur.fetchone()
+            print(f"  {n} agent runs · ${float(usd):.2f} · {int(tin):,} in / {int(tout):,} out · {bad} failed")
+            cur.execute("""SELECT product, stage, ts::time(0), rc FROM traces
+                           WHERE kind='agent' ORDER BY ts DESC LIMIT 5""")
+            for prod, stage, ts, rc in cur.fetchall():
+                print(f"  {ts} {prod or '-'}:{stage or '-'} rc={rc}")
+    except Exception as e:
+        print(f"  (traces unavailable: {e})")
+    print("── recent workflows (transcript freshness) ──")
+    for wf, newest in sorted(_workflow_dirs(), key=lambda x: -x[1]):
+        print(f"  {wf.name}  last write {round((time.time()-newest)/60)}m ago")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "observe"
     if cmd == "selftest":
         _selftest()
+    elif cmd == "report":
+        report()
     else:
         for i in observe():
             print(json.dumps(i))

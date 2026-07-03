@@ -15,6 +15,10 @@ What it observes (each returns watchdog-shaped issues {sig, level, msg}):
   3. PROVIDER DEGRADED — a burst of overloaded/429/529/rate-limit markers or failures in recent traces:
      Anthropic (or the active provider) is degraded; builds will be slow/failing over. Say so BEFORE
      the user wonders why everything crawls.
+  3b. STUCK ORCHESTRA ACTOR — a durable-org agent (orchestra_actors) that claims to be 'working' in a
+     still-running run but whose heartbeat (store.heartbeat -> last_active) went silent: the actor
+     runtime beats every live actor on a cadence while it works, so silence = a silently-dead employee
+     holding an assignment. This is heartbeat liveness on *agentic work in progress* (NORTH-STAR).
   4. (side-effect) PROACTIVE PROGRESS PING — while agent work is ACTIVE and healthy for a long time,
      periodically tell the owner "fleet still working: N agents, oldest Xm" so long work never looks dead.
   5. (side-effect) BOOT NOTICE — after an OS/WSL restart, announce "system restarted, stack recovered"
@@ -34,14 +38,17 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "orchestra"))
 import psycopg  # noqa: E402
 
 import trace as _trace  # noqa: E402  — same .env.local-sourced DATABASE_URL every other module uses
+import store as _store  # noqa: E402  — the durable org (orchestra actors + heartbeats)
 DB = _trace.DB
 HUNG_AGENT_MIN = int(os.environ.get("AOS_SENTINEL_HUNG_MIN", "50"))        # reap.py kills at 40m; alert past it
 WF_STALE_MIN = int(os.environ.get("AOS_SENTINEL_WF_STALE_MIN", "45"))      # workflow quiet this long = suspect
 WF_WINDOW_H = int(os.environ.get("AOS_SENTINEL_WF_WINDOW_H", "6"))         # only workflows active this recently
 PROVIDER_BURST = int(os.environ.get("AOS_SENTINEL_PROVIDER_BURST", "3"))   # transient markers in 15m = degraded
+ACTOR_STALE_MIN = int(os.environ.get("AOS_SENTINEL_ACTOR_STALE_MIN", "10"))  # orchestra beats every ~45s; 10m silent = stuck
 PROGRESS_EVERY_S = int(os.environ.get("AOS_SENTINEL_PROGRESS_S", "3600"))  # "still working" ping cadence
 _TRANSIENT_SQL = "(output ~* 'overloaded|rate.?limit|too many requests|529|429' OR rc <> 0)"
 CLAUDE_DIR = Path(os.environ.get("AOS_CLAUDE_DIR", str(Path.home() / ".claude" / "projects")))
@@ -139,6 +146,19 @@ def observe(wf_root=None, notify_fn=None, now=None):
     except Exception:
         pass
 
+    # 3b) stuck orchestra actor — 'working' in a live run but its heartbeat went silent. The actor
+    # runtime (research_org's ticker + every store mutation) beats last_active constantly while an
+    # agent works, so a long silence distinguishes "dead" from merely "slow" — the flat-timeout
+    # guillotine problem, solved by liveness. Best-effort: a missing table must not kill the loop.
+    try:
+        for a in _store.stale_working(ACTOR_STALE_MIN):
+            issues.append({"sig": f"sentinel:actor-stale:{a['actor_id']}", "level": "warn",
+                           "msg": f"orchestra actor {a['name']} ({a['role']}, run {a['run_id']}) says "
+                                  f"'working' but has been silent {a['stale_min']}m — possible dead "
+                                  f"agent holding an assignment (tenant {a['tenant_id']})"})
+    except Exception:
+        pass
+
     # 4) proactive progress ping — long-running healthy work must never LOOK dead
     if notify_fn is None:
         try:
@@ -206,8 +226,34 @@ def _selftest():
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM traces WHERE ts > now()-interval '15 minutes' AND {_TRANSIENT_SQL}")
         cur.fetchone()
+    # (e) a stuck orchestra actor is flagged: seed a REAL durable-org run with a 'working' actor
+    # whose heartbeat we backdate (a silently-dead employee), assert observe() raises the issue,
+    # then heartbeat it (sign of life) and assert the issue clears. Cleans up its own rows.
+    import uuid as _uuid
+    stid = f"sentinel-selftest-{_uuid.uuid4().hex[:8]}"
+    orc = _store.start_run(stid, "sentinel liveness probe")["run_id"]
+    a = _store.spawn_actor(orc, stid, "researcher-x", "research-growth", kind="worker")
+    _store.update_actor(a["actor_id"], stid, status="working")
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:   # simulate silence: backdate the beat
+            cur.execute("UPDATE orchestra_actors SET last_active=now()-interval '30 minutes' "
+                        "WHERE actor_id=%s", (a["actor_id"],))
+            c.commit()
+        iss2 = observe(wf_root="/nonexistent", notify_fn=fake_notify)
+        sig = f"sentinel:actor-stale:{a['actor_id']}"
+        hit = [i for i in iss2 if i["sig"] == sig]
+        assert hit and "researcher-x" in hit[0]["msg"] and "working" in hit[0]["msg"], \
+            f"stuck 'working' orchestra actor not flagged: {iss2}"
+        _store.heartbeat(a["actor_id"], stid)               # the actor beats -> it is alive, not stuck
+        iss3 = observe(wf_root="/nonexistent", notify_fn=fake_notify)
+        assert not [i for i in iss3 if i["sig"] == sig], "heartbeat did not clear the stuck-actor issue"
+    finally:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM orchestra_actors WHERE tenant_id=%s", (stid,))
+            cur.execute("DELETE FROM orchestra_runs WHERE tenant_id=%s", (stid,))
+            c.commit()
     print("PASS: sentinel — silent-failure observer (stale-workflow, hung-agent, provider-burst, "
-          "deduped progress ping, boot notice) ✅")
+          "stuck-orchestra-actor heartbeat, deduped progress ping, boot notice) ✅")
 
 
 def report():

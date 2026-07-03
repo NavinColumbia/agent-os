@@ -543,6 +543,7 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
     phase = s["phase"]
     factory._ctx.api_key = api_key
     factory._ctx.tenant = tid          # lets factory.agent enforce the consent gate as a backstop (defense-in-depth)
+    factory._ctx.org = s.get("org_id") # MEMORY SPINE (A3): scope company-memory injection to this org
 
     # CONSENT GATE (EU AI Act Art.50 / Apple 5.1.2(i) / Play AI policy): the controller's whole job is AI work —
     # every phase either sends the CEO's text to the provider (_llm) or fans out paid agent work. Refuse BEFORE
@@ -998,6 +999,12 @@ def advance(thread_id, job_result=None):
             import orgs
             orgs.record_artifact(s["org_id"], "product_repo", f"Shipped {product}", product=product)
             orgs.set_stage(tid, s["org_id"], "live")
+        except Exception:
+            pass
+        try:   # MEMORY SPINE (A3): the company remembers what it shipped, so a v2/next build knows its history
+            import companymemory
+            companymemory.remember(tid, s.get("org_id"), "product",
+                                   f"Shipped '{product}'. Future work should build ON it, not re-decide its basics.")
         except Exception:
             pass
         _report(tid, thread_id, f"✅ Done — **{product}** is built, tested and ready. Download it from Projects. "

@@ -182,6 +182,7 @@ ckp "governance controls wired"              "$PY scripts/test_governance_wired.
 ckp "quality-lens triad wired"               "$PY scripts/test_quality_lenses_wired.py | grep -q PASS"
 ckp "daemon supervision wired"               "$PY scripts/test_supervision_wired.py | grep -q PASS"
 ckp "sentinel silent-failure observer"       "$PY scripts/sentinel.py selftest | grep -q PASS"
+ckp "memory spine (company mem + role lessons)"  "$PY scripts/companymemory.py selftest | grep -q PASS"
 ckp "acceptance dogfood wired"               "$PY scripts/dogfood.py selftest | grep -q PASS"
 ckp "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ckp "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"

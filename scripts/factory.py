@@ -516,7 +516,16 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
         prompt = (f"You are the {role}, replying live in a chat with a non-technical CEO. Be warm, concise, and "
                   f"helpful; answer directly without preamble.\n\n{task}")
     else:
-        prompt = f"{role_brief(role)}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
+        # MEMORY SPINE (REBUILD-PLAN A3): the brief carries the elite role charter PLUS this company's
+        # memory (decisions/preferences/history) + this role's hard-won lessons — so a spawned agent is not
+        # a blank slate that "remembers nothing from yesterday". Best-effort: memory must never block a spawn.
+        mem = ""
+        try:
+            import companymemory
+            mem = companymemory.brief_context(getattr(_ctx, "tenant", None), getattr(_ctx, "org", None), role)
+        except Exception:
+            mem = ""
+        prompt = f"{role_brief(role)}{mem}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
     # MULTI-PROVIDER: a tenant may have ONLY a Codex/OpenAI key (no Claude). Route them to Codex as the
     # PRIMARY engine (not just failover), on their own key. Default stays Claude.
     engine = (getattr(_ctx, "engine", None) or "claude").lower()

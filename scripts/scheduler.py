@@ -52,6 +52,9 @@ DEFAULT_SCHEDULES = [
     # console through the qa explorer on the real journeys and FILES findings (blockers alert at once).
     # `cron` detaches the real run so JOB_TIMEOUT can't guillotine a long browser pass.
     ("acceptance-dogfood", f"{VENV_PY} {SCRIPTS / 'dogfood.py'} cron", 86400),
+    # CEO chief-of-staff brief (REBUILD-PLAN B1): DAILY per-tenant briefing composed from each company's
+    # real state, delivered into their console notifications — the "your executive team briefs you" moment.
+    ("chiefofstaff-daily", f"{VENV_PY} {SCRIPTS / 'chiefofstaff.py'} push-daily", 86400),
 ]
 
 

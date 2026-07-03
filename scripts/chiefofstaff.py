@@ -95,6 +95,49 @@ def brief(tid, org_id=0, api_key=None):
     }
 
 
+def _fmt(b):
+    """Render a brief dict into a short notification body."""
+    lines = []
+    if b.get("needs_you"):
+        lines.append("Awaiting you: " + "; ".join(b["needs_you"][:3]))
+    if b.get("team_did"):
+        lines.append("Your team: " + "; ".join(b["team_did"][:2]))
+    if b.get("suggestion"):
+        lines.append("Next: " + b["suggestion"])
+    return "\n".join(lines)[:400]
+
+
+def push_daily(limit=200):
+    """The PROACTIVE morning brief (REBUILD-PLAN B1): for each ACTIVE tenant, compose the chief-of-staff
+    brief and deliver it into their console notifications (+ push if they've connected one). Scheduled
+    daily. Bounded + best-effort — one tenant's failure never blocks the rest, and a session cap just
+    means fewer briefs that day (not a crash). Returns how many were delivered."""
+    import psycopg
+    import trace
+    sent = 0
+    try:
+        with psycopg.connect(trace.DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT tenant_id FROM tenants
+                           WHERE coalesce(suspended,false)=false
+                           ORDER BY tenant_id LIMIT %s""", (limit,))
+            tenants = [r[0] for r in cur.fetchall()]
+    except Exception:
+        tenants = []
+    for tid in tenants:
+        try:
+            b = brief(tid, 0)
+            body = _fmt(b)
+            if not body:
+                continue                              # nothing worth interrupting the CEO for today
+            import notifications
+            notifications.send(tid, "digest", b.get("headline", "Your daily brief"), body,
+                               level="standard", url="/#cockpit")
+            sent += 1
+        except Exception:
+            continue
+    return {"briefs_sent": sent, "tenants": len(tenants)}
+
+
 def _selftest():
     import uuid
     import factory
@@ -126,6 +169,12 @@ def _selftest():
         # (c) facts are grounded (real modules queried, no crash on an empty tenant)
         chk(isinstance(_facts(tid, 0), dict) and "awaiting" in _facts(tid, 0),
             "_facts gathers real state without fabricating (empty tenant -> empty, not invented)")
+
+        # (d) daily push is scheduled (the proactive morning brief) + _fmt renders a body
+        import scheduler
+        scheduled = any(n == "chiefofstaff-daily" for n, _, _ in scheduler.DEFAULT_SCHEDULES)
+        chk(scheduled and _fmt({"needs_you": ["Approve X"], "suggestion": "Ship it"}),
+            "daily brief is scheduled (chiefofstaff-daily) + renders a notification body")
         print("PASS: chiefofstaff — per-tenant CEO brief, AI-composed from grounded real state, "
               "fallback never blank ✅" if ok else "FAIL")
     finally:
@@ -139,3 +188,5 @@ if __name__ == "__main__":
         sys.exit(0 if _selftest() else 1)
     elif cmd == "brief":
         print(json.dumps(brief(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 0), indent=2, default=str))
+    elif cmd == "push-daily":
+        print(json.dumps(push_daily()))

@@ -106,6 +106,38 @@ FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-opus-4-8")
 # tools=[] (charters are already sanitized by sanitize.py; this is the second layer of that defense).
 AGENT_TOOLS = os.environ.get("AOS_AGENT_TOOLS", "WebSearch WebFetch").split()
 _ROLE_TOOLS_CACHE = {}
+# ISOLATED AGENT CONFIG (REBUILD-PLAN A4 — the "single most dangerous finding"): spawned agents must NOT
+# inherit the developer's personal ~/.claude/settings.json (which sets defaultMode:bypassPermissions —
+# auto-approving EVERYTHING and defeating the factory's own --permission-mode/--allowedTools guardrails,
+# personal MCP servers, etc.). We point CLAUDE_CONFIG_DIR at a locked-down dir with a minimal settings.json
+# and a SYMLINK to the host credentials so subscription-login auth still works. Idempotent.
+_AGENT_CONFIG_DIR = Path(os.environ.get("AOS_AGENT_CONFIG_DIR", str(Path.home() / ".agent-os-claude")))
+_AGENT_SETTINGS = {
+    "permissions": {
+        "deny": ["Read(./.env)", "Read(./.env.*)", "Read(./secrets/**)", "Read(**/.env)",
+                 "Bash(git push --force:*)", "Bash(sudo:*)", "Bash(rm -rf /*)"],
+        "defaultMode": "acceptEdits",   # NOT bypassPermissions — the factory's --allowedTools governs tools
+    },
+    "enableAllProjectMcpServers": False,
+}
+
+
+def _agent_config_dir():
+    """The isolated CLAUDE_CONFIG_DIR every spawned agent uses (locked-down settings + shared host creds)."""
+    try:
+        d = _AGENT_CONFIG_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "settings.json").write_text(json.dumps(_AGENT_SETTINGS, indent=2))
+        creds = Path.home() / ".claude" / ".credentials.json"          # host login (subscription mode)
+        link = d / ".credentials.json"
+        if creds.exists() and not link.exists():
+            try:
+                link.symlink_to(creds)                                 # share auth, isolate settings
+            except Exception:
+                pass
+        return str(d)
+    except Exception:
+        return None
 
 
 def _role_tools(role):
@@ -342,8 +374,12 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
     # The deterministic PreToolUse block (enforce_manifest.py) keys on THIS role's manifest — point it
     # there so a repo that wires the hook enforces the same deny_read/denied_paths at the source.
     mpath = ROLES / f"{role}.yaml"
-    genv = ({**(env or os.environ), "CP_MANIFEST": str(mpath), "CP": str(CONTROL_PLANE)}
-            if mpath.exists() else env)
+    genv = {**(env or os.environ)}
+    _cfg = _agent_config_dir()                        # isolate from the dev's bypassPermissions settings
+    if _cfg:
+        genv["CLAUDE_CONFIG_DIR"] = _cfg
+    if mpath.exists():
+        genv["CP_MANIFEST"] = str(mpath); genv["CP"] = str(CONTROL_PLANE)
     p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=genv)
     _govern_writes(role, repo)                      # post-run write backstop: revert/audit out-of-scope writes
     out_text, cost, tin, tout, used = (p.stdout or ""), 0.0, 0, 0, model
@@ -863,11 +899,14 @@ def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=No
     grant = tools if tools is not None else _role_tools(role)
     if grant:
         cmd += ["--allowedTools", *grant]
+    _cfg = _agent_config_dir()                        # isolate from the dev's bypassPermissions settings
     if light:
         # A conversational reply uses no tools; a static deny of the mutation/spawn tools is correct AND
         # avoids loading the role manifest + governance on the hot chat path.
         cmd += ["--disallowedTools", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "Task"]
         genv = {**(env or os.environ), "MAX_THINKING_TOKENS": "0"}
+        if _cfg:
+            genv["CLAUDE_CONFIG_DIR"] = _cfg
     else:
         restr = governance.spawn_restrictions(role)
         disallow = list(restr["disallowed_tools"]) + [f"Read({g})" for g in restr["deny_read"]]
@@ -875,6 +914,8 @@ def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=No
             cmd += ["--disallowedTools", *disallow]
         mpath = ROLES / f"{role}.yaml"
         genv = {**(env or os.environ), "MAX_THINKING_TOKENS": "0"}
+        if _cfg:
+            genv["CLAUDE_CONFIG_DIR"] = _cfg
         if mpath.exists():
             genv["CP_MANIFEST"] = str(mpath); genv["CP"] = str(CONTROL_PLANE)
     parts, result_text, cost, tin, tout, used, rc, cancelled = [], "", 0.0, 0, 0, model, 0, False

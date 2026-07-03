@@ -19,6 +19,12 @@ companies with tens of thousands of employees:
 - **Quality bar: astonish a skeptic.** Assume users are fickle, hard to win, and trust AI *less* than
   humans. One frustration and they're gone. The system must *surprise* them with how good it is —
   frustration-free, high-quality, zero bugs reaching a human.
+- **Resilient to LOUD and SILENT failures — anything and everything.** OS shutdown, a container dying,
+  provider rate-limits/529 storms, a hung agent, a stalled workflow, a network blip — the system detects
+  it (observer agents constantly watching, heartbeats on everything including *agentic work in progress*),
+  heals itself where it can, and **proactively communicates** otherwise: the controller pings the CEO
+  before the CEO ever wonders "did something silently die?". Long-running work reports progress on a
+  cadence; silence is itself treated as a failure signal. Nothing fails invisibly.
 
 **Commercial bar:** sellable for hundreds of millions; hundreds of thousands of users, each launching
 millions of dollars of business through it.

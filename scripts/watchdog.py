@@ -95,6 +95,14 @@ def check():
                 if idle_min and idle_min > STALL_MIN:
                     issues.append({"sig": f"stall:{res}", "level": "warn",
                                    "msg": f"build '{res}' silent {round(idle_min)}m — possible stall"})
+    # 3b) SILENT failures (sentinel): hung agent work, dead workflows, provider 529-storms — plus its
+    # proactive side-channels (progress ping while long work runs healthy, boot-recovery notice). A broken
+    # sentinel must never take the watchdog down with it.
+    try:
+        import sentinel
+        issues.extend(sentinel.observe())
+    except Exception as e:
+        issues.append({"sig": "sentinel:self", "level": "warn", "msg": f"sentinel observe failed: {e}"})
     # 4) stale heartbeats (a loop that should be beating went quiet)
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("SELECT component, EXTRACT(EPOCH FROM now()-ts) FROM heartbeats")

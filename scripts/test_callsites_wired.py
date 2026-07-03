@@ -39,7 +39,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(HERE, "qa"))   # the agentic QA engine (qa_run/qa_report seams)
+sys.path.insert(0, os.path.join(HERE, "qa"))         # the agentic QA engine (qa_run/qa_report seams)
+sys.path.insert(0, os.path.join(HERE, "orchestra"))  # the durable actor runtime (store/research_org seams)
 
 # ---------------------------------------------------------------------------
 # 1. Curated INTEGRATION-SEAM targets: module -> {leaf function names}
@@ -61,6 +62,12 @@ TARGETS = {
     "qa_run":       {"qa_run", "write_verdict"},
     "qa_report":    {"build_report"},
     "factory":      {"run_grounded_qa", "run_independent_qa", "run_agentic_web_qa"},
+    # A1 durable-org seams: loopcontroller -> research.start(engine=) -> research_org.run_research
+    # -> store.* — a signature drift anywhere on this chain silently unwires the orchestra engine.
+    "store":        {"start_run", "finish_run", "spawn_actor", "update_actor", "heartbeat",
+                     "org_tree", "runs_for", "stale_working", "emit", "claim_events",
+                     "complete_event"},
+    "research_org": {"run_research"},
 }
 
 

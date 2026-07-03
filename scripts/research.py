@@ -7,10 +7,18 @@ research_fleet (decompose -> parallel fleet -> synthesize) with durable run stat
 step: once the report lands, a research-growth agent reads it and proposes 3 DISTINCT strategic
 options, one marked recommended. The controller starts a run, polls run_state, then select()s.
 
+ENGINES (REBUILD-PLAN A1): with AOS_ORCHESTRA on (the DEFAULT), the run executes as a durable
+ORCHESTRA org run (scripts/orchestra/research_org.py: controller actor -> research supervisor ->
+N child researchers as Postgres rows, events on the persisted bus, heartbeats for sentinel) —
+orchestra IS the engine with this as its production caller. Flag off (AOS_ORCHESTRA=0) falls back
+to the legacy in-process fleet. Either way the output contract here (research_runs / report /
+options) is identical, so the console UX never changes.
+
     research.py json <tenant_id> <run_id>     # the run state + option cards
     research.py selftest
 Run with the agent-os venv python. No web server — DB + a daemon thread, like the orchestrator.
 """
+import os
 import sys
 import threading
 from pathlib import Path
@@ -19,9 +27,17 @@ import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(SCRIPTS / "orchestra"))
 import audit          # noqa: E402
 import factory        # noqa: E402
 import research_fleet  # noqa: E402
+import research_org   # noqa: E402  — the durable ORCHESTRA org-run engine (default)
+
+
+def orchestra_on():
+    """AOS_ORCHESTRA — default ON: research runs as a durable orchestra org run. Set
+    AOS_ORCHESTRA=0 to fall back to the legacy in-process research_fleet path."""
+    return os.environ.get("AOS_ORCHESTRA", "1").strip().lower() not in ("0", "false", "off", "no")
 
 ENV = Path.home() / "projects" / "agent-os" / ".env.local"
 DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
@@ -40,8 +56,11 @@ def _ensure():
         c.commit()
 
 
-def start(tenant_id, org_id, thread_id, question, api_key=None):
-    """Insert a research_runs row and kick off the fleet in a daemon thread. Returns {run_id}.
+def start(tenant_id, org_id, thread_id, question, api_key=None, engine=None):
+    """Insert a research_runs row and kick off the run in a daemon thread. Returns {run_id}.
+
+    ENGINE: None (default) resolves via orchestra_on() — 'orchestra' (the durable org run) unless
+    AOS_ORCHESTRA=0 -> 'fleet' (legacy in-process). Callers may also pin it explicitly.
 
     GOVERNED SPEND PATH (mirrors orchestrator.confirm): launching the fleet fans out unbounded LLM
     work, so gate on consent + billing quota BEFORE any spend, and thread the TENANT's connected
@@ -50,6 +69,7 @@ def start(tenant_id, org_id, thread_id, question, api_key=None):
     terminates promptly instead of hanging) and the thread is NOT started.
     """
     _ensure()
+    engine = engine or ("orchestra" if orchestra_on() else "fleet")
     import billing
     import consent
     import tenantproviders
@@ -86,16 +106,26 @@ def start(tenant_id, org_id, thread_id, question, api_key=None):
         # ACTIONABLE reason to the user instead of an opaque 'failed'. The thread is NOT started (no spend).
         return {"run_id": run_id, "status": "failed", "error": block}
     audit.append(actor="research", action="ResearchRunStart", resource=str(run_id),
-                 decision="executed", payload={"question": (question or "")[:160], "tenant": tenant_id})
-    threading.Thread(target=_run, args=(run_id, question, api_key), daemon=True).start()
+                 decision="executed", payload={"question": (question or "")[:160], "tenant": tenant_id,
+                                               "engine": engine})
+    threading.Thread(target=_run, args=(run_id, question, api_key, engine, tenant_id, org_id),
+                     daemon=True).start()
     return {"run_id": run_id}
 
 
-def _run(run_id, question, api_key=None):
-    """Daemon worker: run the fleet (on the tenant's provider key), persist the report, distill option
-    cards. Exceptions -> failed."""
+def _run(run_id, question, api_key=None, engine="orchestra", tenant_id=None, org_id=None):
+    """Daemon worker: run the research (on the tenant's provider key), persist the report, distill
+    option cards. Exceptions -> failed. engine='orchestra' (default) executes as a durable org run
+    (research_org: Postgres actors + persisted events + heartbeats); 'fleet' is the legacy
+    in-process path. Both land the report at the same path, so everything below is engine-agnostic.
+    The DB run_id is threaded into either engine so the workspace is per-run isolated."""
     try:
-        res = research_fleet.research(question, "REPORT.md", api_key=api_key)
+        if engine == "orchestra":
+            res = research_org.run_research(question, "REPORT.md", api_key=api_key,
+                                            research_run_id=run_id, tenant_id=tenant_id,
+                                            org_id=org_id)
+        else:
+            res = research_fleet.research(question, "REPORT.md", api_key=api_key, run_id=run_id)
         report_path = res.get("report")
         report_text = ""
         try:
@@ -256,7 +286,21 @@ def _selftest():
     tmp = Path(tempfile.mkdtemp()) / "REPORT.md"
     tmp.write_text("# Research report\nKey finding: creators are underserved. Three paths exist.\n")
     real_research, real_agent = research_fleet.research, factory.agent
-    research_fleet.research = lambda q, out_rel="REPORT.md", **k: {"report": str(tmp)}
+    real_org = research_org.run_research
+    # ENGINE ROUTING under test: default (AOS_ORCHESTRA on) must dispatch the ORCHESTRA org run;
+    # engine='fleet' must fall back to the legacy in-process fleet. Count each seam's calls.
+    engines = {"orchestra": 0, "fleet": 0}
+
+    def _fake_org(q, out_rel="REPORT.md", **k):
+        engines["orchestra"] += 1
+        return {"report": str(tmp), "subquestions": 3, "answered": 3}
+
+    def _fake_fleet(q, out_rel="REPORT.md", **k):
+        engines["fleet"] += 1
+        return {"report": str(tmp)}
+
+    research_org.run_research = _fake_org
+    research_fleet.research = _fake_fleet
     factory.agent = lambda *a, **k: {"rc": 0, "out": ("* OPT: Creator-first :: focus on creators\n"
                                                       "OPT: Ad-free subs :: subscription model\n"
                                                       "OPT: Short-form :: tiktok style")}
@@ -312,14 +356,29 @@ def _selftest():
         except ValueError:
             xselect_ok = True
         xtenant_ok = xread == [] and xselect_ok
+        # ENGINE ROUTING: the two completed runs above (default engine) must BOTH have gone through
+        # the orchestra org run; an explicit engine='fleet' run must take the legacy path and still
+        # land the same report/options contract (console UX identical either way).
+        lg_id = start(tid, "org-self", 1, "legacy engine path", engine="fleet")["run_id"]
+        dl3 = time.time() + 10
+        lst = run_state(tid, lg_id)
+        while lst["status"] not in ("done", "failed") and time.time() < dl3:
+            time.sleep(0.2)
+            lst = run_state(tid, lg_id)
+        routing_ok = (engines["orchestra"] == 2 and engines["fleet"] == 1
+                      and lst["status"] == "done" and len(lst["options"]) >= 1)
+        print(f"engine routing: orchestra={engines['orchestra']} (default ON) "
+              f"fleet={engines['fleet']} (explicit fallback, status={lst['status']})")
         ok = (parse_ok and extracted_ok and chosen_ok and xtenant_ok and blocked_ok
-              and done_implies_options and fallback_ok)
+              and done_implies_options and fallback_ok and routing_ok)
         print(f"run {run_id}: status={st['status']} options={len(opts)} recommended={len(recs)} "
               f"chosen={chosen['title'] if chosen else None} xtenant_guard={xtenant_ok} "
-              f"preconsent_block={blocked_ok} fallback_ok={fallback_ok}")
-        print("PASS: research STATE+OPTIONS (async run -> 3 selectable cards -> select) ✅" if ok else "FAIL")
+              f"preconsent_block={blocked_ok} fallback_ok={fallback_ok} engine_routing={routing_ok}")
+        print("PASS: research STATE+OPTIONS (async run -> 3 selectable cards -> select; "
+              "orchestra engine default, legacy fleet fallback) ✅" if ok else "FAIL")
     finally:
         research_fleet.research, factory.agent = real_research, real_agent
+        research_org.run_research = real_org
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("""DELETE FROM research_options WHERE run_id IN
                            (SELECT id FROM research_runs WHERE tenant_id=%s)""", (tid,))

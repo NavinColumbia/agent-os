@@ -7,8 +7,12 @@ leads/specialists reporting to it — OVERLAID with the tenant's LIVE agents fro
 table (which roles are actually active on this tenant's products right now, their status + current
 task). So the owner sees both the intended org and who is really on the clock.
 
-  orgchart(tid) -> {"tree":[{role,title,reports_to,live,status,task,count}...]}  every static node,
-                   marked live with the count of that role's active instances + most recent task.
+  orgchart(tid) -> {"tree":[{role,title,reports_to,live,status,task,count}...], "org_runs":[...]}
+                   every static node, marked live with the count of that role's active instances +
+                   most recent task — PLUS the REAL org (REBUILD-PLAN A1/B2): the tenant's recent
+                   orchestra runs rendered from store.org_tree(), i.e. actually-hired agents with
+                   names, roles, status, tenure and heartbeat age from real spawn data.
+  org_runs(tid) -> just that real-spawn-data view (the durable store's nested org trees).
   roster(tid)   -> the flat list of the tenant's currently-live agents.
 
     orgview.py json <tenant_id>     # the org chart payload on the CLI
@@ -23,7 +27,9 @@ import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(SCRIPTS / "orchestra"))
 import audit  # noqa: E402  (audit-trail the org reads, same convention as the other surfaces)
+import store  # noqa: E402  (the durable org: real hired agents with identity/tenure/heartbeats)
 
 ENV = Path.home() / "projects" / "agent-os" / ".env.local"
 DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
@@ -68,9 +74,22 @@ def _live_by_role(cur, products):
     return by_role
 
 
+def org_runs(tid, limit=3):
+    """THE REAL ORG (A1 seam, feeds B2): the tenant's most recent orchestra runs, each rendered
+    from store.org_tree() — a nested tree of ACTUALLY-HIRED agents (Postgres rows from real spawn
+    data) with name, control-plane role, status, assignment, tenure_s and last_active_age_s.
+    Best-effort: an unreachable store yields [] rather than killing the whole chart."""
+    try:
+        runs = store.runs_for(tid, limit=limit)
+        return [{"run": r, **store.org_tree(r["run_id"], tid)} for r in runs]
+    except Exception:
+        return []
+
+
 def orgchart(tid):
     """Every node of the static hierarchy, marked live + with the count of that role's active
-    instances on the tenant's products and the most recent task. Root reports_to=null."""
+    instances on the tenant's products and the most recent task. Root reports_to=null.
+    PLUS org_runs: the durable store's real spawned-agent trees (see org_runs above)."""
     with psycopg.connect(DB) as c, c.cursor() as cur:
         products = _products(cur, tid)
         by_role = _live_by_role(cur, products)
@@ -86,7 +105,7 @@ def orgchart(tid):
             "task": live["task"] if live else None,
             "count": live["count"] if live else 0,
         })
-    return {"tenant": tid, "tree": tree}
+    return {"tenant": tid, "tree": tree, "org_runs": org_runs(tid)}
 
 
 def roster(tid):
@@ -116,6 +135,14 @@ def _selftest():
                        ON CONFLICT (agent_id) DO UPDATE SET role=EXCLUDED.role, status='active',
                          product=EXCLUDED.product, task=EXCLUDED.task, updated_at=now()""", (f"builder@{prod}", prod))
         c.commit()
+    # Seed a REAL orchestra run for this tenant (durable store rows: hired controller -> supervisor
+    # -> worker) so the chart's org_runs section renders actual spawn data, not the static list.
+    orc = store.start_run(tid, "grow the creator platform")["run_id"]
+    s_ctrl = store.spawn_actor(orc, tid, "controller", "controller", kind="controller")
+    s_sup = store.spawn_actor(orc, tid, "research-supervisor", "research-growth", kind="supervisor",
+                              supervisor_id=s_ctrl["actor_id"], assignment="lead the research")
+    store.spawn_actor(orc, tid, "researcher-01", "research-growth", kind="worker",
+                      supervisor_id=s_sup["actor_id"], assignment="market sizing")
     try:
         oc = orgchart(tid)
         tree = oc["tree"]
@@ -126,14 +153,30 @@ def _selftest():
               and len(tree) >= 6
               and builder is not None and builder["live"] is True and builder["count"] >= 1
               and any(x["agent_id"] == f"builder@{prod}" for x in rs))
+        # REAL spawn data on the chart: the seeded run appears with the nested hired agents, each
+        # carrying identity + status + tenure (what the B2 living-org UI will render).
+        runs = oc.get("org_runs") or []
+        node = runs[0]["tree"][0] if runs and runs[0].get("tree") else {}
+        sup_node = (node.get("reports") or [{}])[0]
+        real_ok = (len(runs) == 1 and runs[0]["run"]["run_id"] == orc and runs[0]["actors"] == 3
+                   and node.get("name") == "controller" and node.get("status") == "idle"
+                   and isinstance(node.get("tenure_s"), int)
+                   and sup_node.get("name") == "research-supervisor"
+                   and sup_node.get("role") == "research-growth"
+                   and (sup_node.get("reports") or [{}])[0].get("name") == "researcher-01")
+        ok = ok and real_ok
         print(f"root={root['role'] if root else None}(reports_to={root['reports_to'] if root else '?'}) "
               f"nodes={len(tree)} builder.live={builder['live'] if builder else None} "
-              f"builder.count={builder['count'] if builder else 0} roster={len(rs)}")
-        print("PASS: org chart hierarchy overlaid with live directory agents ✅" if ok else "FAIL")
+              f"builder.count={builder['count'] if builder else 0} roster={len(rs)} "
+              f"org_runs(real spawn data)={real_ok}(runs={len(runs)},actors={runs[0]['actors'] if runs else 0})")
+        print("PASS: org chart — static hierarchy overlaid with live directory agents + REAL "
+              "orchestra org trees (names/roles/status/tenure from spawn rows) ✅" if ok else "FAIL")
     finally:
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("DELETE FROM directory WHERE product=%s", (prod,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM orchestra_actors WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM orchestra_runs WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
             c.commit()
     sys.exit(0 if ok else 1)

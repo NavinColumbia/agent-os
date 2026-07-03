@@ -874,7 +874,14 @@ def advance(thread_id, job_result=None):
         q = (s["brief"] or {}).get("question", "build my product")
         def _do_research():
             import research as _r, time
-            started = _r.start(tid, s["org_id"], thread_id, q)
+            # AOS_ORCHESTRA (default ON): dispatch the research as a durable ORCHESTRA org run —
+            # controller actor -> research supervisor -> N child researchers as Postgres rows
+            # (identity/tenure/heartbeats) with events on the persisted bus (REBUILD-PLAN A1:
+            # orchestra IS the engine, this is its production callsite). Flag off -> the legacy
+            # in-process fleet. Same research_runs/report/options contract either way, so the
+            # console UX below is engine-agnostic.
+            eng = "orchestra" if _r.orchestra_on() else "fleet"
+            started = _r.start(tid, s["org_id"], thread_id, q, engine=eng)
             rid = started.get("run_id")
             if started.get("error"):
                 # The governed-spend gate (consent/quota) refused the fan-out up front — no thread was
@@ -1383,7 +1390,11 @@ def _selftest():
                         "charter: A video API.\n[[/PLAN]]")
         return {"rc": 0, "out": "ok", "out_full": "ok"}
     factory.agent = fake_agent
-    _r.start = lambda t, o, th, q: {"run_id": 999}
+    research_kw = {}                                        # captures HOW the RESEARCH phase dispatches
+    def _fake_rstart(t, o, th, q, **k):
+        research_kw.update(k)
+        return {"run_id": 999}
+    _r.start = _fake_rstart
     _r.run_state = lambda t, rid: {"status": "done", "options": [{"id": 1, "title": "A", "recommended": True}]}
     _r.select = lambda t, rid, oid: {"option_id": oid, "title": "A"}
     _d.prototype = lambda t, o, p, pl, **k: {"screens": 3, "surfaces": ["cockpit", "team", "external"]}
@@ -1619,12 +1630,19 @@ def _selftest():
         factory.run_grounded_qa = _green_gq                    # back to green for anything downstream
         qa_gate_ok = qa_green and qa_zero_story and qa_blocking and qa_crash
 
+        # A1 WIRING: with AOS_ORCHESTRA on (default), the RESEARCH phase must have dispatched the
+        # run as an ORCHESTRA org run (engine='orchestra' through research.start) — the review's
+        # "zero production callers" verdict is dead only if the LIVE path actually routes there.
+        import research as _rmod
+        orchestra_wired_ok = research_kw.get("engine") == ("orchestra" if _rmod.orchestra_on()
+                                                           else "fleet")
+
         ok = (consent_gate_ok and opt and gate_held and in_design and plan_persisted and plan_card
               and no_tag_leak and proto and deliver and jobs >= 3 and qa_gate_ok
               and eta_ok and research_eta_ok and consts_ok and ping_ok and live_cancel_ok
               and consent_reask_ok and sla_ok and status_honest_ok and midflight_intent_ok and dedupe_ok
               and options_elaborate_ok and options_nudge_ok and research_report_ok and plan_full_ok
-              and design_surface_ok)
+              and design_surface_ok and orchestra_wired_ok)
         print(f"consent_gate={consent_gate_ok} options={opt} gate_held={gate_held} design={in_design} "
               f"plan_persisted={plan_persisted} plan_card={plan_card} no_tag_leak={no_tag_leak} "
               f"prototype={proto} deliver={deliver} jobs_done={jobs}")
@@ -1643,6 +1661,8 @@ def _selftest():
               f"design_surface={design_surface_ok}")
         print(f"qa_gate(C1 verdict-consumed)={qa_gate_ok}(green={qa_green},zero_story={qa_zero_story},"
               f"blocking={qa_blocking},crash_fail_closed={qa_crash})")
+        print(f"orchestra_wired(A1 research engine)={orchestra_wired_ok}"
+              f"(engine={research_kw.get('engine')})")
         print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel"
               " + consent-reask/sla/status-honesty ✅" if ok else "FAIL")
     finally:

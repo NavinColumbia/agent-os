@@ -22,6 +22,7 @@ process) — resume_stalled() (run from the scheduler) recovers a killed worker 
 Run with the agent-os venv python.
 """
 import json
+import os
 import re
 import sys
 import threading
@@ -1024,7 +1025,12 @@ def qa_gate(product) -> dict:
         return {"qa_ok": False, "error": str(e)[:200]}
 
 
-RUNNING_TIMEOUT_MIN = 30  # a job still 'running' past this is presumed crashed (its worker died mid-run)
+RUNNING_TIMEOUT_MIN = 30   # (legacy constant kept for callers/tests; superseded by heartbeat liveness below)
+# HEARTBEAT LIVENESS (REBUILD-PLAN A2): a job is presumed crashed only if it is BOTH older than this floor
+# AND has been SILENT (no factory audit / orchestra heartbeat) for STALL_SILENT_MIN. A healthy hour-long
+# agentic-QA build keeps itself alive by working; only a truly dead worker gets reaped. No more 30-min guillotine.
+RUNNING_FLOOR_MIN = int(os.environ.get("AOS_JOB_FLOOR_MIN", "20"))       # never reap younger than this
+STALL_SILENT_MIN = int(os.environ.get("AOS_JOB_SILENT_MIN", "12"))       # no activity this long = actually dead
 
 
 def resume_stalled():
@@ -1088,14 +1094,31 @@ def resume_stalled():
     except Exception:
         pass
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        # 1) Reap timed-out 'running' jobs: the worker is gone, so mark them failed (durable terminal state).
-        cur.execute("""UPDATE controller_jobs SET status='failed',
-                           result = COALESCE(result, '{}'::jsonb)
-                                    || '{"error":"worker timed out / crashed","status":"failed"}'::jsonb,
-                           finished_at = now()
-                       WHERE status='running'
-                         AND started_at < now() - make_interval(mins => %s)""",
-                    (RUNNING_TIMEOUT_MIN,))
+        # 1) Reap CRASHED jobs — by HEARTBEAT LIVENESS, not a flat guillotine (REBUILD-PLAN A2). The old rule
+        #    ("running > 30m = dead") killed HEALTHY long builds — and the agentic-QA ship gate now makes a
+        #    build legitimately run ~1h. A worker proves life by writing to the audit stream (factory:%) or
+        #    beating an orchestra actor. So a job is only "crashed" when it is BOTH past a generous floor AND
+        #    has shown NO activity for STALL_SILENT_MIN. A long build that logged 2 minutes ago stays alive.
+        cur.execute("""
+            UPDATE controller_jobs cj SET status='failed',
+                result = COALESCE(cj.result,'{}'::jsonb)
+                         || '{"error":"worker crashed (silent past stall window)","status":"failed"}'::jsonb,
+                finished_at = now()
+            FROM controller_state cs
+            WHERE cs.thread_id = cj.thread_id
+              AND cj.status='running'
+              AND cj.started_at < now() - make_interval(mins => %s)          -- past the generous floor
+              AND NOT EXISTS (                                               -- and genuinely SILENT: no factory
+                    SELECT 1 FROM audit_log al                              -- audit for this product recently
+                    WHERE al.actor LIKE 'factory:%%'
+                      AND al.resource = cs.product
+                      AND al.ts > now() - make_interval(mins => %s))
+              AND NOT EXISTS (                                               -- and no live orchestra actor for
+                    SELECT 1 FROM orchestra_actors oa                       -- this TENANT beating recently
+                    WHERE oa.tenant_id = cj.tenant_id
+                      AND oa.status NOT IN ('done','dead')
+                      AND oa.last_active > now() - make_interval(mins => %s))
+        """, (RUNNING_FLOOR_MIN, STALL_SILENT_MIN, STALL_SILENT_MIN))
         c.commit()
         # 2) For every NON-research thread parked on 'fleet', take its most recent job (any status).
         #    RESEARCH is reconciled above against its real run, so exclude it here.

@@ -32,9 +32,14 @@ run_one(){ # $1=index $2=results-dir  — runs in a background subshell
   local i="$1" RD="$2" name="${PAR_NAMES[$i]}" cmd="${PAR_CMDS[$i]}"
   local t0=$SECONDS
   if [ -n "${SELFTEST_TIMING:-}" ]; then trap 'printf "%6ss  %s\n" "$((SECONDS-t0))" "$name" >>"$SELFTEST_TIMING"' RETURN; fi
-  if eval "$cmd" >"$RD/$i.log" 2>&1; then
+  # RESILIENCE: every check is hard-capped so ONE hung command can never stall the whole suite (a wedged DB
+  # lock / a slow model call / an infinite loop fails THAT check, not the run). SIGTERM, then SIGKILL 10s
+  # later. A timed-out check is a FAIL with a clear reason — never a silent 75-minute hang.
+  if timeout -k 10 "${CKP_TIMEOUT:-300}" bash -c "$cmd" >"$RD/$i.log" 2>&1; then
     { echo PASS; printf "  ✅ %s\n" "$name"; } >"$RD/$i.res"
   else
+    local rc=$?
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then echo "CHECK TIMED OUT after ${CKP_TIMEOUT:-300}s (hang guard)" >>"$RD/$i.log"; fi
     { echo FAIL; printf "  ❌ %s\n" "$name"; tail -2 "$RD/$i.log" | sed 's/^/       /'; } >"$RD/$i.res"
   fi
 }

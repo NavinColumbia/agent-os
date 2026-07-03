@@ -49,6 +49,8 @@ WF_STALE_MIN = int(os.environ.get("AOS_SENTINEL_WF_STALE_MIN", "45"))      # wor
 WF_WINDOW_H = int(os.environ.get("AOS_SENTINEL_WF_WINDOW_H", "6"))         # only workflows active this recently
 PROVIDER_BURST = int(os.environ.get("AOS_SENTINEL_PROVIDER_BURST", "3"))   # transient markers in 15m = degraded
 ACTOR_STALE_MIN = int(os.environ.get("AOS_SENTINEL_ACTOR_STALE_MIN", "10"))  # orchestra beats every ~45s; 10m silent = stuck
+DB_TXN_STALE_MIN = int(os.environ.get("AOS_SENTINEL_DB_TXN_MIN", "3"))       # idle-in-transaction older than this = a leak -> auto-terminate
+DB_LOCK_PILEUP = int(os.environ.get("AOS_SENTINEL_DB_LOCK_PILEUP", "8"))     # this many lock-waiters = contention/hang forming
 PROGRESS_EVERY_S = int(os.environ.get("AOS_SENTINEL_PROGRESS_S", "3600"))  # "still working" ping cadence
 _TRANSIENT_SQL = "(output ~* 'overloaded|rate.?limit|too many requests|529|429' OR rc <> 0)"
 CLAUDE_DIR = Path(os.environ.get("AOS_CLAUDE_DIR", str(Path.home() / ".claude" / "projects")))
@@ -156,6 +158,45 @@ def observe(wf_root=None, notify_fn=None, now=None):
                            "msg": f"orchestra actor {a['name']} ({a['role']}, run {a['run_id']}) says "
                                   f"'working' but has been silent {a['stale_min']}m — possible dead "
                                   f"agent holding an assignment (tenant {a['tenant_id']})"})
+    except Exception:
+        pass
+
+    # 3c) DB HANG — a leaked 'idle in transaction' backend (a crashed/timed-out process that opened a txn and
+    # never committed) holds row/table locks and silently WEDGES everything that touches those rows. This cost
+    # the owner 75 minutes once (a test heredoc's INSERT held controller_jobs). AUTO-HEAL it: terminate any
+    # idle-in-transaction older than the threshold, and flag a lock-wait pileup. Safe + idempotent — a healthy
+    # app connection commits in milliseconds, so anything idle-in-txn for minutes is a leak, never live work.
+    try:
+        with psycopg.connect(DB, autocommit=True) as c, c.cursor() as cur:
+            cur.execute("""SELECT count(*) FROM pg_stat_activity
+                           WHERE state='idle in transaction'
+                             AND query_start < now() - make_interval(mins => %s)
+                             AND pid <> pg_backend_pid()""", (DB_TXN_STALE_MIN,))
+            stale = cur.fetchone()[0]
+            if stale:
+                cur.execute("""SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                               WHERE state='idle in transaction'
+                                 AND query_start < now() - make_interval(mins => %s)
+                                 AND pid <> pg_backend_pid()""", (DB_TXN_STALE_MIN,))
+                killed = cur.rowcount
+                issues.append({"sig": "sentinel:db-hang-healed", "level": "warn", "_healed": True,
+                               "msg": f"🛠 auto-healed a DB hang: terminated {killed} leaked idle-in-transaction "
+                                      f"backend(s) older than {DB_TXN_STALE_MIN}m (were holding locks / wedging queries)"})
+                if notify_fn is None:
+                    try:
+                        import notify; notify_fn = notify.send
+                    except Exception:
+                        notify_fn = None
+                if notify_fn:
+                    try:
+                        notify_fn(issues[-1]["msg"], title="agent-os sentinel")
+                    except Exception:
+                        pass
+            cur.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock'")
+            waiting = cur.fetchone()[0]
+            if waiting >= DB_LOCK_PILEUP:
+                issues.append({"sig": "sentinel:db-lock-pileup", "level": "warn",
+                               "msg": f"DB contention: {waiting} queries waiting on locks — possible hang forming"})
     except Exception:
         pass
 

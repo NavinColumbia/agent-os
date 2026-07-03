@@ -392,6 +392,7 @@ GETS = {
     "/api/company": lambda tid, q: cockpit.company_summary(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/comms_graph": lambda tid, q: cockpit.comms_graph(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/org": lambda tid, q: orgview.orgchart(tid),
+    "/api/org/live": lambda tid, q: {"runs": orgview.org_runs(tid)},   # B2 living org: REAL hired agents (store.org_tree)
     "/api/livestatus": lambda tid, q: {"products": livestatus.live_status(tid)},
     "/api/chat/history": lambda tid, q: {"messages": orchestrator.history(tid, int(q.get("thread", ["0"])[0] or 0))},
     "/api/providers": lambda tid, q: {"providers": tenantproviders.list_providers(tid)},

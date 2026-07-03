@@ -219,13 +219,22 @@ def _ensure_repo_hygiene(repo: Path, kind: str):
         (repo / "README.md").write_text(f"# {repo.name}\n\nAn {kind} built by the agent-os factory.\n")
 
 
-def publish(name, private=True):
-    """Init git (if needed), track deps/version/README, create a PRIVATE GitHub repo, push, record the URL.
-    GATED action (creates a repo + pushes) — invoked only on explicit owner request. Idempotent-ish: if a
-    remote already exists it just commits + pushes."""
+def publish(name, private=True, role="controller", approval_id=None):
+    """Init git (if needed), track deps/version/README, create a GitHub repo, push, record the URL.
+    GATED action (creates a repo + pushes). A PUBLIC publish is high-blast-radius (it exposes the product
+    to the world), so REBUILD-PLAN C4 makes the human-approval gate actually FIRE here: require_approval
+    fail-closes a public publish unless a hash-pinned, single-use human approval exists (private publish is
+    ungated). This is the first real call site of the approval gate that was defined but never invoked."""
     repo = PRODUCTS / name
     if not repo.exists():
         return {"name": name, "error": "no such product"}
+    if not private:                                   # public publish -> require a verified human approval
+        try:
+            import governance
+            governance.require_approval(role, "public_post", {"publish": name, "public": True},
+                                        approval_id=approval_id)
+        except PermissionError as e:
+            return {"name": name, "error": f"public publish blocked — needs human approval: {e}", "blocked": True}
     kind = detect_kind(repo)
     _ensure_repo_hygiene(repo, kind)
     def git(*a, check=True):

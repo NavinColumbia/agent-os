@@ -727,6 +727,20 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         _report(tid, thread_id, "When your provider is connected in Settings → Providers, say \"ready\".")
         return {"phase": phase}
 
+    # LIFE AFTER DELIVER (REBUILD-PLAN A2): a company doesn't die at one product. Once delivered, a new
+    # build / feature / v2 / next-product request starts a FRESH workstream (re-enters DISCOVER) instead of
+    # the thread becoming a dead Q&A bot. The company's history (org, shipped products, portfolio) persists;
+    # only the per-cycle fields reset. A pure question/status still just gets answered (below).
+    if phase == "DELIVER" and (msg or "").strip() and not _is_status_query(msg):
+        intent = _classify_intent(tid, thread_id, msg, phase, "delivered", api_key=api_key)
+        if intent["verdict"] in ("steer", "proceed", "approve", "choose", "revise"):
+            _set(thread_id, brief={"question": msg}, awaiting=None, plan=None, product=None,
+                 research_run_id=None, chosen_option=None, pending_intent=None)
+            _to(thread_id, "DISCOVER")
+            _report(tid, thread_id, "On it — kicking off a new build for that. Let me scope it.",
+                    {"kind": "new_workstream"})
+            return say(tid, thread_id, msg, api_key=api_key, on_delta=on_delta)   # re-enter at DISCOVER
+
     _report(tid, thread_id, _llm(tid, thread_id, "Answer the CEO briefly.", s, on_delta=on_delta))
     return {"phase": phase}
 

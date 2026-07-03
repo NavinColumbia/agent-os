@@ -39,6 +39,7 @@ import agentfeatures     # noqa: E402
 import crossorg          # noqa: E402
 import crossorgview      # noqa: E402
 import designview        # noqa: E402
+import chiefofstaff       # noqa: E402
 import integrationsview  # noqa: E402
 import livestatus        # noqa: E402
 import loopcontroller    # noqa: E402
@@ -89,7 +90,7 @@ def _owns(tid, org_id):
 
 
 # Routes that carry a client-supplied org id — gated through _owns() before they ever touch a module.
-ORG_SCOPED_GET = {"/api/controller/state", "/api/controller/research", "/api/design",
+ORG_SCOPED_GET = {"/api/controller/state", "/api/controller/research", "/api/design", "/api/brief",
                   "/api/cockpit", "/api/projects", "/api/fleet",
                   "/api/health", "/api/company", "/api/comms_graph"}
 ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/controller/cancel",
@@ -403,6 +404,7 @@ GETS = {
     "/api/help/topics": lambda tid, q: {"topics": helpagent.topics()},
     "/api/agents": lambda tid, q: {"agents": customagents.list_agents(tid), "roles": list(customagents.ALLOWED_ROLES), "system": _system_agents()},
     "/api/orgs": lambda tid, q: {"orgs": orgsmod.list_orgs(tid)},
+    "/api/brief": lambda tid, q: chiefofstaff.brief(tid, int((q.get("org", ["0"])[0]) or 0)),   # B1 chief-of-staff
     "/api/portfolio": lambda tid, q: crossorgview.portfolio(tid),
     "/api/portfolio/analytics": lambda tid, q: crossorgview.analytics(tid),
     "/api/portfolio/failures": lambda tid, q: crossorgview.failures(tid),

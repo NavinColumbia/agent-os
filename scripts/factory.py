@@ -93,9 +93,12 @@ MAX_REVIEW = int(os.environ.get("AOS_MAX_REVIEW", "1"))  # bounded REVIEW->BUILD
 # capped here (each ~430MB) so a big fleet can't exhaust RAM or hammer the API into rate-limits.
 _AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8")))
 # Model policy (pinned for reproducibility; cheaper model for low-stakes stages; fallback on overload).
-BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-opus-4-8")
+# Owner directive (2026-07): ALL agents default to Fable (the frontier model); if Fable has issues the
+# CLI's --fallback-model drops to Opus automatically; deeper layers (transient retry/backoff, then Codex
+# engine failover) are unchanged. Flexibility preserved: env vars + per-call agent(model=...) override.
+BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-fable-5")
 CHEAP_MODEL = os.environ.get("AOS_CHEAP_MODEL", "claude-haiku-4-5-20251001")
-FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-sonnet-4-6")
+FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-opus-4-8")
 # Tools every factory agent may use beyond auto-accepted file edits. Web is on by default so research/
 # intel/build agents can reach live data instead of guessing. Override per-deployment with AOS_AGENT_TOOLS
 # (space-separated), or per-call via agent(..., tools=[...]). SECURITY: web access turns an agent into a
@@ -714,7 +717,8 @@ _API_CLIENTS_LOCK = threading.Lock()
 # Per-1M-token (input, output) list price for the models the fast path uses — to report honest cost on the
 # API path (the CLI reports total_cost_usd for us; the raw API does not). Cache reads bill ~0.1x, writes ~1.25x.
 _PRICES = {"claude-haiku-4-5": (1.0, 5.0), "claude-sonnet-4-6": (3.0, 15.0),
-           "claude-opus-4-8": (5.0, 25.0), "claude-opus-4-7": (5.0, 25.0)}
+           "claude-opus-4-8": (5.0, 25.0), "claude-opus-4-7": (5.0, 25.0),
+           "claude-fable-5": (5.0, 25.0)}   # opus-tier estimate; CLI paths report real total_cost_usd
 
 
 def _anthropic_available() -> bool:
@@ -1055,31 +1059,40 @@ def run_js_tests(repo: str) -> tuple[bool, str]:
     return ok_all, "\n".join(outs)
 
 
-def run_web_qa(repo: str) -> tuple[bool, str]:
-    """QA for the WEB line: (1) run the builder's functional Node tests (every path/error/edge), THEN
-    (2) serve the app and load it in a real headless browser to assert it renders without console errors
-    + screenshot it. BOTH must pass — functional correctness AND it-actually-runs, not one or the other."""
-    js_ok, js_out = run_js_tests(repo)              # functional path coverage FIRST (was never run before)
+def _serve_static(repo: str):
+    """Serve a static web build over loopback (fresh from disk on every request, so a mid-run fix is
+    immediately observable). Returns (httpd, url); (None, None) when there is no index.html to serve."""
     import functools
     import http.server
     import socket
-    import threading
     root = repo
     if (Path(repo) / "public" / "index.html").exists():
         root = str(Path(repo) / "public")
     elif not (Path(repo) / "index.html").exists():
         idx = next(Path(repo).rglob("index.html"), None)
         if not idx:
-            return False, "no index.html found in the build"
+            return None, None
         root = str(idx.parent)
     s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
     httpd = http.server.HTTPServer(("127.0.0.1", port),
                                    functools.partial(http.server.SimpleHTTPRequestHandler, directory=root))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, f"http://127.0.0.1:{port}"
+
+
+def run_web_qa(repo: str) -> tuple[bool, str]:
+    """PRE-GATE for the WEB line (fast, builder-authored — never the ship gate itself): (1) run the
+    builder's functional Node tests (every path/error/edge), THEN (2) serve the app and load it in a real
+    headless browser to assert it renders without console errors + screenshot it. BOTH must pass.
+    The actual ship gate is the AGENTIC verdict (run_agentic_web_qa) that follows a green pre-gate."""
+    js_ok, js_out = run_js_tests(repo)              # functional path coverage FIRST (was never run before)
+    httpd, url = _serve_static(repo)
+    if not httpd:
+        return False, "no index.html found in the build"
     try:
         shot = f"/tmp/webqa-{Path(repo).name}.png"
         env = {**os.environ, "NODE_PATH": str(Path.home() / "projects" / "products" / "noupload" / "node_modules")}
-        p = subprocess.run(["node", str(SCRIPTS / "web_smoke.cjs"), f"http://127.0.0.1:{port}", shot],
+        p = subprocess.run(["node", str(SCRIPTS / "web_smoke.cjs"), url, shot],
                            capture_output=True, text=True, timeout=120, env=env)
         audit.append(actor="factory:qa-security", action="WebSmoke", resource=Path(repo).name,
                      decision="executed", payload={"rc": p.returncode})
@@ -1234,6 +1247,184 @@ def run_service_qa(repo: str, pkg: str) -> tuple[bool, str]:
         return False, "UNIT TESTS FAILED (fix before runtime):\n" + out_u
     ok_e, out_e = run_e2e_qa(repo, pkg)
     return ok_e, "unit: PASS\n" + out_e
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────
+# THE SHIP GATE (REBUILD-PLAN C1): the builder NEVER grades its own homework. Everything above this
+# line (run_tests / run_js_tests / run_web_qa / run_ext_qa / run_service_qa) is a FAST PRE-GATE built
+# on builder-authored tests; the verdict that actually clears LAUNCH is produced here — the agentic
+# explorer stack for web/UI builds, an independent qa-security verification for everything else — and
+# persisted as the machine-readable LAUNCH artifact (docs/QA-VERDICT.json) that gate_check consumes.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────
+def _qa_stack_path():
+    """Put scripts/qa on sys.path (the qa modules import factory back, so they are imported lazily at
+    call time — never at factory import)."""
+    qa_dir = str(SCRIPTS / "qa")
+    if qa_dir not in sys.path:
+        sys.path.insert(0, qa_dir)
+
+
+def qa_verdict_ok(v: dict) -> bool:
+    """The ship condition, verbatim what gate_check._v_qa_verdict enforces on the LAUNCH artifact:
+    passed==true AND blocking_open==0 AND stories>0. Fail-closed on any missing/garbled fact."""
+    try:
+        return (isinstance(v, dict) and v.get("passed") is True
+                and int(v.get("blocking_open")) == 0 and int(v.get("stories")) > 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def run_agentic_web_qa(repo: str, product: str, vision: str, summary: str,
+                       target_url: str = None) -> dict:
+    """The AGENTIC verification body for web/UI builds: serve the build (unless a running target_url is
+    supplied), let story_gen enumerate the coverage set from the product charter, qa_explorer drive a
+    real browser story-by-story, dev_loop fix blocking bugs, and gate on the grounded verdict. qa_run
+    writes the machine verdict (docs/QA-VERDICT.json) — the LAUNCH artifact.
+
+    Returns {passed, stories, blocking_open, verdict, verdict_json, detail} (fail-closed on any crash:
+    an unverifiable build is a FAILED gate, never a silent pass)."""
+    _qa_stack_path()
+    import qa_run as qa_run_mod                        # lazy: qa_run imports factory back
+
+    def _qa_heartbeat(kind, payload):
+        """LIVENESS during the (legitimately hours-long) exploration: print + trace every qa_run event so
+        the build log and the traces table both show forward motion. Without this the QA stage was silent
+        for the whole run — the watchdog paged 'possible stall' and the resume sweep (idle-trace heuristic)
+        launched a DUPLICATE build against the same product mid-QA."""
+        line = f"[factory:qa] {kind} {json.dumps(payload, default=str)[:300]}"
+        print(line, flush=True)
+        try:
+            _trace("test", "qa-security", f"QA progress: {kind}", line, 0)
+        except Exception:
+            pass
+
+    httpd, url = None, target_url
+    if not url:
+        httpd, url = _serve_static(repo)
+        if not httpd:
+            return {"passed": False, "stories": 0, "blocking_open": 0, "verdict_json": None,
+                    "verdict": "no index.html to serve — the agentic explorer has nothing to drive"}
+    try:
+        report = qa_run_mod.qa_run(url, vision, None, "0", summary, product=product, repo=str(repo),
+                                   restart_cmd=None, on_event=_qa_heartbeat)
+    except Exception as e:
+        return {"passed": False, "stories": 0, "blocking_open": 0, "verdict_json": None,
+                "verdict": f"agentic QA crashed: {str(e)[:200]} — unverifiable builds do not ship"}
+    finally:
+        if httpd:
+            httpd.shutdown()
+    out = {"passed": bool(report.get("passed")), "stories": int(report.get("total_stories") or 0),
+           "blocking_open": int(report.get("blocking_open") or 0), "verdict": report.get("verdict"),
+           "verdict_json": report.get("verdict_json"), "detail": report.get("md")}
+    audit.append(actor="factory:qa-security", action="AgenticWebQA", resource=Path(repo).name,
+                 decision="passed" if qa_verdict_ok(out) else "failed",
+                 payload={"stories": out["stories"], "blocking_open": out["blocking_open"],
+                          "rounds": report.get("rounds")})
+    return out
+
+
+def run_independent_qa(repo: str, product: str, vision: str, kind: str = "lib") -> dict:
+    """INDEPENDENT verification for non-browser products (lib/service/extension): a qa-security agent —
+    never the builder — re-runs the product's tests ITSELF, checks they are real coverage (not theatre:
+    trivial asserts, skipped suites, deleted edge cases), probes beyond the happy path per
+    docs/STANDARDS-verification.md ('default to BROKEN'), and reports story-level results as strict JSON.
+    The verdict tally is then computed DETERMINISTICALLY by qa_report from those structured findings and
+    persisted by qa_run.write_verdict as the LAUNCH artifact (docs/QA-VERDICT.json).
+
+    FAIL-CLOSED: a failed run, an unparseable reply, or zero verified stories is a FAILED gate."""
+    _qa_stack_path()
+    import qa_run as qa_run_mod                        # lazy: these import factory back
+    import qa_report as qa_report_mod
+    t0 = time.time()
+    test_hint = {
+        "extension": "each builder test file: `node tests/<name>.test.js` (plus manifest sanity)",
+        "service": f"unit: `{VENV_PY} -m pytest -q tests/unit`; then boot `python -m src.{product.replace('-', '_')}` "
+                   f"on 127.0.0.1:$PORT and run `{VENV_PY} -m pytest -q tests/e2e` against it",
+    }.get(kind, f"`{VENV_PY} -m pytest -q`")
+    prompt = (
+        "You are the INDEPENDENT QA gate for this product — the builder never grades its own homework, "
+        "so YOU must verify it, per docs/STANDARDS-verification.md: DEFAULT TO BROKEN, evidence or it "
+        "didn't happen, and state what was NOT covered.\n\n"
+        f"PRODUCT VISION/CHARTER:\n{(vision or '')[:3000]}\n\n"
+        f"1. RUN THE TEST SUITE YOURSELF with Bash (do not trust any prior claim of green): {test_hint}\n"
+        "2. READ the tests: flag theatre (trivial/tautological asserts, skipped or deleted cases, "
+        "happy-path-only coverage) — weak tests are a FINDING, not a pass.\n"
+        "3. PROBE beyond the tests: exercise at least the empty/error/boundary behaviors the spec "
+        "(docs/SPEC.md) promises, with real commands.\n"
+        "4. Report EVERY verified behavior as a user story and EVERY defect as a bug.\n\n"
+        "END YOUR REPLY WITH ONLY this JSON object (no fence, no prose after it):\n"
+        '{"stories": [{"id": "US-1", "title": "<behavior>", "expected": "<what the spec promises>", '
+        '"status": "passed|failed|blocked", "evidence": "<the exact command + observed output>"}, ...], '
+        '"bugs": [{"title": "<defect>", "detail": "<what is wrong>", "expected": "<spec>", '
+        '"actual": "<observed>", "blocking": true|false, "severity": "critical|high|medium|low"}, ...], '
+        '"not_covered": "<what this verification did NOT exercise>"}'
+    )
+    res = agent("qa-security", str(repo), prompt)
+    data = None
+    if isinstance(res, dict) and not res.get("failed") and res.get("rc") in (0, None):
+        data = _extract_json(res.get("out_full") or res.get("out") or "")
+    stories = [s for s in ((data or {}).get("stories") or []) if isinstance(s, dict)]
+    bugs = [b for b in ((data or {}).get("bugs") or []) if isinstance(b, dict)]
+    if not stories:
+        # NO verifiable signal from the independent verifier -> the gate fails with a blocking finding
+        # (qa_report's zero-story tally is 'NO VERDICT', passed=False — fail-closed by construction).
+        bugs = [{"title": "independent QA produced no verifiable result",
+                 "detail": ("the qa-security verification returned no parseable story-level evidence "
+                            f"(rc={res.get('rc') if isinstance(res, dict) else 'n/a'}); "
+                            "an unverified build must not ship"),
+                 "blocking": True, "severity": "critical"}]
+    run = {
+        "product": product, "vision": vision, "started_at": t0, "finished_at": time.time(),
+        "stories": [{
+            "id": s.get("id") or f"US-{i + 1}", "title": s.get("title", "(untitled)"),
+            "expected": s.get("expected", ""), "status": (s.get("status") or "").lower(),
+            "steps": [{"action": "independent verification (qa-security)",
+                       "expected": s.get("expected", ""), "actual": s.get("evidence", ""),
+                       "verdict": "match" if (s.get("status") or "").lower() in ("passed", "pass")
+                       else "mismatch"}],
+        } for i, s in enumerate(stories)],
+        "bugs": [{
+            "id": f"BUG-{i + 1}", "story": b.get("story", ""), "title": b.get("title", "defect"),
+            "detail": b.get("detail", ""), "expected": b.get("expected", ""),
+            "actual": b.get("actual", ""), "blocking": bool(b.get("blocking")), "fixed": False,
+            "severity": b.get("severity", "medium"),
+        } for i, b in enumerate(bugs)],
+        "not_covered": (data or {}).get("not_covered"),
+    }
+    report = qa_report_mod.build_report(run)
+    vpath = qa_run_mod.write_verdict(str(repo), report, product=product, producer="independent-qa")
+    out = {"passed": bool(report.get("passed")), "stories": int(report.get("total_stories") or 0),
+           "blocking_open": int(report.get("blocking_open") or 0), "verdict": report.get("verdict"),
+           "verdict_json": vpath, "detail": report.get("md"),
+           "not_covered": (data or {}).get("not_covered")}
+    audit.append(actor="factory:qa-security", action="IndependentQA", resource=Path(repo).name,
+                 decision="passed" if qa_verdict_ok(out) else "failed",
+                 payload={"kind": kind, "stories": out["stories"],
+                          "blocking_open": out["blocking_open"]})
+    return out
+
+
+def run_grounded_qa(product: str, kind: str = None, vision: str = None, summary: str = None,
+                    target_url: str = None) -> dict:
+    """ONE entry point for the grounded ship-gate verdict — used by build_product's QA stage and by
+    loopcontroller's TESTQA. Web/UI builds (or anything already RUNNING at target_url) go through the
+    agentic browser stack; everything else gets the independent qa-security verification. Both write
+    docs/QA-VERDICT.json — the machine-readable LAUNCH artifact gate_check consumes — so a product
+    without a verdict fails the gate honestly, and one with a verdict ships only on its JSON facts."""
+    repo = PRODUCTS / product
+    if not repo.exists():
+        return {"passed": False, "stories": 0, "blocking_open": 0, "verdict_json": None,
+                "verdict": f"no such product repo: {repo}"}
+    kind = kind or _detect_kind(repo)
+    if vision is None:
+        ch = repo / "docs" / "CHARTER.md"
+        vision = ch.read_text()[:4000] if ch.exists() else f"The {product} product ({kind})."
+    if summary is None:
+        sp = repo / "docs" / "SPEC.md"
+        summary = sp.read_text()[:4000] if sp.exists() else vision[:2000]
+    if kind == "web" or target_url:
+        return run_agentic_web_qa(str(repo), product, vision, summary, target_url=target_url)
+    return run_independent_qa(str(repo), product, vision, kind)
 
 
 def _review_verdict(repo, text: str = "") -> str:
@@ -1469,21 +1660,55 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
             return {"passed": True, "verdict": verdict}
         stage("DESIGN", "design-ux", design)
 
-    # QA — run REAL verification (browser smoke for web, pytest for lib); bounded fix loop on failure.
-    # qa_run is hoisted so the REVIEW cycle can re-verify after a review-driven fix (no quality regress).
-    qa_run = ((lambda: run_ext_qa(str(repo))) if ext else
-              (lambda: run_web_qa(str(repo))) if web else
-              (lambda: run_service_qa(str(repo), pkg)) if service else (lambda: run_tests(str(repo))))
+    # QA — the two-layer ship gate (REBUILD-PLAN C1). Layer 1 is the FAST PRE-GATE: the builder's own
+    # tests (pytest / Node tests / browser smoke / MV3 static) with a bounded fix loop — cheap signal,
+    # NEVER the gate. Layer 2 is the GROUNDED VERDICT: for web builds the agentic stack (serve the build,
+    # story_gen coverage from the charter, qa_explorer drives a real browser, dev_loop fixes blocking
+    # bugs); for lib/service/extension an INDEPENDENT qa-security agent that re-runs + verifies the tests
+    # itself. Layer 2 writes docs/QA-VERDICT.json — the machine LAUNCH artifact gate_check consumes — and
+    # the stage passes only on qa_verdict_ok (passed==true, blocking_open==0, stories>0). The builder
+    # never grades its own homework. Both layers are hoisted so the REVIEW cycle can re-verify after a
+    # review-driven fix (no quality regress, no stale verdict shipping).
+    pre_gate = ((lambda: run_ext_qa(str(repo))) if ext else
+                (lambda: run_web_qa(str(repo))) if web else
+                (lambda: run_service_qa(str(repo), pkg)) if service else (lambda: run_tests(str(repo))))
+
+    def grounded_verdict():
+        """Layer 2: produce + gate on THE machine verdict (refreshes docs/QA-VERDICT.json)."""
+        v = run_grounded_qa(product, kind=kind, vision=charter)
+        gok = qa_verdict_ok(v)
+        gout = (f"grounded verdict: {v.get('verdict')} (stories={v.get('stories')}, "
+                f"blocking_open={v.get('blocking_open')}) -> {v.get('verdict_json')}")
+        _trace("test", "qa-security",
+               "QA grounded verdict (agentic explorer)" if web else "QA grounded verdict (independent qa-security)",
+               gout, 0 if gok else 1)
+        return gok, gout, v
+
+    def verified_qa():
+        """Full re-verification for the REVIEW cycle: pre-gate AND a FRESH grounded verdict — a
+        review-driven fix must not regress QA, and the LAUNCH artifact must describe the final code."""
+        ok, out = pre_gate()
+        if not ok:
+            return False, out
+        gok, gout, _ = grounded_verdict()
+        return gok, out[-800:] + "\n" + gout
 
     def qa():
-        ok, out = qa_run()
-        label = ("QA run (extension static)" if ext else "QA run (browser smoke)" if web else
-                 "QA run (unit + runtime E2E + load)" if service else "QA run (pytest)")
+        # a stale verdict from a previous run must never satisfy the gate for THIS build's code
+        try:
+            (repo / "docs" / "QA-VERDICT.json").unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        ok, out = pre_gate()
+        label = ("QA pre-gate (extension static)" if ext else "QA pre-gate (browser smoke)" if web else
+                 "QA pre-gate (unit + runtime E2E + load)" if service else "QA pre-gate (pytest)")
         _trace("test", "qa-security", label, out, 0 if ok else 1)
         attempts = 0
         while not ok and attempts < MAX_FIX:
             attempts += 1
-            print(f"[factory] QA red — fix attempt {attempts}/{MAX_FIX}", flush=True)
+            print(f"[factory] QA pre-gate red — fix attempt {attempts}/{MAX_FIX}", flush=True)
             fix = (f"The Chrome extension FAILED static QA. Output:\n\n{out[-1800:]}\n\n"
                    f"Fix manifest.json/files (valid MV3, no dangling refs, script-mode JS) AND the "
                    f"FUNCTIONAL Node tests (tests/*.test.js exercising add/edit/delete/search/export). If "
@@ -1505,8 +1730,14 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
                    f"Fix the code under src/ (or a genuinely wrong test) so all tests pass. "
                    f"Do not delete tests to make them pass.")
             agent("builder", str(repo), fix)
-            ok, out = qa_run()
-        return {"passed": ok, "fix_attempts": attempts, "tail": out[-400:]}
+            ok, out = pre_gate()
+        if not ok:                                    # pre-gate never went green -> no grounded round
+            return {"passed": False, "fix_attempts": attempts, "pre_gate": False, "tail": out[-400:]}
+        gok, gout, v = grounded_verdict()             # THE gate: the grounded, independent verdict
+        return {"passed": gok, "fix_attempts": attempts, "pre_gate": True,
+                "stories": v.get("stories"), "blocking_open": v.get("blocking_open"),
+                "verdict": v.get("verdict"), "verdict_json": v.get("verdict_json"),
+                "tail": gout[-400:]}
     qa_res = stage("QA", "qa-security", qa)
 
     # REVIEW — an independent reviewer whose verdict is LOAD-BEARING. Development isn't purely linear:
@@ -1551,7 +1782,9 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
                   "The independent reviewer REQUESTED CHANGES (also in docs/REVIEW.md). Address every "
                   "risk/change it raised:\n\n" + (review_out or "(see docs/REVIEW.md)") + "\n\nDo NOT "
                   "remove or weaken tests, and add NO network/external dependencies.")
-            ok, out = qa_run()                                  # re-verify: a review fix must not regress QA
+            # re-verify the FULL gate (pre-gate + a FRESH grounded verdict): a review fix must not
+            # regress QA, and the persisted LAUNCH artifact must describe the code that actually ships.
+            ok, out = verified_qa()
             _trace("test", "qa-security", f"re-QA after review cycle {cycles}", out, 0 if ok else 1)
             qa_ok[0] = ok
             review_out, verdict = do_review()
@@ -1653,11 +1886,29 @@ def _detect_kind(repo: Path) -> str:
     return "lib"
 
 
+def _build_process_alive(product: str) -> bool:
+    """GROUND-TRUTH liveness for the resume sweep: is a `factory.py build <product>` process running RIGHT
+    NOW? Trace/audit idleness is a heuristic (a legitimately long agentic-QA exploration can go quiet for
+    longer than any idle threshold — that false 'stall' once resumed a build whose original process was
+    still alive, giving TWO concurrent writers of docs/QA-VERDICT.json). Fail-closed for the sweep: if we
+    cannot determine liveness, report alive=True so we never double-launch on a broken probe."""
+    try:
+        r = subprocess.run(["pgrep", "-f", f"factory.py build {product} "], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return True
+        # exact-arg fallback: the product may be the last argv (no trailing space in the cmdline)
+        r2 = subprocess.run(["pgrep", "-f", f"factory.py build {product}$"], capture_output=True, timeout=10)
+        return r2.returncode == 0
+    except Exception:
+        return True
+
+
 def find_incomplete_builds(max_age_min: int = 20):
     """Builds that were INTERRUPTED, not finished: BUILD checkpointed (rc=0) but the line never reached a
     terminal verdict (no 'ProductComplete' audit — that row is written for BOTH launched AND blocked-at-QA,
-    so a genuinely-blocked build is NOT considered interrupted and won't be re-resumed forever), and idle
-    for >= max_age_min so we never grab one that's actively running. Returns [(product, kind), ...]."""
+    so a genuinely-blocked build is NOT considered interrupted and won't be re-resumed forever), idle
+    for >= max_age_min, AND with no live build process (trace idleness alone once false-positived on a
+    long agentic-QA run and spawned a duplicate line). Returns [(product, kind), ...]."""
     out = []
     with psycopg.connect(_DB) as c, c.cursor() as cur:
         cur.execute("""
@@ -1674,6 +1925,8 @@ def find_incomplete_builds(max_age_min: int = 20):
         """, (max_age_min,))
         for (run_id,) in cur.fetchall():
             product = run_id[len("build-"):]
+            if _build_process_alive(product):             # still running — NOT interrupted, never duplicate
+                continue
             out.append((product, _detect_kind(PRODUCTS / product)))
     return out
 
@@ -1799,10 +2052,49 @@ def _main(a):
             globals()["_anthropic_available"] = _orig_avail; globals()["_stream_api"] = _orig_stream
             audit.append = _orig_audit; _ctx.api_key = None
 
-        ok = ok and cost_ok and pool_ok and sig_ok and cancel_ok and success_ok
+        # --- C1 SHIP GATE (offline): the grounded-verdict wiring. qa_verdict_ok mirrors gate_check's
+        # LAUNCH condition exactly, and run_independent_qa must (a) pass + persist the LAUNCH artifact
+        # on real story-level evidence, (b) FAIL CLOSED (blocking finding, failing artifact) when the
+        # independent verifier yields no verifiable signal. All AI + audit calls stubbed — no spend.
+        import tempfile as _tf
+        gate_ok = (qa_verdict_ok({"passed": True, "blocking_open": 0, "stories": 3})
+                   and not qa_verdict_ok({"passed": True, "blocking_open": 1, "stories": 3})
+                   and not qa_verdict_ok({"passed": True, "blocking_open": 0, "stories": 0})
+                   and not qa_verdict_ok({"passed": "yes", "blocking_open": 0, "stories": 3})
+                   and not qa_verdict_ok({}) and not qa_verdict_ok(None))
+        indep_pass_ok = indep_fail_ok = artifact_ok = False
+        _c1repo = Path(_tf.mkdtemp(prefix="factory-c1-"))
+        _orig_agent, _orig_audit2 = globals()["agent"], audit.append
+        try:
+            audit.append = lambda **k: None
+            good = json.dumps({"stories": [{"id": "US-1", "title": "adds two numbers",
+                                            "expected": "returns the sum", "status": "passed",
+                                            "evidence": "$ pytest -q -> 4 passed"}],
+                               "bugs": [], "not_covered": "sustained load"})
+            globals()["agent"] = lambda role, repo, prompt, **k: {"rc": 0, "out": good, "out_full": good}
+            v_good = run_independent_qa(str(_c1repo), "c1demo", "a tiny adder lib", "lib")
+            indep_pass_ok = (qa_verdict_ok(v_good) and v_good["verdict_json"]
+                             and Path(v_good["verdict_json"]).exists())
+            globals()["agent"] = lambda role, repo, prompt, **k: {"rc": 1, "failed": True, "out": ""}
+            v_bad = run_independent_qa(str(_c1repo), "c1demo", "a tiny adder lib", "lib")
+            indep_fail_ok = (not qa_verdict_ok(v_bad)) and int(v_bad.get("blocking_open") or 0) >= 1
+            vdoc = json.loads((_c1repo / "docs" / "QA-VERDICT.json").read_text())
+            artifact_ok = vdoc["passed"] is False and vdoc["producer"] == "independent-qa"
+        except Exception as e:
+            print(f"C1 gate selftest error: {e}")
+        finally:
+            globals()["agent"] = _orig_agent
+            audit.append = _orig_audit2
+            shutil.rmtree(_c1repo, ignore_errors=True)
+
+        ok = (ok and cost_ok and pool_ok and sig_ok and cancel_ok and success_ok
+              and gate_ok and indep_pass_ok and indep_fail_ok and artifact_ok)
         print(f"warm-HTTP: cost={cost_ok} pool={pool_ok} | stop: sig={sig_ok} cancel-discarded={cancel_ok} "
               f"stream-success={success_ok}")
-        print("PASS: factory prompt assembly + governance wiring + fast-path/stop ✅" if ok else "FAIL")
+        print(f"C1 ship gate: verdict-condition={gate_ok} independent-qa-pass={indep_pass_ok} "
+              f"fail-closed={indep_fail_ok} launch-artifact={artifact_ok}")
+        print("PASS: factory prompt assembly + governance wiring + fast-path/stop + C1 grounded ship gate ✅"
+              if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
 

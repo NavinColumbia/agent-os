@@ -441,6 +441,7 @@ POSTS = {
     "/api/account/export": lambda tid, q, b: account.export(tid),
     "/api/account/delete": lambda tid, q, b: account.delete(tid, confirm=bool(b.get("confirm"))),
     "/api/help/ask": lambda tid, q, b: helpagent.ask(tid, b.get("question", "")),
+    "/api/org/message": lambda tid, q, b: orgview.message_agent(tid, b.get("actor_id"), b.get("text", "")),   # B2: CEO -> a specific agent
     "/api/orgs/new": lambda tid, q, b: orgsmod.create(tid, b.get("name", ""), b.get("vision", "")),
     "/api/controller/say": lambda tid, q, b: _ctl_say(tid, int(b.get("org") or 0), b.get("message", "")),
     "/api/controller/choose": lambda tid, q, b: _ctl_choose(tid, int(b.get("org") or 0), int(b.get("option_id") or 0)),

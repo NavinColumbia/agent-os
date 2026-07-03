@@ -86,6 +86,28 @@ def org_runs(tid, limit=3):
         return []
 
 
+def message_agent(tid, actor_id, text):
+    """B2 — the CEO messages a SPECIFIC hired agent ("ask my CTO"). Validates the actor belongs to this
+    tenant, then drops a durable event into that actor's inbox (context_update from CEO) — the runtime's
+    decide-loop folds it into the agent's work. Kill-switch-gated at the store layer."""
+    try:
+        import store
+        a = store.actor(int(actor_id), tid)               # tenant-scoped -> None if not this CEO's agent
+    except Exception:
+        a = None
+    if not a:
+        return {"error": "no such agent for this company"}
+    if not (text or "").strip():
+        return {"error": "empty message"}
+    try:
+        import store
+        store.emit(a["run_id"], tid, None, a["actor_id"], "context_update",
+                   {"from": "CEO", "text": text[:1000]})
+        return {"ok": True, "delivered_to": a.get("name"), "role": a.get("role")}
+    except Exception as e:
+        return {"error": f"could not deliver: {e}"}
+
+
 def orgchart(tid):
     """Every node of the static hierarchy, marked live + with the count of that role's active
     instances on the tenant's products and the most recent task. Root reports_to=null.

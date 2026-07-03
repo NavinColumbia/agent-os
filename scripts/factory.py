@@ -545,6 +545,17 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     if _halt.get("halted"):                           # operator / EU-AI-Act kill-switch: refuse next spawn
         return {"rc": -1, "failed": True, "out": "halted",
                 "blocker": f"fleet HALTED by operator (scope={_halt.get('scope')}): {_halt.get('reason')} — resume with killswitch.py resume"}
+    _prod = getattr(_ctx, "product", None)            # MONEY CIRCUIT-BREAKER (C4): the per-app spend/loss cap
+    if _prod:                                          # must FIRE mid-build, not just an hourly sweep after the fact
+        try:
+            import appguard
+            _ab = appguard.blocks(_prod)
+        except Exception:
+            _ab = None
+        if _ab:
+            return {"rc": -1, "failed": True, "out": "app circuit-breaker",
+                    "blocker": f"'{_prod}' hit its spend circuit-breaker ({_ab}) — auto-paused; raise the "
+                               f"cap or resume it in Approvals before more spend"}
     # RUNTIME COST GOVERNOR (ADR 0002): enforce the per-product HARD token cap before every dispatch.
     # budget.allow_spend denies (and audits) when this product's configured token_budget would be blown
     # with hard_stop on — we refuse the dispatch and escalate rather than burn past the cap. No budget set

@@ -126,6 +126,23 @@ def guard():
     return {"evaluated": len(results), "paused": [p["app"] for p in paused]}
 
 
+def blocks(app):
+    """PRE-SPEND circuit-breaker (REBUILD-PLAN C4 — make the money breaker FIRE in the live path, not just
+    an hourly sweep). evaluate() checks THIS app's real spend vs its cap/loss and AUTO-PAUSES if over;
+    returns a refusal reason when the app is (now) paused, else None. Called before every agent spawn so a
+    runaway build HALTS at its cap instead of blowing past it. Fail-OPEN on infra error — the process
+    budget cap + killswitch still bound spend, so a guard hiccup never bricks the fleet."""
+    if not app:
+        return None
+    try:
+        r = evaluate(app)
+        if r.get("state") == "paused":
+            return r.get("reason") or "spend cap / loss limit reached"
+    except Exception:
+        return None
+    return None
+
+
 def paused_apps():
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:

@@ -357,11 +357,12 @@ def test_review_verdict_parsing(tmp_path):
     assert verdict("risk: a possible REQUEST-CHANGES situation if X\n\nVERDICT: APPROVE") == "APPROVE"
     # whole-doc fallback when no explicit VERDICT line
     assert verdict("Overall this REQUEST-CHANGES because of a bug") == "REQUEST-CHANGES"
-    # ambiguous / silent -> APPROVE (QA is the hard gate; never block a green build on a parse miss)
+    # review prose with no explicit verdict and no change request -> APPROVE (QA stays the hard gate)
     assert verdict("Looks fine to me, nice work.") == "APPROVE"
-    # missing file -> APPROVE
+    # NO signal at all (no reply text, no file) -> FAIL CLOSED: a silent review gate must escalate
+    # (REQUEST-CHANGES -> BLOCKED_AT_REVIEW), never silently auto-pass an unreviewed build.
     rv.unlink()
-    assert factory._review_verdict(str(tmp_path)) == "APPROVE"
+    assert factory._review_verdict(str(tmp_path)) == "REQUEST-CHANGES"
 
 
 # ── budget control: a spend cap halts new agent spawning (per-factory tunable) ─

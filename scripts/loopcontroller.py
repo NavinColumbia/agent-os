@@ -639,7 +639,8 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
     if phase == "DEEP_DESIGN" and s["awaiting"] != "user_feedback":
         return {"phase": phase}
     if phase == "DEEP_DESIGN":
-        if _affirmative(msg) and (s["plan"]):
+        if s["plan"] and _classify_intent(tid, thread_id, msg, phase, "user_feedback",
+                                           api_key=api_key)["verdict"] in ("approve", "proceed"):
             _set(thread_id, awaiting=None); _to(thread_id, "PLAN_APPROVAL"); advance(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
         sysp = ("Turn the chosen direction into a concrete, RIGOROUS plan that accounts for EVERYTHING before "
@@ -704,14 +705,21 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         return {"phase": phase}
 
     if s["awaiting"] in ("user_feedback", "user_approval"):
-        if _affirmative(msg):
+        intent = _classify_intent(tid, thread_id, msg, phase, s["awaiting"], api_key=api_key)
+        if intent["verdict"] in ("approve", "proceed"):
             _resume_halts(thread_id)   # a 'retry' after a cancel() must lift the halt before re-dispatching
             _set(thread_id, awaiting=None); advance(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
-        _report(tid, thread_id, "Got it — I'll fold that in.")
+        if intent["verdict"] == "cancel":
+            cancel(tid, thread_id, reason="stopped by user")
+            return {"phase": _st(thread_id)["phase"], "cancelled": True}
+        # reject/revise/steer/question — the feedback is REAL; record it so the re-dispatch folds it in,
+        # never silently ignore it (the "not good" that used to auto-approve now correctly holds the gate).
+        _set(thread_id, pending_intent=((s.get("pending_intent") or "") + "\n" + (msg or "")).strip())
+        _report(tid, thread_id, "Got it — I'll fold that in and rework it, not push it through.")
         return {"phase": phase}
     if s["awaiting"] == "credentials":
-        if _affirmative(msg):
+        if _classify_intent(tid, thread_id, msg, phase, "credentials", api_key=api_key)["verdict"] in ("approve", "proceed"):
             _resume_halts(thread_id)
             _set(thread_id, awaiting=None); advance(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
@@ -1259,12 +1267,74 @@ def _plan_full_text(plan, raw=""):
     return full or (raw or "").strip()
 
 
+_NEGATION = re.compile(r"\b(not|no|don'?t|isn'?t|aren'?t|doesn'?t|didn'?t|never|stop|wait|hold|bad|wrong|"
+                       r"terrible|awful|hate|nope|nah|un-?happy|change|revise|redo it differently|"
+                       r"instead|rather|but )\b", re.I)
+_AFFIRM = re.compile(r"\b(looks good|approve|approved|go ahead|yes|yep|yeah|ship it|do it|ready|lgtm|"
+                     r"perfect|great|good|sounds good|proceed|retry|re-?run|try again|redo|run it again)\b", re.I)
+
+
 def _affirmative(msg):
-    # Includes the recovery words the failure UI tells the CEO to type ("retry" etc.) so the instructed
-    # word actually clears the gate and re-dispatches the parked phase via advance() — not a no-op.
-    return bool(re.search(r"\b(looks good|approve|approved|go ahead|yes|ship it|do it|ready|lgtm|perfect|good"
-                          r"|retry|re-?run|try again|redo|run it again)\b",
-                          (msg or "").lower()))
+    # FAIL-SAFE fallback for _classify_intent (used only when the model call fails). NEGATION-AWARE so the
+    # review's bug — "\bgood\b" matching "not good" -> false approval — can NEVER recur: an affirmative word
+    # is only an approval when NO negation is present in the message.
+    m = (msg or "")
+    return bool(_AFFIRM.search(m)) and not _NEGATION.search(m)
+
+
+# ───────────────────────────────────────────────────────────────────────────────────────────────────
+# A2 — the AGENTIC intent gate. The regex waterfall (which read "not good" as approval) is replaced by a
+# real model decision: given the CEO's message + what the controller is awaiting, classify intent. Every
+# gate decision is now an AI call (cost is not a concern; NORTH-STAR). Fails SAFE to the negation-aware
+# _affirmative above, never to a blind approve.
+# ───────────────────────────────────────────────────────────────────────────────────────────────────
+_INTENT_SYS = (
+    "Text-classification task. A user replied to a software build assistant that is waiting for '{awaiting}' "
+    "(stage '{phase}'). Classify the reply's INTENT into exactly one label and output ONLY a JSON object, "
+    "nothing else:\n"
+    '{{"verdict":"approve|reject|revise|proceed|choose|status|steer|question|cancel","option":<int or null>,'
+    '"reason":"<=8 words"}}\n'
+    "Label meanings — approve: a clear yes / go-ahead / 'looks good'. reject or revise: any dissatisfaction, "
+    "doubt, or requested change, e.g. 'not good', 'this looks off', 'change the layout' (a negated phrase like "
+    "'not good' is NEVER approve). proceed: hands the decision to the assistant, e.g. 'go with your "
+    "recommendation', 'just build it'. choose: picks a numbered option (put the 1-based number in option). "
+    "status: asks about progress, e.g. 'done yet?'. cancel: stop/halt. steer: a new instruction to fold in. "
+    "question: asks something. If unsure between approve and any negative reading, do not pick approve."
+)
+
+
+def _classify_intent(tid, thread_id, msg, phase, awaiting, options=None, api_key=None):
+    """One AI DECISION replacing the regex gates. Returns {verdict, option, reason}. Fail-SAFE: on any model
+    error, derive a conservative verdict from the negation-aware _affirmative (approve/steer only)."""
+    m = (msg or "").strip()
+    if not m:
+        return {"verdict": "status", "option": None, "reason": "empty"}
+    try:
+        opt_txt = ""
+        if options:
+            opt_txt = " OPTIONS: " + "; ".join(f"{i+1}. {(o.get('title') if isinstance(o,dict) else o)}"
+                                                for i, o in enumerate(options))
+        sysp = _INTENT_SYS.format(awaiting=awaiting or "-", phase=phase or "-")
+        if api_key is not None:                      # factory routes the tenant key via thread-local _ctx
+            try:
+                factory._ctx.api_key = api_key
+            except Exception:
+                pass
+        reply = factory.agent("classifier", ".",
+                              sysp + "\nUSER REPLY: " + m[:600] + opt_txt,
+                              light=True, model=factory.CHEAP_MODEL)
+        data = factory._extract_json((reply or {}).get("out_full") or (reply or {}).get("out") or "")
+        v = (data or {}).get("verdict")
+        if v in ("approve", "reject", "revise", "proceed", "choose", "status", "steer", "question", "cancel"):
+            opt = data.get("option")
+            return {"verdict": v, "option": int(opt) if isinstance(opt, (int, float)) or
+                    (isinstance(opt, str) and opt.isdigit()) else None, "reason": data.get("reason", "")}
+    except Exception:
+        pass
+    # fail-safe: negation-aware, conservative
+    if _affirmative(m):
+        return {"verdict": "approve", "option": None, "reason": "fallback-affirm"}
+    return {"verdict": "steer", "option": None, "reason": "fallback-nonaffirm"}
 
 
 def _is_status_query(msg):
@@ -1663,8 +1733,15 @@ def _selftest():
               f"blocking={qa_blocking},crash_fail_closed={qa_crash})")
         print(f"orchestra_wired(A1 research engine)={orchestra_wired_ok}"
               f"(engine={research_kw.get('engine')})")
+        # A2 GUARD: the agentic intent gate must NEVER read a negation as approval (the regex bug). Tests the
+        # fail-SAFE path (offline, no model call) — the model path is strictly better; this locks the floor.
+        intent_neg_ok = (not _affirmative("this is not good") and not _affirmative("no, change it")
+                         and not _affirmative("the plan doesn't look right") and _affirmative("looks good")
+                         and _affirmative("approve") and not _affirmative("bad, redo"))
+        ok = ok and intent_neg_ok
+        print(f"A2_intent_gate(negation-safe)={intent_neg_ok}")
         print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel"
-              " + consent-reask/sla/status-honesty ✅" if ok else "FAIL")
+              " + consent-reask/sla/status-honesty + A2 agentic-intent-gate ✅" if ok else "FAIL")
     finally:
         factory.agent = real_agent
         _r.start, _r.run_state, _r.select, _d.prototype, _q.run, factory.run_grounded_qa = real

@@ -105,6 +105,28 @@ FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-opus-4-8")
 # potential exfiltration path under prompt-injection — for agents processing UNTRUSTED tenant input, pass
 # tools=[] (charters are already sanitized by sanitize.py; this is the second layer of that defense).
 AGENT_TOOLS = os.environ.get("AOS_AGENT_TOOLS", "WebSearch WebFetch").split()
+_ROLE_TOOLS_CACHE = {}
+
+
+def _role_tools(role):
+    """PER-ROLE tool grant (REBUILD-PLAN A4): the allow-list is DERIVED FROM THE ROLE MANIFEST's `tools`
+    list (explicit, versioned, per-role) — not a one-size global default. Was declared-but-not-wired: every
+    role got the same AGENT_TOOLS regardless of manifest. Merges the manifest tools with the web tools
+    (live data), deduped. governance.spawn_restrictions still applies deny-beats-allow on top. Falls back to
+    AGENT_TOOLS only when a role has no manifest."""
+    if role in _ROLE_TOOLS_CACHE:
+        return _ROLE_TOOLS_CACHE[role]
+    grant = list(AGENT_TOOLS)
+    try:
+        import yaml
+        m = yaml.safe_load((ROLES / f"{role}.yaml").read_text()) or {}
+        mt = m.get("tools") or []
+        if mt:
+            grant = list(dict.fromkeys(list(mt) + list(AGENT_TOOLS)))   # manifest tools first, + web, deduped
+    except Exception:
+        pass
+    _ROLE_TOOLS_CACHE[role] = grant
+    return grant
 _TRANSIENT = ("overloaded", "rate limit", "rate_limit", "429", "529", "503", "timeout", "temporarily")
 # Cross-provider failover: when Claude/Anthropic is degraded or down (retries exhausted on transient
 # errors), the SAME task is retried once on OpenAI Codex so the factory keeps moving. Set to "none" to
@@ -307,7 +329,7 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
     # Grant the agent the tools its job needs. File edits already flow via acceptEdits; non-edit tools
     # (WebSearch/WebFetch and friends) must be allow-listed or the agent can't reach them. Additive —
     # builders keep Edit/Write AND gain web. Configure the default set with AOS_AGENT_TOOLS.
-    grant = tools if tools is not None else AGENT_TOOLS
+    grant = tools if tools is not None else _role_tools(role)
     if grant:
         cmd += ["--allowedTools", *grant]
     # GOVERNANCE (spawn restrictions — deny beats allow). Disallow the tools the role's manifest forbids
@@ -838,7 +860,7 @@ def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=No
     cmd = ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
            "--output-format", "stream-json", "--include-partial-messages", "--verbose",
            "--model", model, "--fallback-model", FALLBACK_MODEL]
-    grant = tools if tools is not None else AGENT_TOOLS
+    grant = tools if tools is not None else _role_tools(role)
     if grant:
         cmd += ["--allowedTools", *grant]
     if light:

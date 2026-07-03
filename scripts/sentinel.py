@@ -51,6 +51,7 @@ PROVIDER_BURST = int(os.environ.get("AOS_SENTINEL_PROVIDER_BURST", "3"))   # tra
 ACTOR_STALE_MIN = int(os.environ.get("AOS_SENTINEL_ACTOR_STALE_MIN", "10"))  # orchestra beats every ~45s; 10m silent = stuck
 DB_TXN_STALE_MIN = int(os.environ.get("AOS_SENTINEL_DB_TXN_MIN", "3"))       # idle-in-transaction older than this = a leak -> auto-terminate
 DB_LOCK_PILEUP = int(os.environ.get("AOS_SENTINEL_DB_LOCK_PILEUP", "8"))     # this many lock-waiters = contention/hang forming
+SESSION_BURN_WARN = int(os.environ.get("AOS_SENTINEL_BURN_WARN", "4000000")) # output tokens/hr that says "approaching the session cap"
 PROGRESS_EVERY_S = int(os.environ.get("AOS_SENTINEL_PROGRESS_S", "3600"))  # "still working" ping cadence
 _TRANSIENT_SQL = "(output ~* 'overloaded|rate.?limit|too many requests|529|429' OR rc <> 0)"
 CLAUDE_DIR = Path(os.environ.get("AOS_CLAUDE_DIR", str(Path.home() / ".claude" / "projects")))
@@ -135,6 +136,29 @@ def observe(wf_root=None, notify_fn=None, now=None):
                 issues.append({"sig": f"sentinel:wf-dead:{wf.name}", "level": "warn",
                                "msg": f"workflow {wf.name} quiet {round(quiet_min)}m with no agents running — "
                                       f"may have died silently (check its result/output)"})
+
+    # 3a) SESSION USAGE CAP — the Anthropic 5-hour account cap (NOT a 529). It killed the fleet mid-workflow
+    # TWICE with no warning. Two signals: (a) the cap-hit SIGNATURE in recent failures ("session limit" /
+    # "usage limit" / "resets") = HARD STOP, heavy work fails until reset — pause new workflows; (b) a high
+    # BURN RATE (output tokens/hr) = approaching the wall, a heads-up to pace before we hit it.
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT count(*) FROM traces WHERE ts > now()-interval '20 minutes'
+                           AND output ~* 'session limit|usage limit|hit your .* limit|limit .* resets'""")
+            capped = cur.fetchone()[0]
+            if capped:
+                issues.append({"sig": "sentinel:session-cap", "level": "crit",
+                               "msg": f"⛔ SESSION USAGE CAP reached ({capped} cap-hit(s) in 20m) — heavy work "
+                                      f"(builds/workflows) will FAIL until the account's 5h window resets. "
+                                      f"Pause new fleets; resume after reset (workflows resume from their runId)."})
+            cur.execute("SELECT coalesce(sum(tokens_out),0) FROM traces WHERE ts > now()-interval '60 minutes'")
+            burn = int(cur.fetchone()[0])
+            if burn >= SESSION_BURN_WARN:
+                issues.append({"sig": "sentinel:session-burn", "level": "warn",
+                               "msg": f"high burn: {burn:,} output tokens in the last hour — approaching the "
+                                      f"session cap; pace heavy fan-outs so work doesn't die mid-flight"})
+    except Exception:
+        pass
 
     # 3) provider degraded — burst of transient failures in recent traces
     try:

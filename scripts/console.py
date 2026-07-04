@@ -1057,12 +1057,16 @@ const VIEWS={
   let hl=null;try{hl=await get('/api/health?org='+ORG)}catch(e){}
   let ls={};try{const l=await get('/api/livestatus');(l.products||[]).forEach(p=>ls[p.product]=p)}catch(e){}
   let h='<h1>Cockpit</h1><p class=sub>Your whole company at a glance.</p>';
-  let br=null;try{br=await get('/api/brief?org='+ORG)}catch(e){}
-  if(br&&br.headline){h+=`<section class=card aria-label="Your chief-of-staff brief" style="border-color:var(--accent)"><div class=row style="gap:8px;align-items:center"><span aria-hidden=true>🗞️</span> <b>${esc(br.headline)}</b></div>`
-    +((br.needs_you&&br.needs_you.length)?`<div class=muted style=margin-top:6px><b>Awaiting you:</b> ${br.needs_you.map(esc).join(' · ')}</div>`:'')
-    +((br.team_did&&br.team_did.length)?`<div class=muted style=margin-top:4px><b>Your team:</b> ${br.team_did.slice(0,2).map(esc).join(' · ')}</div>`:'')
-    +(br.suggestion?`<div class=muted style=margin-top:4px><b>Suggested next:</b> ${esc(br.suggestion)}</div>`:'')
-    +`</section>`;}
+  try{const pf=await get('/api/portfolio');if(pf&&pf.totals){const t=pf.totals;const sr=t.products?Math.round(100*(t.live||0)/t.products):0;h+=kpis([['Products',t.products||0],['Live',t.live||0],['In progress',t.building||0],['Ship rate',sr+'%'],['AI spend','$'+(t.spend_usd||0)]]);}}catch(_e){}
+  // BRIEF is a MODEL call (~seconds) — load it ASYNC into a placeholder so it NEVER blocks the cockpit
+  // render (a blocking await here hung the whole main screen ~8s). Fire-and-forget; injects when it lands.
+  h+='<div id=cockpit_brief></div>';
+  (async()=>{try{const br=await get('/api/brief?org='+ORG);const el=$('#cockpit_brief');
+    if(el&&br&&br.headline){el.innerHTML=`<section class=card aria-label="Your chief-of-staff brief" style="border-color:var(--accent)"><div class=row style="gap:8px;align-items:center"><span aria-hidden=true>🗞️</span> <b>${esc(br.headline)}</b></div>`
+      +((br.needs_you&&br.needs_you.length)?`<div class=muted style=margin-top:6px><b>Awaiting you:</b> ${br.needs_you.map(esc).join(' · ')}</div>`:'')
+      +((br.team_did&&br.team_did.length)?`<div class=muted style=margin-top:4px><b>Your team:</b> ${br.team_did.slice(0,2).map(esc).join(' · ')}</div>`:'')
+      +(br.suggestion?`<div class=muted style=margin-top:4px><b>Suggested next:</b> ${esc(br.suggestion)}</div>`:'')
+      +`</section>`;}}catch(_e){}})();
   if(co){const cm={healthy:'ok',attention:'warn',critical:'bad'}[co.verdict]||'ok';h+=`<div class=card><div class=row><span class="dot ${cm}" style="width:10px;height:10px;border-radius:50%"></span> <b>${esc(co.line||co.verdict)}</b></div></div>`;}
   if(ob&&!ob.completed){   // SINGLE SOURCE OF TRUTH: render the SAME checklist as the Assistant, driven by the server's real per-step status — never a second, divergent "next step"
    const obSteps=(ob.steps||[]).map(s=>({done:!!s.done,label:OB_LABEL[s.key]||s.title||s.key}));

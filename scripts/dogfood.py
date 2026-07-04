@@ -329,6 +329,10 @@ def run_once(persona: str = None, base: str = BASE) -> dict:
     bugs_found = 0
     stories_run = 0
     story_status = {}
+    # Fair-share the budget ACROSS stories so a bounded run SAMPLES every journey instead of one deep
+    # journey eating the whole budget (seen live: J1 consumed all 991s, J2-J5 were skipped-budget). Each
+    # step is a slow model call, so give each story its own slice (>=120s) but never exceed the global cap.
+    per_story = max(120, BUDGET_S // max(1, len(stories)))
     for story in stories:
         if time.time() - started > BUDGET_S:      # graceful budget stop — never a hard kill mid-story
             story_status[story["id"]] = "skipped-budget"
@@ -340,9 +344,10 @@ def run_once(persona: str = None, base: str = BASE) -> dict:
                                     _file_bug(persona, _s, bug, counters, run_id))
         try:
             ex = qa_explorer.Explorer(base, vision, token=token, org=str(org))
-            # enforce the wall-clock budget MID-story too (each step is a slow model call) so a bounded
-            # run actually stops on time instead of overrunning by a whole story's worth of AI steps.
-            ex.explore(story, max_steps=MAX_STEPS, on_bug=cb, deadline=started + BUDGET_S)
+            # per-story deadline (its fair slice) AND the global cap — whichever comes first — so every
+            # story gets a turn and the whole run still stops on time.
+            ex.explore(story, max_steps=MAX_STEPS, on_bug=cb,
+                       deadline=min(started + BUDGET_S, time.time() + per_story))
             story_status[story["id"]] = "blocked" if any(b.get("blocking") for b in collected) \
                 else ("failed" if collected else "passed")
         except Exception as e:                     # an explorer/browser crash is itself a blocking finding

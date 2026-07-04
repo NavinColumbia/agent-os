@@ -186,6 +186,7 @@ ckp "prompt-injection sanitize"              "$PY scripts/sanitize.py selftest |
 ckp "callsite signature wiring"              "$PY scripts/test_callsites_wired.py | grep -q PASS"
 ckp "enforcement-layer consistency (gov==hook)" "$PY scripts/test_enforcement_consistency.py | grep -q PASS"
 ckp "governance controls wired"              "$PY scripts/test_governance_wired.py | grep -q PASS"
+ckp "A4 MCP tier wired (--mcp-config)"        "$PY scripts/test_mcp_wired.py | grep -q '^PASS: A4 MCP'"
 ckp "quality-lens triad wired"               "$PY scripts/test_quality_lenses_wired.py | grep -q PASS"
 ckp "daemon supervision wired"               "$PY scripts/test_supervision_wired.py | grep -q PASS"
 ckp "sentinel silent-failure observer"       "$PY scripts/sentinel.py selftest | grep -q PASS"

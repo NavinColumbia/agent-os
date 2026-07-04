@@ -26,6 +26,7 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import account           # noqa: E402
 import approvals          # noqa: E402
+import audit              # noqa: E402
 import billing           # noqa: E402
 import billingview       # noqa: E402
 import cockpit           # noqa: E402
@@ -384,6 +385,8 @@ GETS = {
     "/api/fleet": lambda tid, q: _fleet(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/observability": lambda tid, q: traceview.overview(tid),
     "/api/runs": lambda tid, q: {"runs": traceview.runs(tid)},
+    # per-tenant audit chain: a CEO cryptographically verifies their OWN complete, unbroken audit trail (C2)
+    "/api/audit/verify": lambda tid, q: (lambda r: {"intact": r[0], "reason": r[1]})(audit.verify_tenant(tid)),
     "/api/replay": lambda tid, q: traceview.replay(tid, q.get("run_id", [""])[0]),
     "/api/approvals": lambda tid, q: approvals.inbox(tid),
     "/api/integrations": lambda tid, q: {"integrations": integrationsview.status(tid)},

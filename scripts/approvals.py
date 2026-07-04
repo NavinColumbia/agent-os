@@ -103,13 +103,27 @@ def _hire_requests():
 
 
 def _dead_letters(tid):
-    """Dead-lettered tasks. Scope to the tenant's products where a task title/role references them;
-    a dead task with no obvious tenant link still surfaces (a human must clear it somewhere)."""
+    """Dead-lettered tasks OWNED BY THIS TENANT, scoped by the product embedded in the task's assignee
+    ('<role>@<product>') matched against the tenant's products. WAS A CROSS-TENANT LEAK: the docstring
+    claimed scoping but the query was `WHERE status='dead'` with NO tenant filter, so EVERY CEO's inbox
+    showed EVERY tenant's (and the platform's) dead-lettered tasks. Truly orphaned dead tasks (no derivable
+    owner) are a PLATFORM concern surfaced via tasksweep dead-letter depth / the operator — never dumped
+    into a random tenant's inbox."""
+    prods = set(_tenant_products(tid))
+    if not prods:
+        return []
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT id, title, role, last_error, attempts FROM tasks
+        cur.execute("""SELECT id, title, role, last_error, attempts, assignee FROM tasks
                        WHERE status='dead' ORDER BY id""")
-        return [{"id": r[0], "title": r[1] or "", "role": r[2] or "",
-                 "last_error": r[3] or "", "attempts": r[4] or 0} for r in cur.fetchall()]
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        assignee = r[5] or ""
+        prod = assignee.split("@", 1)[1] if "@" in assignee else ""
+        if prod and prod in prods:                        # only THIS tenant's own dead-letters
+            out.append({"id": r[0], "title": r[1] or "", "role": r[2] or "",
+                        "last_error": r[3] or "", "attempts": r[4] or 0})
+    return out
 
 
 def _retry_build(product):
@@ -282,10 +296,11 @@ def _selftest():
                            VALUES (%s,%s,%s,'open') RETURNING id""",
                         ("approvals-selftest", "qa-bot", "selftest hire"))
             hire_id = cur.fetchone()[0]
-            # A dead-lettered task that a human must retry/drop.
+            # A dead-lettered task OWNED BY THIS TENANT (assignee '<role>@<product>' where product is the
+            # tenant's) — so it surfaces for THIS tenant only, not globally (tests the isolation fix).
             cur.execute("""INSERT INTO tasks (assignee, requester, role, title, status, attempts, max_retry)
-                           VALUES ('','approvals-selftest','qa-bot','selftest dead task','dead',3,3)
-                           RETURNING id""")
+                           VALUES (%s,'approvals-selftest','qa-bot','selftest dead task','dead',3,3)
+                           RETURNING id""", (f"qa-bot@{blk_product}",))
             dead_id = cur.fetchone()[0]
             # A blocked build the tenant owns, recorded as a ProductComplete BLOCKED_AT_REVIEW row.
             cur.execute("""INSERT INTO tenant_products (product, tenant_id)
@@ -302,6 +317,12 @@ def _selftest():
         hire_present = any(i["kind"] == "hire_request" and i["ref"] == hire_id for i in box["items"])
         dead_present = any(i["kind"] == "dead_letter" and i["ref"] == dead_id for i in box["items"])
         consent_present = "consent" in kinds       # fresh tenant -> consent must be required
+
+        # ISOLATION GUARD: a DIFFERENT tenant must NOT see this tenant's dead-letter (guards the cross-tenant
+        # leak — _dead_letters used to return ALL dead tasks platform-wide for every tenant).
+        other_tid = billing.signup("approvals-selftest-other", "free")["tenant_id"]
+        isolated = not any(i["kind"] == "dead_letter" and i["ref"] == dead_id
+                           for i in inbox(other_tid)["items"])
 
         # Resolve the hire_request and verify it leaves the inbox.
         decide(tid, "hire_request", hire_id, "approve")
@@ -337,12 +358,13 @@ def _selftest():
         blocked_cleared = not any(i["kind"] == "blocked_build" and i["ref"] == blk_product
                                   for i in inbox(tid)["items"])
 
-        ok = (hire_present and dead_present and consent_present and blocked_present and
+        ok = (hire_present and dead_present and consent_present and blocked_present and isolated and
               hire_resolved and dead_resolved and consent_resolved and
               blocked_retried and blocked_cleared)
         print(f"surfaced: hire={hire_present} dead={dead_present} consent={consent_present} "
-              f"blocked={blocked_present} | resolved: hire={hire_resolved} dead={dead_resolved} "
-              f"consent={consent_resolved} blocked_retry={blocked_retried} blocked_cleared={blocked_cleared}")
+              f"blocked={blocked_present} tenant_isolated={isolated} | resolved: hire={hire_resolved} "
+              f"dead={dead_resolved} consent={consent_resolved} blocked_retry={blocked_retried} "
+              f"blocked_cleared={blocked_cleared}")
         print("PASS: approvals inbox aggregates + decide() resolves each kind ✅" if ok else "FAIL")
         rc = 0 if ok else 1
     finally:
@@ -358,6 +380,10 @@ def _selftest():
                 cur.execute("DELETE FROM tasks WHERE id=%s", (dead_id,))
             if hire_id is not None:
                 cur.execute("DELETE FROM hire_requests WHERE id=%s", (hire_id,))
+            try:
+                cur.execute("DELETE FROM tenants WHERE name='approvals-selftest-other'")
+            except Exception:
+                pass
             # NOTE: never DELETE from audit_log — it is an append-only tamper-evident chain; deleting rows
             # breaks `audit.py verify`. The few test rows are harmless append-only entries.
             cur.execute("DELETE FROM traces WHERE product=%s OR run_id=%s",

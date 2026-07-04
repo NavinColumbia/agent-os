@@ -81,6 +81,28 @@ def run_proof(cmd, marker):
         return False, str(e)[:60]
 
 
+def _last_skeptic():
+    """The most recent agentic-skeptic (dogfood) result, so the live-proof line reflects REALITY, not just a
+    command to run. Fail-open (None if unavailable)."""
+    try:
+        import psycopg
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import trace  # noqa: E402 — shared DATABASE_URL
+        with psycopg.connect(trace.DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT payload, ts FROM audit_log WHERE actor='dogfood' AND action='DogfoodPass'
+                           ORDER BY id DESC LIMIT 1""")
+            r = cur.fetchone()
+        if not r:
+            return None
+        p = r[0] or {}
+        ss = p.get("story_status", {}) or {}
+        passed = sum(1 for v in ss.values() if v == "passed")
+        return (f"last run [{p.get('persona','?')}]: {passed}/{len(ss)} journeys passed, "
+                f"{p.get('bugs', '?')} bugs  ({str(r[1])[:16]})")
+    except Exception:
+        return None
+
+
 def report():
     print("═══ NORTH-STAR ACCEPTANCE SCORECARD ═══\n")
     auto = [p for p in PROOFS if p[2] is not None]
@@ -96,8 +118,10 @@ def report():
         print(f"  {'✅' if ok else '❌'} {claim}" + (f"   [{why}]" if why else ""))
     print(f"\n── AUTO PROOFS: {passed}/{len(auto)} passing ──")
     print("\n── LIVE-ONLY (the real finish line — billed runs, listed not auto-run) ──")
+    skeptic = _last_skeptic()
     for pil, claim, _c2, note in live:
-        print(f"  ◻ {claim}\n      → {note}")
+        extra = f"\n      ✓ {skeptic}" if (skeptic and "skeptic" in claim.lower()) else ""
+        print(f"  ◻ {claim}\n      → {note}{extra}")
     frac = passed / len(auto) if auto else 0
     print(f"\nAUTO north-star readiness: {frac:.0%} ({passed}/{len(auto)}).  "
           f"Remaining to 100%: the {len(live)} live proofs + any ❌ above.")

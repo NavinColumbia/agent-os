@@ -186,7 +186,8 @@ def health(tid, org_id=0):
     """Tenant org-health: blocked waits, deadlock cycles, conflicts, dead-letter + stuck tasks — all
     scoped to the tenant's own agents. Every table read is guarded; never crashes (returns [] on error)."""
     out = {"blocked": [], "deadlocks": [], "conflicts": [], "dead_letter": 0, "stuck": 0, "ok": True}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    import dbpool                                                # C2: cockpit health is auto-polled every 6s
+    with dbpool.connection(autocommit=True) as c, c.cursor() as cur:
         try:
             prods, agents = _tenant_agents(cur, tid, org_id)
         except Exception:

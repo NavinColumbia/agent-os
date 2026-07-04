@@ -49,6 +49,7 @@ WF_STALE_MIN = int(os.environ.get("AOS_SENTINEL_WF_STALE_MIN", "45"))      # wor
 WF_WINDOW_H = int(os.environ.get("AOS_SENTINEL_WF_WINDOW_H", "6"))         # only workflows active this recently
 PROVIDER_BURST = int(os.environ.get("AOS_SENTINEL_PROVIDER_BURST", "3"))   # transient markers in 15m = degraded
 ACTOR_STALE_MIN = int(os.environ.get("AOS_SENTINEL_ACTOR_STALE_MIN", "10"))  # orchestra beats every ~45s; 10m silent = stuck
+BUILD_STUCK_H = int(os.environ.get("AOS_SENTINEL_BUILD_STUCK_H", "3"))       # a product still building 3h+ w/o finishing = looping
 DB_TXN_STALE_MIN = int(os.environ.get("AOS_SENTINEL_DB_TXN_MIN", "3"))       # idle-in-transaction older than this = a leak -> auto-terminate
 DB_LOCK_PILEUP = int(os.environ.get("AOS_SENTINEL_DB_LOCK_PILEUP", "8"))     # this many lock-waiters = contention/hang forming
 SESSION_BURN_WARN = int(os.environ.get("AOS_SENTINEL_BURN_WARN", "4000000")) # output tokens/hr that says "approaching the session cap"
@@ -182,6 +183,28 @@ def observe(wf_root=None, notify_fn=None, now=None):
                            "msg": f"orchestra actor {a['name']} ({a['role']}, run {a['run_id']}) says "
                                   f"'working' but has been silent {a['stale_min']}m — possible dead "
                                   f"agent holding an assignment (tenant {a['tenant_id']})"})
+    except Exception:
+        pass
+
+    # 3b-ii) STUCK / LOOPING BUILD — a product still spawning agents (traces in the last 20m) but that has
+    # been "building" for BUILD_STUCK_H+ hours and NEVER reached a terminal ProductComplete (LAUNCHED/BLOCKED/
+    # FAILED). A real build finishes in well under an hour; hours of continuous agents with no verdict is a
+    # poison-phase retry loop that makes no noise while it burns agents/tokens. WARN (observe, don't kill).
+    try:
+        with psycopg.connect(DB, autocommit=True) as c, c.cursor() as cur:
+            cur.execute("""SELECT t.product, count(*), round(extract(epoch from now()-min(t.ts))/3600, 1)
+                           FROM traces t
+                           WHERE t.kind='agent'
+                           GROUP BY t.product
+                           HAVING max(t.ts) > now() - interval '20 minutes'
+                              AND min(t.ts) < now() - make_interval(hours => %s)
+                              AND NOT EXISTS (SELECT 1 FROM audit_log a
+                                              WHERE a.resource=t.product AND a.action='ProductComplete')
+                           ORDER BY 2 DESC LIMIT 10""", (BUILD_STUCK_H,))
+            for prod, n, hrs in cur.fetchall():
+                issues.append({"sig": f"sentinel:build-stuck:{prod}", "level": "warn",
+                               "msg": f"build '{prod}' has spawned {n} agents over {hrs}h and still has NO "
+                                      f"terminal outcome — a stuck/looping build phase burning agents silently"})
     except Exception:
         pass
 

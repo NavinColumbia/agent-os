@@ -39,6 +39,7 @@ PROOFS = [
     ("Trust", "Approval gate: nothing risky happens without a human decision", _c("scripts/approvals.py selftest"), ""),
     ("Trust", "Explainability: 'why the AI did X' from the real trail", _c("scripts/explain.py selftest"), ""),
     ("Trust", "Audit chain is tamper-evident (append-only hash chain)", _c("scripts/audit.py verify"), "INTACT"),
+    ("Trust", "Per-tenant audit sub-chains: each tenant independently verifies their OWN trail", _c("scripts/test_audit_tamper.py"), "genuinely tamper-EVIDENT"),
     ("Trust", "Multi-tenant isolation: each tenant sees only their own", _c("scripts/tenancy.py test"), ""),
     ("Trust", "Tenant isolation holds on READ + WRITE + org-IDOR (no cross-tenant access)", _c("scripts/test_tenant_isolation.py"), "isolation holds"),
 

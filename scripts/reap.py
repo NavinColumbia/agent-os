@@ -113,11 +113,26 @@ def reap(dry=False):
     cleaned = _clean_scratch(dry)
     stale_dir = _sweep_directory(dry)                 # release dead agent presence (accumulates + misleads routing)
     stale_browsers = _sweep_browsers(dry)             # reap leaked playwright browsers (orphaned/very old)
+    stale_runs = _sweep_stale_runs(dry)               # abandon crashed 'running' orchestra runs (inflate counts)
     if killed and not dry:
         audit.append(actor="reap", action="ReapAgents", resource="orphans", decision="killed",
                      payload={"count": len(killed), "pids": [k["pid"] for k in killed][:10]})
     return {"reaped": killed, "scratch_cleaned": cleaned, "stale_directory_released": stale_dir,
-            "stale_browsers_reaped": stale_browsers}
+            "stale_browsers_reaped": stale_browsers, "stale_runs_abandoned": stale_runs}
+
+
+def _sweep_stale_runs(dry=False):
+    """Abandon orchestra runs stuck 'running' after an orchestrator crash (no actor sign-of-life in the
+    window) — they inflate the running count + mislead dashboards. Delegates to store.abandon_stale_runs,
+    which NEVER touches a run with a recently-active actor. Fail-open; dry-run mutates nothing."""
+    if dry:
+        return 0
+    try:
+        sys.path.insert(0, str(SCRIPTS / "orchestra"))
+        import store
+        return store.abandon_stale_runs()
+    except Exception:
+        return 0
 
 
 def _sweep_directory(dry=False, stale_min=None):
@@ -174,9 +189,13 @@ def _selftest():
     browser_safe = _reap_browser_decision(ppid=12345, etimes=60) is False \
         and _reap_browser_decision(ppid=1, etimes=60) is True \
         and _reap_browser_decision(ppid=999, etimes=BROWSER_STALE_S + 1) is True
-    ok = keep and orphan and stuck and interactive_excluded and dir_ok and browser_wired and browser_safe
+    # stale-run sweep is wired into reap() (abandons crashed 'running' orchestra runs)
+    runs_wired = "stale_runs_abandoned" in reap(dry=True)
+    ok = (keep and orphan and stuck and interactive_excluded and dir_ok and browser_wired
+          and browser_safe and runs_wired)
     print(f"keep-healthy={keep} reap-orphan={orphan} reap-stuck={stuck} session-excluded={interactive_excluded} "
-          f"directory-sweep={dir_ok} browser-sweep={browser_wired} browser-safe={browser_safe}")
+          f"directory-sweep={dir_ok} browser-sweep={browser_wired} browser-safe={browser_safe} "
+          f"stale-run-sweep={runs_wired}")
     print("PASS: orphan/stuck reaper (decision + session-safe) ✅" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 

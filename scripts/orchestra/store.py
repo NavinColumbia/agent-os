@@ -141,6 +141,31 @@ def start_run(tenant_id, vision, org_id=None):
     return _run_dict(row)
 
 
+def abandon_stale_runs(stale_h=None):
+    """Resilience sweep: a run whose orchestrator crashed stays status='running' FOREVER — inflating the
+    'running' count and misleading dashboards/routing (found 16 such, all >2h old). Mark a running run
+    'abandoned' when it is older than the threshold AND no actor within it has shown a sign of life
+    (last_active) inside the window. A LIVE build — any actor active recently (e.g. an in-flight prodr
+    build) — is NEVER touched, so this is safe to run on a cadence. Returns the count. Fail-open."""
+    ensure()
+    import os
+    secs = (stale_h if stale_h is not None else float(os.environ.get("AOS_RUN_STALE_H", "2"))) * 3600
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""UPDATE orchestra_runs r SET status='abandoned', finished_at=now()
+                           WHERE r.status='running'
+                             AND r.created_at < now() - make_interval(secs => %s)
+                             AND NOT EXISTS (SELECT 1 FROM orchestra_actors a
+                                             WHERE a.run_id = r.run_id
+                                               AND a.last_active > now() - make_interval(secs => %s))""",
+                        (secs, secs))
+            n = cur.rowcount
+            c.commit()
+            return n
+    except Exception:
+        return 0
+
+
 def run(run_id, tenant_id=None):
     """Fetch one run (tenant-scoped when tenant_id given). None if absent/not yours."""
     ensure()
@@ -546,14 +571,32 @@ def _selftest():
         fin_ok = (fin["status"] == "done" and fin["finished_at"]
                   and "error" in finish_run(rid, "sideways", tenant_id=tid))
 
+        # --- stale-run sweep: a crashed 'running' run (no fresh actor) is abandoned; a run with a
+        #     recently-active actor (a LIVE build) is KEPT. Both backdated past the window to isolate the
+        #     'actor sign-of-life' signal from age.
+        stale_run = start_run(tid, "x")["run_id"]
+        fresh_run = start_run(tid, "x")["run_id"]
+        fresh_actor = spawn_actor(fresh_run, tid, "live", "backend-engineer", kind="worker")["actor_id"]
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("UPDATE orchestra_runs SET created_at=now()-interval '3 h' WHERE run_id IN (%s,%s)",
+                        (stale_run, fresh_run))
+            cur.execute("UPDATE orchestra_actors SET last_active=now() WHERE actor_id=%s", (fresh_actor,))
+            c.commit()
+        abandon_stale_runs(2)
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT status FROM orchestra_runs WHERE run_id=%s", (stale_run,)); ss = cur.fetchone()[0]
+            cur.execute("SELECT status FROM orchestra_runs WHERE run_id=%s", (fresh_run,)); fs = cur.fetchone()[0]
+        abandon_ok = ss == "abandoned" and fs == "running"   # crashed run swept; live-actor build untouched
+
         ok = all([run_ok, spawn_ok, guard_ok, tree_ok, claim_ok, reclaim_blocked, comp_ok,
                   drained, crash_ok, race_ok, upd_ok, hb_ok, stale_ok, view_ok, scope_ok,
-                  audit_ok, fin_ok])
+                  audit_ok, fin_ok, abandon_ok])
         print(f"run={run_ok} spawn3={spawn_ok} hire_guards={guard_ok} org_tree_nested={tree_ok} "
               f"emit/claim={claim_ok} lease_holds={reclaim_blocked} complete={comp_ok} "
               f"drained={drained} crash_reclaim={crash_ok} skip_locked_race(3x{n_events})={race_ok} "
               f"update+memory_merge={upd_ok} heartbeat_tenure={hb_ok} stale_working_sweep={stale_ok} "
-              f"runs_for+tenure_view={view_ok} tenant_scope={scope_ok} audit={audit_ok} finish={fin_ok}")
+              f"runs_for+tenure_view={view_ok} tenant_scope={scope_ok} audit={audit_ok} finish={fin_ok} "
+              f"stale_run_abandon={abandon_ok}")
         print("PASS: durable org — actors are Postgres rows with identity/tenure/memory, the org "
               "tree nests from supervisor links, events are SKIP-LOCKED claimable and crash-"
               "reclaimable, everything tenant-scoped ✅" if ok else "FAIL")

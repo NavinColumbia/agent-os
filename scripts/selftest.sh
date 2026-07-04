@@ -107,6 +107,7 @@ ckp "feature flags + rollout"               "$PY scripts/flags.py test | grep -q
 ckp "health monitor + alerting"             "$PY scripts/monitor.py test | grep -q PASS"
 ckp "HTTP API (health+auth)"                 "curl -s http://127.0.0.1:8090/health | grep -q agent-os && [ \$(curl -s -o /dev/null -w %{http_code} http://127.0.0.1:8090/status) = 401 ]"
 ckp "multi-tenant isolation"                 "$PY scripts/tenancy.py test | grep -q PASS"
+ckp "tenant isolation: inbox+traces scoped"  "$PY scripts/test_tenant_isolation.py | grep -q '^PASS: tenant isolation holds'"
 ckp "skills/capability registry"            "$PY scripts/skills.py test | grep -q PASS"
 ckp "portable encrypted snapshot"           "$PY platform/snapshot.py selftest | grep -q PASS"
 ckp "platform inventory covers stack"       "for s in postgres ntfy cerbos; do grep -q \"name: \$s\" platform/inventory.yaml || exit 1; done"

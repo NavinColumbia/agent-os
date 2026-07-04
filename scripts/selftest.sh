@@ -195,6 +195,7 @@ ckp "isolated agent config (no bypassPermissions)"  "$PY -c \"import sys;sys.pat
 ckp "chief-of-staff CEO brief (B1)"          "$PY scripts/chiefofstaff.py selftest | grep -q PASS"
 ckp "money circuit-breaker wired (C4)"          "grep -q 'appguard.blocks' scripts/factory.py && $PY -c \"import sys;sys.path.insert(0,'scripts');import appguard;print('PASS' if hasattr(appguard,'blocks') else 'x')\" | grep -q PASS"
 ckp "approval gate fires on public publish (C4)"  "grep -q 'require_approval' scripts/appregistry.py && $PY -c \"import sys;sys.path.insert(0,'scripts');import appregistry,pathlib,governance;p=appregistry.PRODUCTS/'c4g';p.mkdir(parents=True,exist_ok=True);(p/'a').write_text('x');r=appregistry.publish('c4g',private=False);import shutil;shutil.rmtree(p,ignore_errors=True);print('PASS' if r.get('blocked') else 'x')\" | grep -q PASS"
+ckp "C4 explainability (why-did-AI trail)"    "$PY scripts/explain.py selftest | grep -q PASS"
 ckp "acceptance dogfood wired"               "$PY scripts/dogfood.py selftest | grep -q PASS"
 ckp "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ckp "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"

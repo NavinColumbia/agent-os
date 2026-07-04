@@ -40,6 +40,7 @@ import crossorg          # noqa: E402
 import crossorgview      # noqa: E402
 import designview        # noqa: E402
 import chiefofstaff       # noqa: E402
+import explain            # noqa: E402
 import integrationsview  # noqa: E402
 import livestatus        # noqa: E402
 import loopcontroller    # noqa: E402
@@ -404,6 +405,7 @@ GETS = {
     "/api/versions": lambda tid, q: {"versions": versions.versions(tid, q.get("product", [""])[0])},
     "/api/help/topics": lambda tid, q: {"topics": helpagent.topics()},
     "/api/agents": lambda tid, q: {"agents": customagents.list_agents(tid), "roles": list(customagents.ALLOWED_ROLES), "system": _system_agents()},
+    "/api/explain": lambda tid, q: explain.explain((q.get("product", [""])[0])),   # C4 explainability: why the AI did X
     "/api/orgs": lambda tid, q: {"orgs": orgsmod.list_orgs(tid)},
     "/api/brief": lambda tid, q: chiefofstaff.brief(tid, int((q.get("org", ["0"])[0]) or 0)),   # B1 chief-of-staff
     "/api/portfolio": lambda tid, q: crossorgview.portfolio(tid),

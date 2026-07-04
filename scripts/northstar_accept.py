@@ -57,6 +57,7 @@ PROOFS = [
     # ── BUSINESS: sellable ────────────────────────────────────────────────────────────────
     ("Business", "Billing / plans / usage metering", _c("scripts/billing.py selftest"), ""),
     ("Business", "Connection pool (C2 scale headroom)", _c("scripts/dbpool.py selftest"), ""),
+    ("Business", "Worker fleet scales horizontally (exactly-once claim under concurrency)", _c("scripts/dispatcher.py selftest"), "fleet-safe"),
 
     # ── LIVE-ONLY: the true 'astonish a skeptic' finish line (billed real runs) ────────────
     ("Live", "One-shot vision -> a real shipped product (build + QA + deploy)", None,

@@ -905,7 +905,7 @@ async function refreshTopbar(){
  try{const s=await get('/api/status');const _sv=({operational:'ok',degraded:'warn',major_outage:'bad'}[s.verdict]||'ok');const _SV={operational:'all systems operational',degraded:'degraded performance',major_outage:'major outage'};const _st=$('#statusdot');_st.className='dot '+_sv;const _sl='Status — '+(_SV[s.verdict]||s.verdict||'operational');_st.title=_sl;_st.setAttribute('aria-label',_sl)}catch(e){}
  loadProviders();   // keep PROVIDER_OK fresh so the Assistant connect-banner reflects the latest provider state
 }
-async function go(k){CUR=k;renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';toggleNav(false);$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
+async function go(k){CUR=k;if((location.hash.slice(1))!==k){try{location.hash=k}catch(_){}}renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';toggleNav(false);$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
  try{await VIEWS[k]()}catch(e){if(e.kind==='auth'){if(TOK)signOut();return}$('#view').innerHTML=errCard(k,e.message)}}
 function userBusy(){const a=document.activeElement;if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'||a.isContentEditable))return true;const m=$('#acctmenu');if(m&&m.style.display!=='none')return true;return false}
 async function refreshView(){ // background poll: no skeleton flash, no nav/scroll disruption, never clobber what the user is touching
@@ -1422,10 +1422,15 @@ function palHi(){[...document.querySelectorAll('#pallist .pal-item')].forEach((e
 function palGo(k){closePalette();go(k);}
 function palKey(e){if(e.key==='Escape'){closePalette();}else if(e.key==='ArrowDown'){e.preventDefault();PAL_SEL=Math.min(PAL_ITEMS.length-1,PAL_SEL+1);palHi();}else if(e.key==='ArrowUp'){e.preventDefault();PAL_SEL=Math.max(0,PAL_SEL-1);palHi();}else if(e.key==='Enter'){e.preventDefault();if(PAL_ITEMS[PAL_SEL])palGo(PAL_ITEMS[PAL_SEL].k);}}
 document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&(e.key==='k'||e.key==='K')){e.preventDefault();openPalette();}});
+// URL routing: back/forward buttons + manual hash edits navigate. go() already sets CUR first, so this only
+// fires for a REAL change (never a loop). Deep-links + refresh are handled in boot().
+window.addEventListener('hashchange',()=>{if(!TOK)return;const k=(location.hash||'').slice(1);if(k&&k!==CUR&&LABEL[k])go(k)});
 async function boot(){renderNav();refreshTopbar();await loadOrgs();await loadProviders();
  if(!ORG&&ORGS.length){ORG=ORGS[0].org_id;localStorage.setItem('aos_org',ORG);setOrgName();}   // default into a company at boot; the user can switch to All orgs (home) anytime
  let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
- if(ORGS.length&&ob&&!ob.completed&&ob.step!=='done')go('cockpit');   // first-run with a company: Cockpit renders the guided onboarding banner
+ const _hk=(location.hash||'').slice(1);
+ if(_hk&&LABEL[_hk])go(_hk);                                          // deep-link / refresh restores the exact screen
+ else if(ORGS.length&&ob&&!ob.completed&&ob.step!=='done')go('cockpit');   // first-run with a company: Cockpit renders the guided onboarding banner
  else go('controller');   // Assistant is the primary surface — it handles the zero-company home state itself
  if(!window.TOPBARPOLL)window.TOPBARPOLL=setInterval(refreshTopbar,15000);
  if(!window.AUTOPOLL)window.AUTOPOLL=setInterval(()=>{if(!TOK)return;if(!['cockpit','activity'].includes(CUR))return;if(($('#acctmenu')||{}).style&&$('#acctmenu').style.display==='block')return;if(document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#view'))return;refreshView()},6000)}

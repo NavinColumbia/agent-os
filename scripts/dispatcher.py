@@ -208,10 +208,44 @@ def tick():
     return {"processed": len(results), "tasks": results}
 
 
+def run(interval=None):
+    """A single worker loop: tick() forever, sleeping `interval` between ticks. The C2 FLEET runs N of these
+    concurrently. Concurrent workers are safe by construction — _pull claims via SELECT ... FOR UPDATE SKIP
+    LOCKED, so two workers NEVER claim the same task. Never raises out of the loop."""
+    import time
+    iv = int(interval or os.environ.get("AOS_WORKER_INTERVAL", "5"))
+    while True:
+        try:
+            tick()
+        except Exception:
+            pass
+        time.sleep(iv)
+
+
+def fleet(n=None):
+    """C2 worker fleet: launch N detached workers draining the shared task queue concurrently for horizontal
+    scale. Additive + safe — the durable queue's SKIP-LOCKED claim already guarantees exactly-once dispatch no
+    matter how many workers run. Returns the launched pids."""
+    import subprocess
+    n = max(1, int(n or os.environ.get("AOS_WORKER_FLEET", "3")))
+    me = os.path.abspath(__file__)
+    log = open("/tmp/worker-fleet.log", "a")
+    pids = []
+    for _ in range(n):
+        p = subprocess.Popen([sys.executable, me, "run"], stdout=log, stderr=log,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        pids.append(p.pid)
+    return {"launched": n, "pids": pids}
+
+
 def _main(a):
     import json
     if not a or a[0] == "tick":
         print(json.dumps(tick(), indent=2))
+    elif a[0] == "run":
+        run()                                             # one worker loop (the fleet spawns N of these)
+    elif a[0] == "fleet":
+        print(json.dumps(fleet(a[1] if len(a) > 1 else None), indent=2))
     elif a[0] == "selftest":
         # offline: prove the claim path (pull-and-claim semantics) without spending on an agent call
         import orchestrate
@@ -253,6 +287,31 @@ def _main(a):
                 cur.execute("DELETE FROM tasks WHERE assignee=%s", (hb_ag,)); c.commit()
         print(f"heartbeat refreshed live lease: {hb_ok}")
         ok = ok and hb_ok
+        # C2 FLEET-SAFETY: the horizontal-scale guarantee — N concurrent workers draining the SAME queue must
+        # NEVER double-claim a task (SELECT ... FOR UPDATE SKIP LOCKED). Enqueue 6 for a throwaway assignee,
+        # claim from 3 threads AT ONCE, assert every task is claimed EXACTLY once (no dup, no loss). Offline.
+        import threading
+        fag = f"technical-writer@fleet-{suf}"
+        try:
+            for i in range(6):
+                orchestrate.enqueue(fag, f"selftest task {suf} {i}", priority=5, requester=f"controller@{suf}")
+            results = {}
+
+            def _w(k):
+                results[k] = [r[0] for r in _pull(6, fag)]
+
+            threads = [threading.Thread(target=_w, args=(k,)) for k in (0, 1, 2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            claimed = [i for v in results.values() for i in v]
+            fleet_ok = len(claimed) == len(set(claimed)) == 6      # exactly-once: no double-claim, no loss
+        finally:
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("DELETE FROM tasks WHERE assignee=%s", (fag,)); c.commit()
+        print(f"fleet-safe: 3 concurrent workers claim 6 tasks exactly-once (no double-claim): {fleet_ok}")
+        ok = ok and fleet_ok
         # circuit-breaker gate: a claimed task whose app appguard PAUSED must be skipped (agent NOT invoked,
         # so $0 spent) and released back to 'pending' for later — NOT failed/dead-lettered. Proven offline.
         papp = f"paused-app-{suf}"

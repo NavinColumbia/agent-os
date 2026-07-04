@@ -88,6 +88,15 @@ def overview(tid):
         recent_errors = [{"product": p, "stage": st, "run_id": rid,
                           "ts": ts.isoformat() if ts else None, "snippet": _snip(o, 160)}
                          for p, st, rid, ts, o in cur.fetchall()]
+        # recent activity TIMELINE — the fleet's real work as it happens (which agent did what), success
+        # AND fail, so the CEO can WATCH their company work, not just read error rollups. Tenant-scoped.
+        cur.execute("""SELECT t.product, t.stage, t.role, t.ts, t.rc
+                       FROM traces t JOIN tenant_products tp ON tp.product=t.product
+                       WHERE tp.tenant_id=%s AND t.kind='agent'
+                       ORDER BY t.ts DESC LIMIT 15""", (tid,))
+        recent_activity = [{"product": p, "stage": st, "role": role,
+                            "ts": ts.isoformat() if ts else None, "ok": (rc == 0 or rc is None)}
+                           for p, st, role, ts, rc in cur.fetchall()]
     return {
         "runs": runs_n or 0,
         "steps": steps_n or 0,
@@ -96,6 +105,7 @@ def overview(tid):
         "tokens": int(toks or 0),
         "by_stage": by_stage,
         "recent_errors": recent_errors,
+        "recent_activity": recent_activity,
     }
 
 

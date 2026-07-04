@@ -198,6 +198,7 @@ ckp "approval gate fires on public publish (C4)"  "grep -q 'require_approval' sc
 ckp "C4 explainability (why-did-AI trail)"    "$PY scripts/explain.py selftest | grep -q PASS"
 ckp "DB connection pool (fail-open, C2)"     "$PY scripts/dbpool.py selftest | grep -q PASS"
 ckp "concurrent workstreams per org (A2)"    "$PY -c \"import sys;sys.path.insert(0,'scripts');import loopcontroller as l;assert hasattr(l,'new_workstream') and hasattr(l,'workstreams');print('PASS')\" | grep -q PASS"
+ckp "skills consumed into brief (A4)"     "$PY -c \"import sys;sys.path.insert(0,'scripts');import skills,factory;b=skills.brief_for('backend-engineer');assert 'YOUR CAPABILITIES' in b;print('PASS')\" | grep -q PASS"
 ckp "acceptance dogfood wired"               "$PY scripts/dogfood.py selftest | grep -q PASS"
 ckp "security scan (invariants)"             "$PY scripts/security_scan.py | grep -q PASS"
 ckp "unit test suite (pytest)"               "$PY -m pytest tests/ -q | tail -1 | grep -q passed"

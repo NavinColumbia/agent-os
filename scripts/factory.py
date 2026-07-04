@@ -594,7 +594,13 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
             mem = companymemory.brief_context(getattr(_ctx, "tenant", None), getattr(_ctx, "org", None), role)
         except Exception:
             mem = ""
-        prompt = f"{role_brief(role)}{mem}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
+        cap = ""
+        try:
+            import skills
+            cap = skills.brief_for(role)              # A4: the role's READY capabilities + tools (was unconsumed)
+        except Exception:
+            cap = ""
+        prompt = f"{role_brief(role)}{cap}{mem}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
     # MULTI-PROVIDER: a tenant may have ONLY a Codex/OpenAI key (no Claude). Route them to Codex as the
     # PRIMARY engine (not just failover), on their own key. Default stays Claude.
     engine = (getattr(_ctx, "engine", None) or "claude").lower()

@@ -185,6 +185,22 @@ def for_role(role):
         return cur.fetchall()
 
 
+def brief_for(role):
+    """REBUILD-PLAN A4 — CONSUME the skills catalog (it was defined but never loaded into any agent). Returns
+    a compact line naming this role's READY capabilities + their tools, injected into the agent's brief so it
+    knows what it is equipped to do (and reaches for the right tool) instead of guessing. '' if none/on error."""
+    try:
+        ready = [(n, tools) for (n, status, eng, tools) in for_role(role) if status == "ready"]
+    except Exception:
+        return ""
+    if not ready:
+        return ""
+    names = ", ".join(n for n, _ in ready[:12])
+    tools = sorted({t for _, ts in ready for t in (ts or [])})[:12]
+    return (f"\n\nYOUR CAPABILITIES (skills you are equipped for — use them, don't improvise around them): "
+            f"{names}." + (f" Tooling available: {', '.join(tools)}." if tools else ""))
+
+
 def find(sub):
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""SELECT name, status, engine FROM skills

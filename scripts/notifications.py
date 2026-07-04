@@ -96,7 +96,8 @@ def feed(tid, unread_only=False, limit=50):
     q = """SELECT id, channel, category, level, title, body, url, created_at, read_at
            FROM notifications WHERE tenant_id=%s {} ORDER BY id DESC LIMIT %s"""
     q = q.format("AND read_at IS NULL" if unread_only else "")
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    import dbpool                                                # C2: polled every few seconds by every open console
+    with dbpool.connection(autocommit=True) as c, c.cursor() as cur:
         cur.execute(q, (tid, limit))
         rows = cur.fetchall()
     return [{"id": r[0], "channel": r[1], "category": r[2], "level": r[3], "title": r[4],
@@ -107,7 +108,8 @@ def feed(tid, unread_only=False, limit=50):
 
 def unread_count(tid):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:           # silent never contributes to the badge
+    import dbpool                                                # C2: the notification-bell poll (very hot)
+    with dbpool.connection(autocommit=True) as c, c.cursor() as cur:   # silent never contributes to the badge
         cur.execute("""SELECT count(*) FROM notifications WHERE tenant_id=%s AND read_at IS NULL
                        AND level <> 'silent'""", (tid,))
         return cur.fetchone()[0]

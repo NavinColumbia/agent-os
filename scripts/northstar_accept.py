@@ -103,6 +103,27 @@ def _last_skeptic():
         return None
 
 
+def _pipeline_stats():
+    """Real build-pipeline evidence for the 'vision -> shipped product' proof: how many products the fleet
+    has LAUNCHED and — the trust bar — how many the quality gates BLOCKED (it refuses to ship broken work).
+    Fail-open."""
+    try:
+        import psycopg
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import trace  # noqa: E402
+        with psycopg.connect(trace.DB) as c, c.cursor() as cur:
+            cur.execute("SELECT decision, count(*) FROM audit_log WHERE action='ProductComplete' GROUP BY decision")
+            d = dict(cur.fetchall())
+        launched = d.get("LAUNCHED", 0)
+        blocked = sum(v for k, v in d.items() if str(k).startswith("BLOCKED"))
+        failed = d.get("FAILED", 0)
+        if not (launched or blocked):
+            return None
+        return f"pipeline to date: {launched} LAUNCHED, {blocked} BLOCKED by QA/review/verify gates, {failed} hard-failed"
+    except Exception:
+        return None
+
+
 def report():
     print("═══ NORTH-STAR ACCEPTANCE SCORECARD ═══\n")
     auto = [p for p in PROOFS if p[2] is not None]
@@ -119,8 +140,13 @@ def report():
     print(f"\n── AUTO PROOFS: {passed}/{len(auto)} passing ──")
     print("\n── LIVE-ONLY (the real finish line — billed runs, listed not auto-run) ──")
     skeptic = _last_skeptic()
+    pipeline = _pipeline_stats()
     for pil, claim, _c2, note in live:
-        extra = f"\n      ✓ {skeptic}" if (skeptic and "skeptic" in claim.lower()) else ""
+        extra = ""
+        if skeptic and "skeptic" in claim.lower():
+            extra = f"\n      ✓ {skeptic}"
+        elif pipeline and "shipped product" in claim.lower():
+            extra = f"\n      ✓ {pipeline}"
         print(f"  ◻ {claim}\n      → {note}{extra}")
     frac = passed / len(auto) if auto else 0
     print(f"\nAUTO north-star readiness: {frac:.0%} ({passed}/{len(auto)}).  "

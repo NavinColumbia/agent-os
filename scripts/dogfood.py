@@ -431,9 +431,10 @@ def _selftest():
             FakeExplorer.seen.append({"url": url, "vision": vision, "token": token, "org": org})
             self._token = token
 
-        def explore(self, story, max_steps=25, on_bug=None):
+        def explore(self, story, max_steps=25, on_bug=None, deadline=None):
             calls.append(("explore", story["id"]))
             assert max_steps == MAX_STEPS
+            assert deadline is not None and deadline > 0, "run_once must pass a wall-clock deadline"
             if story["id"] == "J1-signup-verify":
                 on_bug({"bug": "verification code input rejects paste", "severity": "high",
                         "blocking": False, "expected": "code entry works", "url": "http://c/#signup",

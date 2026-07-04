@@ -99,6 +99,21 @@ _AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8"
 BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-fable-5")
 CHEAP_MODEL = os.environ.get("AOS_CHEAP_MODEL", "claude-haiku-4-5-20251001")
 FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-opus-4-8")
+
+
+def _default_build_model():
+    """The fleet's default heavy-build model — Fable-5 (BUILD_MODEL) — UNLESS the 'opus_default_build' feature
+    flag is rolled on, in which case Opus (FALLBACK_MODEL) becomes the default. Lets ops flip or gradually
+    A/B the fleet's default model WITHOUT a deploy (serves the owner's 'fable by default, but flexible'
+    directive) — the first real consumer of the flags system. FAIL-OPEN: any flag/DB error keeps BUILD_MODEL,
+    so model selection can never break on a flag hiccup. An explicit per-call `model=` still overrides both."""
+    try:
+        import flags
+        if flags.evaluate("opus_default_build", subject="fleet"):
+            return FALLBACK_MODEL
+    except Exception:
+        pass
+    return BUILD_MODEL
 # Tools every factory agent may use beyond auto-accepted file edits. Web is on by default so research/
 # intel/build agents can reach live data instead of guessing. Override per-deployment with AOS_AGENT_TOOLS
 # (space-separated), or per-call via agent(..., tools=[...]). SECURITY: web access turns an agent into a
@@ -466,7 +481,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     ONE model round-trip. All the governance/consent/provider/budget/killswitch gates below still apply —
     light only changes model + prompt weight + the pre-flight, never the safety chokepoints. Heavy work
     (research/build/spec/review) leaves light=False and keeps the strong model + full charter."""
-    model = model or (CHEAP_MODEL if light else BUILD_MODEL)
+    model = model or (CHEAP_MODEL if light else _default_build_model())
     _apply_scale()                                    # dial capability (agents/rigor/depth) to the wallet
     # GOVERNANCE (can_spawn gate): the factory spawns this sub-agent ON BEHALF of the orchestrating role.
     # Thread the REAL requester (explicit arg > per-build _ctx.spawner > the controller that drives the

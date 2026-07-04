@@ -29,6 +29,7 @@ MAX_RUNTIME_S = int(os.environ.get("AOS_AGENT_MAX_RUNTIME", "2400"))   # 40 min 
 SCRATCH_MAX_AGE_S = int(os.environ.get("AOS_SCRATCH_MAX_AGE", "3600")) # 1 h
 SCRATCH_GLOBS = ["codexrun-*", "improve-*", "research-*", "webqa-*.png"]
 BROWSER_STALE_S = int(os.environ.get("AOS_BROWSER_STALE_MIN", "60")) * 60  # 60 min — far beyond any live QA run
+BUILD_ABANDON_H = int(os.environ.get("AOS_BUILD_ABANDON_H", "12"))         # no-outcome build after 12h = dead (sentinel WARNs at 3h)
 
 
 def _reap_reason(ppid, etimes, max_s=MAX_RUNTIME_S):
@@ -99,6 +100,32 @@ def _sweep_browsers(dry=False):
     return len(killed)
 
 
+def _sweep_stuck_builds(dry=False):
+    """Auto-RESOLVE (not just detect) a build stuck with NO terminal outcome for BUILD_ABANDON_H+ hours: mark
+    it ABANDONED (a recoverable terminal state) so the loop can stop, the sentinel stuck-build flag clears,
+    and the projects view shows the truth instead of an eternal 'building'. VERY conservative — 12h, no real
+    build runs that long, and sentinel already WARN-observes at 3h. Returns the count abandoned. Fail-open."""
+    try:
+        import psycopg
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT t.product FROM traces t WHERE t.kind='agent'
+                           GROUP BY t.product
+                           HAVING max(t.ts) > now() - interval '20 minutes'
+                              AND min(t.ts) < now() - make_interval(hours => %s)
+                              AND NOT EXISTS (SELECT 1 FROM audit_log a
+                                              WHERE a.resource=t.product AND a.action='ProductComplete')
+                           LIMIT 20""", (BUILD_ABANDON_H,))
+            stuck = [r[0] for r in cur.fetchall()]
+        if dry or not stuck:
+            return len(stuck)
+        for prod in stuck:
+            audit.append(actor="reap", action="ProductComplete", resource=prod, decision="ABANDONED",
+                         payload={"reason": f"stuck build: agents for >{BUILD_ABANDON_H}h with no terminal outcome"})
+        return len(stuck)
+    except Exception:
+        return 0
+
+
 def reap(dry=False):
     killed = []
     for pid, ppid, etimes, args in _agent_procs():
@@ -114,11 +141,13 @@ def reap(dry=False):
     stale_dir = _sweep_directory(dry)                 # release dead agent presence (accumulates + misleads routing)
     stale_browsers = _sweep_browsers(dry)             # reap leaked playwright browsers (orphaned/very old)
     stale_runs = _sweep_stale_runs(dry)               # abandon crashed 'running' orchestra runs (inflate counts)
+    stuck_builds = _sweep_stuck_builds(dry)           # auto-resolve builds looping with no outcome (>12h)
     if killed and not dry:
         audit.append(actor="reap", action="ReapAgents", resource="orphans", decision="killed",
                      payload={"count": len(killed), "pids": [k["pid"] for k in killed][:10]})
     return {"reaped": killed, "scratch_cleaned": cleaned, "stale_directory_released": stale_dir,
-            "stale_browsers_reaped": stale_browsers, "stale_runs_abandoned": stale_runs}
+            "stale_browsers_reaped": stale_browsers, "stale_runs_abandoned": stale_runs,
+            "stuck_builds_abandoned": stuck_builds}
 
 
 def _sweep_stale_runs(dry=False):
@@ -189,13 +218,14 @@ def _selftest():
     browser_safe = _reap_browser_decision(ppid=12345, etimes=60) is False \
         and _reap_browser_decision(ppid=1, etimes=60) is True \
         and _reap_browser_decision(ppid=999, etimes=BROWSER_STALE_S + 1) is True
-    # stale-run sweep is wired into reap() (abandons crashed 'running' orchestra runs)
+    # stale-run + stuck-build sweeps are wired into reap() (crashed runs; builds looping w/o outcome)
     runs_wired = "stale_runs_abandoned" in reap(dry=True)
+    builds_wired = "stuck_builds_abandoned" in reap(dry=True) and isinstance(_sweep_stuck_builds(dry=True), int)
     ok = (keep and orphan and stuck and interactive_excluded and dir_ok and browser_wired
-          and browser_safe and runs_wired)
+          and browser_safe and runs_wired and builds_wired)
     print(f"keep-healthy={keep} reap-orphan={orphan} reap-stuck={stuck} session-excluded={interactive_excluded} "
           f"directory-sweep={dir_ok} browser-sweep={browser_wired} browser-safe={browser_safe} "
-          f"stale-run-sweep={runs_wired}")
+          f"stale-run-sweep={runs_wired} stuck-build-sweep={builds_wired}")
     print("PASS: orphan/stuck reaper (decision + session-safe) ✅" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 

@@ -330,13 +330,17 @@ def run_once(persona: str = None, base: str = BASE) -> dict:
     stories_run = 0
     story_status = {}
     # Fair-share the budget ACROSS stories so a bounded run SAMPLES every journey instead of one deep
-    # journey eating the whole budget (seen live: J1 consumed all 991s, J2-J5 were skipped-budget). Each
-    # step is a slow model call, so give each story its own slice (>=120s) but never exceed the global cap.
-    per_story = max(120, BUDGET_S // max(1, len(stories)))
-    for story in stories:
-        if time.time() - started > BUDGET_S:      # graceful budget stop — never a hard kill mid-story
+    # journey eating the whole budget (seen live: J1 consumed all 991s, J2-J5 were skipped-budget). Give
+    # each story a fair slice of the REMAINING budget (computed per-story, not once) so the LAST journey —
+    # J5 review-respond, which kept getting skipped-budget because earlier stories each overran their fixed
+    # slice by one step — always gets whatever is left instead of zero. Each step is a slow model call.
+    for idx, story in enumerate(stories):
+        elapsed = time.time() - started
+        if elapsed >= BUDGET_S:                   # graceful budget stop — never a hard kill mid-story
             story_status[story["id"]] = "skipped-budget"
             continue
+        remaining_stories = len(stories) - idx
+        per_story = max(90, (BUDGET_S - elapsed) / remaining_stories)
         token = None if story.get("fresh") else tok
         ex = None
         collected = []

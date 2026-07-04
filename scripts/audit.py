@@ -67,7 +67,11 @@ def append(actor, action, resource="", decision="executed", payload=None, tenant
     Untenanted rows (platform events) simply leave the tenant columns NULL — the global chain covers them."""
     db, key = _cfg()
     payload = payload or {}
-    tid = tenant_id or ((payload.get("tenant") or payload.get("tenant_id")) if isinstance(payload, dict) else None)
+    # derive the tenant for the sub-chain: explicit arg > payload.tenant/tenant_id > actor when the actor IS a
+    # tenant (ids are 't-…'; no role/system actor uses that prefix), so tenant-actor events (account export/
+    # delete, settings, etc.) land in the tenant's own trail too — without threading tid through every caller.
+    tid = (tenant_id or ((payload.get("tenant") or payload.get("tenant_id")) if isinstance(payload, dict) else None)
+           or (actor if isinstance(actor, str) and actor.startswith("t-") else None))
     with psycopg.connect(db) as conn, conn.cursor() as cur:
         # serialize appends so the chain has no races
         cur.execute("SELECT pg_advisory_xact_lock(742042)")

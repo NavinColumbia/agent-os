@@ -76,12 +76,19 @@ def ask(tenant_id, question, kind="info", org_id=None, thread_id=None):
     return {"request_id": rid, "status": "open"}
 
 
-def answer(request_id, answer):
-    """A human resolves the request. Flips it to 'answered' so a polling caller resumes. Returns {request_id, status}."""
+def answer(request_id, answer, tenant_id=None):
+    """A human resolves the request. Flips it to 'answered' so a polling caller resumes. Returns {request_id,
+    status}. When tenant_id is given (a tenant-facing call from the console), the write is SCOPED to that
+    tenant so one tenant can NEVER answer another tenant's question by guessing an id (cross-tenant write
+    guard); a mismatch matches 0 rows and raises just like a missing id."""
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""UPDATE agent_requests SET status='answered', answer=%s, answered_at=now()
-                       WHERE id=%s""", (answer, request_id))
+        if tenant_id is not None:
+            cur.execute("""UPDATE agent_requests SET status='answered', answer=%s, answered_at=now()
+                           WHERE id=%s AND tenant_id=%s""", (answer, request_id, tenant_id))
+        else:
+            cur.execute("""UPDATE agent_requests SET status='answered', answer=%s, answered_at=now()
+                           WHERE id=%s""", (answer, request_id))
         matched = cur.rowcount
         c.commit()
     if matched == 0:

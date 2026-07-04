@@ -21,6 +21,7 @@ import trace as _trace  # noqa: E402
 import billing          # noqa: E402
 import orchestrate      # noqa: E402
 import approvals        # noqa: E402
+import agent_request    # noqa: E402
 import traceview        # noqa: E402
 
 DB = _trace.DB
@@ -45,7 +46,8 @@ def _seed(tag):
                        VALUES (%s,'BUILD','builder','agent',0,'built','p',900900,0.1,now())""", (prod,))
         c.commit()
     hire_id = orchestrate.file_hire("iso-agent", "qa-bot", "need one", tenant_id=tid)
-    return {"tid": tid, "prod": prod, "dead_id": dead_id, "hire_id": hire_id}
+    q_id = agent_request.ask(tid, "seed question?", kind="decision")["request_id"]
+    return {"tid": tid, "prod": prod, "dead_id": dead_id, "hire_id": hire_id, "q_id": q_id}
 
 
 def _cleanup(*seeds):
@@ -53,6 +55,7 @@ def _cleanup(*seeds):
         for s in seeds:
             cur.execute("DELETE FROM tasks WHERE id=%s", (s["dead_id"],))
             cur.execute("DELETE FROM hire_requests WHERE id=%s", (s["hire_id"],))
+            cur.execute("DELETE FROM agent_requests WHERE id=%s", (s["q_id"],))
             cur.execute("DELETE FROM traces WHERE product=%s", (s["prod"],))
             cur.execute("DELETE FROM tenant_products WHERE product=%s", (s["prod"],))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (s["tid"],))
@@ -92,6 +95,10 @@ try:
         "tenant B CANNOT decide tenant A's hire-request (cross-tenant write blocked)")
     chk(not _rejected(lambda: approvals.decide(A["tid"], "dead_letter", A["dead_id"], "retry")),
         "tenant A CAN decide its OWN dead-letter (ownership allows)")
+    chk(_rejected(lambda: agent_request.answer(A["q_id"], "hack", tenant_id=B["tid"])),
+        "tenant B CANNOT answer tenant A's AI question (cross-tenant write blocked)")
+    chk(agent_request.get(A["q_id"])["status"] == "open",
+        "tenant A's question stays OPEN after B's blocked answer attempt")
 
     # observability: each tenant's trace aggregate counts ONLY its own product's runs.
     ao = traceview.overview(A["tid"])

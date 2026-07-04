@@ -458,7 +458,7 @@ POSTS = {
     "/api/agents/delete": lambda tid, q, b: customagents.delete(tid, int(b.get("id") or 0)),
     "/api/control": lambda tid, q, b: cockpit.control(tid, b.get("product", ""), b.get("action", "")),
     "/api/approvals/decide": lambda tid, q, b: approvals.decide(tid, b.get("kind"), b.get("ref"), b.get("verdict")),
-    "/api/requests/answer": lambda tid, q, b: __import__("agent_request").answer(b.get("ref"), b.get("text", "")),
+    "/api/requests/answer": lambda tid, q, b: __import__("agent_request").answer(b.get("ref"), b.get("text", ""), tenant_id=tid),
     "/api/integrations/connect": lambda tid, q, b: integrationsview.connect(tid, b.get("slug", ""), b.get("secret")),
     "/api/integrations/disconnect": lambda tid, q, b: integrationsview.disconnect(tid, b.get("slug", "")),
     "/api/billing/plan": lambda tid, q, b: billingview.change_plan(tid, b.get("plan", "")),

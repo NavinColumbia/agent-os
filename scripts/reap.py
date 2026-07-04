@@ -22,6 +22,8 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
+import trace as _trace  # noqa: E402  — shared DATABASE_URL
+DB = _trace.DB
 
 MAX_RUNTIME_S = int(os.environ.get("AOS_AGENT_MAX_RUNTIME", "2400"))   # 40 min — beyond any real agent
 SCRATCH_MAX_AGE_S = int(os.environ.get("AOS_SCRATCH_MAX_AGE", "3600")) # 1 h
@@ -67,10 +69,33 @@ def reap(dry=False):
                 except Exception:
                     pass
     cleaned = _clean_scratch(dry)
+    stale_dir = _sweep_directory(dry)                 # release dead agent presence (accumulates + misleads routing)
     if killed and not dry:
         audit.append(actor="reap", action="ReapAgents", resource="orphans", decision="killed",
                      payload={"count": len(killed), "pids": [k["pid"] for k in killed][:10]})
-    return {"reaped": killed, "scratch_cleaned": cleaned}
+    return {"reaped": killed, "scratch_cleaned": cleaned, "stale_directory_released": stale_dir}
+
+
+def _sweep_directory(dry=False, stale_min=None):
+    """Release STALE agent presence in the directory: an 'active' entry whose updated_at is older than the
+    threshold is a dead agent that never released (a finished build, a crashed worker). Left alone they
+    accumulate (we found 66) and MISLEAD orchestrate.request_collaborator into reusing a non-existent agent
+    instead of hiring — a correctness bug at scale, not just test cruft. Real live agents update far more
+    often than this floor, so releasing stale presence is safe. Returns the count released."""
+    import os
+    mins = stale_min if stale_min is not None else int(os.environ.get("AOS_DIRECTORY_STALE_MIN", "30"))
+    try:
+        import psycopg
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            if dry:
+                cur.execute("SELECT count(*) FROM directory WHERE status='active' AND updated_at < now()-make_interval(mins=>%s)", (mins,))
+                return cur.fetchone()[0]
+            cur.execute("UPDATE directory SET status='released' WHERE status='active' AND updated_at < now()-make_interval(mins=>%s)", (mins,))
+            n = cur.rowcount
+            c.commit()
+            return n
+    except Exception:
+        return 0
 
 
 def _clean_scratch(dry=False):
@@ -98,8 +123,11 @@ def _selftest():
     orphan = _reap_reason(ppid=1, etimes=60) == "orphaned (parent dead)"    # PPID 1 -> reap
     stuck = _reap_reason(ppid=999, etimes=99999) is not None                # too old -> reap
     interactive_excluded = not any("claude --continue" in a for _, _, _, a in _agent_procs())  # never our session
-    ok = keep and orphan and stuck and interactive_excluded
-    print(f"keep-healthy={keep} reap-orphan={orphan} reap-stuck={stuck} session-excluded={interactive_excluded}")
+    # directory-staleness sweep is wired + released count is an int (dry-run against the live DB)
+    dir_ok = isinstance(_sweep_directory(dry=True), int) and "stale_directory_released" in reap(dry=True)
+    ok = keep and orphan and stuck and interactive_excluded and dir_ok
+    print(f"keep-healthy={keep} reap-orphan={orphan} reap-stuck={stuck} session-excluded={interactive_excluded} "
+          f"directory-sweep={dir_ok}")
     print("PASS: orphan/stuck reaper (decision + session-safe) ✅" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 

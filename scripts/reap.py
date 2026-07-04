@@ -28,6 +28,7 @@ DB = _trace.DB
 MAX_RUNTIME_S = int(os.environ.get("AOS_AGENT_MAX_RUNTIME", "2400"))   # 40 min — beyond any real agent
 SCRATCH_MAX_AGE_S = int(os.environ.get("AOS_SCRATCH_MAX_AGE", "3600")) # 1 h
 SCRATCH_GLOBS = ["codexrun-*", "improve-*", "research-*", "webqa-*.png"]
+BROWSER_STALE_S = int(os.environ.get("AOS_BROWSER_STALE_MIN", "60")) * 60  # 60 min — far beyond any live QA run
 
 
 def _reap_reason(ppid, etimes, max_s=MAX_RUNTIME_S):
@@ -57,6 +58,47 @@ def _agent_procs():
     return procs
 
 
+def _reap_browser_decision(ppid, etimes, max_s=BROWSER_STALE_S):
+    """Pure decision (unit-tested): reap a playwright browser only if ORPHANED (parent dead) or very OLD.
+    A live QA run's browser is young + parented -> kept."""
+    return ppid == 1 or etimes > max_s
+
+
+def _browser_procs():
+    """(pid, ppid, etimes) for playwright chrome-headless-shell ROOT browsers (not renderer children).
+    QA/explorer runs spawn these; a crashed run can orphan them (we saw one 1 DAY old)."""
+    out = subprocess.run(["ps", "-eo", "pid,ppid,etimes,args"], capture_output=True, text=True).stdout
+    procs = []
+    for line in out.splitlines()[1:]:
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, ppid, etimes, args = parts
+        # the browser ROOT has no --type=; renderer/gpu children do (and die with the root anyway)
+        if "chrome-headless-shell" in args and "--type=" not in args:
+            try:
+                procs.append((int(pid), int(ppid), int(etimes)))
+            except ValueError:
+                pass
+    return procs
+
+
+def _sweep_browsers(dry=False):
+    """Kill ORPHANED (PPID 1) or very-OLD (> BROWSER_STALE_S) playwright browsers leaked by crashed/finished
+    QA explorer runs. CONSERVATIVE by design: a live QA run's browser is young (<~15m) with a live parent, so
+    it is never touched — only genuine leaks are reaped. Returns the count killed."""
+    killed = []
+    for pid, ppid, etimes in _browser_procs():
+        if _reap_browser_decision(ppid, etimes):
+            killed.append(pid)
+            if not dry:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+    return len(killed)
+
+
 def reap(dry=False):
     killed = []
     for pid, ppid, etimes, args in _agent_procs():
@@ -70,10 +112,12 @@ def reap(dry=False):
                     pass
     cleaned = _clean_scratch(dry)
     stale_dir = _sweep_directory(dry)                 # release dead agent presence (accumulates + misleads routing)
+    stale_browsers = _sweep_browsers(dry)             # reap leaked playwright browsers (orphaned/very old)
     if killed and not dry:
         audit.append(actor="reap", action="ReapAgents", resource="orphans", decision="killed",
                      payload={"count": len(killed), "pids": [k["pid"] for k in killed][:10]})
-    return {"reaped": killed, "scratch_cleaned": cleaned, "stale_directory_released": stale_dir}
+    return {"reaped": killed, "scratch_cleaned": cleaned, "stale_directory_released": stale_dir,
+            "stale_browsers_reaped": stale_browsers}
 
 
 def _sweep_directory(dry=False, stale_min=None):
@@ -125,9 +169,14 @@ def _selftest():
     interactive_excluded = not any("claude --continue" in a for _, _, _, a in _agent_procs())  # never our session
     # directory-staleness sweep is wired + released count is an int (dry-run against the live DB)
     dir_ok = isinstance(_sweep_directory(dry=True), int) and "stale_directory_released" in reap(dry=True)
-    ok = keep and orphan and stuck and interactive_excluded and dir_ok
+    # browser sweep is wired + conservative: a YOUNG parented browser is kept; an orphan/very-old one is reaped
+    browser_wired = isinstance(_sweep_browsers(dry=True), int) and "stale_browsers_reaped" in reap(dry=True)
+    browser_safe = _reap_browser_decision(ppid=12345, etimes=60) is False \
+        and _reap_browser_decision(ppid=1, etimes=60) is True \
+        and _reap_browser_decision(ppid=999, etimes=BROWSER_STALE_S + 1) is True
+    ok = keep and orphan and stuck and interactive_excluded and dir_ok and browser_wired and browser_safe
     print(f"keep-healthy={keep} reap-orphan={orphan} reap-stuck={stuck} session-excluded={interactive_excluded} "
-          f"directory-sweep={dir_ok}")
+          f"directory-sweep={dir_ok} browser-sweep={browser_wired} browser-safe={browser_safe}")
     print("PASS: orphan/stuck reaper (decision + session-safe) ✅" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 

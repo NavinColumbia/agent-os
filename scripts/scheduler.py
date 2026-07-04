@@ -155,37 +155,43 @@ def tick():
     install starts recovering immediately even though ticker.sh only ever calls `tick`."""
     bootstrap()
     ran = 0
+    # CLAIM phase — a SHORT transaction: grab all due jobs (FOR UPDATE SKIP LOCKED so concurrent tickers
+    # don't double-claim) and advance next_run+last_run immediately, then commit. We do NOT run any job
+    # inside this transaction: running subprocesses inside the open txn pinned it idle-in-transaction AND
+    # held the row locks for the whole tick (a real hang risk per hang-resilience). Advancing next_run at
+    # claim time also keeps the 'slow/poison job never pins the loop' guarantee.
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("SELECT name, command FROM schedules WHERE enabled AND next_run <= now() "
                     "ORDER BY next_run FOR UPDATE SKIP LOCKED")
         due = cur.fetchall()
-        for name, command in due:
-            decision, rc = "executed", None
-            argv = _safe_argv(command)
-            if argv is None:
-                # fail-closed: a command we can't validate is never handed to a shell/exec
-                decision = "rejected"
-            else:
-                try:
-                    rc = subprocess.run(argv, cwd=str(ROOT), capture_output=True,
-                                        timeout=JOB_TIMEOUT).returncode
-                    if rc != 0:
-                        decision = "nonzero"
-                    else:
-                        ran += 1
-                except subprocess.TimeoutExpired:
-                    decision = "timeout"
-                except Exception as e:                       # never let one job abort the whole tick
-                    decision = "error"
-                    rc = None
-                    audit.append(actor="scheduler", action="RunJob", resource=name,
-                                 decision="error", payload={"error": str(e)[:300]})
-            # ALWAYS advance next_run so a slow/broken/poison job can't block the loop or itself
+        for name, _command in due:
             cur.execute("UPDATE schedules SET last_run=now(), "
                         "next_run=now() + (interval_s || ' seconds')::interval WHERE name=%s", (name,))
-            audit.append(actor="scheduler", action="RunJob", resource=name, decision=decision,
-                         payload={"rc": rc})
         c.commit()
+    # RUN phase — no open transaction, no row locks held while subprocesses run (which can take up to
+    # JOB_TIMEOUT each). Each job is isolated: a raise/timeout/rejection never aborts the others.
+    for name, command in due:
+        decision, rc = "executed", None
+        argv = _safe_argv(command)
+        if argv is None:
+            decision = "rejected"                            # fail-closed: unvalidated command never runs
+        else:
+            try:
+                rc = subprocess.run(argv, cwd=str(ROOT), capture_output=True,
+                                    timeout=JOB_TIMEOUT).returncode
+                if rc != 0:
+                    decision = "nonzero"
+                else:
+                    ran += 1
+            except subprocess.TimeoutExpired:
+                decision = "timeout"
+            except Exception as e:                           # never let one job abort the whole tick
+                decision = "error"
+                rc = None
+                audit.append(actor="scheduler", action="RunJob", resource=name,
+                             decision="error", payload={"error": str(e)[:300]})
+        audit.append(actor="scheduler", action="RunJob", resource=name, decision=decision,
+                     payload={"rc": rc})
     return ran
 
 

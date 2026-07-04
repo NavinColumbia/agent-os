@@ -40,6 +40,7 @@ PROOFS = [
     ("Trust", "Explainability: 'why the AI did X' from the real trail", _c("scripts/explain.py selftest"), ""),
     ("Trust", "Audit chain is tamper-evident (append-only hash chain)", _c("scripts/audit.py verify"), "INTACT"),
     ("Trust", "Multi-tenant isolation: each tenant sees only their own", _c("scripts/tenancy.py test"), ""),
+    ("Trust", "Tenant isolation holds on READ + WRITE + org-IDOR (no cross-tenant access)", _c("scripts/test_tenant_isolation.py"), "isolation holds"),
 
     # ── EXPERIENCE: the CEO of an AI company ──────────────────────────────────────────────
     ("Experience", "Chief-of-staff brief from grounded real state (+ awaiting guard)", _c("scripts/chiefofstaff.py selftest"), ""),

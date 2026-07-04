@@ -272,6 +272,17 @@ def confirm(tid, thread_id, api_key=None):
     # the live build-launch path (only the controller may spawn; manifest invariant, read here).
     governance.enforce("controller", "spawn")
     product = f"{tid.replace('t-', '')[:6]}-{p['name'].lower()}"
+    # Register the product IMMEDIATELY (before the async build thread) so the CEO can SEE + track the build they
+    # just directed on Projects/Cockpit right away — it renders as 'queued' — instead of it being INVISIBLE on
+    # every surface until the first agent trace lands seconds-to-minutes later (a QA feature-completeness gap:
+    # "directed build has zero visibility, uncancellable everywhere"). Fail-open: never block the build on this.
+    try:
+        with psycopg.connect(DB) as _c, _c.cursor() as _cur:
+            _cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                         (product, tid))
+            _c.commit()
+    except Exception:
+        pass
     threading.Thread(target=_run_and_report, args=(tid, thread_id, product, p["charter"], p["kind"]), daemon=True).start()
     audit.append(actor="orchestrator", action="BuildFromChat", resource=product, decision="started",
                  payload={"thread": thread_id, "kind": p["kind"]})

@@ -226,6 +226,25 @@ def _selftest():
         scheduled = any(n == "chiefofstaff-daily" for n, _, _ in scheduler.DEFAULT_SCHEDULES)
         chk(scheduled and _fmt({"needs_you": ["Approve X"], "suggestion": "Ship it"}),
             "daily brief is scheduled (chiefofstaff-daily) + renders a notification body")
+
+        # (e) REGRESSION GUARD: a tenant with a REAL pending decision must surface it in 'awaiting'. The
+        #     inbox-shape bug (approvals.inbox() returns {items:[...],count:N}, not a list) made this
+        #     silently EMPTY, so the CEO's brief never showed a single decision. A provider connected but
+        #     no consent always yields a 'consent required' inbox item -> awaiting must be non-empty.
+        import billing
+        import tenantproviders
+        gtid = billing.signup("cos-await-" + uuid.uuid4().hex[:6], "free")["tenant_id"]
+        tenantproviders.connect(gtid, "anthropic", "subscription")
+        gfacts = _facts(gtid, 0)
+        chk(len(gfacts["awaiting"]) > 0 and any(a.get("title") for a in gfacts["awaiting"]),
+            "a tenant with a pending decision surfaces it in awaiting (guards the inbox {items} shape bug)")
+        try:
+            import psycopg
+            import trace
+            with psycopg.connect(trace.DB) as c, c.cursor() as cur:
+                cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (gtid,)); c.commit()
+        except Exception:
+            pass
         print("PASS: chiefofstaff — per-tenant CEO brief, AI-composed from grounded real state, "
               "fallback never blank ✅" if ok else "FAIL")
     finally:

@@ -244,6 +244,9 @@ def decide(tid, kind, ref, verdict):
             consent.revoke(tid)
 
     elif kind == "paused_app":
+        # OWNERSHIP: only the owning tenant may resume/unpause its product (cross-tenant write guard).
+        if ref not in _tenant_products(tid):
+            raise ValueError(f"product {ref!r} is not owned by tenant {tid}")
         if verdict == "approve":
             if killswitch is not None:
                 killswitch.resume(ref)            # clear scoped kill_switch row
@@ -253,7 +256,11 @@ def decide(tid, kind, ref, verdict):
     elif kind == "hire_request":
         new = "fulfilled" if verdict == "approve" else "denied"
         with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("UPDATE hire_requests SET status=%s WHERE id=%s", (new, int(ref)))
+            # OWNERSHIP: only the owning tenant may decide its hire (cross-tenant write guard).
+            cur.execute("UPDATE hire_requests SET status=%s WHERE id=%s AND tenant_id=%s",
+                        (new, int(ref), tid))
+            if cur.rowcount == 0:
+                raise ValueError(f"hire_request {ref} is not owned by tenant {tid}")
             c.commit()
 
     elif kind == "blocked_build":
@@ -270,15 +277,20 @@ def decide(tid, kind, ref, verdict):
             return {"ok": True, "kind": kind, "ref": ref, "verdict": verdict}
 
     elif kind == "dead_letter":
-        if verdict == "retry":
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            # OWNERSHIP: the dead task's product (embedded in assignee '<role>@<product>') must be the
+            # tenant's — else a tenant could retry/drop ANOTHER tenant's task by id (cross-tenant write).
+            cur.execute("SELECT assignee FROM tasks WHERE id=%s", (int(ref),))
+            row = cur.fetchone()
+            prod = (row[0].split("@", 1)[1] if row and row[0] and "@" in row[0] else "")
+            if not prod or prod not in _tenant_products(tid):
+                raise ValueError(f"dead_letter {ref} is not owned by tenant {tid}")
+            if verdict == "retry":
                 cur.execute("""UPDATE tasks SET status='pending', not_before=now(), last_error=NULL
                                WHERE id=%s""", (int(ref),))
-                c.commit()
-        else:  # 'drop'
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            else:  # 'drop'
                 cur.execute("UPDATE tasks SET status='done' WHERE id=%s", (int(ref),))
-                c.commit()
+            c.commit()
 
     else:
         raise ValueError(f"unknown decision kind: {kind}")

@@ -77,6 +77,22 @@ try:
     chk(not any(i["kind"] == "dead_letter" and i["ref"] == A["dead_id"] for i in b_inbox),
         "tenant B does NOT see tenant A's dead-letter (symmetric)")
 
+    # WRITE isolation: tenant B must NOT be able to DECIDE (mutate) tenant A's items — even by guessing
+    # the id. A cross-tenant write is worse than a read; decide() must verify ownership per kind.
+    def _rejected(fn):
+        try:
+            fn()
+            return False
+        except Exception:
+            return True
+
+    chk(_rejected(lambda: approvals.decide(B["tid"], "dead_letter", A["dead_id"], "drop")),
+        "tenant B CANNOT decide tenant A's dead-letter (cross-tenant write blocked)")
+    chk(_rejected(lambda: approvals.decide(B["tid"], "hire_request", A["hire_id"], "approve")),
+        "tenant B CANNOT decide tenant A's hire-request (cross-tenant write blocked)")
+    chk(not _rejected(lambda: approvals.decide(A["tid"], "dead_letter", A["dead_id"], "retry")),
+        "tenant A CAN decide its OWN dead-letter (ownership allows)")
+
     # observability: each tenant's trace aggregate counts ONLY its own product's runs.
     ao = traceview.overview(A["tid"])
     a_prods = {r.get("product") for r in (ao.get("recent") or [])}

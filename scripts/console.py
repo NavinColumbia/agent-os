@@ -729,7 +729,7 @@ function renderOrgSw(){const list=$('#orglist');if(!list)return;const q=(($('#or
 function pickOrg(id){ORG=id;if(id)localStorage.setItem('aos_org',id);else localStorage.removeItem('aos_org');   // org=0 = home; org=N = a company
   setOrgName();toggleOrgSw(false);if(window.CTLPOLL){clearInterval(window.CTLPOLL);window.CTLPOLL=null;}   // re-target the controller poll at the new context
   if(VIEWS[CUR])go(CUR);else go('controller');}   // re-render the CURRENT view in place — never navigate away
-function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);setOrgName();go('controller');}   // intentional navigation: "Open" from My orgs lands on the Assistant
+async function switchOrg(id){ORG=id;localStorage.setItem('aos_org',id);await loadOrgs();go('controller');}   // reload ORGS FIRST so a just-created company resolves to its real name (not the 'company' placeholder) and isn't reset to home; then land on the Assistant
 function gateError(e){return e==='consent_required'||e==='provider_required';}
 function gateKey(r){return r?(r.error||r.blocked):'';}   // same gates surface as 'error' (front door) OR 'blocked' (controller/chat loop) — handle both
 function gateNote(e){

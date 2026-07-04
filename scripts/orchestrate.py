@@ -266,6 +266,12 @@ def _main(a):
         top = next_task(legal)
         # Case B: no instance active -> hire request -> controller spawns
         directory.release(legal)
+        # TEST ISOLATION: a leftover active 'tax-advisor' (a prior run that didn't release it, or the live
+        # fleet/scheduler) makes request_collaborator REUSE instead of HIRE, flaking this case. Guarantee a
+        # clean slate for the target role so Case B deterministically exercises the hire path.
+        with psycopg.connect(DB) as _c, _c.cursor() as _cur:
+            _cur.execute("UPDATE directory SET status='released' WHERE role='tax-advisor' AND status='active'")
+            _c.commit()
         r2 = request_collaborator(dev, "tax-advisor", "review sales-tax nexus", priority=4)
         # Case B': controller fulfills the spawn — the queued task must reach the new agent's queue
         # (regression guard for #7: the task used to be dropped on the spawn path).

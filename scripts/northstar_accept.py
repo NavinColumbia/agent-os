@@ -51,6 +51,7 @@ PROOFS = [
     ("Resilience", "Scheduler claims-then-runs (no txn/lock held during jobs)", _c("scripts/scheduler.py selftest"), ""),
     ("Resilience", "Kill-switch halts new work, allows in-flight drain", _c("scripts/killswitch.py selftest"), ""),
     ("Resilience", "Watchdog keeps the daemon fleet supervised", _c("scripts/watchdog.py selftest"), ""),
+    ("Resilience", "Reaper self-heals orphans / leaked browsers / stale runs / stuck builds", _c("scripts/reap.py selftest"), ""),
 
     # ── BUSINESS: sellable ────────────────────────────────────────────────────────────────
     ("Business", "Billing / plans / usage metering", _c("scripts/billing.py selftest"), ""),

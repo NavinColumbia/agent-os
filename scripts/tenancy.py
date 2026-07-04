@@ -29,7 +29,9 @@ def create_tenant(name):
 
 
 def tenant_for_token(token):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    # C2: the per-request auth lookup (every authenticated console call) — the hottest read, pooled (fail-open).
+    import dbpool
+    with dbpool.connection(autocommit=True) as c, c.cursor() as cur:
         cur.execute("SELECT tenant_id FROM tenants WHERE api_token=%s", (token,))
         r = cur.fetchone()
         return r[0] if r else None

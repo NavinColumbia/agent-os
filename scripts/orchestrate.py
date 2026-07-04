@@ -89,6 +89,9 @@ def _ensure():
         # The queued task that motivated the hire MUST survive on the row so fulfill() can route it
         # (older deployments predate these columns — add them idempotently).
         cur.execute("ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS title TEXT")
+        # tenant_id scopes a hire to the owning company so approvals.inbox never leaks it cross-tenant
+        # (NULL = a platform/shared-pool hire with no owning tenant — surfaced to no CEO inbox).
+        cur.execute("ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS tenant_id TEXT")
         cur.execute("ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 5")
         c.commit()
 
@@ -158,15 +161,16 @@ def _pending_count(assignee):
         return cur.fetchone()[0]
 
 
-def file_hire(requester, need_role, reason, title=None, priority=5):
+def file_hire(requester, need_role, reason, title=None, priority=5, tenant_id=None):
     """File a hire request. The motivating task (title + priority + requester) is persisted on the
     row so fulfill() can route it to the freshly-spawned instance — otherwise the work is silently
-    dropped on the spawn path."""
+    dropped on the spawn path. tenant_id scopes it to the owning company for approvals.inbox (None =
+    a shared-pool hire with no owning tenant — it surfaces to no CEO inbox, never cross-tenant)."""
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""INSERT INTO hire_requests (requester, need_role, reason, title, priority)
-                       VALUES (%s,%s,%s,%s,%s) RETURNING id""",
-                    (requester, need_role, reason, title, max(1, min(9, priority))))
+        cur.execute("""INSERT INTO hire_requests (requester, need_role, reason, title, priority, tenant_id)
+                       VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (requester, need_role, reason, title, max(1, min(9, priority)), tenant_id))
         hid = cur.fetchone()[0]
         c.commit()
     return hid

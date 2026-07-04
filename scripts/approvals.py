@@ -94,12 +94,18 @@ def _blocked_builds(tid):
     return out
 
 
-def _hire_requests():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT id, requester, need_role, reason FROM hire_requests
-                       WHERE status='open' ORDER BY id""")
-        return [{"id": r[0], "requester": r[1], "need_role": r[2], "reason": r[3] or ""}
-                for r in cur.fetchall()]
+def _hire_requests(tid):
+    """Open hire requests OWNED BY THIS TENANT. WAS a cross-tenant leak (no filter -> every CEO saw every
+    tenant's hires). NULL-tenant rows are shared-pool/platform hires with no owning company — surfaced to no
+    CEO inbox (an operator concern), never to a random tenant."""
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT id, requester, need_role, reason FROM hire_requests
+                           WHERE status='open' AND tenant_id = %s ORDER BY id""", (tid,))
+            return [{"id": r[0], "requester": r[1], "need_role": r[2], "reason": r[3] or ""}
+                    for r in cur.fetchall()]
+    except Exception:
+        return []            # fail-closed (e.g. pre-migration column absent): show nothing, never leak
 
 
 def _dead_letters(tid):
@@ -184,7 +190,7 @@ def inbox(tid):
             "action_label": "Retry build",
         })
 
-    for h in _hire_requests():
+    for h in _hire_requests(tid):
         items.append({
             "id": f"hire_request:{h['id']}",
             "kind": "hire_request",
@@ -292,9 +298,9 @@ def _selftest():
     try:
         # An item we fully control: an OPEN hire_request (global, surfaces in every tenant's inbox).
         with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""INSERT INTO hire_requests (requester, need_role, reason, status)
-                           VALUES (%s,%s,%s,'open') RETURNING id""",
-                        ("approvals-selftest", "qa-bot", "selftest hire"))
+            cur.execute("""INSERT INTO hire_requests (requester, need_role, reason, status, tenant_id)
+                           VALUES (%s,%s,%s,'open',%s) RETURNING id""",
+                        ("approvals-selftest", "qa-bot", "selftest hire", tid))
             hire_id = cur.fetchone()[0]
             # A dead-lettered task OWNED BY THIS TENANT (assignee '<role>@<product>' where product is the
             # tenant's) — so it surfaces for THIS tenant only, not globally (tests the isolation fix).
@@ -321,8 +327,9 @@ def _selftest():
         # ISOLATION GUARD: a DIFFERENT tenant must NOT see this tenant's dead-letter (guards the cross-tenant
         # leak — _dead_letters used to return ALL dead tasks platform-wide for every tenant).
         other_tid = billing.signup("approvals-selftest-other", "free")["tenant_id"]
-        isolated = not any(i["kind"] == "dead_letter" and i["ref"] == dead_id
-                           for i in inbox(other_tid)["items"])
+        other_box = inbox(other_tid)["items"]
+        isolated = (not any(i["kind"] == "dead_letter" and i["ref"] == dead_id for i in other_box)
+                    and not any(i["kind"] == "hire_request" and i["ref"] == hire_id for i in other_box))
 
         # Resolve the hire_request and verify it leaves the inbox.
         decide(tid, "hire_request", hire_id, "approve")

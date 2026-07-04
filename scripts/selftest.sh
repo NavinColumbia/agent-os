@@ -82,6 +82,7 @@ done
 sect "enforcement & safety"
 ckp "constraint smoke (8/8 deny/allow)"      "bash scripts/constraint_smoke_test.sh | grep -q '8 passed, 0 failed'"
 ckp "audit chain integrity"                  "$PY scripts/audit.py verify | grep -q INTACT"
+ckp "audit tamper-evidence (edits caught)"    "$PY scripts/test_audit_tamper.py | grep -q '^PASS: audit log is genuinely'"
 ckp "Cerbos PDP (6/6 decisions)"             "$PY scripts/cerbos_check.py | grep -q '6/6 correct'"
 ckp "signed-identity tamper rejected"        "cp ~/projects/control-plane/roles/builder.yaml /tmp/m.yaml; $PY scripts/identity.py keygen st >/dev/null; $PY scripts/identity.py sign st /tmp/m.yaml >/dev/null; echo x>>/tmp/m.yaml; ! $PY scripts/identity.py verify st /tmp/m.yaml"
 

@@ -1050,6 +1050,12 @@ const VIEWS={
   let hl=null;try{hl=await get('/api/health?org='+ORG)}catch(e){}
   let ls={};try{const l=await get('/api/livestatus');(l.products||[]).forEach(p=>ls[p.product]=p)}catch(e){}
   let h='<h1>Cockpit</h1><p class=sub>Your whole company at a glance.</p>';
+  let br=null;try{br=await get('/api/brief?org='+ORG)}catch(e){}
+  if(br&&br.headline){h+=`<section class=card aria-label="Your chief-of-staff brief" style="border-color:var(--accent)"><div class=row style="gap:8px;align-items:center"><span aria-hidden=true>🗞️</span> <b>${esc(br.headline)}</b></div>`
+    +((br.needs_you&&br.needs_you.length)?`<div class=muted style=margin-top:6px><b>Awaiting you:</b> ${br.needs_you.map(esc).join(' · ')}</div>`:'')
+    +((br.team_did&&br.team_did.length)?`<div class=muted style=margin-top:4px><b>Your team:</b> ${br.team_did.slice(0,2).map(esc).join(' · ')}</div>`:'')
+    +(br.suggestion?`<div class=muted style=margin-top:4px><b>Suggested next:</b> ${esc(br.suggestion)}</div>`:'')
+    +`</section>`;}
   if(co){const cm={healthy:'ok',attention:'warn',critical:'bad'}[co.verdict]||'ok';h+=`<div class=card><div class=row><span class="dot ${cm}" style="width:10px;height:10px;border-radius:50%"></span> <b>${esc(co.line||co.verdict)}</b></div></div>`;}
   if(ob&&!ob.completed){   // SINGLE SOURCE OF TRUTH: render the SAME checklist as the Assistant, driven by the server's real per-step status — never a second, divergent "next step"
    const obSteps=(ob.steps||[]).map(s=>({done:!!s.done,label:OB_LABEL[s.key]||s.title||s.key}));

@@ -33,6 +33,7 @@ import select
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -619,13 +620,18 @@ class Explorer:
         }
 
     # --- the state-based loop --------------------------------------------------------------------
-    def explore(self, story, max_steps=25, on_bug=None):
+    def explore(self, story, max_steps=25, on_bug=None, deadline=None):
         """Run the observe -> AI-decide -> act -> (retry-on-miss) -> observe -> AI-evaluate loop for one
-        story. Returns a list of step-records. Fires on_bug(bug_record) for each real bug the AI finds."""
+        story. Returns a list of step-records. Fires on_bug(bug_record) for each real bug the AI finds.
+        `deadline` (epoch secs) bounds WALL-CLOCK: each AI step is a real (slow) model call, so a bounded
+        run must be able to stop MID-story, not only between stories — else one story blows the whole
+        budget (seen live: a 10-min budget overran to 14min+)."""
         if self.bridge is None:
             raise RuntimeError("Explorer has no browser bridge (constructed with autostart=False)")
         records, history = [], []
         for step in range(max_steps):
+            if deadline and time.time() > deadline:              # wall-clock budget stop (mid-story)
+                break
             state = self.bridge.state()                          # OBSERVE
             decision = self._ai_decide(story, state, history)    # AI DECIDES
             raw_action = decision["next_action"]

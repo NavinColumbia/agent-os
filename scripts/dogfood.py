@@ -340,7 +340,9 @@ def run_once(persona: str = None, base: str = BASE) -> dict:
                                     _file_bug(persona, _s, bug, counters, run_id))
         try:
             ex = qa_explorer.Explorer(base, vision, token=token, org=str(org))
-            ex.explore(story, max_steps=MAX_STEPS, on_bug=cb)
+            # enforce the wall-clock budget MID-story too (each step is a slow model call) so a bounded
+            # run actually stops on time instead of overrunning by a whole story's worth of AI steps.
+            ex.explore(story, max_steps=MAX_STEPS, on_bug=cb, deadline=started + BUDGET_S)
             story_status[story["id"]] = "blocked" if any(b.get("blocking") for b in collected) \
                 else ("failed" if collected else "passed")
         except Exception as e:                     # an explorer/browser crash is itself a blocking finding

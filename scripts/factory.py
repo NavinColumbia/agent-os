@@ -205,6 +205,10 @@ def _role_mcp_config(role, repo):
 
 
 _TRANSIENT = ("overloaded", "rate limit", "rate_limit", "429", "529", "503", "timeout", "temporarily")
+# A pinned model hitting its SUBSCRIPTION usage cap (distinct from API overload above): the CLI's
+# --fallback-model only covers overload, so a capped model just keeps failing. Detect it and SWITCH models.
+_MODEL_EXHAUSTED = ("reached your", "usage-credits", "usage limit", "switch models with", "run /model",
+                    "upgrade to continue", "out of credits")
 # Cross-provider failover: when Claude/Anthropic is degraded or down (retries exhausted on transient
 # errors), the SAME task is retried once on OpenAI Codex so the factory keeps moving. Set to "none" to
 # disable. CODEX_MODEL is just the label recorded in the trace (Codex uses its own configured model).
@@ -711,6 +715,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                f"~{est_min} min, {est_ret} retries -> timeout {timeout}s", 0)
     last = {"rc": -1, "out": ""}
     saw_transient = False                            # did any attempt fail on overload/timeout (outage)?
+    exhausted_primary = False                         # did the pinned model hit its subscription usage cap?
     for attempt in range(retries + 1):
         t0 = time.time()
         try:
@@ -739,9 +744,33 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
             return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost, "tokens_in": tin,
                     "tokens_out": tout, "attempts": attempt + 1, "model": used}
         last = {"rc": rc, "out": out_text}
+        if any(t in (out_text or "").lower() for t in _MODEL_EXHAUSTED) and model != FALLBACK_MODEL:
+            exhausted_primary = True                    # subscription cap on the pinned model -> switch, don't retry it
+            break
         transient = any(t in (out_text or "").lower() for t in _TRANSIENT)
         saw_transient = saw_transient or transient
         time.sleep((8 if transient else 4) * (attempt + 1))   # longer backoff on rate-limit/overload
+    # MODEL-EXHAUSTION FAILOVER — the pinned model (e.g. Fable 5) hit its SUBSCRIPTION usage cap, which
+    # --fallback-model does NOT cover. Retry the SAME task once on the FALLBACK_MODEL (a different quota, e.g.
+    # Opus) before giving up. If the fallback is ALSO capped, saw_transient lets the Codex failover try next.
+    if exhausted_primary:
+        _trace("agent", role, prompt, f"{model} hit its usage limit — switching to {FALLBACK_MODEL}", -1, model=model)
+        audit.append(actor=f"factory:{role}", action="AgentModelSwitch", resource=Path(repo).name,
+                     decision="exhausted", payload={"from": model, "to": FALLBACK_MODEL})
+        try:
+            with _AGENT_SEM:
+                rc, out_text, cost, tin, tout, used = _run_once(role, repo, prompt, timeout, env, FALLBACK_MODEL, tools)
+            _add_spend(cost)
+            _trace("agent", role, prompt, out_text, rc, 0.0, cost, tin, tout, used)
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="executed-modelswitch", payload={"rc": rc, "model": used})
+            if rc == 0 and out_text.strip():
+                return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost,
+                        "tokens_in": tin, "tokens_out": tout, "attempts": retries + 2, "model": used}
+            last = {"rc": rc, "out": out_text}
+            saw_transient = True                        # fallback also failed/capped -> allow Codex failover
+        except subprocess.TimeoutExpired:
+            saw_transient = True
     # PROVIDER FAILOVER — Claude exhausted its retries on transient/overload/timeout (Anthropic likely
     # degraded or down): run the SAME task once on Codex before giving up. Skipped for BYO-key tenants
     # (we don't silently spend platform OpenAI on their behalf) and when Codex isn't installed/enabled.

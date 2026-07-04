@@ -346,6 +346,23 @@ def report():
     print("── recent workflows (transcript freshness) ──")
     for wf, newest in sorted(_workflow_dirs(), key=lambda x: -x[1]):
         print(f"  {wf.name}  last write {round((time.time()-newest)/60)}m ago")
+    print("── DB connection pool (C2 scale headroom) ──")
+    try:
+        import dbpool
+        print(f"  {dbpool.stats()}")
+    except Exception as e:
+        print(f"  (pool stats unavailable: {e})")
+    # idle-in-transaction is the hang canary ([[hang-resilience]]) — surface it in the one-look report too
+    try:
+        with psycopg.connect(DB, autocommit=True) as c, c.cursor() as cur:
+            cur.execute("SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction'")
+            it = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock'")
+            lk = cur.fetchone()[0]
+            flag = "  ⚠️ investigate (hang risk)" if (it > 3 or lk > 3) else ""
+            print(f"  DB health: idle-in-transaction={it} lock-waiters={lk}{flag}")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

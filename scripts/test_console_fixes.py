@@ -44,6 +44,14 @@ chk("if(CUR==='cockpit')$('#view').innerHTML=h" in SRC,
 chk("No activity yet" not in SRC and "appear as they spin up" in SRC,
     "Activity empty-state acknowledges an in-flight build (no cross-surface contradiction)")
 
+# 5) factory (live-caught): a pinned model hitting its SUBSCRIPTION usage cap must switch to the fallback
+#    model, not retry the exhausted model forever. Guard both the detection + the model-switch failover.
+FSRC = (Path(__file__).resolve().parent / "factory.py").read_text()
+chk("_MODEL_EXHAUSTED" in FSRC and "reached your" in FSRC and "switch models with" in FSRC,
+    "factory detects a subscription usage-cap (not just API overload)")
+chk("exhausted_primary" in FSRC and "FALLBACK_MODEL, tools)" in FSRC and "executed-modelswitch" in FSRC,
+    "factory switches to the fallback model on usage-cap exhaustion (Fable5 -> Opus)")
+
 print("PASS: all QA-found console fixes are still in place" if ok
       else "FAIL: a console fix guard regressed")
 sys.exit(0 if ok else 1)

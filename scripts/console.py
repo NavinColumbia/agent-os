@@ -986,6 +986,13 @@ const VIEWS={
    if(!PROVIDER_OK)h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Step 2 — Connect an AI model.</b> Your agents need an AI model to do the work. It takes one click.</span><button class=pri onclick="go(\'providers\')">Connect an AI model</button></div></div>';
    else h+='<div class=card style="border-color:var(--accent)"><div class="row spread"><span><b>Step 3 — Approve AI use.</b> A one-time, revocable OK to let your AI model process what you type, so your agents can build.</span><button class=pri aria-label="Approve AI use and continue" onclick=frConsent()>Approve &amp; continue</button></div></div>';
   }
+  if(!home){try{let ws=null;try{ws=await get('/api/workstreams?org='+ORG)}catch(e){}
+   const list=(ws&&ws.workstreams)||[];
+   let ws_h='<div class="row spread" style="align-items:center;flex-wrap:wrap;gap:8px"><b>Workstreams</b><button onclick="ctlNewWorkstream()">+ New workstream</button></div>';
+   if(list.length){ws_h+='<div class=row style="flex-wrap:wrap;gap:8px;margin-top:8px">'+list.map(w=>{const badge=w.running?pill('running','accent'):(w.awaiting?pill('awaiting','warn'):pill('idle'));return `<span class=item style="margin:0;padding:6px 10px"><b>${esc(w.phase||'—')}</b> <span class=muted>${esc(w.product||'unscoped')}</span> ${badge}</span>`;}).join('')+'</div>';}
+   else{ws_h+='<div class=muted style=margin-top:6px>One workstream — start another to build things in parallel.</div>';}
+   h+='<div class=card>'+ws_h+'</div>';
+  }catch(e){}}
   h+='<div class=card id=clog style="max-height:54vh;overflow:auto;display:flex;flex-direction:column;gap:10px"></div>';
   // CONTEXT-AWARE CHIPS: hide the generic starters once a build is in flight; once a scoping conversation is underway swap them for next-step suggestions
   const inFlight=(d.awaiting==='fleet')||!!d.progress;
@@ -1087,6 +1094,10 @@ const VIEWS={
  agents:async()=>{const d=await get('/api/agents');d.agents=d.agents||[];const roles=(d.roles||['research-growth']);const sys=d.system||[];
   let h='<h1>Your agents</h1><p class=sub>Three tiers: the built-in system org that runs your builds (read-only), your own standing agents (yours to edit), and agentic features you embed in your product.</p>';
   h+='<div class=card><h2>System agents · read-only</h2><p class=muted style=margin:0_0_10px>The standing org your Assistant runs. These are governed and built-in — you can\'t edit or delete them, and only the Controller can spawn workers.</p>'+(sys.length?sys.map(a=>`<div class=item><div class="row spread"><span><b>${esc(a.title)}</b> ${pill(a.role)} ${a.can_spawn?pill('sole spawner','accent'):''} ${a.reports_to?('<span class=muted>reports to '+esc(a.reports_to)+'</span>'):pill('chief of staff','ok')}</span>${pill('read-only')}</div></div>`).join(''):'<div class=muted>—</div>')+'</div>';
+  try{let live=null;try{live=await get('/api/org/live')}catch(e){}
+   let flat=[];((live&&live.runs)||[]).forEach(r=>{const stack=[...(Array.isArray(r.tree)?r.tree:[])];while(stack.length){const n=stack.pop();if(n&&n.name)flat.push(n);if(n&&Array.isArray(n.reports))stack.push(...n.reports);}});
+   if(flat.length){h+='<div class=card><h2>Live team · currently hired</h2><p class=muted style=margin:0_0_10px>The agents your Controller has hired and put to work right now.</p>'+flat.map(n=>{const st=(n.status||'').toLowerCase();const stc=st==='working'?'accent':(st==='done'?'ok':(st==='blocked'?'bad':''));return `<div class=item><div class="row spread"><span><b>${esc(n.name)}</b> ${pill(n.role)} ${n.status?pill(n.status,stc):''}</span></div>${n.assignment?('<div class=muted>'+esc(n.assignment)+'</div>'):''}</div>`;}).join('')+'</div>';}
+  }catch(e){}
   h+='<div class=card><h2>Your custom agents</h2>'+(d.agents.length?d.agents.map(a=>`<div class=item><div class="row spread"><span><b>${esc(a.name)}</b> ${pill(a.role)} ${pill(a.trigger==='recurring'?('every '+Math.round((a.interval_s||0)/86400)+'d'):'manual',a.trigger==='recurring'?'accent':'')} ${a.enabled?pill('on','ok'):pill('off')}</span><span><button onclick="agentRun(${a.id})">run now</button> <button onclick="agentToggle(${a.id},${a.enabled?'false':'true'})">${a.enabled?'pause':'enable'}</button> <button class=danger onclick="agentDel(${a.id})">delete</button></span></div><div class=muted>last run: ${a.last_run?esc(a.last_run):'never'} ${a.last_status?('· '+esc(a.last_status)):''}</div></div>`).join(''):emptyB('🤖','No custom agents yet','Create a standing agent below — it runs on a schedule and reports into your feed.'))+'</div>';
   h+='<div class=card><h2>Create an agent</h2><label>Name</label><input id=an aria-label="Agent name" placeholder="Market Watch"><div class=grid><div><label>Specialty</label><select id=ar>'+roles.map(r=>`<option value="${r}">${r}</option>`).join('')+'</select></div><div><label>Runs</label><select id=at><option value=manual>On demand</option><option value=recurring>Every week</option></select></div></div><label>What should it do?</label><textarea id=ai placeholder="Every week, scan my market for new competitors and pricing changes; give me 3 prioritized takeaways with sources."></textarea><div style=margin-top:10px><button class=pri onclick=agentCreate()>Create agent</button></div><div id=anote class=muted style=margin-top:8px></div></div>';
   h+='<div class=card><h2>Agentic features</h2><div class="row spread"><span class=muted>Embed agents INTO your product — buttons and endpoints your own users trigger. A curated catalog your fleet builds into your app.</span><button onclick="go(\'agentic\')">Browse features</button></div></div>';
@@ -1172,6 +1183,7 @@ function grow(t){if(!t)return;t.style.height='auto';t.style.height=Math.min(t.sc
 function taKey(e,fn){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();fn()}}   // ChatGPT/Claude: Enter sends, Shift+Enter inserts a newline
 function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus();grow(i)}}
 function ctlFill(t){const i=$('#cmsg');if(i){i.value=t;i.focus();grow(i)}}
+async function ctlNewWorkstream(){try{await post('/api/workstreams/new',{org:ORG});}catch(e){}go('controller');}   // A2: start a parallel workstream, then refresh the Assistant
 function ctlNextChips(phase){   // CONTEXT-AWARE CHIPS: after scoping, swap the generic starters for next-step suggestions tied to the phase
  const M={DISCOVER:['That covers it — show me options','Add a must-have detail','Who is it for?'],
   OPTIONS:['Go with the recommended option','Compare the options'],

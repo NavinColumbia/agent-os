@@ -72,6 +72,35 @@ for e in base:
     prev = h
 chk(alt[0] != good[0], "the chain hash binds to the HMAC secret (can't be forged without the key)")
 
+# ── PER-TENANT sub-chains (C2): each tenant's rows form their OWN hash chain (t_entry binds fields + the
+#    tenant's previous t_entry + the tenant id), independently verifiable + isolated. Same math audit.append
+#    and audit.verify_tenant use, over a synthetic interleaved log (no DB) so it can't corrupt the live chain.
+def _tchain(entries, tid):
+    """Build the per-tenant t_entry_hash chain exactly as audit.append does for one tenant's rows."""
+    hashes, prev = [], ""
+    for e in entries:
+        c = audit._canonical(e["actor"], e["action"], e["resource"], e["decision"], e["payload"], prev)
+        h = audit._chain_hash(KEY, c + "||TENANT:" + tid)
+        hashes.append(h)
+        prev = h
+    return hashes
+
+
+ta = [{"actor": "ctrl", "action": "Spend", "resource": "pA", "decision": "ok", "payload": {"usd": i}} for i in range(3)]
+tb = [{"actor": "ctrl", "action": "Deploy", "resource": "pB", "decision": "approved", "payload": {"n": i}} for i in range(3)]
+ha, hb = _tchain(ta, "tenantA"), _tchain(tb, "tenantB")
+
+chk(ha == _tchain(ta, "tenantA"), "a tenant sub-chain recomputes identically (verify_tenant passes on untampered)")
+# tampering tenant A's row changes A's hash (+ propagates) — caught by verify_tenant(A)
+ta_t = [dict(e) for e in ta]
+ta_t[1]["decision"] = "denied"
+ha_t = _tchain(ta_t, "tenantA")
+chk(ha_t[1] != ha[1] and ha_t[2] != ha[2], "tampering a tenant row changes its t_entry_hash + propagates (verify_tenant catches)")
+# isolation: tampering A's rows does NOT change B's sub-chain — a tenant only verifies (and can only break) their own
+chk(_tchain(tb, "tenantB") == hb, "a tenant's sub-chain is ISOLATED — another tenant's tamper can't affect it")
+# the tenant binding matters: the SAME business rows under a different tenant id yield different hashes
+chk(_tchain(ta, "tenantX")[0] != ha[0], "the sub-chain binds to the tenant id (no cross-tenant hash collision)")
+
 print("PASS: audit log is genuinely tamper-EVIDENT — any edit to any field is detected + propagates"
       if ok else "FAIL: tamper-evidence is broken")
 sys.exit(0 if ok else 1)

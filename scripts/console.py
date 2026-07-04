@@ -584,6 +584,13 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
  .navscrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:55}.app.navopen .navscrim{display:block}
  .main{padding:18px 14px}.topbar{padding:0 10px}
 }
+.pal-ov{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:flex-start;justify-content:center;z-index:9999}
+.pal-box{margin-top:12vh;width:min(560px,92vw);background:var(--card,#fff);border:1px solid var(--line,#ddd);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.35);overflow:hidden}
+.pal-input{width:100%;box-sizing:border-box;border:0;border-bottom:1px solid var(--line,#eee);padding:14px 16px;font-size:15px;outline:none;background:transparent;color:inherit}
+.pal-list{max-height:52vh;overflow:auto}
+.pal-item{padding:10px 16px;cursor:pointer;display:flex;justify-content:space-between;gap:8px}
+.pal-item.sel{background:var(--accent,#4457ff);color:#fff}
+.pal-item.sel .muted{color:rgba(255,255,255,.85)}
 </style></head><body>
 <div id=splash style="display:none;position:fixed;inset:0;align-items:center;justify-content:center;flex-direction:column;gap:14px;background:var(--bg);z-index:50;color:var(--mut)">
   <div class=brand style="font-size:22px"><span class=mk>⬡</span> agent-os</div><div style="font-size:13px">Reconnecting…</div></div>
@@ -1403,6 +1410,17 @@ async function saveKey(){const v=($('#bk')||{}).value||'';const note=$('#bknote'
 async function acctExport(){$('#acctnote').textContent='preparing export…';const r=await post('/api/account/export',{});$('#acctnote').textContent=r.ok?('Export ready ('+r.products+' products) on the server: '+(r.path||'')):'export failed';}
 async function acctDelete(){const r=await post('/api/account/delete',{confirm:false});if(!confirm('Permanently delete your account and ALL data? This cannot be undone.'))return;const r2=await post('/api/account/delete',{confirm:true});if(r2.ok){localStorage.removeItem('aos_tenant');TOK='';clearTimers();$('#view').innerHTML='<div class=card>Your account and data were deleted. Goodbye.</div>';}}
 async function pref(cat,ia,em,pu){const cur=(PREFS||[]).find(p=>p.category==cat)||{in_app:true,email:true,push:false};await post('/api/settings/pref',{category:cat,in_app:ia==null?cur.in_app:ia,email:em==null?cur.email:em,push:pu==null?cur.push:pu});}
+// COMMAND PALETTE (Cmd/Ctrl-K): fast keyboard nav for power users — fuzzy-jump to any screen in LABEL.
+let PAL_SEL=0, PAL_ITEMS=[];
+function palItems(q){q=(q||'').toLowerCase().trim();return Object.keys(LABEL).map(k=>({k,label:LABEL[k]})).filter(x=>!q||x.label.toLowerCase().includes(q)||x.k.includes(q));}
+function openPalette(){if(!TOK)return;let ov=$('#palette');if(!ov){ov=document.createElement('div');ov.id='palette';ov.className='pal-ov';ov.innerHTML='<div class=pal-box><input id=palq class=pal-input placeholder="Jump to a screen…  (type to filter · ↑↓ · Enter · Esc)" aria-label="Command palette"><div id=pallist class=pal-list></div></div>';document.body.appendChild(ov);ov.addEventListener('click',e=>{if(e.target===ov)closePalette()});$('#palq').addEventListener('input',renderPal);$('#palq').addEventListener('keydown',palKey);}
+  ov.style.display='flex';$('#palq').value='';PAL_SEL=0;renderPal();$('#palq').focus();}
+function closePalette(){const ov=$('#palette');if(ov)ov.style.display='none';}
+function renderPal(){const q=$('#palq')?$('#palq').value:'';PAL_ITEMS=palItems(q);if(PAL_SEL>=PAL_ITEMS.length)PAL_SEL=Math.max(0,PAL_ITEMS.length-1);$('#pallist').innerHTML=PAL_ITEMS.length?PAL_ITEMS.map((x,i)=>`<div class="pal-item${i===PAL_SEL?' sel':''}" onmousemove="PAL_SEL=${i};palHi()" onclick="palGo('${x.k}')"><span>${esc(x.label)}</span> <span class=muted>${esc(x.k)}</span></div>`).join(''):'<div class=pal-item><span class=muted>No matches</span></div>';}
+function palHi(){[...document.querySelectorAll('#pallist .pal-item')].forEach((el,i)=>el.classList.toggle('sel',i===PAL_SEL));}
+function palGo(k){closePalette();go(k);}
+function palKey(e){if(e.key==='Escape'){closePalette();}else if(e.key==='ArrowDown'){e.preventDefault();PAL_SEL=Math.min(PAL_ITEMS.length-1,PAL_SEL+1);palHi();}else if(e.key==='ArrowUp'){e.preventDefault();PAL_SEL=Math.max(0,PAL_SEL-1);palHi();}else if(e.key==='Enter'){e.preventDefault();if(PAL_ITEMS[PAL_SEL])palGo(PAL_ITEMS[PAL_SEL].k);}}
+document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&(e.key==='k'||e.key==='K')){e.preventDefault();openPalette();}});
 async function boot(){renderNav();refreshTopbar();await loadOrgs();await loadProviders();
  if(!ORG&&ORGS.length){ORG=ORGS[0].org_id;localStorage.setItem('aos_org',ORG);setOrgName();}   // default into a company at boot; the user can switch to All orgs (home) anytime
  let ob=null;try{ob=await get('/api/onboarding')}catch(e){}

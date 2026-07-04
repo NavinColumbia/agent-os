@@ -62,9 +62,51 @@ _BRIEF_SYS = (
 )
 
 
-def brief(tid, org_id=0, api_key=None):
+def _cache_get(tid, org_id=0, ttl_s=1800):
+    """Return a recently-computed brief (< ttl_s old) for INSTANT serving, else None. The brief is an ~8s
+    model call; without this the cockpit recomputes it on every load. Fail-open (None on any error, incl.
+    a missing table on first-ever call). Hot path -> pooled read."""
+    try:
+        import dbpool
+        with dbpool.connection(autocommit=True) as c, c.cursor() as cur:
+            cur.execute("""SELECT data FROM brief_cache WHERE tenant_id=%s AND org_id=%s
+                           AND computed_at > now() - make_interval(secs => %s)""",
+                        (tid, int(org_id or 0), int(ttl_s)))
+            r = cur.fetchone()
+        if r and isinstance(r[0], dict):
+            d = dict(r[0]); d["_cached"] = True
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def _cache_put(tid, org_id, data):
+    """Store a freshly-computed brief for reuse. Idempotent per (tenant, org). Never raises."""
+    try:
+        import psycopg
+        import trace
+        with psycopg.connect(trace.DB) as c, c.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS brief_cache (
+                tenant_id TEXT NOT NULL, org_id INT NOT NULL DEFAULT 0, data JSONB NOT NULL,
+                computed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (tenant_id, org_id))""")
+            cur.execute("""INSERT INTO brief_cache (tenant_id, org_id, data, computed_at)
+                           VALUES (%s,%s,%s,now()) ON CONFLICT (tenant_id, org_id)
+                           DO UPDATE SET data=EXCLUDED.data, computed_at=now()""",
+                        (tid, int(org_id or 0), json.dumps(data, default=str)))
+            c.commit()
+    except Exception:
+        pass
+
+
+def brief(tid, org_id=0, api_key=None, use_cache=True):
     """Compose the per-tenant chief-of-staff brief from real state. Returns a structured dict the console
-    renders. Falls back to a deterministic brief (still grounded) if the model call fails — never blank."""
+    renders. Serves a warm cache instantly (the model call is ~8s); computes + caches on a miss. Falls
+    back to a deterministic brief (still grounded) if the model call fails — never blank."""
+    if use_cache:
+        cached = _cache_get(tid, org_id)
+        if cached is not None:
+            return cached
     facts = _facts(tid, org_id)
     try:
         import factory
@@ -78,6 +120,7 @@ def brief(tid, org_id=0, api_key=None):
         data = factory._extract_json((r or {}).get("out_full") or (r or {}).get("out") or "")
         if isinstance(data, dict) and data.get("headline"):
             data["_facts"] = facts
+            _cache_put(tid, org_id, data)          # warm the cache so the next cockpit load is instant
             return data
     except Exception:
         pass

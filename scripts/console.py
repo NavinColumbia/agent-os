@@ -91,10 +91,10 @@ def _owns(tid, org_id):
 
 
 # Routes that carry a client-supplied org id — gated through _owns() before they ever touch a module.
-ORG_SCOPED_GET = {"/api/controller/state", "/api/controller/research", "/api/design", "/api/brief",
+ORG_SCOPED_GET = {"/api/controller/state", "/api/controller/research", "/api/design", "/api/brief", "/api/workstreams",
                   "/api/cockpit", "/api/projects", "/api/fleet",
                   "/api/health", "/api/company", "/api/comms_graph"}
-ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/controller/cancel",
+ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/controller/cancel", "/api/workstreams/new",
                    "/api/design/decide"}
 
 
@@ -415,6 +415,7 @@ GETS = {
     "/api/agentfeatures": lambda tid, q: {"features": agentfeatures.catalog(), "categories": agentfeatures.categories(), "triggers": agentfeatures.triggers()},
     "/api/agentfeatures/recommend": lambda tid, q: agentfeatures.recommend(q.get("need", [""])[0]),
     "/api/controller/state": lambda tid, q: _controller_state(tid, int(q.get("org", ["0"])[0] or 0)),
+    "/api/workstreams": lambda tid, q: {"workstreams": loopcontroller.workstreams(tid, int(q.get("org", ["0"])[0] or 0))},   # A2 concurrent workstreams
     "/api/controller/research": lambda tid, q: _ctl_research(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/xorg": lambda tid, q: {"ops": crossorg.list_ops(tid)},
     "/api/team": lambda tid, q: _team(tid),
@@ -445,6 +446,7 @@ POSTS = {
     "/api/help/ask": lambda tid, q, b: helpagent.ask(tid, b.get("question", "")),
     "/api/org/message": lambda tid, q, b: orgview.message_agent(tid, b.get("actor_id"), b.get("text", "")),   # B2: CEO -> a specific agent
     "/api/orgs/new": lambda tid, q, b: orgsmod.create(tid, b.get("name", ""), b.get("vision", "")),
+    "/api/workstreams/new": lambda tid, q, b: loopcontroller.new_workstream(tid, int(b.get("org") or 0)),   # A2: start a parallel workstream
     "/api/controller/say": lambda tid, q, b: _ctl_say(tid, int(b.get("org") or 0), b.get("message", "")),
     "/api/controller/choose": lambda tid, q, b: _ctl_choose(tid, int(b.get("org") or 0), int(b.get("option_id") or 0)),
     "/api/controller/cancel": lambda tid, q, b: _ctl_cancel(tid, int(b.get("org") or 0)),

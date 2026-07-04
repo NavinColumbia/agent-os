@@ -391,8 +391,36 @@ def start(tid, org_id):
     return {"thread_id": thread_id, "phase": "DISCOVER"}
 
 
+MAX_WORKSTREAMS = int(os.environ.get("AOS_MAX_WORKSTREAMS", "8"))   # cap concurrent loops per org
+
+
+def workstreams(tid, org_id):
+    """REBUILD-PLAN A2: a real company runs SEVERAL workstreams at once (build one product, iterate a v2,
+    run ops) — not one at a time. Every in-flight controller thread for this org, with its live state, so
+    the CEO can see + switch between concurrent workstreams. The default thread (thread_for_org) is just
+    the first of these."""
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""SELECT thread_id, phase, product, awaiting, job_kind, job_status
+                       FROM controller_state WHERE tenant_id=%s AND org_id=%s ORDER BY thread_id""",
+                    (tid, org_id))
+        return [{"thread_id": t, "phase": ph, "product": pr, "awaiting": aw,
+                 "running": aw == "fleet", "job": jk, "status": js}
+                for t, ph, pr, aw, jk, js in cur.fetchall()]
+
+
+def new_workstream(tid, org_id):
+    """Start a NEW parallel workstream (controller thread) for the org — the company takes on another
+    concurrent effort. Capped (AOS_MAX_WORKSTREAMS) so an org can't spawn unbounded controller loops."""
+    if len(workstreams(tid, org_id)) >= MAX_WORKSTREAMS:
+        return {"error": f"workstream limit reached ({MAX_WORKSTREAMS}) — finish or archive one first"}
+    r = start(tid, org_id)
+    return {"thread_id": r["thread_id"], "phase": r["phase"], "created": True}
+
+
 def thread_for_org(tid, org_id):
-    """The org's single controller thread — create it (start the loop) on first access."""
+    """The org's DEFAULT controller thread (the first workstream) — create it on first access. Additional
+    concurrent workstreams are created via new_workstream() and listed by workstreams()."""
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("SELECT thread_id FROM controller_state WHERE tenant_id=%s AND org_id=%s ORDER BY thread_id LIMIT 1",

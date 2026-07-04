@@ -189,6 +189,7 @@ ckp "governance controls wired"              "$PY scripts/test_governance_wired.
 ckp "quality-lens triad wired"               "$PY scripts/test_quality_lenses_wired.py | grep -q PASS"
 ckp "daemon supervision wired"               "$PY scripts/test_supervision_wired.py | grep -q PASS"
 ckp "sentinel silent-failure observer"       "$PY scripts/sentinel.py selftest | grep -q PASS"
+ckp "north-star acceptance harness sound"    "$PY scripts/northstar_accept.py selftest | grep -q 'harness is sound'"
 ckp "memory spine (company mem + role lessons)"  "$PY scripts/companymemory.py selftest | grep -q PASS"
 ckp "per-role tools wired from manifest (A4)"  "$PY -c \"import sys;sys.path.insert(0,'scripts');import factory as f;t=f._role_tools('backend-engineer');assert 'Bash' in t and t!=f.AGENT_TOOLS,t;print('PASS')\" | grep -q PASS"
 ckp "isolated agent config (no bypassPermissions)"  "$PY -c \"import sys;sys.path.insert(0,'scripts');import factory,json,pathlib;d=factory._agent_config_dir();s=json.load(open(pathlib.Path(d)/'settings.json'));assert s['permissions']['defaultMode']!='bypassPermissions';print('PASS')\" | grep -q PASS"

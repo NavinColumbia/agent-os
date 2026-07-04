@@ -25,7 +25,7 @@ def _facts(tid, org_id=0):
     f = {"awaiting": [], "health": None, "verdict": None, "portfolio": None, "spend": None}
     try:
         import approvals
-        inbox = approvals.inbox(tid) or []
+        inbox = (approvals.inbox(tid) or {}).get("items", [])     # inbox() returns {items:[...], count:N}
         f["awaiting"] = [{"kind": i.get("kind"), "title": i.get("title") or i.get("summary")} for i in inbox][:8]
     except Exception:
         pass
@@ -106,6 +106,14 @@ def brief(tid, org_id=0, api_key=None, use_cache=True):
     if use_cache:
         cached = _cache_get(tid, org_id)
         if cached is not None:
+            # The AI narrative is cached, but decisions awaiting the CEO can't wait ~30min — overlay the
+            # LIVE approvals inbox so 'needs_you' is always current even on a cache hit (cheap query).
+            try:
+                import approvals
+                items = (approvals.inbox(tid) or {}).get("items", [])   # inbox() -> {items:[...], count:N}
+                cached["needs_you"] = [t for t in ((i.get("title") or i.get("summary")) for i in items) if t][:5]
+            except Exception:
+                pass
             return cached
     facts = _facts(tid, org_id)
     try:

@@ -713,7 +713,7 @@ const NAV=[
  ['Portfolio',[['orgs','My companies','🏢'],['portfolio','Portfolio','◎']]],
  ['Account',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
 ];
-const LABEL={controller:'Assistant',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My companies',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
+const LABEL={controller:'Assistant',assistant:'Assistant',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My companies',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
 let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];let PROVIDER_OK=true;let PEND_EMAIL='';
 async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];
@@ -908,7 +908,7 @@ async function refreshTopbar(){
  try{const s=await get('/api/status');const _sv=({operational:'ok',degraded:'warn',major_outage:'bad'}[s.verdict]||'ok');const _SV={operational:'all systems operational',degraded:'degraded performance',major_outage:'major outage'};const _st=$('#statusdot');_st.className='dot '+_sv;const _sl='Status — '+(_SV[s.verdict]||s.verdict||'operational');_st.title=_sl;_st.setAttribute('aria-label',_sl)}catch(e){}
  loadProviders();   // keep PROVIDER_OK fresh so the Assistant connect-banner reflects the latest provider state
 }
-async function go(k){CUR=k;if((location.hash.slice(1))!==k){try{location.hash=k}catch(_){}}renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';toggleNav(false);$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
+async function go(k){if(k==='assistant')k='controller';CUR=k;if((location.hash.slice(1))!==k){try{location.hash=k}catch(_){}}renderNav();$('#tbtitle').textContent=LABEL[k]||k;$('#acctmenu').style.display='none';toggleNav(false);$('#view').innerHTML='<div class=card><div class=skel style=width:40%></div><div class=skel style=width:75%></div></div>';
  try{await VIEWS[k]()}catch(e){if(e.kind==='auth'){if(TOK)signOut();return}$('#view').innerHTML=errCard(k,e.message)}}
 function userBusy(){const a=document.activeElement;if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'||a.isContentEditable))return true;const m=$('#acctmenu');if(m&&m.style.display!=='none')return true;return false}
 async function refreshView(){ // background poll: no skeleton flash, no nav/scroll disruption, never clobber what the user is touching

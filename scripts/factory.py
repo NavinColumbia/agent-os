@@ -174,6 +174,36 @@ def _role_tools(role):
         pass
     _ROLE_TOOLS_CACHE[role] = grant
     return grant
+
+
+# A4 MCP tier: the KNOWN, vetted MCP servers a role may be granted via its manifest `mcp_servers`. {repo} is
+# substituted at spawn. Start with filesystem (repo-scoped, no creds — verifiable now); slack/vercel/deploy
+# slot in here once their creds land (governance ALREADY gates their mcp__* tools in approval_required_for).
+_MCP_CATALOG = {
+    "filesystem": ("npx", ["-y", "@modelcontextprotocol/server-filesystem", "{repo}"]),
+}
+
+
+def _role_mcp_config(role, repo):
+    """The --mcp-config for a role, built from its manifest `mcp_servers` resolved against _MCP_CATALOG.
+    Returns a config dict or None. WAS declared-not-wired: governance gated mcp__* tools but factory never
+    spawned any MCP server, so those tools never existed for an agent. A role with no `mcp_servers` -> None,
+    so every current role is byte-for-byte unchanged (zero blast radius)."""
+    try:
+        import yaml
+        m = yaml.safe_load((ROLES / f"{role}.yaml").read_text()) or {}
+        want = m.get("mcp_servers") or []
+    except Exception:
+        want = []
+    servers = {}
+    for name in want:
+        spec = _MCP_CATALOG.get(name)
+        if spec:
+            cmd0, args = spec
+            servers[name] = {"command": cmd0, "args": [a.replace("{repo}", str(repo)) for a in args]}
+    return {"mcpServers": servers} if servers else None
+
+
 _TRANSIENT = ("overloaded", "rate limit", "rate_limit", "429", "529", "503", "timeout", "temporarily")
 # Cross-provider failover: when Claude/Anthropic is degraded or down (retries exhausted on transient
 # errors), the SAME task is retried once on OpenAI Codex so the factory keeps moving. Set to "none" to
@@ -395,7 +425,24 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
         genv["CLAUDE_CONFIG_DIR"] = _cfg
     if mpath.exists():
         genv["CP_MANIFEST"] = str(mpath); genv["CP"] = str(CONTROL_PLANE)
-    p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=genv)
+    # MCP (A4): connect the MCP servers the role's manifest declares so its governed mcp__* tools actually
+    # exist. Additive + fail-safe — a role with no `mcp_servers` gets no flag (byte-for-byte unchanged); the
+    # temp config is always cleaned up (no /tmp leak). --strict-mcp-config ignores any ambient MCP config.
+    _mcpf = None
+    _mcpcfg = _role_mcp_config(role, repo)
+    if _mcpcfg and _mcpcfg.get("mcpServers"):
+        import tempfile
+        _mcpf = tempfile.NamedTemporaryFile("w", suffix=".mcp.json", delete=False, dir="/tmp")
+        json.dump(_mcpcfg, _mcpf); _mcpf.close()
+        cmd += ["--mcp-config", _mcpf.name, "--strict-mcp-config"]
+    try:
+        p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=genv)
+    finally:
+        if _mcpf:
+            try:
+                os.unlink(_mcpf.name)
+            except Exception:
+                pass
     _govern_writes(role, repo)                      # post-run write backstop: revert/audit out-of-scope writes
     out_text, cost, tin, tout, used = (p.stdout or ""), 0.0, 0, 0, model
     try:

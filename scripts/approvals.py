@@ -181,6 +181,24 @@ def inbox(tid):
             "action_label": "Approve / Deny",
         })
 
+    # AI -> CEO questions: an agent hit something only the CEO can answer (a choice, a credential, a
+    # judgment call) and PAUSED. Surfacing them here is the 'ask-the-CEO' loop (B1) — without this the
+    # question only push-notified and the CEO had nowhere in-product to answer, so the phase stayed blocked.
+    try:
+        import agent_request
+        for r in (agent_request.open_requests(tid) or []):
+            items.append({
+                "id": f"question:{r['id']}",
+                "kind": "question",
+                "ref": r["id"],
+                "title": r.get("question") or "Your AI team needs your input",
+                "detail": "Your fleet paused on this and is waiting for your answer to continue.",
+                "severity": "med",
+                "action_label": "Answer",
+            })
+    except Exception:
+        pass
+
     for d in _dead_letters(tid):
         items.append({
             "id": f"dead_letter:{d['id']}",

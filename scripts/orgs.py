@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import psycopg
+import dbpool   # noqa: E402  — pooled read path (C2)
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
@@ -67,7 +68,7 @@ def list_orgs(tenant_id, include_archived=False):
                   (SELECT count(*) FROM tenant_products tp WHERE tp.org_id = o.id) AS products
            FROM orgs o WHERE tenant_id=%s {} ORDER BY created_at DESC"""
     q = q.format("" if include_archived else "AND status='active'")
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with dbpool.connection(autocommit=True) as c, c.cursor() as cur:   # C2: pooled read
         cur.execute(q, (tenant_id,))
         return [{"org_id": i, "name": n, "vision": v, "stage": st, "status": stat,
                  "created_at": str(ca), "products": p} for i, n, v, st, stat, ca, p in cur.fetchall()]
@@ -111,7 +112,7 @@ def resolve(tenant_id, org_id):
 
 def get(tenant_id, org_id):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with dbpool.connection(autocommit=True) as c, c.cursor() as cur:   # C2: pooled read
         cur.execute("SELECT id, name, vision, stage, status, created_at FROM orgs WHERE tenant_id=%s AND id=%s",
                     (tenant_id, org_id))
         r = cur.fetchone()

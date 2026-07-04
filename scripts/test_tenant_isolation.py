@@ -10,6 +10,7 @@ loudly if any read regresses to a global/unscoped query.
     python test_tenant_isolation.py     # prints PASS / FAIL
 Run with the agent-os venv python.
 """
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -99,6 +100,18 @@ try:
         "tenant B CANNOT answer tenant A's AI question (cross-tenant write blocked)")
     chk(agent_request.get(A["q_id"])["status"] == "open",
         "tenant A's question stays OPEN after B's blocked answer attempt")
+
+    # STRUCTURAL org-IDOR guard: EVERY console route whose handler reads a client-supplied 'org' param MUST
+    # be _owns-gated (listed in ORG_SCOPED_GET/POST) — else a newly-added org route silently becomes a
+    # cross-tenant IDOR (a tenant reads another's company by passing its org id). Source-probe console.py.
+    csrc = (SCRIPTS / "console.py").read_text()
+    org_routes = {m.group(1) for line in csrc.splitlines()
+                  if (m := re.search(r'"(/api/[^"]+)":\s*lambda', line)) and '.get("org"' in line}
+    _scoped_block = csrc[csrc.find("ORG_SCOPED_GET"): csrc.find("def ", csrc.find("ORG_SCOPED_POST"))]
+    scoped = set(re.findall(r'"(/api/[^"]+)"', _scoped_block))
+    ungated = org_routes - scoped
+    chk(bool(org_routes) and not ungated,
+        f"every org-param route is _owns-gated ({'UNGATED IDOR: ' + str(ungated) if ungated else str(len(org_routes)) + ' routes, all gated'})")
 
     # observability: each tenant's trace aggregate counts ONLY its own product's runs.
     ao = traceview.overview(A["tid"])

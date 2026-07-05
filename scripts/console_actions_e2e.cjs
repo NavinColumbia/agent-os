@@ -81,6 +81,45 @@ const SKIP_TEXT = /sign out|log ?out|delete|remove|disconnect|cancel account|res
           exercised++;
           if (errors.length > before) broken.push(label);
           else if (!didSomething && hadOnclick) dead.push(label);   // onclick that genuinely did NOTHING
+          // LEAK FIX: if the click opened a modal/menu, crawl INSIDE it — a dead button in a modal was
+          // invisible to the old crawl (it stopped at "a modal opened = did something"). Also flag a control
+          // that OPENED an essentially-empty modal (a dead-end panel — e.g. 'Read the full research' showing
+          // nothing) when it clearly promised content (view/read/show/why).
+          if (opened) {
+            const surf = await p.evaluate(() => {
+              const m = document.querySelector('#ctlmodal, .modal, [role=dialog]') ||
+                        [...document.querySelectorAll('.menu')].find(x => getComputedStyle(x).display !== 'none');
+              if (!m) return null;
+              const body = m.querySelector('#ctlmodalbody') || m;
+              return { text: (body.innerText || '').trim(), n: m.querySelectorAll('button,a,[onclick]').length };
+            });
+            if (surf) {
+              if (/view|read|show|why|full|details?|report/i.test(label) && surf.text.length < 15)
+                dead.push(label + ` -> opened an EMPTY panel ("${surf.text.slice(0, 30)}")`);
+              // click each control inside the opened surface (skip close/destructive), catching dead/broken
+              const innerN = await p.evaluate(() => {
+                const m = document.querySelector('#ctlmodal, .modal, [role=dialog]') ||
+                          [...document.querySelectorAll('.menu')].find(x => getComputedStyle(x).display !== 'none');
+                return m ? m.querySelectorAll('button, a, [onclick]').length : 0;
+              });
+              for (let j = 0; j < innerN && j < 12; j++) {
+                const inner = await p.$$('#ctlmodal button, #ctlmodal a, #ctlmodal [onclick], .modal button, .modal a, [role=dialog] button, [role=dialog] a, .menu a, .menu button');
+                const it = inner[j]; if (!it) continue;
+                const ilabel = `[${screen}/modal] ` + await it.evaluate(e => `<${e.tagName.toLowerCase()}> "${(e.innerText || e.getAttribute('aria-label') || '').slice(0, 34).trim()}"`).catch(() => '<?>');
+                if (SKIP_TEXT.test(ilabel) || /close/i.test(ilabel)) continue;
+                const iErrB = errors.length, iReqB = reqs, iDomB = await p.evaluate(() => document.body.innerHTML.length);
+                const iHadOnclick = await it.evaluate(e => !!(e.getAttribute('onclick') || e.onclick)).catch(() => false);
+                await it.click({ timeout: 1200, force: true }).catch(() => {}); await sleep(200);
+                const iChanged = await p.evaluate(bb => document.body.innerHTML.length !== bb, iDomB);
+                const iNav = await p.evaluate(() => !document.querySelector('#ctlmodal, .modal, [role=dialog]'));  // it may close the modal (= did something)
+                if (errors.length > iErrB) broken.push(ilabel);
+                else if (iHadOnclick && !iChanged && !iNav && reqs === iReqB) dead.push(ilabel);
+                if (iNav) break;   // surface closed; stop crawling it
+              }
+            }
+          }
+          // reset: close any open modal/menu, then re-render the screen for the next control
+          await p.evaluate(() => { const m = document.querySelector('#ctlmodal'); if (m) m.remove(); const mm = document.querySelector('.modal, [role=dialog]'); if (mm && mm.remove) { try { mm.remove(); } catch (e) {} } }).catch(() => {});
           await p.evaluate(s => window.go && window.go(s), screen).catch(() => {}); await sleep(250);
         }
       } catch (e) { errors.push(`[${screen}] screen failed: ${String(e).split('\n')[0]}`); }

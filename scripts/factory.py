@@ -100,6 +100,25 @@ BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-fable-5")
 CHEAP_MODEL = os.environ.get("AOS_CHEAP_MODEL", "claude-haiku-4-5-20251001")
 FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-opus-4-8")
 
+# Model-exhaustion COOLDOWN: once a model hits its subscription usage cap (see _MODEL_EXHAUSTED), remember it
+# so the REST of the fleet skips straight to the fallback instead of each agent wasting a failed call on the
+# capped model. TTL-bounded so it recovers automatically after the limit window resets. Process-local (one
+# build = one process), which is exactly the right scope.
+_MODEL_COOLDOWN = {}                       # model -> monotonic time it was last found exhausted
+_COOLDOWN_TTL = int(os.environ.get("AOS_MODEL_COOLDOWN_S", "900"))   # 15 min default
+
+
+def _note_exhausted(m):
+    try:
+        _MODEL_COOLDOWN[m] = time.monotonic()
+    except Exception:
+        pass
+
+
+def _in_cooldown(m):
+    t = _MODEL_COOLDOWN.get(m)
+    return bool(t) and (time.monotonic() - t) < _COOLDOWN_TTL
+
 
 def _default_build_model():
     """The fleet's default heavy-build model — Fable-5 (BUILD_MODEL) — UNLESS the 'opus_default_build' feature
@@ -113,6 +132,8 @@ def _default_build_model():
             return FALLBACK_MODEL
     except Exception:
         pass
+    if _in_cooldown(BUILD_MODEL):          # BUILD_MODEL recently hit its usage cap -> don't hand it out again yet
+        return FALLBACK_MODEL
     return BUILD_MODEL
 # Tools every factory agent may use beyond auto-accepted file edits. Web is on by default so research/
 # intel/build agents can reach live data instead of guessing. Override per-deployment with AOS_AGENT_TOOLS
@@ -754,6 +775,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     # --fallback-model does NOT cover. Retry the SAME task once on the FALLBACK_MODEL (a different quota, e.g.
     # Opus) before giving up. If the fallback is ALSO capped, saw_transient lets the Codex failover try next.
     if exhausted_primary:
+        _note_exhausted(model)             # remember it so the rest of the fleet skips this capped model (cooldown)
         _trace("agent", role, prompt, f"{model} hit its usage limit — switching to {FALLBACK_MODEL}", -1, model=model)
         audit.append(actor=f"factory:{role}", action="AgentModelSwitch", resource=Path(repo).name,
                      decision="exhausted", payload={"from": model, "to": FALLBACK_MODEL})

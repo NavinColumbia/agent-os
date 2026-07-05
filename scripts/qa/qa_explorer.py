@@ -451,6 +451,24 @@ def _fmt_targeting(targeting):
            if t.get('expected_control') else ""))
 
 
+def _perception_section(before_state, after_state):
+    """What a human EYE saw DURING the action: full page reloads + view re-render/skeleton flashes. The old QA
+    judged only the settled end-state and so missed transient/perceptual defects (e.g. the whole page flashing
+    a reload after every reply). This surfaces the delta so the evaluator can judge the experience, not just the
+    final DOM."""
+    bp = (before_state or {}).get("perception") or {}
+    ap = (after_state or {}).get("perception") or {}
+    if not bp and not ap:
+        return "(perception not captured for this action)"
+    # a FULL reload wipes window.__qa -> firstAt changes (and loads resets). Same-window SPA re-renders keep
+    # firstAt and just bump clobbers. So: firstAt changed => a full page reload happened this action.
+    reloaded = bool(bp.get("firstAt") and ap.get("firstAt") and bp["firstAt"] != ap["firstAt"])
+    reflows = max(0, int(ap.get("clobbers", 0)) - int(bp.get("clobbers", 0))) if not reloaded else int(ap.get("clobbers", 0))
+    reloads = 1 if reloaded else 0
+    return (f"During the action the screen underwent: {reloads} full page reload(s), "
+            f"{reflows} main-view re-render/skeleton-flash(es).")
+
+
 def _evaluate_prompt(vision, story, expected, targeting, before_state, after_state):
     return f"""ROLE: You are the QA-SECURITY explorer. Task: EVALUATE expected-vs-actual after an action.
 
@@ -477,6 +495,15 @@ STORY EXPECTED OUTCOME: {story.get('expected', story.get('expected_outcome', '')
 {_fmt_state(after_state)}
 Screenshot after the action: {after_state.get('screenshot')}  (read it to judge visual/rendering correctness)
 
+=== PERCEPTION (what a human EYE saw DURING the action — not just the settled end-state) ===
+{_perception_section(before_state, after_state)}
+A human notices the screen JUMP. On a routine IN-PLACE interaction — sending a message, clicking a suggestion
+chip, toggling a tab, submitting an inline form — a FULL PAGE RELOAD, or the main view flashing to a skeleton
+and re-rendering, is a real jarring UX defect EVEN IF the settled DOM ends up correct: it loses scroll position,
+wipes what the user was reading, and feels broken/amateur. If perception shows an unexpected reload/re-render
+flash on such an action, that IS a "bug" (severity per how disruptive). A reload/re-render is EXPECTED + fine
+after an explicit navigation, a sign-in/out, or an action whose whole point is to load a new page/screen.
+
 CONTRACT — apply IN THIS ORDER:
 1. Was the INTENDED control correctly actuated? (driver matched the intent's label AND the action
    registered an effect). If NO — the intended control was never exercised (a mis-target or a missed
@@ -498,7 +525,14 @@ CONTRACT — apply IN THIS ORDER:
    selection (a cursor resting on a button is not "active"). Only call a state bug when the DOM
    semantics themselves are wrong, or a control visibly claims a state its semantics contradict AND the
    styling is clearly the selected treatment (not hover/focus).
-3. If it behaved as expected, verdict "pass".
+   SILENT-EMPTY GUARD: do NOT trust a plausible-sounding empty state. A panel/list/report that says "nothing
+   yet", "not ready", "no data", or renders blank is a REAL DEFECT when the story/journey implies content
+   SHOULD be there (e.g. 'read the full research' right after research finished, an empty Projects list right
+   after a build was directed, an empty inbox after an action that creates a notification). A believable
+   "empty" message is exactly how a silent data-wiring bug hides — if content is expected and it's absent,
+   lean toward "bug" (or "inconclusive" with a probe), never a reflexive "pass".
+3. If it behaved as expected — the right result rendered AND no unexpected reload/flash AND no silent-empty —
+   verdict "pass".
 
 Reply with ONLY a JSON object, no prose:
 {{

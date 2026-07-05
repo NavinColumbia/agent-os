@@ -170,6 +170,27 @@ class Bridge {
     this.ctx = await this.browser.newContext({
       viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1,
     });
+    // PERCEPTION RECORDER: a human notices the screen JUMP — a full page reload, or the SPA wiping the main
+    // view to a skeleton (the 'page refresh' flash) — even when the SETTLED DOM ends up correct. The old QA
+    // only saw the settled end-state, so it missed transient/perceptual defects (the reload-after-reply bug).
+    // This runs before app code on every load and counts those events so the evaluator can judge them.
+    await this.ctx.addInitScript(() => {
+      try {
+        window.__qa = window.__qa || { loads: 0, clobbers: 0, firstAt: Date.now() };
+        window.__qa.loads++;                                     // full page load/reload counter
+        // Detect a skeleton node being ADDED (the 'refresh flash'), not queried after the fact — the skeleton
+        // is transient and can be replaced before a state-query callback runs, so inspect the mutations.
+        const mo = new MutationObserver((muts) => {
+          for (const m of muts) {
+            for (const n of (m.addedNodes || [])) {
+              if (n.nodeType === 1 && (n.classList && n.classList.contains('skel') ||
+                  (n.querySelector && n.querySelector('.skel')))) { window.__qa.clobbers++; return; }
+            }
+          }
+        });
+        mo.observe(document, { subtree: true, childList: true });   // observe the Document node (documentElement is null this early)
+      } catch (_) {}
+    });
     this.page = await this.ctx.newPage();
     this._wire(this.page);
   }
@@ -279,6 +300,8 @@ class Bridge {
     let url = null, title = null;
     try { url = this.page.url(); } catch (_) {}
     try { title = await this.page.title(); } catch (_) {}
+    let perception = null;
+    try { perception = await this.page.evaluate(() => window.__qa ? { loads: window.__qa.loads, clobbers: window.__qa.clobbers, firstAt: window.__qa.firstAt } : null); } catch (_) {}
     return {
       url,
       title,
@@ -287,6 +310,7 @@ class Bridge {
       settled: true,   // this snapshot was taken AFTER settle() — the DOM was done painting
       console_errors: this.consoleErrors.slice(-MAX_CONSOLE),
       recent_requests: this.requests.slice(-MAX_REQUESTS),
+      perception,      // {loads, clobbers}: full reloads + view re-render/skeleton flashes seen so far (perceptual layer)
     };
   }
 

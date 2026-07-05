@@ -1009,14 +1009,14 @@ const VIEWS={
   const inFlight=(d.awaiting==='fleet')||!!d.progress;
   const ph0=(d.phase||'').toUpperCase();
   const scoping=(d.messages||[]).length>0;   // any back-and-forth yet? then the generic starters are stale — go context-aware
-  let CHIPS;
+  let CHIPS, chipSend=false;   // chipSend: next-step chips are clear intents -> SUBMIT on click; generic starters just fill for editing
   if(inFlight||gateErr)CHIPS=[];
   else if(home)CHIPS=['Create a new company','What needs my attention across all companies?','A quick throwaway prototype'];
-  else if(ph0&&ph0!=='DISCOVER')CHIPS=ctlNextChips(ph0);
-  else if(scoping)CHIPS=ctlNextChips('DISCOVER');   // mid-scoping: suggest how to move the conversation forward, not "Build a competitor to YouTube"
+  else if(ph0&&ph0!=='DISCOVER'){CHIPS=ctlNextChips(ph0);chipSend=true;}
+  else if(scoping){CHIPS=ctlNextChips('DISCOVER');chipSend=true;}   // mid-scoping next-step chips submit to advance the conversation
   else CHIPS=['Build a competitor to YouTube','An internal tool for my team','A booking page for my salon'];
   const ph=home?'e.g. start a new company, or ask about any of them…':'e.g. build a competitor to YouTube';
-  h+='<div class=card>'+(CHIPS.length?'<div class=chips>'+CHIPS.map(c=>`<span class=chip-s onclick="ctlFill('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+'</div>':'')+`<div class="row composer"><textarea id=cmsg class=chatbox rows=1 aria-label="Message your assistant" placeholder="${ph}" oninput="grow(this)" onkeydown="taKey(event,ctlSend)"></textarea><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
+  h+='<div class=card>'+(CHIPS.length?'<div class=chips>'+CHIPS.map(c=>`<span class=chip-s onclick="${chipSend?'ctlChipSend':'ctlFill'}('${c.replace(/'/g,"")}')">${esc(c)}</span>`).join('')+'</div>':'')+`<div class="row composer"><textarea id=cmsg class=chatbox rows=1 aria-label="Message your assistant" placeholder="${ph}" oninput="grow(this)" onkeydown="taKey(event,ctlSend)"></textarea><button class=pri id=ctlsend onclick=ctlSend()>Send</button></div><div id=cnote class=muted style=margin-top:6px></div></div>`;
   $('#view').innerHTML=h;
   if(gateErr){$('#cnote').innerHTML=gateNote(d.error);ctlRender([]);}
   else if(d&&d.error){const log=$('#clog');if(log)log.innerHTML='<div class=muted>'+esc(d.error)+'</div>';}
@@ -1200,6 +1200,7 @@ function grow(t){if(!t)return;t.style.height='auto';t.style.height=Math.min(t.sc
 function taKey(e,fn){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();fn()}}   // ChatGPT/Claude: Enter sends, Shift+Enter inserts a newline
 function chipFill(t){const i=$('#msg');if(i){i.value=t;i.focus();grow(i)}}
 function ctlFill(t){const i=$('#cmsg');if(i){i.value=t;i.focus();grow(i)}}
+async function ctlChipSend(t){const i=$('#cmsg');if(i){i.value=t;grow(i)}await ctlSend();}   // a NEXT-STEP chip is a clear intent ("show me options") -> submit it; don't just paste + make the user click Send again
 async function ctlNewWorkstream(){try{await post('/api/workstreams/new',{org:ORG});}catch(e){}go('controller');}   // A2: start a parallel workstream, then refresh the Assistant
 function ctlNextChips(phase){   // CONTEXT-AWARE CHIPS: after scoping, swap the generic starters for next-step suggestions tied to the phase
  const M={DISCOVER:['That covers it — show me options','Add a must-have detail','Who is it for?'],

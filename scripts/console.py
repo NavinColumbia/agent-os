@@ -1254,7 +1254,7 @@ function ctlRender(msgs,prog){const log=$('#clog');if(!log)return;
  if(atBottom)log.scrollTop=log.scrollHeight;   // only re-pin if user was already at the bottom; don't yank scrollback
 }
 async function ctlSend(){
- if(CTLBUSY)return;const i=$('#cmsg');const m=(i?i.value:'').trim();if(!m)return;
+ if(CTLBUSY)return;const i=$('#cmsg');const m=(i?i.value:'').trim();if(!m){const n=$('#cnote');if(n)n.textContent='Type a message first.';if(i)i.focus();return}   // empty Send no longer silently does nothing
  // GUIDED FIRST-RUN: never reject the first idea behind a gate — save it and walk them through the missing step
  if(!PROVIDER_OK){setPend(m);if(i){i.value='';grow(i)}const n=$('#cnote');if(n)n.innerHTML='Saved your idea ✓ — connect an AI model first and I\'ll start automatically.';go('providers');return;}
  if(!CONSENT_OK){setPend(m);if(i){i.value='';grow(i)}const n=$('#cnote');if(n)n.innerHTML='Saved your idea ✓ — tap <b>Approve &amp; continue</b> above and I\'ll start automatically.';return;}

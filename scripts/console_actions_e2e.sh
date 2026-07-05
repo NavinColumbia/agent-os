@@ -31,6 +31,10 @@ print(r['api_token'], r['tenant_id'])" 2>/dev/null)
 [ -n "${TOK:-}" ] || miss "a seeded tenant token"
 ORG=$(curl -s -X POST http://127.0.0.1:8099/api/orgs/new -H "X-Tenant-Token: $TOK" -H 'Content-Type: application/json' -d '{"name":"ActionCrawl Co"}' | grep -oE '[0-9]+' | head -1)
 curl -s -X POST http://127.0.0.1:8099/api/settings/consent -H "X-Tenant-Token: $TOK" -H 'Content-Type: application/json' -d '{"accept":true}' >/dev/null 2>&1
+# DEEP-STATE FIXTURES: seed a project + a dead-lettered build (Approvals decision) + a notification so the crawl
+# exercises data-dependent controls (the 'Why?' explain, approve/deny buttons, notification items) — an empty
+# tenant hides them, which is how data-dependent dead controls slipped past.
+"$PY" "$ROOT/scripts/qa/seed_fixtures.py" "$TID" "${ORG:-0}" >/dev/null 2>&1 || true
 
 # crawl; retry once on failure (a transient — console warming, a slow first paint — must not red the suite;
 # a REAL dead/erroring control fails deterministically both times). Fresh seed on retry.
@@ -38,12 +42,13 @@ crawl() { NODE_PATH="$NP" node "$ROOT/scripts/console_actions_e2e.cjs" http://12
 OUT="$(crawl "$TOK" "$ORG")"
 if ! echo "$OUT" | grep -q '^PASS'; then
   sleep 2
-  read TOK2 _ < <("$PY" -c "import sys;sys.path.insert(0,'$ROOT/scripts');import billing,tenantproviders;r=billing.signup('ActionCrawlR','free')
+  read TOK2 TID2 < <("$PY" -c "import sys;sys.path.insert(0,'$ROOT/scripts');import billing,tenantproviders;r=billing.signup('ActionCrawlR','free')
 try: tenantproviders.connect(r['tenant_id'],'anthropic','subscription')
 except Exception: pass
-print(r['api_token'])" 2>/dev/null)
+print(r['api_token'], r['tenant_id'])" 2>/dev/null)
   ORG2=$(curl -s -X POST http://127.0.0.1:8099/api/orgs/new -H "X-Tenant-Token: $TOK2" -H 'Content-Type: application/json' -d '{"name":"ActionCrawlR Co"}' | grep -oE '[0-9]+' | head -1)
   curl -s -X POST http://127.0.0.1:8099/api/settings/consent -H "X-Tenant-Token: $TOK2" -H 'Content-Type: application/json' -d '{"accept":true}' >/dev/null 2>&1
+  "$PY" "$ROOT/scripts/qa/seed_fixtures.py" "$TID2" "${ORG2:-0}" >/dev/null 2>&1 || true
   OUT="$(crawl "$TOK2" "$ORG2")"
 fi
 if echo "$OUT" | grep -q '^PASS'; then echo "PASS: exhaustive action coverage (every control fires, no JS errors)"; exit 0

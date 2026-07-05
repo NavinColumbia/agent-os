@@ -303,12 +303,13 @@ def _ctl_research(tid, org_id):
         org_id = _home_org(tid)
         if not org_id:
             return {"report": ""}
-    thread = loopcontroller.thread_for_org(tid, org_id)
-    fn = getattr(loopcontroller, "research", None)
+    # the report doc lives at research_report(tid, org) — NOT 'research' (which doesn't exist; getattr silently
+    # returned None -> empty panel = 'Read the full research' showed nothing even when the full doc was on disk).
+    fn = getattr(loopcontroller, "research_report", None) or getattr(loopcontroller, "research", None)
     if not callable(fn):
         return {"report": ""}
     try:
-        r = fn(tid, thread)
+        r = fn(tid, org_id)        # research_report(tid, org): reads the FULL synthesized report markdown off disk
     except Exception as e:
         return {"report": "", "error": str(e)[:160]}
     if isinstance(r, dict):
@@ -1297,7 +1298,12 @@ async function ctlSend(){
  if(r&&r.error==='stopped'){($('#cnote')||{}).textContent='Stopped.';return;}   // ctlStop already parked the job + reloaded
  const cg=gateKey(r);if(r&&gateError(cg)){$('#cnote').innerHTML=gateNote(cg);if(i){i.value=m;grow(i)}return;}   // friendly connect/consent prompt — keep their text
  if(r&&r.error){($('#cnote')||{}).textContent='✗ '+r.error+' — your message is in the box, press Send to retry.';if(i){i.value=m;grow(i)}return;}
- ($('#cnote')||{}).textContent='';go('controller');
+ ($('#cnote')||{}).textContent='';
+ // SOFT re-render (not go('controller')): re-render the assistant IN PLACE so chips/phase/proposals update via
+ // md() WITHOUT the skeleton flash + scroll jump that made every reply look like a full page refresh. Keep the
+ // newest message in view. Falls back to a hard nav only on error / if the user navigated away mid-reply.
+ if(CUR==='controller'){try{await VIEWS.controller();const lg=$('#clog');if(lg)lg.scrollTop=lg.scrollHeight;}catch(e){go('controller');}}
+ else go('controller');
 }
 function ctlStreamInto(text){   // paint streamed tokens into the live assistant bubble (final reload re-renders via md())
  const t=$('#ctltyping');if(!t)return;const b=t.querySelector('.bubble');if(b)b.textContent=text;

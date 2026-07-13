@@ -214,10 +214,13 @@ def _hire(ctx, supervisor_id, spec):
     """One governance-passed hire: a durable child row + its kickoff `task` event.
     Returns the new actor_id (or None on a store refusal, which is journaled)."""
     kind = "supervisor" if spec.get("kind") == "supervisor" else "worker"
+    mem = {"repo": ctx.repo}
+    if spec.get("tool"):                      # a TOOL-worker: tool + args ride in memory.context so its
+        mem["context"] = {"tool": spec["tool"], "tool_args": spec.get("tool_args") or {}}  # step dispatch-and-parks
     child = store.spawn_actor(ctx.run_id, ctx.tenant, spec.get("name") or spec.get("role") or "agent",
                               spec.get("role") or "engineer", kind=kind,
                               supervisor_id=supervisor_id, assignment=spec.get("task"),
-                              memory={"repo": ctx.repo})
+                              memory=mem)
     if child.get("error"):
         _audit(f"actor:{supervisor_id}", "HireFailed", "error", {"spec": spec, "err": child["error"]})
         return None
@@ -378,16 +381,48 @@ _CONTROLLER_PROMPT = (
     '"message":"<what to tell the team / ask the human>"}}. ESCALATION: {payload}')
 
 
+def _coordinator_specs(ctx, a, task, role):
+    """QA/dev COORDINATORS spawn TOOL-workers DETERMINISTICALLY (not an AI decompose): one qa-explorer per
+    story, or one dev-fixer per bug. The run params (vision/target_url/token/org/stories/bug) ride in the
+    coordinator's memory.context, set by the agentic entrypoint (qa_run agentic=True). Returns [] if there is
+    nothing to spawn (e.g. dev-coordinator with no bug yet) so the caller falls back to the generic path."""
+    c = dict((a.get("memory") or {}).get("context") or {})
+    if role == "qa-coordinator":
+        base = {"target_url": c.get("target_url"), "vision": c.get("vision") or task,
+                "token": c.get("token"), "org": c.get("org", "0"), "artifact_dir": c.get("artifact_dir")}
+        return [{"name": f"{a['name']}.explorer{i}", "role": "qa-explorer", "kind": "worker",
+                 "task": f"QA-explore story: {(s.get('title') or s.get('id') or i)}",
+                 "tool": "qa_explore", "tool_args": {**base, "story": s}}
+                for i, s in enumerate(c.get("stories") or [])]
+    if role == "dev-coordinator":
+        bug = c.get("bug")
+        if not bug:
+            return []
+        return [{"name": f"{a['name']}.fixer", "role": "dev-fixer", "kind": "worker",
+                 "task": f"Fix: {bug.get('title') or bug.get('bug') or 'defect'}",
+                 "tool": "dev_fix", "tool_args": {"bug": bug, "vision": c.get("vision"), "repo": c.get("repo"),
+                    "target_url": c.get("target_url"), "stories": c.get("stories"),
+                    "restart_cmd": c.get("restart_cmd"), "health_url": c.get("health_url"),
+                    "token": c.get("token"), "org": c.get("org")}}]
+    return []
+
+
 def _decompose_specs(ctx, a, task):
     """The org-shape AI call. The root controller plans DOMAINS via org_decider.plan_org (one
-    supervisor per domain — recursive from there); a lead splits its task into worker /
-    sub-supervisor child specs. Never returns [] — a parse miss degrades to a single IC."""
+    supervisor per domain — recursive from there); QA/dev coordinators spawn tool-workers deterministically;
+    any other lead splits its task via AI into worker / sub-supervisor child specs. Never returns [] — a
+    parse miss degrades to a single IC."""
     if a["kind"] == "controller":
         plan = org_decider.plan_org(task)
         return [{"name": f"{d['name']}-lead", "role": d.get("supervisor") or "supervisor",
                  "kind": "supervisor",
                  "task": f"Deliver the '{d['name']}' domain toward the vision: {task}"}
                 for d in plan["root"]["children"]]
+    _role = (a.get("role") or "").lower()
+    if _role in ("qa-coordinator", "dev-coordinator"):
+        specs = _coordinator_specs(ctx, a, task, _role)
+        if specs:
+            return specs
     d = _ai_json(a["role"], ctx.repo, _DECOMPOSE_PROMPT.format(task=task), spawner=a["role"])
     specs = []
     for i, c in enumerate(d.get("children") or []):

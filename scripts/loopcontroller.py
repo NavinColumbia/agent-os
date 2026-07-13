@@ -953,21 +953,41 @@ def advance(thread_id, job_result=None):
               level="urgent")
         return
     if job_result and (job_result.get("shipped") is not None or job_result.get("result")):  # build done
-        _to(thread_id, "TESTQA"); advance(thread_id)
+        product = _st(thread_id).get("product")
+        # BOUNDARY CONTRACT (root-cause fix): record the build outcome to the single-source-of-truth registry,
+        # then VALIDATE that QA is even allowed to run — build genuinely succeeded AND its artifact exists at the
+        # REGISTERED path. A failed/empty build must NOT advance to a QA that can't find it (F6/F7); it auto-loops
+        # back to the builder instead. Fail-open: a registry hiccup never blocks the pipeline.
+        build_ok = bool(job_result.get("shipped")) or (job_result.get("result") not in (None, "", "error")
+                                                        and job_result.get("status") != "error")
+        proceed, why = True, ""
+        try:
+            import productregistry as _preg
+            _preg.record_phase(product, "build", ok=build_ok, artifact=_preg.path(product),
+                               verdict=str(job_result.get("status") or job_result.get("result") or "")[:200])
+            proceed, why = _preg.precondition(product, "qa")
+        except Exception:
+            proceed = True
+        if proceed:
+            _to(thread_id, "TESTQA"); advance(thread_id)
+        else:
+            _autoloop_build(thread_id, tid, product, reason=why)
         return
     if job_result and "qa_ok" in job_result:                        # qa verdict in -> ENFORCE it (#48)
+        product = _st(thread_id).get("product")
+        try:
+            import productregistry as _preg
+            _preg.record_phase(product, "qa", ok=bool(job_result.get("qa_ok")),
+                               verdict=str(job_result.get("verdict") or job_result.get("error") or "")[:300])
+        except Exception:
+            pass
         if job_result.get("qa_ok"):
             _to(thread_id, "DELIVER"); advance(thread_id)
         else:
-            # A failed (or unverifiable) build must NOT reach DELIVER. Loop back to IMPLEMENT, but gate on
-            # the user so we don't silently auto-rebuild forever — they say "approve"/"retry" to rebuild.
-            _set(thread_id, awaiting="user_feedback")
-            _to(thread_id, "IMPLEMENT")
-            _report(tid, thread_id,
-                    "⚠️ QA did not pass — the build failed verification, so I'm holding it back from delivery. "
-                    "Say \"approve\" to rebuild and re-test, or tell me what to change.",
-                    {"kind": "qa_failed"}, urgent=True)
-            audit.append(actor="loopcontroller", action="QAGate", resource=str(thread_id), decision="BLOCKED")
+            # A failed/unverifiable build must NOT reach DELIVER — but the CEO is NOT the first responder.
+            # Auto-loop back to the builder (bounded); escalate to the human ONLY when the loop is exhausted.
+            _autoloop_build(thread_id, tid, product,
+                            reason=(job_result.get("verdict") or job_result.get("error") or "QA did not pass"))
         return
 
     if phase == "RESEARCH":
@@ -1029,6 +1049,11 @@ def advance(thread_id, job_result=None):
         plan = s["plan"] or {}
         product = (s.get("product") or f"{s['org_id'] or 'o'}-{plan.get('name', 'app')}")[:30]
         _set(thread_id, product=product)
+        try:  # SINGLE SOURCE OF TRUTH: register the product ONCE — every later phase reads its id+path from here
+            import productregistry as _preg
+            _preg.register(product, tenant_id=tid, org_id=s.get("org_id"), plan=plan)
+        except Exception:
+            pass
         def _do_proto():
             import design_fleet
             return design_fleet.prototype(tid, str(s["org_id"]), product, plan)
@@ -1041,6 +1066,11 @@ def advance(thread_id, job_result=None):
         plan = s["plan"] or {}
         product = (s.get("product") or f"{s['org_id'] or 'o'}-{plan.get('name', 'app')}")[:30]
         _set(thread_id, product=product)
+        try:  # ensure the authoritative record exists (idempotent) before the build writes its artifact
+            import productregistry as _preg
+            _preg.register(product, tenant_id=tid, org_id=s.get("org_id"), plan=plan)
+        except Exception:
+            pass
         def _do_build():
             import frontdoor
             frontdoor._own(product, tid)
@@ -1297,6 +1327,36 @@ def sla_watchdog():
                      payload={"elapsed_min": em, "eta_min": new_eta, "reping": bool(again)})
         warned += 1
     return {"warned": warned}
+
+
+MAX_BUILD_RETRY = int(os.environ.get("AOS_MAX_BUILD_RETRY", "3"))
+
+
+def _autoloop_build(thread_id, tid, product, reason=""):
+    """A failed/unverifiable build routes back to the DEV/builder AUTOMATICALLY (bounded), and escalates to the
+    CEO ONLY when the autonomous loop is exhausted — never bothering the human before then (North Star: the
+    human is the last resort, not the first responder). Leaves the thread runnable so jobd/advance re-dispatches
+    the build in a long-lived process."""
+    try:
+        import productregistry as _preg
+        n = _preg.attempt(product, "build_retry")
+    except Exception:
+        n = MAX_BUILD_RETRY + 1                     # registry unavailable -> be conservative, escalate
+    if n <= MAX_BUILD_RETRY:
+        _to(thread_id, "IMPLEMENT"); _set(thread_id, awaiting=None)     # runnable -> re-dispatch the build
+        _report(tid, thread_id,
+                f"🔧 Verification didn't pass (attempt {n}/{MAX_BUILD_RETRY}: {str(reason)[:150]}). Handing it "
+                f"back to the builder to fix and re-test — nothing needed from you.",
+                {"kind": "auto_rebuild", "attempt": n}, urgent=False)
+        audit.append(actor="loopcontroller", action="AutoRebuild", resource=str(thread_id), decision=f"attempt-{n}")
+        advance(thread_id)
+    else:
+        _set(thread_id, awaiting="user_feedback"); _to(thread_id, "IMPLEMENT")
+        _report(tid, thread_id,
+                f"⚠️ I tried to fix and re-test this {MAX_BUILD_RETRY}× but it still isn't passing "
+                f"({str(reason)[:150]}). I've held it back from delivery — tell me how you'd like to proceed, or "
+                f"say \"retry\" to keep trying.", {"kind": "qa_failed_escalate"}, urgent=True)
+        audit.append(actor="loopcontroller", action="QAGate", resource=str(thread_id), decision="ESCALATE")
 
 
 def _to(thread_id, phase):
@@ -1613,7 +1673,17 @@ def _selftest():
     _r.run_state = lambda t, rid: {"status": "done", "options": [{"id": 1, "title": "A", "recommended": True}]}
     _r.select = lambda t, rid, oid: {"option_id": oid, "title": "A"}
     _d.prototype = lambda t, o, p, pl, **k: {"screens": 3, "surfaces": ["cockpit", "team", "external"]}
-    _q.run = lambda product, **k: {"run_id": 1, "status": "shipped", "shipped": True, "rounds": 1}
+    def _fake_build(product, **k):
+        # a REAL (stubbed) build produces its artifact at the REGISTERED path, so the boundary contract
+        # (QA requires the artifact to exist) passes — exactly as a real successful build would.
+        try:
+            import productregistry as _preg, pathlib
+            d = pathlib.Path(_preg.path(product)); d.mkdir(parents=True, exist_ok=True)
+            (d / "app.py").write_text("# built by selftest")
+        except Exception:
+            pass
+        return {"run_id": 1, "status": "shipped", "shipped": True, "rounds": 1}
+    _q.run = _fake_build
     # TESTQA consumes the machine qa verdict (C1): stub the grounded-QA seam with a GREEN verdict shaped
     # exactly like factory.run_grounded_qa's contract (passed / blocking_open / stories / verdict_json).
     _green_gq = lambda product, **k: {
@@ -1895,7 +1965,13 @@ def _selftest():
                       "tenant_providers", "tenant_products", "ai_consent", "notifications", "push_targets",
                       "tenants", "memory_checkpoints"):
                 cur.execute(f"DELETE FROM {t} WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM product_registry WHERE tenant_id=%s RETURNING repo_path", (tid,))
+            paths = [r[0] for r in cur.fetchall()]
             c.commit()
+        import shutil as _sh                     # remove the stubbed-build artifact dirs the test created
+        for p in paths:
+            if p and "/products/" in p:
+                _sh.rmtree(p, ignore_errors=True)
     sys.exit(0 if ok else 1)
 
 

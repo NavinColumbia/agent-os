@@ -233,6 +233,7 @@ ckp "coordinator plan/phase checkpoints wired (item10)" "grep -q 'companymemory.
 ckp "MAST failure-mode taxonomy (14 modes)"          "$PY scripts/orchestra/mast.py | grep -q 'mast selftest: PASS'"
 ckp "OTel GenAI span mapping (portable traces)"      "$PY scripts/otel.py | grep -q 'otel selftest: PASS'"
 ckp "central execution daemon (jobd drives builds)"  "$PY scripts/jobd.py selftest | grep -q 'jobd selftest: PASS'"
+ckp "product registry + phase-boundary contracts"    "$PY scripts/productregistry.py selftest | grep -q 'productregistry selftest: PASS'"
 ckp "verdict gating stays code-driven (item14 regress)" "grep -q 'close_call' scripts/qa/qa_run.py && grep -q 'close_call' scripts/qa/qa_agentic.py"
 ckp "git-publish records a provable effect (item13)"  "grep -q 'Effect:git_publish' scripts/appregistry.py"
 ckp "task CONTRACT on every hire (item 5, fail-open)" "$PY -c \"import sys;sys.path.insert(0,'scripts/orchestra');import runtime;c,m=runtime._task_contract({'task':'x'});assert set(c)=={'objective','output_format','allowed_tools','boundaries'} and 'objective' in m;c2,m2=runtime._task_contract({'task':'x','contract':{'objective':'o','output_format':'f','allowed_tools':'t','boundaries':'b'}});assert not m2 and c2['boundaries']=='b';print('PASS')\" | grep -q PASS"

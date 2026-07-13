@@ -122,13 +122,21 @@ silence → reconcile re-dispatches).
 1. ✅ DONE — Phases 3b/4/5 + 4b hand-off (`52da513`/`a8aed28`/`8ad739b`/`f4bbcd0`/`ef0253b`). The agentic org
    WORKS end-to-end incl. **qa-coordinator → dev-coordinator → dev-fixer** hand-off, reliably tested
    (`python scripts/qa/qa_agentic.py`: 2 explorers find bugs → 2 dev-coordinators → 2 dev-fixers → done).
-2. **Phase 4b remaining refinements (NEXT).** Done: (a) blocking-finding → dev-coordinator hand-off. Still to
-   add as `_supervisor_step` qa-coordinator branches: (b) on incomplete coverage in an explorer's `done`,
-   hire more qa-explorers (gap-fill); (c) after a dev-coordinator's `done`, RE-TEST the fixed story (hire a
-   fresh qa-explorer for it) — the closed loop; (d) at aggregate, run `review.review` (auditor) sign-off and
-   emit an honest verdict as the coordinator's `done`. Role manifests (governance hygiene; fail-open works
-   without them): `~/projects/control-plane/roles/{qa-coordinator,dev-coordinator}.yaml` (`can_spawn:true`),
+2. **Phase 4b remaining refinements (NEXT).** Done: (a) blocking-finding → dev-coordinator hand-off
+   (`ef0253b`); (d) honest deterministic verdict at aggregate (`acb1ac1`). Still to add as `_supervisor_step`
+   qa-coordinator branches: (b) on incomplete coverage in an explorer's `done` (its result carries the
+   coverage ledger + stop_reason), hire more qa-explorers with `resume_covered` (gap-fill as real hires);
+   (c) after a dev-coordinator's `done`, RE-TEST the fixed story (hire a fresh qa-explorer for it) — the
+   closed loop; bound re-tests per story (e.g. 3) to avoid a fix↔find cycle; (e) at aggregate also run
+   `review.review` (auditor) — needs the agentic org to assemble an evidence dossier from the explorers'
+   results first. Role manifests (governance hygiene; fail-open works without them):
+   `~/projects/control-plane/roles/{qa-coordinator,dev-coordinator}.yaml` (`can_spawn:true`),
    `{qa-explorer,dev-fixer}.yaml` (`can_spawn:false`).
+
+   **Gotcha for (b)/(c):** these HIRE more actors, growing the children set that the aggregate join waits on
+   — fine (the loop settles), but bound them so it terminates; findings arrive as separate `finding` events
+   (not in child `done` payloads), so track state in the coordinator's `mem` and persist it in `step.memory`
+   (see how `qa_findings` is threaded in `acb1ac1`).
 3. **Phase 5 — agentic entrypoint.** `qa_run(..., agentic=True)` creates the QA org: `create_org(tenant,
    vision)` → the controller/plan spawns a qa-coordinator whose memory.context carries
    {vision, target_url, token, org, product, stories (from story_gen), artifact_dir, repo, restart_cmd,

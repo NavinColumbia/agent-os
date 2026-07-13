@@ -32,13 +32,14 @@ present.** The org can already be *planned* for any company and *run* on a durab
 
 ### 1. Give each function REAL work (generalize the tool-worker pattern) — IN PROGRESS
 ✅ DONE (`820d9a2`): the pattern is now GENERIC — any coordinator whose `memory.context` declares a `tool` +
-a list of `items` spawns one tool-worker per item (`runtime._coordinator_specs` generic branch). Two new
-knowledge-work tools shipped in `orchestra/tools.py`: `research` (web-grounded, cited) and `finance_report`
-(CEO financial report from real data/billing). So a research-/finance-/legal-/data-coordinator now staffs a
-real team with one config, reusing dispatch-and-park + report-up. **Remaining: add the specific tools** for
-the functions that need external action (legal doc-scan, data queries, marketing/design outputs, connectors)
-— each is one `run_tool` entry, same shape. Knowledge-work roles (PM specs, strategy, reviews) already work
-as text agents. Original note:
+a list of `items` spawns one tool-worker per item (`runtime._coordinator_specs` generic branch). Tools in
+`orchestra/tools.py`: `research` (web-grounded, cited), `finance_report` (CEO financial report), and
+**`knowledge_work`** — a catch-all that runs ANY of the 92 role charters (product-manager spec, legal review,
+strategy, analysis) as a real deliverable. So EVERY function can be staffed today: structured ones
+(qa/dev/research/finance) with specialized tools, everything else via `knowledge_work` +
+`worker_role=<role>`. **Remaining: specialized tools where a function needs a real EXTERNAL action** (legal
+doc-scan against policy, live data queries, marketing/design asset generation, connectors) — each is one
+`run_tool` entry, same `_agent_tool`/tool-worker shape. Original note:
 Today most of the 92 roles run as **text-only AI workers** (a `factory.agent` decision). That's genuinely
 enough for knowledge work (a PM writing a spec, a strategy memo, a legal *review* of a provided doc, a
 finance analysis of provided numbers). But functions that need an **external action** need a TOOL — exactly

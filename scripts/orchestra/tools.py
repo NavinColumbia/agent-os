@@ -125,7 +125,22 @@ def finance_report(args: dict) -> dict:
     return r
 
 
-_TOOLS = {"qa_explore": qa_explore, "dev_fix": dev_fix, "research": research, "finance_report": finance_report}
+def knowledge_work(args: dict) -> dict:
+    """The catch-all for any KNOWLEDGE-WORK function — a product-manager writing a spec, a legal-compliance
+    review of a provided doc, a strategy memo, an analysis. Runs the given role agent on the task and returns
+    its deliverable. This is how MOST of the 92 role charters do real work (no external tool needed) — pair it
+    with a coordinator's tool-team context (tool='knowledge_work', worker_role='<role>')."""
+    role = args.get("role") or args.get("worker_role") or "specialist"
+    task = args.get("task") or args.get("prompt") or args.get("topic") or ""
+    ctx = args.get("context")
+    prompt = (f"You are the {role}. Do this task to an elite, CEO-grade standard and return your deliverable "
+              f"(be concrete and honest; state assumptions).\n\nTASK:\n{task}"
+              + (f"\n\nCONTEXT:\n{json.dumps(ctx, default=str)[:3000]}" if ctx else ""))
+    return _agent_tool(role, prompt, args)
+
+
+_TOOLS = {"qa_explore": qa_explore, "dev_fix": dev_fix, "research": research,
+          "finance_report": finance_report, "knowledge_work": knowledge_work}
 
 
 def run_tool(name: str, args: dict) -> dict:
@@ -195,6 +210,12 @@ def _selftest():
     assert rr["result"]["topic"] == "the market for AI QA tools"
     rf = run_tool("finance_report", {"data": {"spend": 100, "revenue": 250}})
     assert rf["status"] == "done" and rf["result"]["role"] == "finance-cost-controller", rf
+    # knowledge_work: any role (product-manager, legal-compliance, strategist, …) does a deliverable.
+    fake_f.agent = lambda role, repo, task, **k: {"rc": 0, "out_full": f"[{role}] deliverable"}
+    kw = run_tool("knowledge_work", {"role": "product-manager", "task": "write the launch spec"})
+    assert kw["status"] == "done" and kw["result"]["role"] == "product-manager", kw
+    lg = run_tool("knowledge_work", {"role": "legal-compliance-checklist", "task": "review the ToS", "context": {"doc": "..."}})
+    assert lg["status"] == "done" and "deliverable" in lg["result"]["report"], lg
     fake_f.agent = lambda role, repo, task, **k: {"rc": 1, "out_full": ""}   # a failed agent -> failed tool
     assert run_tool("research", {"topic": "x"})["status"] == "failed"
 
@@ -207,7 +228,8 @@ def _selftest():
     assert run_tool("boom", {})["status"] == "failed" and "browser died" in run_tool("boom", {})["result"]["error"]
     del _TOOLS["boom"]
 
-    print("tools selftest: PASS (qa_explore + dev_fix + research + finance_report; role reports; errors fail-soft)")
+    print("tools selftest: PASS (qa_explore + dev_fix + research + finance_report + knowledge_work; "
+          "any role does real work; errors fail-soft)")
     return 0
 
 

@@ -75,11 +75,18 @@ Expect the same "under-stubbed/timing" fixes we made in the QA drive.
 CONSOLE already has the living org chart (`orgview.py` area B2 → `store.org_tree`, `/api/org/live`); ✅
 specialized external-action tools: `data_query` (`c2b1412`), `legal_scan` + `connector_ingest` (`e7111e6`) —
 the org's tool set now spans qa/dev/research/finance/knowledge_work/data/legal/connectors; ✅ human-pattern
-CEO reporting: the founder digest now includes a **"YOUR ORG (LIVE)"** section — what agents are doing + a
-"⚠ NEEDS YOU" flag for silent/stuck work (`194af72`). Remaining (nice-to-have): a first-class **disagreement**
-pattern (an agent/coordinator pushing back on a directive it believes is wrong — today it can `blocked`/
-`question`/`escalate`; a dedicated posture would be more human), and per-function output tools where a
-function produces artifacts (marketing/design asset generation).
+CEO reporting: the founder digest now includes a **"YOUR ORG (LIVE)"** section (`194af72`); ✅ a first-class
+**DISAGREEMENT** posture (`15fa34b`) — an agent that judges its assignment wrong emits `disagree`, parks, and
+the objection routes UP to the CEO tier to rule on (proceed/revise) via `human_hook`; ✅ **artifact-output
+tools** (`b214251`): `produce_artifact` (writes real deliverable files — marketing copy, docs, reports) +
+`design_asset` (SVG/HTML mockups). **Item 4 is essentially done.**
+
+### 6. Arbitrary CEO directives → the org (loopcontroller callsite) — DONE
+✅ `company.run_directive(directive)` (`cd6f2a7`) AI-plans the org functions a free-text directive needs, then
+drives the company org. ✅ `loopcontroller.run_ceo_directive(directive)` (`338117b`) wires it into the CEO
+controller as an ISOLATED callsite (records a controller_jobs row; does NOT touch the product-build phase
+machine). Remaining: production should dispatch it async (it can be long-running) + surface its result in the
+console; and the LIVE full run to completion (Codex).
 
 ### 5. Standing org that persists across directives
 Confirm the org is a **standing company** (persists, takes directives over time, grows/shrinks) vs ephemeral

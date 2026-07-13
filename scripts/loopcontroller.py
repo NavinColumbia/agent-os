@@ -791,6 +791,39 @@ def choose(tid, thread_id, option_id):
     return {"phase": "DEEP_DESIGN", "chosen": chosen}
 
 
+def run_ceo_directive(directive, *, tenant_id=None, thread_id=None, functions=None):
+    """CALLSITE for an ARBITRARY, ad-hoc CEO directive (beyond the product-build workstream): route it to the
+    agentic COMPANY ORG (company.run_directive AI-plans the functions, then drives them). ISOLATED + additive —
+    it does NOT touch the product-build phase machine (`advance`); it records a controller_jobs row for console
+    visibility and returns the org run result. Production should dispatch this async (it can be long-running);
+    here it's a clean, directly-callable entrypoint. Fail-open on the visibility bookkeeping."""
+    import sys as _sys
+    _orch = str(Path(__file__).resolve().parent / "orchestra")
+    if _orch not in _sys.path:
+        _sys.path.insert(0, _orch)
+    import company
+    tid = tenant_id or (_st(thread_id).get("tenant_id") if thread_id else None) or "ceo"
+    jid = None
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind)
+                           VALUES (%s,%s,'DIRECTIVE','company-directive') RETURNING id""", (thread_id, tid))
+            jid = cur.fetchone()[0]; c.commit()
+    except Exception:
+        pass
+    out = company.run_directive(directive, tenant=tid, functions=functions)
+    try:
+        if jid is not None:
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("UPDATE controller_jobs SET status=%s, result=%s WHERE id=%s",
+                            (out.get("status", "done"), json.dumps({"run_id": out.get("run_id"),
+                             "functions": len(out.get("functions") or [])}), jid))
+                c.commit()
+    except Exception:
+        pass
+    return out
+
+
 def advance(thread_id, job_result=None):
     s = _st(thread_id)
     if not s:

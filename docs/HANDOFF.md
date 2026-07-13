@@ -97,22 +97,19 @@ silence → reconcile re-dispatches).
   `qa_explore` + `dev_fix`, fail-soft. Unit-tested.
 - ✅ **Phase 3a — job runner** (`de7d9f7`): `scripts/orchestra/jobrunner.py` — `dispatch(job)` runs a tool in
   a bg thread, emits `finding`+`done` to the supervisor, flips the parked worker terminal; `reconcile()`
-  re-dispatches silent jobs (idempotent). Unit-tested. **No runtime hot-loop change yet.**
+  re-dispatches silent jobs (idempotent). Unit-tested.
+- ✅ **Phase 3b — runtime hook** (`52da513`): `_worker_step` detects a tool-worker (`memory.context.tool`) and
+  dispatch-and-parks via jobrunner instead of an inline AI call; `run_org` calls `jobrunner.reconcile_parked`
+  at startup (crash-resume). Additive + guarded — the text-worker path is unchanged; `runtime.py selftest`
+  stays 0-fail (incl. the timing-sensitive sibling race).
 
 ---
 
 ## Part 3 — What's REMAINING (do IN ORDER; test each)
 
 ### Short-term (finish the agentic org — the current thrust)
-1. **Phase 3b — the worker hook** (small, but touches the timing-sensitive runtime). In
-   `scripts/orchestra/runtime.py` `_worker_step`, add a branch: if the actor is a **tool-worker** (its
-   `memory.context.tool` is set), on a `task` event call `jobrunner.dispatch({...from actor + assignment...})`
-   and PARK (`step.status="blocked"`, store the job spec in `step.memory`), completing the task event. Do NOT
-   run the tool inline. **After this, `runtime.py selftest` MUST still pass** — it is timing-sensitive
-   (a stray synchronous DB write once broke the "correction broadcast to sibling" race). Also add a
-   reconcile hook in `_pool_loop`/`run_org` (or the watchdog) that calls `jobrunner.reconcile()` for
-   stale tool-job pulses.
-2. **Phase 4 — coordinator actors.** Define `qa-coordinator` and `dev-coordinator` as **supervisor** roles
+1. ✅ DONE — Phase 3b (the worker hook), committed `52da513`. See Part 2.
+2. **Phase 4 — coordinator actors (NEXT).** Define `qa-coordinator` and `dev-coordinator` as **supervisor** roles
    whose `_decompose_specs` spawns tool-workers (extend it to allow a child spec carrying a `tool` + `args`
    in memory). The qa-coordinator: story → one qa-explorer tool-worker each; collect `finding`/`done`;
    blocking bug → hand off (`need_agent`/`task`) to the dev-coordinator; incomplete coverage → spawn more

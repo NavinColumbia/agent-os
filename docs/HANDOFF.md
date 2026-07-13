@@ -85,6 +85,15 @@ converse over the durable message bus, spawn worker actors, hand off to each oth
 survive crashes — instead of the current procedural Python loops (`qa_run.py`, `dev_loop.py`). This is the
 biggest remaining North-Star item. **Full design: [`AGENTIC-QA-ORG.md`](AGENTIC-QA-ORG.md) — read it first.**
 
+> **Beyond QA — the FULL CEO-directed org is now built too** (see [`NORTH-STAR-ROADMAP.md`](NORTH-STAR-ROADMAP.md)).
+> The QA/dev pattern was generalized: `orchestra/tools.py` gained `research`, `finance_report`, and a
+> catch-all `knowledge_work` (any of the 92 role charters does real work); `runtime._coordinator_specs` gained
+> a GENERIC tool-team branch (any coordinator's `context.{tool,items}` staffs a worker team) and a COMPANY
+> branch (a CEO-coordinator's `context.functions` spawns one function coordinator per function); and
+> `orchestra/company.py` `run_company_org(vision, functions)` drives the whole thing — CEO-coordinator →
+> function coordinators → tool-worker teams → reports aggregating up — proven offline (`company.py` selftest).
+> Remaining is live activation + specialized external-action tools + deeper console UI (roadmap items 1/2/3-live/4).
+
 **The crux the design solves:** a story's `qa_explore` drives a LIVE browser for 10–30 min. That can't run
 inside a short lease-bound decide-step (the 900s event lease would reclaim it → duplicate browser) and can't
 be sliced across steps (the browser subprocess must stay alive the whole story). **Solution =

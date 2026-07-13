@@ -296,58 +296,82 @@ def _bug_report(bug: dict, story: dict, n: int, fixed: bool = False) -> dict:
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
 # one round — explore EVERY story fresh, returning (story_reports, bug_reports, first_blocking_bug).
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
+# How many stories to explore CONCURRENTLY. QA is otherwise sequential — one story, one ~2-min claude
+# decide-call at a time — so a real sweep took hours. Each story gets its OWN browser; the global claude_gate
+# still bounds total concurrent claude calls, so this can't over-subscribe. Wall-time drops ~N×.
+_QA_PARALLEL = int(os.environ.get("AOS_QA_PARALLEL", "4"))
+
+
+def _explore_one(story, target_url, vision, token, org, *, max_steps, explorer_cls, artifact_dir, pulse_work_id):
+    """Explore ONE story end-to-end in its own browser. Returns (story_report, collected_bugs). Never raises —
+    a browser/bridge failure or a mid-story crash becomes a blocking bug on the report (safe to run in a pool)."""
+    collected, ex, records = [], None, []
+    try:
+        try:
+            ex = explorer_cls(target_url, vision, token=token, org=org, artifact_dir=artifact_dir)
+        except TypeError:
+            ex = explorer_cls(target_url, vision, token=token, org=org)
+        if ex is not None and pulse_work_id:
+            setattr(ex, "pulse_work_id", pulse_work_id)
+    except Exception as e:                                # a browser/bridge failure is itself a blocking bug
+        collected = [{"bug": f"could not launch the explorer/browser: {e}", "expected": "app is reachable",
+                      "blocking": True, "severity": "critical", "url": target_url, "action": {"cmd": "goto"}}]
+    else:
+        try:
+            records = ex.explore(story, max_steps=max_steps, on_bug=collected.append)
+        except Exception as e:
+            collected.append({"bug": f"explorer crashed mid-story: {e}", "expected": "story completes",
+                              "blocking": True, "severity": "critical", "url": target_url, "action": {"cmd": "noop"}})
+        finally:
+            try:
+                ex.close()
+            except Exception:
+                pass
+    sr = _story_report(story, records, collected)
+    if ex is not None:
+        sr["coverage"] = getattr(ex, "coverage", None)
+        sr["stop_reason"] = getattr(ex, "stop_reason", None)
+        sr["video"] = str(getattr(ex, "video_mp4", None) or "") or None
+    return sr, collected
+
+
 def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_cls,
                bug_seq, on_event=None, artifact_dir=None, pulse_work_id=None):
-    """Drive all stories once against the live app. Stops the round EARLY on the first BLOCKING bug
-    (the app will be fixed + reset + re-run from scratch, so finishing the round is wasted work)."""
-    story_reports, bug_reports, first_blocking = [], [], None
-    for story in stories:
-        collected = []
-        ex = None
-        try:
-            try:
-                ex = explorer_cls(target_url, vision, token=token, org=org, artifact_dir=artifact_dir)
-            except TypeError:
-                ex = explorer_cls(target_url, vision, token=token, org=org)
-            if ex is not None and pulse_work_id:
-                setattr(ex, "pulse_work_id", pulse_work_id)   # per-step heartbeat during explore
-        except Exception as e:                            # a browser/bridge failure is itself a blocking bug
-            bug = {"bug": f"could not launch the explorer/browser: {e}", "expected": "app is reachable",
-                   "blocking": True, "severity": "critical", "url": target_url, "action": {"cmd": "goto"}}
-            collected = [bug]
-            records = []
-        else:
-            try:
-                records = ex.explore(story, max_steps=max_steps, on_bug=collected.append)
-            except Exception as e:
-                records = []
-                collected.append({"bug": f"explorer crashed mid-story: {e}", "expected": "story completes",
-                                  "blocking": True, "severity": "critical", "url": target_url,
-                                  "action": {"cmd": "noop"}})
-            finally:
-                try:
-                    ex.close()
-                except Exception:
-                    pass
+    """Drive all stories once against the live app — CONCURRENTLY (up to _QA_PARALLEL browsers). Sequential
+    exploration made a real sweep take hours; each story is independent, so we fan them out. Results are merged
+    in the original story order; the first BLOCKING bug (by that order) drives the fix+reset+re-run."""
+    from concurrent.futures import ThreadPoolExecutor
+    n = max(1, min(_QA_PARALLEL, len(stories)))
+    results = [None] * len(stories)
 
-        sr = _story_report(story, records, collected)
-        # carry the coverage ledger (tested-vs-yet-to-test), why the story stopped, and its scrollable clip.
-        if ex is not None:
-            sr["coverage"] = getattr(ex, "coverage", None)
-            sr["stop_reason"] = getattr(ex, "stop_reason", None)
-            sr["video"] = str(getattr(ex, "video_mp4", None) or "") or None
+    def _task(i, story):
+        return i, _explore_one(story, target_url, vision, token, org, max_steps=max_steps,
+                               explorer_cls=explorer_cls, artifact_dir=artifact_dir, pulse_work_id=pulse_work_id)
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        for fut in [pool.submit(_task, i, s) for i, s in enumerate(stories)]:
+            try:
+                i, (sr, collected) = fut.result()
+            except Exception as e:                        # a task itself dying is a blocking bug on that story
+                continue
+            results[i] = (sr, collected)
+            if on_event:
+                on_event("story_done", {"story": stories[i].get("id"), "status": sr["status"],
+                                        "bugs": len(collected)})
+
+    # merge in story order (deterministic bug ids + first_blocking), skipping any task that produced nothing.
+    story_reports, bug_reports, first_blocking = [], [], None
+    for i, res in enumerate(results):
+        if res is None:
+            continue
+        sr, collected = res
         story_reports.append(sr)
         for b in collected:
             bug_seq[0] += 1
-            br = _bug_report(b, story, bug_seq[0])
+            br = _bug_report(b, stories[i], bug_seq[0])
             bug_reports.append(br)
             if b.get("blocking") and first_blocking is None:
-                first_blocking = {"explorer_bug": b, "report_bug": br, "story": story}
-        if on_event:
-            on_event("story_done", {"story": story.get("id"), "status": story_reports[-1]["status"],
-                                    "bugs": len(collected)})
-        if first_blocking is not None:                    # stop early — fix + reset + re-run from scratch
-            break
+                first_blocking = {"explorer_bug": b, "report_bug": br, "story": stories[i]}
     return story_reports, bug_reports, first_blocking
 
 

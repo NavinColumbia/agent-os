@@ -12,6 +12,20 @@ top-9 (single-source, *not* re-verified — treat as leads). The prioritized lis
 the deep-research subagent transcripts, themed by area — the complete raw set the synthesis drew from (use as a
 lead index; single-source, unverified).
 
+> **Verification pass (item 17, 2026-07-13).** A second, web-grounded pass re-checked the single-source **[E]**
+> leads against primary sources. **7/8 confirmed**; corrections to note:
+> • **LLM-MAS memory** citation `arXiv 2604.03295` is **WRONG** (different paper) — real source is on TechRxiv/
+>   Springer (see the Appendix note); the 5-challenge + transactive-memory substance is confirmed.
+> • **OTel field names**: our `scripts/otel.py` was **verified correct** — it uses `gen_ai.provider.name` (the
+>   current attr, not the deprecated `gen_ai.system`) and does not assume the unstable `mcp.tool.name`. Only
+>   confirmed MCP attrs are `mcp.method.name/session.id/protocol.version/resource.uri`; GenAI semconv has moved to
+>   the `semantic-conventions-genai` repo.
+> • **MemAct** (2510.12635, id correct) numbers "matches 16× larger, −51% context" verified — cite as the paper's
+>   single-team result. **Memory forms×functions taxonomy** (2512.13564, id correct) — cite as a recent survey's
+>   framework, not settled consensus. **A2A**: MITM/per-message-signing → arXiv **2511.03841**; token/consent gaps
+>   → arXiv **2505.12490** (two different papers). Anthropic context-rot/compaction + Temporal durable-execution
+>   claims confirmed accurate.
+
 ## The one-paragraph takeaway
 The field's biggest unresolved tension is **Anthropic** (orchestrator-worker multi-agent beat single-agent by
 90.2% on breadth-first research) vs **Cognition/Devin** ("Don't Build Multi-Agents"; default to single-threaded
@@ -311,7 +325,7 @@ Mined from the 109 deep-research subagent transcripts (146 raw claim occurrences
 - _[supp]_ Access is governed by read policies that produce filtered/transformed views enforcing current user-agent-resource constraints, and write policies that determine fragment retention and sharing, with permissions modeled as bipartite graphs linking users, agents, and resources.
 - _[supp]_ Every memory fragment carries immutable provenance metadata (contributing agents, accessed resources, timestamps), enabling retrospective permission checks and full auditability of memory operations.
 
-**LLM-MAS memory 2604.03295**
+**LLM-MAS memory** *(⚠ verification (item 17): the extraction's arXiv id 2604.03295 was WRONG — that id is a different paper. Real source: "Memory in LLM-based Multi-agent Systems: Mechanisms, Challenges, and Collective Intelligence" — TechRxiv DOI 10.36227/techrxiv.176539617.79044553 / Springer 10.1007/978-981-92-1468-6_10, NOT on arXiv. The 5-challenge + transactive-memory substance below is CONFIRMED.)*
 - _[cent]_ Memory in LLM-based multi-agent systems (LLM-MAS) is a distinct research frontier from single-agent memory, introducing five new classes of challenge: synchronization, access control, scalability, alignment, and safety.
 - _[cent]_ Effective multi-agent coordination requires transactive (meta-)memory — an explicit 'who knows what' index — so agents can allocate work and avoid redundant processing, analogous to human team transactive memory systems.
 - _[cent]_ LLM-MAS memory is organized into three primary topologies: per-agent private/local stores, centralized shared memory (blackboard-style), and hybrid designs combining local perceptual memory with a shared summarized world-state.

@@ -8,10 +8,11 @@ a **research** note (what we dug up, or that a deeper dig is still owed). Anchor
 
 **Status key:** ✅ done · 🟡 in progress · ⛳ next · ⬜ not started · 🔬 needs research first
 
-**Roll-up (2026-07-13):** **✅ done: 1,2,3,4,5,6,7,8,10,12,13,14,15,16,18** · **🟡 capability shipped, more optional:
-9,11** · **🟡 running: 17.** Every buildable item has landed with a selftest + suite wiring; the remaining
-open threads are explicit *decisions* (6/15/16), *measurement-gated* depth (11 live-wiring), *optional deepenings*
-(1/2/9/10/12/13 follow-ups noted per-item), and the *running* verification pass (17). Nothing is silently skipped.
+**Roll-up (2026-07-13):** **✅ done: 1,2,3,4,5,6,7,8,10,12,13,14,15,16,17,18** · **🟡 capability shipped, more
+optional: 9,11.** Every buildable item has landed with a selftest + suite wiring; the item-17 verification pass
+confirmed 7/8 research leads (corrections applied). The only remaining threads are *measurement-gated* depth
+(11 live-wiring), *optional deepenings* (1/2/9/10/12/13 follow-ups noted per-item), and explicit *decisions*
+(6/15/16). Nothing is silently skipped.
 
 ---
 
@@ -184,11 +185,16 @@ sizes outgrow governed-push planning.
 
 ## Follow-up research (owed digs)
 
-### 17. Verify the Tier-2/3 leads — 🟡 verification pass RUNNING
-A focused web-verification agent is checking the single-source **[E]** leads (agent-memory taxonomy, MemAct
-numbers, Collaborative Memory, LLM-MAS 5 challenges, Anthropic context-rot/compaction, **OTel-GenAI exact field
-names**, A2A security, durable-execution). Findings will land here + drive any corrections (esp. OTel field names
-in `otel.py` if ours are stale). *Report pending.*
+### 17. Verify the Tier-2/3 leads — ✅ done (7/8 confirmed; corrections applied)
+Web-grounded verification pass complete. **7/8 leads confirmed.** Corrections applied to the docs:
+- **LLM-MAS memory** citation `arXiv 2604.03295` was WRONG → real source is TechRxiv/Springer (fixed in the
+  research doc; the 5-challenge + transactive substance is confirmed, so the memory design stands).
+- **`otel.py` verified CORRECT** — already uses `gen_ai.provider.name` (not deprecated `gen_ai.system`) and
+  doesn't assume the unstable `mcp.tool.name`; docstring now points at the moved `semantic-conventions-genai` repo.
+- Framing tightened: MemAct 16×/−51% = a single-team result; memory taxonomy = a recent survey's framework; A2A
+  MITM→2511.03841 vs token/consent→2505.12490. MemAct (2510.12635) + memory-survey (2512.13564) + Collaborative
+  Memory (2505.18279) + Anthropic context-rot + Temporal durable-execution all **confirmed**.
+The memory-layer build (item 9) rests on confirmed research; no rework needed.
 
 ### 18. Mine the full claim set — ✅ done
 The full **133 unique claims** are now mined from the deep-research subagent transcripts into the Appendix of

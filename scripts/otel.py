@@ -12,8 +12,12 @@ kind, and attribute dict an exporter would emit. No hot-path change — exporter
     pulse_to_span(row)          -> the same, derived from an agent_pulse row dict
 
 Ref: OpenTelemetry GenAI semantic conventions (create_agent/invoke_agent/invoke_workflow; gen_ai.operation.name,
-gen_ai.agent.name, gen_ai.provider.name, gen_ai.request.model, gen_ai.usage.*). Field names track the conventions
-as of v1.4x; treat as the stable subset (a follow-up can widen coverage).
+gen_ai.agent.name, gen_ai.provider.name, gen_ai.request.model, gen_ai.usage.*). Field names VERIFIED current
+(item-17 pass, 2026-07-13): we use `gen_ai.provider.name` (NOT the deprecated `gen_ai.system`). The GenAI + MCP
+conventions moved out of the main semconv repo into the dedicated `semantic-conventions-genai` GitHub repo —
+that (and opentelemetry.io/docs/specs/semconv/registry/attributes/gen-ai/) is the authoritative source. Confirmed
+MCP attrs are only mcp.method.name / mcp.session.id / mcp.protocol.version / mcp.resource.uri (don't assume
+mcp.tool.name is a stable semconv attribute).
 """
 
 # our internal work KIND -> the OTel GenAI operation it maps to

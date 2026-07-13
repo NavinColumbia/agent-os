@@ -101,6 +101,23 @@ def daily():
     L += ["AWAITING YOUR DECISION"]
     L += [f"  • {d['what']} ({d['why']})" for d in dq] if dq else ["  • nothing — you're clear"]
     L += [""]
+    # YOUR ORG (LIVE): human-pattern status reporting — what the agents are doing right now, and anything
+    # gone silent/stuck that needs the CEO. Briefed, not bothered: only the working summary + the flags.
+    try:
+        import pulse
+        live = pulse.live()
+        active = [w for w in live if w.get("status") == "active" and not w.get("stalled")]
+        stuck = [w for w in live if w.get("stalled")]
+        L += ["YOUR ORG (LIVE)"]
+        L += ["  " + (f"{len(active)} agent(s) working: " + ", ".join(
+                  f"{w['kind']}·{w.get('stage') or '?'}" for w in active[:6]) if active
+              else "idle — no agentic work in flight right now")]
+        if stuck:
+            L += ["  ⚠ NEEDS YOU — silent/stuck: " + ", ".join(
+                  f"{w['kind']} '{w.get('label') or w['work_id']}'" for w in stuck[:4])]
+        L += [""]
+    except Exception:
+        pass
     # risks
     try:
         import risk

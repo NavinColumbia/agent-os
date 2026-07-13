@@ -707,6 +707,12 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
             plan["full"] = _plan_full_text(plan, pb)
             plan["body"] = pb.strip()
             _set(thread_id, plan=plan)
+            try:  # item 10: durable PLAN checkpoint (external memory) so a context truncation can't lose the plan
+                import companymemory
+                companymemory.checkpoint(tid, str(thread_id), "plan", plan.get("full") or plan.get("body") or "",
+                                         actor_id="loopcontroller", phase="PLAN")
+            except Exception:
+                pass
             _report(tid, thread_id, (clean or "Here's the plan.") + "\n\nDoes this look right? Say \"looks good\" "
                                     "to lock it in, or tell me what to change.", {"kind": "plan", "plan": plan})
         else:
@@ -1287,6 +1293,14 @@ def sla_watchdog():
 def _to(thread_id, phase):
     _set(thread_id, phase=phase)
     audit.append(actor="loopcontroller", action="PhaseChange", resource=str(thread_id), decision=phase)
+    try:  # item 10: durable per-phase ledger in the memory layer (distinct from event history), best-effort
+        import companymemory
+        s = _st(thread_id) or {}
+        companymemory.checkpoint(s.get("tenant_id") or "ceo", str(thread_id), "phase_summary",
+                                 f"Entered {phase}" + (f" · product '{s.get('product')}'" if s.get("product") else ""),
+                                 actor_id="loopcontroller", phase=phase)
+    except Exception:
+        pass
 
 
 def _store_user(tid, thread_id, msg):
@@ -1853,7 +1867,7 @@ def _selftest():
         with psycopg.connect(DB) as c, c.cursor() as cur:
             for t in ("controller_jobs", "controller_state", "chat_messages", "chat_threads", "orgs",
                       "tenant_providers", "tenant_products", "ai_consent", "notifications", "push_targets",
-                      "tenants"):
+                      "tenants", "memory_checkpoints"):
                 cur.execute(f"DELETE FROM {t} WHERE tenant_id=%s", (tid,))
             c.commit()
     sys.exit(0 if ok else 1)

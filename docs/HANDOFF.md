@@ -43,7 +43,21 @@ Newest → oldest. Each is committed, tested, and green.
   reads them; (2) **perspective-diverse JURY** (skeptic / user-flow / evidence lenses, `AOS_AUDITOR_ENSEMBLE`
   default 3) that **ESCALATES on a split** (`close_call`) instead of auto-accepting — a single-pass judge is
   research-proven unsafe. Both QA callers (`qa_run.py`, `qa_agentic.py`) treat a close call as **not a pass**.
-  Mid-sized-judge knob `AOS_AUDITOR_MODEL`. Selftest: `python scripts/review.py --selftest` (wired into suite).
+  Mid-sized-judge knob `AOS_AUDITOR_MODEL`. Auditor now **grounds in the real dev work** (`fix-round-*.json`:
+  files changed + residual bugs, cross-checked vs claims). Selftest: `python scripts/review.py --selftest`.
+- **Auditor VALIDATION harness** (`scripts/qa/auditor_validate.py`): Cohen's kappa vs a human-labeled set,
+  position-bias probe (reorder → verdict must not flip), test-retest ≥3, and a **high-stability+high-bias → FAIL**
+  flag on `pulse`. Needs a real labeled fixture set to run in anger. `python scripts/qa/auditor_validate.py --selftest`.
+- **Memory-layer first slice** (`scripts/companymemory.py`, `postgres/initdb/52-memory.sql`) — design in
+  [`docs/MEMORY-LAYER-DESIGN.md`](MEMORY-LAYER-DESIGN.md). Extends the existing spine with two-tier
+  `shared`/`private` visibility, per-role scope, provenance (author/run/sources → tamper-evident audit chain), and
+  **coordinator PLAN + phase-SUMMARY checkpoints** (`checkpoint()`/`plan()`/`summaries()` — item 10 storage).
+  **Activated the previously-dead fleet-learning writer**: `learn_from_fix()` distills a role lesson at the QA
+  fix-loop post-mortem (`AOS_MEMORY_LEARN`, default on). `.venv/bin/python scripts/companymemory.py selftest` (needs DB).
+- **The live tracker is [`docs/IMPROVEMENTS-PLAN.md`](IMPROVEMENTS-PLAN.md)** — per-item status/approach/research
+  owed for all 18. Continue from there. Remaining highlights: item-10 **wiring** (call `checkpoint()` from the
+  controller + `loopcontroller` phase transitions — storage already done), item-11 compaction, Tier-1 (mandatory
+  task contracts, full-trace sharing, fan-out cost gate, MAST checklist), item-13 provable effect records.
 
 ### QA is now coverage-driven and honest
 - **`75834fd` coverage-driven QA** — the explorer no longer stops at a hardcoded step count. It enumerates a

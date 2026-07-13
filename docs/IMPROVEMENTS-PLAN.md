@@ -94,11 +94,12 @@ w/ safe defaults; (2) provenance + `audit.append` on every write; (3) **activate
 **Research owed:** open questions in the design doc (global-vs-tenant lessons; whether coordinators actually
 truncate today → gates item 11; MemAct RL curation deferred to item 17; retention/GDPR).
 
-### 10. [V] External-memory checkpoint of coordinator PLAN + per-phase SUMMARY — 🟡 storage done, wiring pending
-**Done:** the durable store + API (`memory_checkpoints`, `checkpoint()`/`plan()`/`summaries()`) shipped with the
-item-9 slice. **Remaining:** wire the CALLS — controller's first decide step writes `checkpoint('plan', …)` and
-reads it back each turn; `loopcontroller` phase transitions write `checkpoint('phase_summary', …)`. (Design doc §3.)
-**Research:** none owed.
+### 10. [V] External-memory checkpoint of coordinator PLAN + per-phase SUMMARY — ✅ done
+**Done:** storage + API shipped with item 9; now WIRED into `loopcontroller` — a **PLAN checkpoint** is written
+the moment the plan is set (line ~709), and a **phase_summary checkpoint** at every `_to()` phase transition, so
+the plan + progress survive a context truncation. Best-effort (never breaks a transition); suite wiring guard +
+selftest green.
+**Optional:** have the controller decide-prompt READ `plan()` back each turn instead of re-deriving (small follow-up).
 
 ### 11. [E] Context COMPACTION against "context rot" — ⬜ not started
 **Approach:** when a coordinator's context nears the limit, summarize completed phases out of the live window and

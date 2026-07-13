@@ -229,6 +229,7 @@ ckp "QA ship-gate wired (verdict JSON consumed)" "$PY scripts/test_qa_gate_wired
 ckp "auditor: master-key sanitize + jury escalate" "$PY scripts/review.py --selftest | grep -q 'review.py selftest: PASS'"
 ckp "auditor VALIDATION (kappa/bias/retest)"        "$PY scripts/qa/auditor_validate.py --selftest | grep -q 'auditor_validate selftest: PASS'"
 ckp "experiential writer wired (fix-loop -> memory)" "grep -q 'companymemory.learn_from_fix' scripts/qa/qa_run.py"
+ckp "coordinator plan/phase checkpoints wired (item10)" "grep -q 'companymemory.checkpoint' scripts/loopcontroller.py"
 
 # Fire the bounded concurrent pool for everything enqueued above.
 run_pool

@@ -44,11 +44,18 @@ the agent should exit the gate when good-enough. Applies to DISCOVER (→RESEARC
   registered `ceo-e2e` (enterprise plan, subscription provider) for testing.
 
 ## Status
-- [ ] G1 — central `jobd` execution service (the big one)
-- [ ] G2 — decisive chat-gate prompts (agent self-advances)
-- [ ] F1 — `_llm` timeout retry + honest resumable fallback
-- [ ] F3 — precise quota-vs-integrity error mapping
-- [x] F5 — tenant/plan/provider set up for the e2e
+- [x] **G1 — central `jobd` execution service.** `scripts/jobd.py` — a long-lived daemon that each tick (a)
+  runs `resume_stalled()` (recover orphans, now IN a persistent process so re-dispatched work survives), and
+  (b) drives every *runnable* thread (awaiting IS NULL, not DELIVER, settled ≥5s) via `advance()`, so the fleet
+  work it dispatches lives in jobd and cascades to completion — instead of dying with a short-lived caller or
+  the old 10-min `loopcontroller.py resume` subprocess. Per-thread advisory lock prevents double-drive. Wired
+  into `recover.sh` (persistent daemon) + `selftest.sh`; running live (pid confirmed, driving threads).
+  *Follow-up:* fully route dispatch through jobd (enqueue-only `_dispatch`, drop the inline thread) once proven
+  in prod — jobd already guarantees progress as the durable driver, so this is an optimization, not a gap.
+- [x] G2 — decisive chat-gate prompts (agent self-advances; DISCOVER no longer perky).
+- [x] F1 — `_llm` timeout retry (3× backoff, longer timeout) + honest resumable fallback (never bare "timeout").
+- [x] F3 — precise quota-vs-integrity error mapping (only a real "quota reached" → billing message).
+- [x] F5 — tenant/plan/provider set up for the e2e.
 
 ## Live run
 Baseline build (pre-fix): thread 1561, tenant `ceo-e2e` — research fleet ran green after the tenant fix; used

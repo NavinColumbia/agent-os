@@ -70,6 +70,13 @@ else
   ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/dashboard.py serve 8092" >/tmp/dashboard.log 2>&1 </dev/null & )
   sleep 1; pgrep -f "dashboard.py serve" >/dev/null && ok "dashboard started" || warn "dashboard failed"
 fi
+
+hdr "4d2. Central controller execution daemon (jobd — owns driving builds so fleet work never dies with its caller)"
+if pgrep -f "jobd.py serve" >/dev/null; then ok "jobd already running"
+else
+  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/jobd.py serve 15" >/tmp/jobd.log 2>&1 </dev/null & )
+  sleep 1; pgrep -f "jobd.py serve" >/dev/null && ok "jobd started (15s tick)" || warn "jobd failed"
+fi
 tailscale serve status 2>/dev/null | grep -q 9443 || tailscale serve --bg --https=9443 http://127.0.0.1:8092 >/dev/null 2>&1
 ok "dashboard private over Tailscale: https://nyaan.tail502e3f.ts.net:9443"
 

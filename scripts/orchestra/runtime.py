@@ -215,8 +215,12 @@ def _hire(ctx, supervisor_id, spec):
     Returns the new actor_id (or None on a store refusal, which is journaled)."""
     kind = "supervisor" if spec.get("kind") == "supervisor" else "worker"
     mem = {"repo": ctx.repo}
+    cblob = dict(spec.get("context") or {})   # a context blob (e.g. a bug handed to a dev-coordinator)
     if spec.get("tool"):                      # a TOOL-worker: tool + args ride in memory.context so its
-        mem["context"] = {"tool": spec["tool"], "tool_args": spec.get("tool_args") or {}}  # step dispatch-and-parks
+        cblob["tool"] = spec["tool"]          # step dispatch-and-parks
+        cblob["tool_args"] = spec.get("tool_args") or {}
+    if cblob:
+        mem["context"] = cblob
     child = store.spawn_actor(ctx.run_id, ctx.tenant, spec.get("name") or spec.get("role") or "agent",
                               spec.get("role") or "engineer", kind=kind,
                               supervisor_id=supervisor_id, assignment=spec.get("task"),
@@ -572,6 +576,28 @@ def _supervisor_step(ctx, a, evs):
                                        {"note": f"expansion declined: {dec.get('rationale')}"}, corr))
                     act = "declined"
                 handled.append({"frm": frm, "kind": k, "action": act,
+                                "outstanding": _live_children()})
+                continue
+
+            # QA-COORDINATOR dev-handoff (phase 4b): a BLOCKING finding from an explorer is handed to a
+            # dev-coordinator — the coordinator-to-coordinator conversation. Deterministic: hire a
+            # dev-coordinator with the bug + repo/vision in its context; it spawns a dev-fixer, fixes on the
+            # real git diff, and emits `done` back up, which the qa-coordinator aggregates. (Re-test of the
+            # fixed story after the fix is a further refinement — see HANDOFF phase 4b.)
+            if k == "finding" and (a.get("role") or "").lower() == "qa-coordinator" and p.get("blocking"):
+                cc = dict((a.get("memory") or {}).get("context") or {})
+                _hire_or_request(ctx, a, [{
+                    "name": f"{a['name']}.dev{len(children)}", "role": "dev-coordinator", "kind": "supervisor",
+                    "task": f"Fix blocking bug: {p.get('title') or p.get('bug') or 'defect'}",
+                    "context": {"bug": p, "vision": cc.get("vision"), "repo": cc.get("repo"),
+                                "target_url": cc.get("target_url"), "stories": cc.get("stories"),
+                                "token": cc.get("token"), "org": cc.get("org"),
+                                "restart_cmd": cc.get("restart_cmd"), "health_url": cc.get("health_url")}}],
+                    step, corr)
+                children = {c["actor_id"]: c for c in store.actors(ctx.run_id, tid)
+                            if c["supervisor_id"] == me}          # include the new dev-coordinator as a child
+                _audit(a["name"], "QaDevHandoff", "executed", {"bug": (p.get("title") or p.get("bug"))})
+                handled.append({"frm": frm, "kind": k, "action": "dev_handoff",
                                 "outstanding": _live_children()})
                 continue
 

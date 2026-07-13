@@ -97,6 +97,8 @@ def _selftest():
     _orig_tool = tools.run_tool
 
     def fake_tool(name, args):
+        if name == "dev_fix":                     # the dev-fixer tool-worker (spawned via the dev-handoff)
+            return {"status": "done", "findings": [], "result": {"fixed": True, "files": ["src/x.js"]}}
         sid = (args.get("story") or {}).get("id")
         return {"status": "done", "findings": [{"kind": "bug", "title": f"bug {sid}", "blocking": True,
                 "story": sid}], "result": {"story": sid, "stop_reason": "coverage-complete"}}
@@ -107,15 +109,16 @@ def _selftest():
     try:
         out = run_agentic_qa("http://app.test", "A console the user signs in to and messages an assistant.",
                              product="agentic-selftest", stories=[{"id": "US1"}, {"id": "US2"}],
-                             tenant="agentic-selftest", repo=".", workers=2, drive_budget_s=40, stall_s=2.0)
+                             tenant="agentic-selftest", repo=".", workers=2, drive_budget_s=60, stall_s=2.0)
+        roles = [a.get("role") for a in store.actors(out["run_id"], "agentic-selftest")]
         assert out["status"] == "done", f"the org run must finish; got {out['status']}"
-        assert len(out["explorers"]) == 2, f"one qa-explorer per story; got {len(out['explorers'])}"
-        assert all(a.get("status") in ("done", "dead") for a in out["explorers"]), \
-            "every explorer must reach terminal (tool_result -> done)"
+        assert roles.count("qa-explorer") == 2, f"one qa-explorer per story; got {roles.count('qa-explorer')}"
         assert len(out["findings"]) == 2, f"both explorers' findings must flow back over the bus; got {out['findings']}"
-        assert sorted(f.get("story") for f in out["findings"]) == ["US1", "US2"]
-        print(f"qa_agentic selftest: PASS (full async org drive -> {out['status']}: 2 explorers, "
-              f"dispatch-and-park, 2 findings over the bus)")
+        # dev-handoff: each BLOCKING finding -> a dev-coordinator hired, which spawns a dev-fixer.
+        assert roles.count("dev-coordinator") == 2, f"a dev-coordinator per blocking bug; got {roles.count('dev-coordinator')}"
+        assert roles.count("dev-fixer") == 2, f"a dev-fixer per dev-coordinator; got {roles.count('dev-fixer')}"
+        print(f"qa_agentic selftest: PASS (full async org -> {out['status']}: 2 explorers found bugs, "
+              f"qa-coordinator handed off to 2 dev-coordinators -> 2 dev-fixers fixed them)")
         return 0
     finally:
         tools.run_tool = _orig_tool

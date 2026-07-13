@@ -119,19 +119,15 @@ silence → reconcile re-dispatches).
 ## Part 3 — What's REMAINING (do IN ORDER; test each)
 
 ### Short-term (finish the agentic org — the current thrust)
-1. ✅ DONE — Phases 3b/4/5 (`52da513`/`a8aed28`/`8ad739b`/`f4bbcd0`). The agentic org WORKS end-to-end and is
-   reliably tested (full async drive, `python scripts/qa/qa_agentic.py`). See Part 2.
-2. **Phase 4b — coordinator DECISION logic (NEXT — this is what makes it QA, not just "explore + ack").**
-   Right now the qa-coordinator uses the GENERIC supervisor decide/aggregate (it `ack`s child findings and
-   aggregates a bland result). Add the QA-specific decisions as a role-branch in `_supervisor_step`'s
-   finding/aggregate handling. The generic supervisor step already spawns children,
-   reacts to `finding`/`done` via `_DECIDE_PROMPT`, and aggregates. Add the QA-specific decisions on top:
-   (a) qa-coordinator receives a BLOCKING `finding` → hand off to a dev-coordinator (spawn one, or emit a
-   `task` carrying the bug in its context) rather than a generic AI decide; (b) on incomplete coverage in a
-   child's `done`, spawn more qa-explorers (gap-fill as real hires); (c) at aggregate, run the auditor
-   (`review.review`) sign-off before emitting the verdict `done`; (d) dev-coordinator's fixer `done` → tell
-   qa-coordinator to re-test. Likely a small role-branch in `_supervisor_step`'s finding/aggregate handling.
-   Role manifests: `~/projects/control-plane/roles/{qa-coordinator,dev-coordinator}.yaml` (`can_spawn:true`),
+1. ✅ DONE — Phases 3b/4/5 + 4b hand-off (`52da513`/`a8aed28`/`8ad739b`/`f4bbcd0`/`ef0253b`). The agentic org
+   WORKS end-to-end incl. **qa-coordinator → dev-coordinator → dev-fixer** hand-off, reliably tested
+   (`python scripts/qa/qa_agentic.py`: 2 explorers find bugs → 2 dev-coordinators → 2 dev-fixers → done).
+2. **Phase 4b remaining refinements (NEXT).** Done: (a) blocking-finding → dev-coordinator hand-off. Still to
+   add as `_supervisor_step` qa-coordinator branches: (b) on incomplete coverage in an explorer's `done`,
+   hire more qa-explorers (gap-fill); (c) after a dev-coordinator's `done`, RE-TEST the fixed story (hire a
+   fresh qa-explorer for it) — the closed loop; (d) at aggregate, run `review.review` (auditor) sign-off and
+   emit an honest verdict as the coordinator's `done`. Role manifests (governance hygiene; fail-open works
+   without them): `~/projects/control-plane/roles/{qa-coordinator,dev-coordinator}.yaml` (`can_spawn:true`),
    `{qa-explorer,dev-fixer}.yaml` (`can_spawn:false`).
 3. **Phase 5 — agentic entrypoint.** `qa_run(..., agentic=True)` creates the QA org: `create_org(tenant,
    vision)` → the controller/plan spawns a qa-coordinator whose memory.context carries

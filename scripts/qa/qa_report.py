@@ -56,9 +56,23 @@ OUT_DIR = Path(os.environ.get("AOS_QA_DIR", "/tmp/aos-qa"))
 # ---------------------------------------------------------------------------------------------------
 # Grounded tallies — NEVER an AI call. The verdict a human trusts must be derived from the run itself.
 # ---------------------------------------------------------------------------------------------------
+def _incomplete(story: dict) -> bool:
+    """True when the run did NOT finish testing this story — coverage aspects remain untested, or it stopped
+    for an incomplete/stuck/stalled/capped/deadline reason. Such a story is NEVER 'passed' no matter what its
+    label says: a run that gave up mid-way has not earned a pass (the auditor caught exactly this dishonesty)."""
+    cov = story.get("coverage") or []
+    if any(not c.get("covered") for c in cov):
+        return True
+    stop = (story.get("stop_reason") or "").lower()
+    return any(k in stop for k in ("incomplete", "stalled", "stuck", "cap", "deadline"))
+
+
 def _norm_status(story: dict) -> str:
-    """A story's status. Prefer an explicit status; otherwise DERIVE it from its steps so a run that only
-    recorded per-step verdicts still gets an honest story-level pass/fail (no silent 'unknown -> green')."""
+    """A story's status. An INCOMPLETE run can never be 'passed' (honest reporting — see _incomplete). Then
+    prefer an explicit status; otherwise DERIVE it from steps so a run that only recorded per-step verdicts
+    still gets an honest story-level pass/fail (no silent 'unknown -> green')."""
+    if _incomplete(story):
+        return "incomplete"
     s = (story.get("status") or "").strip().lower()
     if s in ("passed", "pass", "ok", "green"):
         return "passed"
@@ -78,7 +92,7 @@ def _tally(run: dict) -> dict:
     """Deterministic coverage + bug accounting for the whole run."""
     stories = run.get("stories") or []
     bugs = run.get("bugs") or []
-    per = {"passed": 0, "failed": 0, "blocked": 0, "unknown": 0}
+    per = {"passed": 0, "failed": 0, "blocked": 0, "unknown": 0, "incomplete": 0}
     for st in stories:
         per[_norm_status(st)] = per.get(_norm_status(st), 0) + 1
 
@@ -90,7 +104,8 @@ def _tally(run: dict) -> dict:
 
     open_bugs = [b for b in bugs if not _truthy(b, "fixed", "resolved")]
     blocking_open = [b for b in open_bugs if _truthy(b, "blocking", "blocker")]
-    all_passed = bool(stories) and per["failed"] == 0 and per["blocked"] == 0 and per["unknown"] == 0
+    all_passed = (bool(stories) and per["failed"] == 0 and per["blocked"] == 0
+                  and per["unknown"] == 0 and per["incomplete"] == 0)
     # A run passes only if every story passed AND nothing blocking is still open. A non-blocking open bug
     # is noted but does not veto the verdict (ship-with-known-issues is a real, honest outcome).
     passed = all_passed and not blocking_open
@@ -117,6 +132,8 @@ def _verdict_line(t: dict) -> str:
         parts.append(f"{p['blocked']} blocked")
     if p["unknown"]:
         parts.append(f"{p['unknown']} inconclusive")
+    if p.get("incomplete"):
+        parts.append(f"{p['incomplete']} INCOMPLETE (coverage not finished)")
     story_part = ", ".join(parts) or "0 clean"
     bug_part = f"{t['open_bugs']} open bug(s)"
     if t["blocking_open"]:

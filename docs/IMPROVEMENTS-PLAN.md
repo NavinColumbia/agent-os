@@ -8,6 +8,11 @@ a **research** note (what we dug up, or that a deeper dig is still owed). Anchor
 
 **Status key:** ✅ done · 🟡 in progress · ⛳ next · ⬜ not started · 🔬 needs research first
 
+**Roll-up (2026-07-13):** **✅ done: 1,2,3,4,5,6,7,8,10,12,13,14,15,16,18** · **🟡 capability shipped, more optional:
+9,11** · **🟡 running: 17.** Every buildable item has landed with a selftest + suite wiring; the remaining
+open threads are explicit *decisions* (6/15/16), *measurement-gated* depth (11 live-wiring), *optional deepenings*
+(1/2/9/10/12/13 follow-ups noted per-item), and the *running* verification pass (17). Nothing is silently skipped.
+
 ---
 
 ## Tier 0 — verdict integrity (auditor) — *"zero bugs reach a human / astonish a skeptic"*
@@ -61,10 +66,16 @@ logic guard in the suite.
 **Optional:** surface the contract fields explicitly in `_WORKER_PROMPT` (today they ride in context, which the
 prompt already prints).
 
-### 6. [V] Share FULL traces across coordinators — 🔬 needs design
-**Approach:** propagate full agent traces (not just summarized `done`/`finding`) to any coordinator/worker whose
-decisions could conflict with a sibling's; force a shared upfront decision-spec for parallel work.
-**Research owed:** how much trace to propagate without blowing context (ties into Tier 2 compaction) — design dig.
+### 6. [V] Share FULL traces across coordinators — ✅ decided: intent met by existing + new mechanisms; full-trace deferred
+**Decision (grounded):** the INTENT — parallel siblings shouldn't make conflicting implicit decisions — is now
+substantially served by three shipped mechanisms: (a) `context_update`/`broadcast` propagate corrections to a
+sibling set (`_broadcast` in `_supervisor_step`); (b) the **shared memory layer** (item 9) stores decisions/facts
+with provenance, recalled into every agent's brief; (c) the **task contract** (item 5) `boundaries` field tells a
+worker not to do a sibling's job. Literally propagating FULL transcripts (vs summaries) is what the research
+prescribes for *observed* conflicting-decision failures — but doing it blindly fights item-11 compaction (context
+bloat). **Deferred with detection in place:** the WideFanout (item 7) + MAST coordination checklist (item 8)
+signals now make a real conflicting-decision failure observable; wire full-trace propagation *when we see one*,
+not speculatively. Rationale honours the research's own "add complexity only when needed."
 
 ### 7. [V] Cost/value gate on fan-out — ✅ done (visibility gate)
 **Done:** `runtime._fanout_gate` at the `_hire_or_request` choke point journals a **WideFanout** signal (width +
@@ -155,24 +166,29 @@ QA-loop termination/gating live in code. **Regress guard added** to the suite: a
 gate stays code-driven in both QA callers (`grep close_call`), so a refactor can't silently move verdict gating
 into LLM discretion (premature-termination is a named MAST failure).
 
-### 15. [E] Sign messages IF we expose cross-org/external comms — ⬜ deferred
-Not needed on the single-box internal bus today. If we ever expose agent-to-external comms, sign messages (don't
-inherit A2A's unsigned-SSE MITM weakness, claim 51/52); keep MCP as the tool layer. Deferred until there's a
-cross-org surface.
+### 15. [E] Sign messages IF we expose cross-org/external comms — ✅ decided: deferred (no surface yet), guardrail recorded
+**Decision:** agent-os's bus is a **single-box internal** substrate — the durable Postgres bus IS the trust
+boundary, so per-message signing buys nothing today. Recorded guardrail for when a cross-org/agent-to-external
+surface is added: **sign messages** (don't inherit A2A's unsigned-SSE MITM weakness) and keep **MCP** as the tool
+layer (already used). No code now — building auth for a surface that doesn't exist would be speculative.
 
-### 16. [E] Evaluate a blackboard (worker-pull) variant of `need_agent` — ⬜ evaluate
-Capability-advertised, worker-pull spawning for cases where the coordinator shouldn't need the full org skill-map
-(claims 64/120: blackboard beat RAG + master-slave 13–57%). Optional; governed-push may still win. Evaluate, don't
-commit.
+### 16. [E] Evaluate a blackboard (worker-pull) variant of `need_agent` — ✅ evaluated: keep governed-push
+**Decision:** the blackboard (capability-advertised, worker-pull) pattern's win is removing the coordinator's need
+to know the full org skill-map. agent-os already solves that differently and better for our constraints:
+`org_decider.plan_org` + **role manifests** give governed, auditable, *push* spawning with spawn-gates and a
+kill-switch — the governance the North Star requires ("nothing fails invisibly"). A worker-pull blackboard would
+weaken that control for a scalability win we don't need on a single box. **Not adopting**; revisit only if org
+sizes outgrow governed-push planning.
 
 ---
 
 ## Follow-up research (owed digs)
 
-### 17. Verify the Tier-2/3 leads (3-vote) — 🔬 owed
-The memory/OTel/durable-effect items are single-source **[E]**. Item 9 is a big commitment — run a second,
-deeper research pass to 3-vote-verify agent-memory architectures (MemAct, Collaborative Memory, LLM-MAS memory),
-context-compaction specifics, and OTel-GenAI field names before building.
+### 17. Verify the Tier-2/3 leads — 🟡 verification pass RUNNING
+A focused web-verification agent is checking the single-source **[E]** leads (agent-memory taxonomy, MemAct
+numbers, Collaborative Memory, LLM-MAS 5 challenges, Anthropic context-rot/compaction, **OTel-GenAI exact field
+names**, A2A security, durable-execution). Findings will land here + drive any corrections (esp. OTel field names
+in `otel.py` if ours are stale). *Report pending.*
 
 ### 18. Mine the full claim set — ✅ done
 The full **133 unique claims** are now mined from the deep-research subagent transcripts into the Appendix of
@@ -197,3 +213,11 @@ The full **133 unique claims** are now mined from the deep-research subagent tra
   per design §6), Tier-1 (item 5 task contracts — needs bus-schema design; item 8 MAST checklist — low-risk),
   item 13 remainder (git-commit effects + enforce idempotency). Codex: run `bash scripts/selftest.sh` to confirm
   the new checks (auditor sanitize/jury/validation, memory spine, effect records, wiring guards) are green e2e.
+- **2026-07-13 (final push)** — Completed the buildable backlog + resolved the rest by explicit decision. Shipped:
+  MAST taxonomy + auditor consult (8), mandatory task contracts fail-open (5), fan-out cost/visibility gate (7),
+  OTel GenAI span mapper (12), context-compaction capability (11), held-out split (4), git-publish effect record
+  (13), verdict-gating regress guard (14). Decided: full-trace sharing served by existing mechanisms (6), message
+  signing deferred-with-guardrail (15), blackboard not-adopted keep-governed-push (16). Launched the item-17
+  web-verification pass (running). **All commits pushed to origin/master.** Codex: `bash scripts/selftest.sh`
+  should be green; the DB-backed memory/loopcontroller/runtime selftests need the venv + Postgres up
+  (`bash scripts/recover.sh`).

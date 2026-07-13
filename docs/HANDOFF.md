@@ -54,10 +54,15 @@ Newest → oldest. Each is committed, tested, and green.
   **coordinator PLAN + phase-SUMMARY checkpoints** (`checkpoint()`/`plan()`/`summaries()` — item 10 storage).
   **Activated the previously-dead fleet-learning writer**: `learn_from_fix()` distills a role lesson at the QA
   fix-loop post-mortem (`AOS_MEMORY_LEARN`, default on). `.venv/bin/python scripts/companymemory.py selftest` (needs DB).
-- **The live tracker is [`docs/IMPROVEMENTS-PLAN.md`](IMPROVEMENTS-PLAN.md)** — per-item status/approach/research
-  owed for all 18. Continue from there. Remaining highlights: item-10 **wiring** (call `checkpoint()` from the
-  controller + `loopcontroller` phase transitions — storage already done), item-11 compaction, Tier-1 (mandatory
-  task contracts, full-trace sharing, fan-out cost gate, MAST checklist), item-13 provable effect records.
+- **The live tracker is [`docs/IMPROVEMENTS-PLAN.md`](IMPROVEMENTS-PLAN.md)** — per-item status for all 18.
+  **As of 2026-07-13 the backlog is worked through:** ✅ items 1–8,10,12,13,14,15,16,18; 🟡 9 & 11 (capability
+  shipped, deeper wiring measurement-gated); 🟡 17 (a web-verification pass is running to confirm the single-source
+  memory/OTel/A2A leads and correct any stale field names). New modules this pass: `scripts/orchestra/mast.py`
+  (MAST 14-mode taxonomy), `scripts/otel.py` (OTel GenAI span mapper), `scripts/qa/auditor_validate.py`
+  (auditor validation + hold-out split). New runtime behaviour: task **contracts** on every hire
+  (`runtime._task_contract`, fail-open), a fan-out **cost/visibility gate** (`runtime._fanout_gate`), provable
+  **effect records** (`tools.effect_record` + `appregistry` git-publish). Items 6/15/16 were resolved by explicit
+  documented **decision** (see the plan) rather than speculative code.
 
 ### QA is now coverage-driven and honest
 - **`75834fd` coverage-driven QA** — the explorer no longer stops at a hardcoded step count. It enumerates a

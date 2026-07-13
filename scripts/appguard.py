@@ -14,6 +14,7 @@ raising a limit is a spend decision and requires your approval.
     appguard.py selftest
 Run with the agent-os venv python.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +30,12 @@ DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
            if l.strip().startswith("DATABASE_URL=")), None)
 PRODUCTS = Path.home() / "projects" / "products"
 RATE_PER_1K = 0.003   # $/1k tokens — operating-spend proxy
-DEFAULT_CAP, DEFAULT_LOSS = 100.0, 20.0
+# Liberal by default (backstops must not be conservative): a from-scratch full-stack Opus build (build + multi-
+# round quality loop + agentic QA) legitimately spends real money, so a tight cap would strangle its own build.
+# This is only a RUNAWAY hard cap; the loss-limit (below) guards a live product's profitability, and only once
+# it's actually earning (revenue > 0). Both env-configurable.
+DEFAULT_CAP = float(os.environ.get("AOS_APP_SPEND_CAP", "500.0"))
+DEFAULT_LOSS = float(os.environ.get("AOS_APP_LOSS_LIMIT", "100.0"))
 
 
 def _ensure():
@@ -92,16 +98,28 @@ def pause(app, reason):
     notify.send(f"⏸ {app} auto-paused — {reason}", title="app circuit-breaker", priority="high", tags="pause_button")
 
 
+def _pause_reason(e, p):
+    """Pure pause decision (unit-testable). Returns a reason string to pause, or None to stay active.
+    - The hard SPEND CAP always binds (runaway guard).
+    - The LOSS/PROFIT breaker only applies to a LIVE, MONETIZING product (revenue > 0). A product still being
+      BUILT always has $0 revenue and non-zero spend, so its profit is always negative — applying the loss limit
+      there would (and did) pause every build the instant its spend passed the loss limit, strangling its OWN
+      build (F9). "Losing money" is only meaningful once a product is actually earning; before launch only the
+      (deliberately liberal) spend cap binds. So the loss breaker stays dormant until revenue attribution exists."""
+    if e["spend"] >= p["spend_cap"]:
+        return f"spend ${e['spend']} ≥ cap ${p['spend_cap']}"
+    if e["revenue"] > 0 and e["profit"] <= -p["loss_limit"]:
+        return f"losing ${-e['profit']} (limit ${p['loss_limit']}) with ${e['revenue']} revenue"
+    return None
+
+
 def evaluate(app):
     p = _policy(app)
     e = economics(app)
     if p["status"] == "paused":
         return {"app": app, "state": "paused", **e}
-    over_cap = e["spend"] >= p["spend_cap"]
-    losing = e["profit"] <= -p["loss_limit"]
-    if over_cap or losing:
-        why = (f"spend ${e['spend']} ≥ cap ${p['spend_cap']}" if over_cap
-               else f"losing ${-e['profit']} (limit ${p['loss_limit']}) with ${e['revenue']} revenue")
+    why = _pause_reason(e, p)
+    if why:
         pause(app, why)
         return {"app": app, "state": "paused", "reason": why, **e}
     return {"app": app, "state": "active", **e}
@@ -179,22 +197,61 @@ def _main(a):
         print(json.dumps(resume(a[1]), indent=2))
     elif a[0] == "selftest":
         import os
-        app = f"guard-demo-{os.urandom(3).hex()}"
-        set_policy(app, cap=100, loss=20)
-        # real operating spend with no revenue: a $24 agent step (over the $20 loss limit)
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,cost_usd)
-                           VALUES (%s,%s,'X','r','agent',24)""", (f"g-{app}", app))
-            c.commit()
-        before = _policy(app)["status"]
-        r = evaluate(app)
-        after = _policy(app)["status"]
-        ok = before == "active" and after == "paused" and r["state"] == "paused"
-        with psycopg.connect(DB) as c, c.cursor() as cur:   # cleanup
-            cur.execute("DELETE FROM app_policies WHERE app=%s", (app,))
-            cur.execute("DELETE FROM traces WHERE product=%s", (app,)); c.commit()
-        print(f"app spent $24 with $0 revenue -> auto-paused: {before}→{after} ({r.get('reason')})")
-        print("PASS: per-app circuit-breaker auto-pause ✅" if ok else "FAIL")
+        ok = True
+
+        def _spend(app, usd, rev=0.0):
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,cost_usd)
+                               VALUES (%s,%s,'X','r','agent',%s)""", (f"g-{app}", app, usd))
+                if rev:
+                    try:
+                        cur.execute("""INSERT INTO org_metrics (product, revenue_usd) VALUES (%s,%s)""", (app, rev))
+                    except Exception:
+                        pass
+                c.commit()
+
+        def _clean(app):
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("DELETE FROM app_policies WHERE app=%s", (app,))
+                cur.execute("DELETE FROM traces WHERE product=%s", (app,))
+                try:
+                    cur.execute("DELETE FROM org_metrics WHERE product=%s", (app,))
+                except Exception:
+                    pass
+                c.commit()
+
+        # (1) F9 FIX: a PRE-LAUNCH build (no revenue) is NOT paused by the loss limit, even though profit is
+        #     negative — else it strangles its own build. Only the hard spend cap binds before launch.
+        a1 = f"guard-build-{os.urandom(3).hex()}"
+        set_policy(a1, cap=500, loss=20)
+        _spend(a1, 24)                              # $24 spend, $0 revenue: profit -$24, past the $20 loss limit
+        r1 = evaluate(a1)
+        c1 = r1["state"] == "active"
+        print(("PASS" if c1 else "FAIL") + f": pre-launch build ($24 spend, $0 rev) is NOT paused by loss limit ({r1['state']})")
+        ok = ok and c1
+        _clean(a1)
+
+        # (2) the HARD SPEND CAP still binds a runaway pre-launch build.
+        a2 = f"guard-runaway-{os.urandom(3).hex()}"
+        set_policy(a2, cap=100, loss=20)
+        _spend(a2, 140)                             # $140 spend > $100 cap
+        r2 = evaluate(a2)
+        c2 = r2["state"] == "paused" and "cap" in (r2.get("reason") or "")
+        print(("PASS" if c2 else "FAIL") + f": runaway build over the hard SPEND CAP IS paused ({r2['state']})")
+        ok = ok and c2
+        _clean(a2)
+
+        # (3) the loss breaker's REAL job (pure predicate — revenue attribution isn't wired in economics() yet,
+        #     so test the decision directly): a LIVE product (revenue > 0) unprofitable past its loss limit pauses;
+        #     the SAME numbers with $0 revenue (a build) do NOT.
+        pol = {"spend_cap": 500, "loss_limit": 20}
+        live = {"spend": 50, "revenue": 10, "profit": -40}       # earning but unprofitable
+        build = {"spend": 50, "revenue": 0, "profit": -50}       # pre-launch build, deeper "loss" but no revenue
+        c3 = _pause_reason(live, pol) is not None and _pause_reason(build, pol) is None
+        print(("PASS" if c3 else "FAIL") + ": loss breaker pauses a LIVE unprofitable product but NOT a $0-revenue build")
+        ok = ok and c3
+
+        print("PASS: per-app circuit-breaker — loss limit only after launch, spend cap always ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
 

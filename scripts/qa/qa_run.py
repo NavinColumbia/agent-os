@@ -561,6 +561,27 @@ def qa_run(target_url, vision, token, org, product_summary, *,
         report["coverage_doc"], report["coverage"] = str(evidence_dir / "COVERAGE.md"), cov_json
     except Exception:
         report["coverage_doc"] = None
+    # AUDITOR SIGN-OFF GATE: a skeptical work-execution auditor reviews HOW the run actually did its job —
+    # from the footage + per-step decisions, NOT the self-report — and a run it REJECTS cannot be reported
+    # 'passed' (so it can't clear the LAUNCH gate). This is the QA coordinator scrutinising its own work
+    # before hand-off. Runs BEFORE _persist_run/write_verdict so the downgrade flows into the gate artifact.
+    # Fail-open: an auditor error never blocks the pipeline (degrades to the coverage-grounded verdict).
+    report["audit"] = None
+    if file_findings and os.environ.get("AOS_QA_AUDIT_GATE", "1").lower() not in ("0", "false", "no"):
+        pulse.beat(pulse_work_id, stage="audit", progress="skeptical work-execution audit")
+        try:
+            import review
+            av = review.review(str(evidence_dir), write=True)
+            report["audit"] = av
+            if av.get("passed_audit") is False:               # the skeptic rejected it -> honestly not a pass
+                report["passed"] = False
+                report["verdict"] = (f"AUDIT REJECTED (score {av.get('score', '?')}/10) — "
+                                     f"{(av.get('summary') or '')[:180]}")
+                emit("audit_rejected", {"score": av.get("score"),
+                                        "skipped_flows": len(av.get("skipped_flows") or []),
+                                        "unbacked_claims": len(av.get("unbacked_claims") or [])})
+        except Exception as e:
+            report["audit_error"] = str(e)
     # DURABLE HISTORY (REBUILD-PLAN C1): every run is a qa_runs row in Postgres — the evidence chain
     # survives reboots. A persistence failure is surfaced on the report, never swallowed silently.
     try:
@@ -667,6 +688,7 @@ def _selftest():
     import tempfile
     import types
 
+    os.environ["AOS_QA_AUDIT_GATE"] = "0"    # offline wiring test — no real auditor (Opus) call
     events = []
     on_event = lambda k, d: events.append((k, d))
 

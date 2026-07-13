@@ -86,23 +86,30 @@ def start(work_id, kind, label="", tenant_id=None, expected_cadence_s=DEFAULT_CA
     return work_id
 
 
-def beat(work_id, stage=None, progress=None, meta=None, status="active"):
-    """Sign of life + current status. Omitted stage/progress keep their prior value (COALESCE). Called on a
-    cadence by any agentic loop. Fail-open by design: a heartbeat write must NEVER break the work it observes."""
+def beat(work_id, stage=None, progress=None, meta=None, status="active",
+         kind=None, label=None, tenant_id=None, expected_cadence_s=None):
+    """Sign of life + current status. Omitted fields keep their prior value (COALESCE). A beat is
+    self-sufficient — pass kind/label and it opens the row itself, so a loop can just beat without a separate
+    start(). Called on a cadence by any agentic loop. Fail-open: a heartbeat write must NEVER break the work."""
     if not DB:
         return
     try:
         _ensure()
         with psycopg.connect(DB) as c, c.cursor() as cur:
             cur.execute("""UPDATE agent_pulse SET last_beat=now(), status=%s,
+                             kind=COALESCE(%s,kind), label=COALESCE(%s,label), tenant_id=COALESCE(%s,tenant_id),
                              stage=COALESCE(%s,stage), progress=COALESCE(%s,progress),
-                             meta = meta || %s::jsonb
+                             expected_cadence_s=COALESCE(%s,expected_cadence_s), meta = meta || %s::jsonb
                            WHERE work_id=%s""",
-                        (status, stage, progress, json.dumps(meta or {}), work_id))
-            if cur.rowcount == 0:                 # a beat implies live work — auto-open if start() was skipped
-                cur.execute("""INSERT INTO agent_pulse (work_id, kind, label, stage, progress)
-                               VALUES (%s,'unknown','',%s,%s) ON CONFLICT (work_id) DO NOTHING""",
-                            (work_id, stage, progress))
+                        (status, kind, label, tenant_id, stage, progress, expected_cadence_s,
+                         json.dumps(meta or {}), work_id))
+            if cur.rowcount == 0:                 # a beat implies live work — open the row itself
+                cur.execute("""INSERT INTO agent_pulse (work_id, kind, label, tenant_id, stage, progress,
+                                 expected_cadence_s)
+                               VALUES (%s, COALESCE(%s,'unknown'), COALESCE(%s,''), %s, %s, %s,
+                                 COALESCE(%s, %s)) ON CONFLICT (work_id) DO NOTHING""",
+                            (work_id, kind, label, tenant_id, stage, progress,
+                             expected_cadence_s, DEFAULT_CADENCE_S))
             c.commit()
     except Exception:
         pass
@@ -140,21 +147,53 @@ def _rows(include_done_s=0):
     return rows
 
 
+def _fleet_rows():
+    """Fleet actors (orchestra) surfaced READ-ONLY from their existing last_active heartbeat — NO write on the
+    actor hot path (a synchronous write there perturbs the timing-sensitive supervisor/sibling race). Only
+    working/blocked actors in still-running runs. Fail-open if the orchestra tables are absent."""
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT a.actor_id, a.role, a.name, a.tenant_id, a.status, a.assignment,
+                             EXTRACT(EPOCH FROM now()-a.last_active)::INT AS beat_age_s,
+                             EXTRACT(EPOCH FROM now()-a.hired_at)::INT AS age_s
+                           FROM orchestra_actors a JOIN orchestra_runs r ON r.run_id = a.run_id
+                           WHERE a.status IN ('working', 'blocked') AND r.status = 'running'
+                           ORDER BY a.last_active DESC LIMIT 200""")
+            out = []
+            for aid, role, name, tid, status, assignment, bage, age in cur.fetchall():
+                cad = 210                                    # ~matches the fleet's own stale-actor threshold
+                out.append({"work_id": f"actor:{aid}", "kind": "fleet-actor",
+                            "label": f"{role} · {name}", "tenant_id": tid, "status": status,
+                            "stage": status, "progress": assignment or "", "expected_cadence_s": cad,
+                            "beat_age_s": bage or 0, "age_s": age or 0,
+                            "stalled": (bage or 0) > cad * STALL_MULT})
+            return out
+    except Exception:
+        return []
+
+
 def live(include_done_s=0):
-    """Every in-flight pulse (+ recently finished if include_done_s>0) with beat age + a stalled flag. This is
-    the unified 'what is every agent doing right now' view a human / observer agent / the CEO can glance at."""
+    """Every in-flight unit of agentic work — pulse rows (QA runs, builds) PLUS fleet actors (read from their
+    existing heartbeat) — with beat age + a stalled flag. The unified 'what is every agent doing right now,
+    and is anything stuck?' view a human / observer agent / the CEO can glance at in one place."""
     if not DB:
         return []
     try:
-        return _rows(include_done_s)
+        return _rows(include_done_s) + _fleet_rows()
     except Exception:
         return []
 
 
 def stalled(mult=None):
-    """In-flight work that has gone SILENT past cadence*mult — the signal the watchdog/sentinel escalate on."""
+    """PULSE-tracked work (QA/builds) gone SILENT past cadence*mult — the watchdog signal. Excludes fleet
+    actors on purpose: the sentinel already owns fleet stale-actor detection (no double-alerting)."""
     m = mult or STALL_MULT
-    return [r for r in live() if r["status"] == "active" and r["beat_age_s"] > r["expected_cadence_s"] * m]
+    if not DB:
+        return []
+    try:
+        return [r for r in _rows() if r["status"] == "active" and r["beat_age_s"] > r["expected_cadence_s"] * m]
+    except Exception:
+        return []
 
 
 def sweep():

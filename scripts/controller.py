@@ -152,6 +152,14 @@ DBOS(config=DBOSConfig(name="agentos-controller", database_url=DB))
 @DBOS.step()
 def stage_step(product: str, stage: str) -> str:
     repo = _repo(product)
+    # LIVE PULSE: the build is visible in the unified observability plane while it walks the lifecycle, so a
+    # stage that hangs (or a gate that blocks it) shows up next to QA runs + fleet actors. Fail-open.
+    try:
+        import pulse
+        pulse.beat(f"build:{product}", kind="factory-build", label=f"build {product}",
+                   stage=stage, progress=f"lifecycle stage {stage}", expected_cadence_s=600)
+    except Exception:
+        pass
     # 1) gate: required prior artifacts must exist (enforced, not assumed)
     missing = gate_check.check(str(repo), stage)
     if missing:
@@ -194,6 +202,11 @@ def run_product(product: str) -> str:
         stage_step(product, stage)
     metrics.record("state_change", product=product, task_id=f"{product}-lifecycle",
                    to_state="done", outcome="success")
+    try:
+        import pulse
+        pulse.finish(f"build:{product}", status="done", result={"outcome": "LAUNCHED"})
+    except Exception:
+        pass
     return f"{product}:LAUNCHED"
 
 

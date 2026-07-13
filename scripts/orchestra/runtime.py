@@ -205,6 +205,9 @@ def _persist(ctx, a, step, evs):
     for ev in evs:
         store.complete_event(ev["id"], ctx.tenant)
     store.heartbeat(a["actor_id"], ctx.tenant)
+    # NOTE: the fleet is surfaced in the unified pulse view by READING orchestra_actors.last_active
+    # (pulse.live() aggregates it) — NOT by a write here. A synchronous pulse write on this hot per-step
+    # path added latency that perturbed the timing-sensitive supervisor/sibling race. Heartbeat already exists.
 
 
 def _hire(ctx, supervisor_id, spec):

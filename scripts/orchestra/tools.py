@@ -16,6 +16,7 @@ Tools:
   dev_fix     {bug, code_context, vision, repo?, target_url?, stories?, restart_cmd?, health_url?, token?, org?}
               -> plan+spawn fixers, judge on the REAL git diff + a fresh observation. result = the fix dict.
 """
+import json
 import sys
 from pathlib import Path
 
@@ -83,7 +84,48 @@ def dev_fix(args: dict) -> dict:
     return {"status": "done" if fix.get("fixed") else "failed", "findings": [], "result": fix}
 
 
-_TOOLS = {"qa_explore": qa_explore, "dev_fix": dev_fix}
+def _agent_tool(role: str, prompt: str, args: dict) -> dict:
+    """Shared shape for knowledge-work tools: run ONE role-specialized factory agent (web on by default, so
+    research/intel/finance agents reach live data) and return its report as the result. The tool-worker
+    dispatch-and-parks it, so a long web-research or analysis call never blocks a decide-step."""
+    import factory
+    res = factory.agent(role, args.get("repo") or str(getattr(factory, "PRODUCTS", "/tmp")), prompt)
+    out = (res.get("out_full") or res.get("out") or "") if isinstance(res, dict) else str(res)
+    ok = isinstance(res, dict) and res.get("rc", 0) == 0 and bool(out.strip())
+    return {"status": "done" if ok else "failed", "findings": [], "result": {"report": out, "role": role}}
+
+
+def research(args: dict) -> dict:
+    """A researcher's real work: thorough, web-grounded research on a topic → a concise, cited report.
+    (Same tool-worker pattern as QA — this is how a 'researcher' role DOES work instead of guessing.)"""
+    topic = args.get("topic") or args.get("task") or args.get("question") or ""
+    r = _agent_tool("researcher", "Research this THOROUGHLY using live web sources. Cross-check claims across "
+                    "independent sources; be concrete and skeptical. Produce a concise report with the key "
+                    "findings, the evidence, and CITATIONS (urls).\n\nTOPIC:\n" + topic, args)
+    r["result"]["topic"] = topic
+    return r
+
+
+def finance_report(args: dict) -> dict:
+    """A finance function's real work: assemble a CEO-facing financial report from the data provided (or the
+    platform's own metrics/billing if present) — spend, revenue, burn, runway, unit economics — honestly."""
+    data = args.get("data")
+    if data is None:                              # pull the platform's real numbers when no data is passed
+        try:
+            import billing
+            data = billing.summary() if hasattr(billing, "summary") else None
+        except Exception:
+            data = None
+    prompt = ("You are the finance function reporting to the CEO. From the DATA below, produce a crisp, honest "
+              "financial report: spend, revenue, burn, runway, unit economics, and the ONE number the CEO "
+              "should watch. State assumptions; never invent figures not supported by the data.\n\nDATA:\n"
+              + json.dumps(data, default=str)[:4000])
+    r = _agent_tool("finance-cost-controller", prompt, args)
+    r["result"]["kind"] = "finance-report"
+    return r
+
+
+_TOOLS = {"qa_explore": qa_explore, "dev_fix": dev_fix, "research": research, "finance_report": finance_report}
 
 
 def run_tool(name: str, args: dict) -> dict:
@@ -143,7 +185,20 @@ def _selftest():
     r3 = run_tool("dev_fix", {"bug": {"bug": "x"}, "vision": "v"})
     assert r3["status"] == "failed", r3
 
-    # 3) unknown tool + a raising tool are FAILED results, never exceptions (org never crashes on a tool).
+    # 3) knowledge-work tools (research, finance_report) run a role agent and return its report. Stub factory.
+    fake_f = types.ModuleType("factory")
+    fake_f.PRODUCTS = "/tmp"
+    fake_f.agent = lambda role, repo, task, **k: {"rc": 0, "out_full": f"[{role}] report: " + task[:30]}
+    sys.modules["factory"] = fake_f
+    rr = run_tool("research", {"topic": "the market for AI QA tools"})
+    assert rr["status"] == "done" and rr["result"]["role"] == "researcher" and "report" in rr["result"], rr
+    assert rr["result"]["topic"] == "the market for AI QA tools"
+    rf = run_tool("finance_report", {"data": {"spend": 100, "revenue": 250}})
+    assert rf["status"] == "done" and rf["result"]["role"] == "finance-cost-controller", rf
+    fake_f.agent = lambda role, repo, task, **k: {"rc": 1, "out_full": ""}   # a failed agent -> failed tool
+    assert run_tool("research", {"topic": "x"})["status"] == "failed"
+
+    # 4) unknown tool + a raising tool are FAILED results, never exceptions (org never crashes on a tool).
     assert run_tool("nope", {})["status"] == "failed"
 
     def _boom(a):
@@ -152,7 +207,7 @@ def _selftest():
     assert run_tool("boom", {})["status"] == "failed" and "browser died" in run_tool("boom", {})["result"]["error"]
     del _TOOLS["boom"]
 
-    print("tools selftest: PASS (qa_explore bugs->findings + coverage; dev_fix judge-gated; errors fail-soft)")
+    print("tools selftest: PASS (qa_explore + dev_fix + research + finance_report; role reports; errors fail-soft)")
     return 0
 
 

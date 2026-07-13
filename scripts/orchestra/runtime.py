@@ -434,6 +434,16 @@ def _coordinator_specs(ctx, a, task, role):
                     "target_url": c.get("target_url"), "stories": c.get("stories"),
                     "restart_cmd": c.get("restart_cmd"), "health_url": c.get("health_url"),
                     "token": c.get("token"), "org": c.get("org")}}]
+    # GENERIC TOOL-TEAM: any coordinator whose context declares a `tool` + a list of `items` spawns one
+    # tool-worker per item — this is how the org staffs ANY function (research, finance, legal, data, …) with
+    # REAL work, reusing the proven tool-worker/dispatch-and-park pattern instead of a per-role branch.
+    tool, items = c.get("tool"), c.get("items")
+    if tool and isinstance(items, list) and items:
+        worker_role = c.get("worker_role") or (role.replace("-coordinator", "").replace("-lead", "") or "worker")
+        return [{"name": f"{a['name']}.w{i}", "role": worker_role, "kind": "worker",
+                 "task": (it.get("task") or it.get("topic") or str(it)) if isinstance(it, dict) else str(it),
+                 "tool": tool, "tool_args": (dict(it) if isinstance(it, dict) else {"task": str(it)})}
+                for i, it in enumerate(items)]
     return []
 
 
@@ -448,11 +458,9 @@ def _decompose_specs(ctx, a, task):
                  "kind": "supervisor",
                  "task": f"Deliver the '{d['name']}' domain toward the vision: {task}"}
                 for d in plan["root"]["children"]]
-    _role = (a.get("role") or "").lower()
-    if _role in ("qa-coordinator", "dev-coordinator"):
-        specs = _coordinator_specs(ctx, a, task, _role)
-        if specs:
-            return specs
+    specs = _coordinator_specs(ctx, a, task, (a.get("role") or "").lower())
+    if specs:
+        return specs
     d = _ai_json(a["role"], ctx.repo, _DECOMPOSE_PROMPT.format(task=task), spawner=a["role"])
     specs = []
     for i, c in enumerate(d.get("children") or []):

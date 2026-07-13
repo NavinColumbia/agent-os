@@ -17,6 +17,7 @@ Tools:
               -> plan+spawn fixers, judge on the REAL git diff + a fresh observation. result = the fix dict.
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -206,6 +207,42 @@ def data_query(args: dict) -> dict:
                        "summary": (s.get("result") or {}).get("report")}}
 
 
+def produce_artifact(args: dict) -> dict:
+    """A function that OUTPUTS a real deliverable FILE — marketing copy, a landing page, a spec doc, a design
+    mockup, a report. The role agent generates the content; we WRITE it to a Windows-visible artifacts dir and
+    return the path (so the CEO gets a real file, not just chat). `role`, `task`, `filename` (its extension
+    picks the format), optional `context`. This is the output counterpart to the read tools (research/data)."""
+    import artifacts
+    role = args.get("role") or args.get("worker_role") or "specialist"
+    filename = Path(args.get("filename") or "artifact.md").name
+    fmt = (Path(filename).suffix.lstrip(".") or "md")
+    prompt = (f"You are the {role}. Produce the deliverable below as a COMPLETE, ready-to-use {fmt} file — "
+              f"output ONLY the file content, no preamble or code fences.\n\nDELIVERABLE:\n{args.get('task', '')}"
+              + (f"\n\nCONTEXT:\n{json.dumps(args.get('context'), default=str)[:3000]}" if args.get("context") else ""))
+    r = _agent_tool(role, prompt, args)
+    content = (r.get("result") or {}).get("report") or ""
+    if r["status"] != "done" or not content.strip():
+        return {"status": "failed", "findings": [], "result": {"error": "agent produced no content"}}
+    try:
+        path = artifacts.run_dir(args.get("product") or role) / filename
+        path.write_text(content)
+    except Exception as e:
+        return {"status": "failed", "findings": [], "result": {"error": f"write failed: {e}"}}
+    return {"status": "done", "findings": [],
+            "result": {"artifact": str(path), "role": role, "format": fmt, "bytes": len(content)}}
+
+
+def design_asset(args: dict) -> dict:
+    """A design function's real artifact: generate a self-contained SVG (or HTML) mockup/asset the CEO can open.
+    The designer agent outputs valid, self-contained markup; we save it as a viewable file."""
+    fmt = (args.get("format") or "svg").lower()
+    spec = args.get("spec") or args.get("task") or ""
+    return produce_artifact({**args, "role": args.get("role") or "brand-designer",
+                             "task": f"Design a clean, on-brand {fmt.upper()} asset for: {spec}. Output valid, "
+                                     f"SELF-CONTAINED {fmt} markup only (no external refs).",
+                             "filename": args.get("filename") or f"asset.{fmt}"})
+
+
 def knowledge_work(args: dict) -> dict:
     """The catch-all for any KNOWLEDGE-WORK function — a product-manager writing a spec, a legal-compliance
     review of a provided doc, a strategy memo, an analysis. Runs the given role agent on the task and returns
@@ -222,7 +259,8 @@ def knowledge_work(args: dict) -> dict:
 
 _TOOLS = {"qa_explore": qa_explore, "dev_fix": dev_fix, "research": research,
           "finance_report": finance_report, "knowledge_work": knowledge_work, "data_query": data_query,
-          "legal_scan": legal_scan, "connector_ingest": connector_ingest}
+          "legal_scan": legal_scan, "connector_ingest": connector_ingest,
+          "produce_artifact": produce_artifact, "design_asset": design_asset}
 
 
 def run_tool(name: str, args: dict) -> dict:
@@ -327,6 +365,27 @@ def _selftest():
     fake_c.ingest = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("egress denied"))
     assert run_tool("connector_ingest", {"url": "http://evil"})["status"] == "failed"
 
+    # artifact-output tools: the role agent's content is WRITTEN to a real file the CEO can open.
+    import tempfile
+    _prev_ev = os.environ.get("AOS_QA_EVIDENCE_DIR")
+    os.environ["AOS_QA_EVIDENCE_DIR"] = tempfile.mkdtemp(prefix="artifact-test-")
+    fake_f.agent = lambda role, repo, task, **k: {"rc": 0, "out_full": "# Launch copy\nBuy our thing."}
+    pa = run_tool("produce_artifact", {"role": "content-marketer", "task": "landing page copy",
+                                       "filename": "landing.md", "product": "demo"})
+    assert pa["status"] == "done" and Path(pa["result"]["artifact"]).exists(), pa
+    assert Path(pa["result"]["artifact"]).read_text().startswith("# Launch copy"), "content written to the file"
+    fake_f.agent = lambda role, repo, task, **k: {"rc": 0, "out_full": "<svg xmlns='http://www.w3.org/2000/svg'/>"}
+    da = run_tool("design_asset", {"spec": "a logo", "product": "demo"})
+    assert da["status"] == "done" and da["result"]["artifact"].endswith(".svg") and Path(da["result"]["artifact"]).exists(), da
+    fake_f.agent = lambda role, repo, task, **k: {"rc": 0, "out_full": "   "}   # empty content -> failed, no file
+    assert run_tool("produce_artifact", {"role": "x", "task": "y", "filename": "z.md"})["status"] == "failed"
+    import shutil as _sh
+    _sh.rmtree(os.environ["AOS_QA_EVIDENCE_DIR"], ignore_errors=True)
+    if _prev_ev is None:
+        os.environ.pop("AOS_QA_EVIDENCE_DIR", None)
+    else:
+        os.environ["AOS_QA_EVIDENCE_DIR"] = _prev_ev
+
     fake_f.agent = lambda role, repo, task, **k: {"rc": 1, "out_full": ""}   # a failed agent -> failed tool
     assert run_tool("research", {"topic": "x"})["status"] == "failed"
 
@@ -340,7 +399,7 @@ def _selftest():
     del _TOOLS["boom"]
 
     print("tools selftest: PASS (qa_explore, dev_fix, research, finance_report, knowledge_work, data_query, "
-          "legal_scan, connector_ingest — every function has real work; errors fail-soft)")
+          "legal_scan, connector_ingest, produce_artifact, design_asset — read + OUTPUT work; errors fail-soft)")
     return 0
 
 

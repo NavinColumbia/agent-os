@@ -70,6 +70,27 @@ def _backup_age_h():
     return round((time.time() - newest) / 3600, 1)
 
 
+def _recent_qa(limit=8):
+    """Latest QA verdict per product — the CEO's product-quality glance: passed vs AUDIT REJECTED vs
+    INCOMPLETE, and how recently. Read-only; fail-open if qa_runs isn't there yet."""
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT DISTINCT ON (product) product, passed, rounds,
+                             COALESCE(verdict->>'verdict',''), EXTRACT(EPOCH FROM now()-ts)::INT
+                           FROM qa_runs ORDER BY product, ts DESC""")
+            rows = cur.fetchall()
+        rows.sort(key=lambda r: r[4])
+        out = []
+        for product, passed, rounds, verdict, age in rows[:limit]:
+            v = verdict or ""
+            level = "ok" if passed else ("crit" if "REJECT" in v.upper() else "warn")
+            out.append({"product": product, "passed": bool(passed), "rounds": rounds,
+                        "verdict": v[:90], "age_min": round((age or 0) / 60), "level": level})
+        return out
+    except Exception:
+        return []
+
+
 def state():
     du = shutil.disk_usage("/")
     disk_pct = round(du.used / du.total * 100)
@@ -197,6 +218,7 @@ def state():
         alerts.append({"level": "warn", "msg": f"{out['throughput']['denies_1h']} policy denials/hr"})
     for cf in confs:
         alerts.append({"level": "warn", "msg": f"conflict: {cf['agents'][0]} & {cf['agents'][1]} on {cf['resource']}"})
+    out["qa"] = _recent_qa()                     # latest QA verdict per product (passed / rejected / incomplete)
     out["alerts"] = alerts or [{"level": "ok", "msg": "all systems nominal"}]
     # LIVE PULSE: every in-flight unit of agentic work (QA runs, builds, fleet actors) in one glance, with
     # beat age + a stalled flag — the "what is every agent doing right now, is anything stuck?" view.
@@ -319,6 +341,9 @@ font-weight:600;cursor:pointer}button:hover{filter:brightness(1.08)}
   <div class="card col12"><h2>Live agent work <span class=mut>· every in-flight unit — QA runs · builds · fleet actors · beat age · STALLED if silent</span></h2>
      <div id=pulse class=feed style="max-height:200px"></div></div>
 
+  <div class="card col12"><h2>QA quality <span class=mut>· latest verdict per product · a run the auditor REJECTED or that left coverage INCOMPLETE cannot ship</span></h2>
+     <div id=qa class=feed style="max-height:170px"></div></div>
+
   <div class="card col12"><h2>Agent directory <span class=mut>· live presence · who's working on what · direct-contact (no sockets, brokered mailboxes)</span></h2>
      <div id=directory class=feed style="max-height:180px"></div></div>
 
@@ -351,6 +376,7 @@ async function tick(){
  const to=$('#to');const cur=to.value;const names=[...new Set(s.graph.nodes.map(n=>n.id).filter(n=>!n.startsWith('human')))].sort();
  to.innerHTML=names.map(n=>`<option>${esc(n)}</option>`).join('');if(cur)to.value=cur;
  $('#runs').innerHTML=(s.runs&&s.runs.length)?s.runs.map(r=>`<div class=row style="cursor:pointer" onclick="showTrace('${esc(r.product)}')"><span class="dot ${r.errors?'d-warn':'d-ok'}"></span><b>${esc(r.product)}</b><span class=grow></span><span class=mut>${r.steps} steps · ${r.total_s}s · errs ${r.errors} ▸</span></div>`).join(''):'<div class=mut>no traced runs yet (only new builds are traced)</div>';
+ $('#qa').innerHTML=(s.qa&&s.qa.length)?s.qa.map(q=>`<div class=row><span class="dot ${q.level==='ok'?'d-ok':q.level==='crit'?'d-crit':'d-warn'}"></span><b>${esc(q.product)}</b><span class=grow></span><span class=mut>${esc(q.verdict||(q.passed?'passed':'not passed'))} · ${q.rounds} round(s) · ${q.age_min}m ago</span></div>`).join(''):'<div class=mut>no QA runs yet</div>';
  const fmtAge=x=>x<90?x+'s':Math.floor(x/60)+'m'+String(x%60).padStart(2,'0')+'s';
  $('#pulse').innerHTML=(s.pulse&&s.pulse.length)?s.pulse.map(w=>`<div class=row><span class="dot ${w.stalled?'d-crit':w.status==='active'?'d-ok':'d-off'}"></span><b>${esc(w.kind)}</b> <span class=tag>${esc(w.stage||'-')}</span> <span class=mut>${esc(w.progress||w.label||w.work_id)}</span><span class=grow></span><span class=mut>${w.stalled?'STALLED · ':''}♥ ${fmtAge(w.beat_age_s)}</span></div>`).join(''):'<div class=mut>no agentic work in flight right now</div>';
  const conf=new Set((s.conflicts||[]).flatMap(c=>c.agents));

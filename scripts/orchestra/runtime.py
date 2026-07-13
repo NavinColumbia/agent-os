@@ -8,7 +8,7 @@ on Postgres via store.py — actors are rows (identity, tenure, assignment, memo
 SKIP-LOCKED-claimable rows, and every decide-loop step is a DURABLE unit:
 
     claim pending events (FOR UPDATE SKIP LOCKED, lease-reclaimable)
-      -> AI decision (factory.agent — Fable default, retries, Codex failover;
+      -> AI decision (factory.agent — Opus default, retries, Codex failover;
          the actor's role + memory + assignment are in the prompt)
       -> persist new state/events/result (store.update_actor / store.emit)
       -> heartbeat, then mark the claimed events processed

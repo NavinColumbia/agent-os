@@ -50,7 +50,7 @@ FSRC = (Path(__file__).resolve().parent / "factory.py").read_text()
 chk("_MODEL_EXHAUSTED" in FSRC and "reached your" in FSRC and "switch models with" in FSRC,
     "factory detects a subscription usage-cap (not just API overload)")
 chk("exhausted_primary" in FSRC and "FALLBACK_MODEL, tools)" in FSRC and "executed-modelswitch" in FSRC,
-    "factory switches to the fallback model on usage-cap exhaustion (Fable5 -> Opus)")
+    "factory switches to the fallback model on usage-cap exhaustion (primary -> fallback)")
 
 print("PASS: all QA-found console fixes are still in place" if ok
       else "FAIL: a console fix guard regressed")

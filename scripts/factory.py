@@ -93,12 +93,16 @@ MAX_REVIEW = int(os.environ.get("AOS_MAX_REVIEW", "1"))  # bounded REVIEW->BUILD
 # capped here (each ~430MB) so a big fleet can't exhaust RAM or hammer the API into rate-limits.
 _AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8")))
 # Model policy (pinned for reproducibility; cheaper model for low-stakes stages; fallback on overload).
-# Owner directive (2026-07): ALL agents default to Fable (the frontier model); if Fable has issues the
-# CLI's --fallback-model drops to Opus automatically; deeper layers (transient retry/backoff, then Codex
-# engine failover) are unchanged. Flexibility preserved: env vars + per-call agent(model=...) override.
-BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-fable-5")
+# Owner directive (2026-07-12): ALL agents default to OPUS as the first choice. Fable is the frontier model
+# but burns too many subscription credits, so it's OPT-IN ONLY (per-call agent(model=...) or the
+# 'fable_default_build' flag). If Opus has issues the CLI's --fallback-model drops to Sonnet automatically;
+# deeper layers (transient retry/backoff, then Codex engine failover) are unchanged. Flexibility preserved:
+# env vars + per-call agent(model=...) override.
+BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-opus-4-8")
 CHEAP_MODEL = os.environ.get("AOS_CHEAP_MODEL", "claude-haiku-4-5-20251001")
-FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-opus-4-8")
+FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-sonnet-4-6")
+# The frontier model — most capable but credit-expensive; opt-in only (never handed out as the fleet default).
+FRONTIER_MODEL = os.environ.get("AOS_FRONTIER_MODEL", "claude-fable-5")
 
 # Model-exhaustion COOLDOWN: once a model hits its subscription usage cap (see _MODEL_EXHAUSTED), remember it
 # so the REST of the fleet skips straight to the fallback instead of each agent wasting a failed call on the
@@ -121,15 +125,16 @@ def _in_cooldown(m):
 
 
 def _default_build_model():
-    """The fleet's default heavy-build model — Fable-5 (BUILD_MODEL) — UNLESS the 'opus_default_build' feature
-    flag is rolled on, in which case Opus (FALLBACK_MODEL) becomes the default. Lets ops flip or gradually
-    A/B the fleet's default model WITHOUT a deploy (serves the owner's 'fable by default, but flexible'
-    directive) — the first real consumer of the flags system. FAIL-OPEN: any flag/DB error keeps BUILD_MODEL,
-    so model selection can never break on a flag hiccup. An explicit per-call `model=` still overrides both."""
+    """The fleet's default heavy-build model — Opus (BUILD_MODEL) — UNLESS the 'fable_default_build' feature
+    flag is rolled on, in which case the credit-expensive Fable frontier model (FRONTIER_MODEL) is used
+    instead. Opus is the owner's first choice (2026-07-12); Fable stays available but OPT-IN because it burns
+    credits. Lets ops flip or gradually A/B the fleet's frontier model WITHOUT a deploy. FAIL-OPEN: any
+    flag/DB error keeps BUILD_MODEL, so model selection can never break on a flag hiccup. An explicit per-call
+    `model=` still overrides both."""
     try:
         import flags
-        if flags.evaluate("opus_default_build", subject="fleet"):
-            return FALLBACK_MODEL
+        if flags.evaluate("fable_default_build", subject="fleet"):
+            return FRONTIER_MODEL
     except Exception:
         pass
     if _in_cooldown(BUILD_MODEL):          # BUILD_MODEL recently hit its usage cap -> don't hand it out again yet

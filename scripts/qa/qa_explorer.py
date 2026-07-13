@@ -551,7 +551,7 @@ def _perception_section(before_state, after_state):
             f"{reflows} main-view re-render/skeleton-flash(es).")
 
 
-def _evaluate_prompt(vision, story, expected, targeting, before_state, after_state):
+def _evaluate_prompt(vision, story, expected, targeting, before_state, after_state, untested=None):
     return f"""ROLE: You are the QA-SECURITY explorer. Task: EVALUATE expected-vs-actual after an action.
 
 Judge honestly and adversarially — but blame the APP only when the RIGHT control was actually exercised.
@@ -616,6 +616,12 @@ CONTRACT — apply IN THIS ORDER:
 3. If it behaved as expected — the right result rendered AND no unexpected reload/flash AND no silent-empty —
    verdict "pass".
 
+=== COVERAGE — aspects still UNTESTED for this story ===
+{chr(10).join('- ' + a for a in (untested or [])) or '(none listed)'}
+An aspect counts as DEMONSTRATED only if the BEFORE->AFTER you can actually see here exercised it — a claim
+with no observed change is NOT demonstrated. This is what makes the tested-vs-untested ledger trustworthy:
+coverage is credited on GROUNDED evidence you evaluated, never on the actor's own say-so.
+
 Reply with ONLY a JSON object, no prose:
 {{
   "target_confirmed": <true ONLY if the intended control was correctly actuated AND registered an effect>,
@@ -623,7 +629,9 @@ Reply with ONLY a JSON object, no prose:
   "verdict": "<pass|bug|inconclusive|retry|control-not-found>",
   "bug": "<clear description of the bug, or null — MUST be null unless verdict is exactly 'bug'>",
   "severity": "<none|low|medium|high|critical>",
-  "blocking": <true if this genuinely prevents any further meaningful exploration of this story>
+  "blocking": <true if this genuinely prevents any further meaningful exploration of this story>,
+  "demonstrated": ["<zero or more of the UNTESTED aspects above that THIS step actually demonstrated
+                    (grounded in the observed before->after); [] if none were genuinely exercised>"]
 }}"""
 
 
@@ -686,8 +694,9 @@ class Explorer:
             "_raw": res,
         }
 
-    def _ai_evaluate(self, story, expected, targeting, before_state, after_state):
-        prompt = _evaluate_prompt(self.vision, story, expected, targeting, before_state, after_state)
+    def _ai_evaluate(self, story, expected, targeting, before_state, after_state, untested=None):
+        prompt = _evaluate_prompt(self.vision, story, expected, targeting, before_state, after_state,
+                                  untested=untested)
         res = _call_agent(ROLE, self.repo, prompt)
         j = _extract_json(res.get("out_full") or res.get("out") or "")
         bug = j.get("bug") if j.get("bug") not in (None, "", "null") else None
@@ -706,6 +715,9 @@ class Explorer:
             "bug": bug,
             "severity": j.get("severity", "none") if bug else "none",
             "blocking": bool(j.get("blocking", False)) if bug else False,
+            # GROUNDED COVERAGE: the aspects the evaluator confirms THIS step actually demonstrated (from the
+            # observed before->after) — this, not the decider's claimed `covers`, is what credits coverage.
+            "demonstrated": [str(a).strip() for a in (j.get("demonstrated") or []) if str(a).strip()],
             "_raw": res,
         }
 
@@ -843,7 +855,9 @@ class Explorer:
                 aim, act_result, state, after, retried=retried, settled=True,
                 expected_control=expected_control or None,
                 expected_control_present=bool(ec_present) if expected_control else None)
-            verdict = self._ai_evaluate(story, decision["expected"], targeting, state, after)  # AI EVALUATES
+            _untested = [c["aspect"] for c in (self.coverage or []) if not c.get("covered")]
+            verdict = self._ai_evaluate(story, decision["expected"], targeting, state, after,
+                                        untested=_untested)  # AI EVALUATES (+ confirms grounded coverage)
 
             bug = None
             if verdict["bug"]:
@@ -879,7 +893,8 @@ class Explorer:
                 "verdict": {k: verdict[k] for k in
                             ("matches_expected", "verdict", "target_confirmed", "bug", "severity", "blocking")},
                 "done": decision["done"],
-                "covers": decision.get("covers", []),
+                "covers": decision.get("covers", []),               # aspects the decider INTENDED to exercise
+                "demonstrated": verdict.get("demonstrated", []),     # aspects the evaluator CONFIRMED (grounded)
                 "act_result": act_result,
             }
             records.append(record)
@@ -889,12 +904,14 @@ class Explorer:
                 "bug": verdict["bug"],
             })
 
-            # COVERAGE UPDATE: a step only TESTS an aspect if it actually did something (effect) and the
-            # evaluator judged it (pass or a real bug) — a no-op click covers nothing. Mark those aspects.
+            # COVERAGE UPDATE: credit an aspect only on GROUNDED evidence — the EVALUATOR (which saw the real
+            # before->after) confirms which aspects were demonstrated, NOT the decider's optimistic `covers`
+            # claim. This is the fix for over-claimed coverage: a step that says it tested X but shows no such
+            # change earns nothing. Requires an effect + a judged step (pass/bug); a no-op covers nothing.
             effect = _effect_registered(state, after, act_result)
             newly = 0
             if effect and verdict["verdict"] in ("pass", "bug"):
-                for asp in decision.get("covers", []):
+                for asp in verdict.get("demonstrated", []):
                     for c in self.coverage:
                         if not c.get("covered") and (asp == c["aspect"] or asp in c["aspect"] or c["aspect"] in asp):
                             c["covered"] = True

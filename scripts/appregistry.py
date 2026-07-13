@@ -258,6 +258,16 @@ def publish(name, private=True, role="controller", approval_id=None):
     else:
         git("push", "-u", "origin", "HEAD", check=False)
     repo_url, last_commit = git_info(repo)
+    # item 13: a PROVABLE effect record for the publish (a real external side-effect). The git commit SHA IS a
+    # tamper-evident content identity, so it doubles as the idempotency key — a re-publish of the same tree is
+    # recognisable. Best-effort; never blocks the publish.
+    try:
+        audit.append(actor=f"publish:{name}", action="Effect:git_publish",
+                     resource=repo_url or str(repo),
+                     payload={"commit": last_commit, "idempotency_key": last_commit,
+                              "repo_url": repo_url, "private": bool(private)})
+    except Exception:
+        pass
     with _conn() as c, c.cursor() as cur:
         cur.execute("""UPDATE app_registry SET repo_url=%s, last_commit=%s, status='published', updated_at=now()
                        WHERE name=%s""", (repo_url, last_commit, name))

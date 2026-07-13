@@ -35,6 +35,20 @@ def _label_bool(x):
     return str(x).strip().lower() in ("accept", "pass", "passed", "true", "1", "yes")
 
 
+def split_holdout(cases, holdout_frac=0.3):
+    """Item 4: partition labeled cases into (optimizer_set, holdout_set) DETERMINISTICALLY by hashing each
+    case's dir, so if we ever tune/select agents against the auditor's score the hold-out is one the optimizer
+    NEVER sees (reward-hacking a judge is only prevented by a judge the optimizer can't observe). Stable across
+    runs (hash-based, no RNG) so the same case always lands in the same partition."""
+    import hashlib
+    cut = max(0, min(100, int(holdout_frac * 100)))
+    opt, hold = [], []
+    for c in cases:
+        h = int(hashlib.sha256(str(c.get("dir", "")).encode()).hexdigest(), 16) % 100
+        (hold if h < cut else opt).append(c)
+    return opt, hold
+
+
 def _accepted(verdict) -> bool:
     """A verdict counts as ACCEPT only on a clean pass — a reject OR a jury-split close call is not-accept
     (matches the launch-gate semantics: a close call escalates, it does not clear)."""
@@ -182,8 +196,14 @@ def _selftest():
         assert rep["biased_and_stable_FAIL"] is True, f"stable + biased must FAIL: {rep}"
         # kappa is computed independently of raw agreement (the whole point of the finding)
         assert cohen_kappa([True, True, True, True], [True, False, True, False]) < 1.0
+        # item 4: hold-out partition is deterministic + disjoint (the optimizer never sees the hold-out)
+        many = [{"dir": f"/x/case-{i}", "label": "accept"} for i in range(200)]
+        opt, hold = split_holdout(many, 0.3)
+        assert len(opt) + len(hold) == 200 and 40 <= len(hold) <= 80, (len(opt), len(hold))
+        assert split_holdout(many, 0.3)[1] == hold, "partition must be stable across calls"
+        assert not ({c["dir"] for c in opt} & {c["dir"] for c in hold}), "partitions disjoint"
         print("auditor_validate selftest: PASS (kappa computed vs labels; position-flip detected; "
-              "deterministic auditor is stable; stable+biased trips the FAIL flag)")
+              "deterministic auditor is stable; stable+biased trips the FAIL flag; hold-out split stable+disjoint)")
         return 0
     finally:
         if _real is not None:

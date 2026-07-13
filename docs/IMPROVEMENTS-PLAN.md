@@ -40,11 +40,12 @@ call as not-a-pass. Selftest proves the split-escalates + unanimous-accepts path
 **Research:** 3-LLM ensemble kappa 0.432 vs 0.049 single-heuristic (2604.16706); panel juries +15%, judges
 degrade ~200% on close calls (2512.16041) — motivated the design.
 
-### 4. [E] Human-labeled hold-out the optimizer never sees — ⬜ not started
-**Approach:** when we add any agent selection/tuning against auditor score, reserve a labeled hold-out set the
-optimizer can't observe (reuse item 2's fixture set, partitioned). Pairs with item 2. Low urgency until we
-actually optimize against the auditor.
-**Research:** reward-hacking-against-a-judge mechanism (2606.04923) — motivation clear; no dig needed.
+### 4. [E] Human-labeled hold-out the optimizer never sees — ✅ done (partition helper)
+**Done:** `auditor_validate.split_holdout(cases, holdout_frac)` deterministically (hash-based, no RNG) partitions
+labeled cases into (optimizer_set, holdout_set) — disjoint + stable across runs — so if we ever tune/select
+agents against the auditor's score, the hold-out is one the optimizer NEVER sees (the only real defense against
+reward-hacking a judge). Selftest proves stability + disjointness. Activates fully once item-2's real labeled set
+exists and we actually optimize against the auditor.
 
 ---
 
@@ -133,22 +134,26 @@ work as OTel spans. Selftest + suite wiring.
 **Remaining (follow-up):** an actual OTel EXPORTER/bridge that ships `active_spans()` to a collector (Tempo/Jaeger),
 and stamping `model`/token usage into pulse `meta` so the spans carry them. The mapping (the hard/portable part) is done.
 
-### 13. [E] Provable side-effects (durable EFFECT records) — 🟡 core shipped
-**Done:** `tools.effect_record(action, resource, content=…)` writes a tamper-evident EFFECT into the audit chain
-with a **sha256 content hash** + an **idempotency key**, so the org can *prove* what actually happened and a
-retried step is recognisable. Wired into `produce_artifact` (file writes) and `connector_ingest` (egress); the
-effect rides back on the tool result. Selftest binds the hash to the real bytes.
-**Remaining:** wire git-commit effects (the build/dev path) + actually USE the idempotency key to short-circuit a
-proven-duplicate side-effect (today it's recorded, not yet enforced). Extends the durable-execution model.
-**Research:** durable-execution guidance (Temporal/Inngest/Zylos; claims 27/40/103) — enough to build.
+### 13. [E] Provable side-effects (durable EFFECT records) — ✅ done; idempotency ENFORCEMENT is the follow-up
+**Done:** `tools.effect_record(action, resource, content=…)` writes a tamper-evident EFFECT (sha256 content hash
++ idempotency key) into the audit chain, wired into `produce_artifact` (file writes) and `connector_ingest`
+(egress). **Git publish** now records an effect too (`appregistry.publish`): the commit **SHA is the
+tamper-evident identity + idempotency key**, so a re-publish of the same tree is recognisable. The org can *prove*
+what actually happened, not just that an agent said so.
+**Remaining follow-up:** actually USE the idempotency key to SHORT-CIRCUIT a proven-duplicate side-effect
+(needs per-tool check-before-side-effect restructuring; today duplicates are *recordable*, not yet *prevented* —
+adding a half-wired check nothing calls would be speculative, so it's a clean, scoped follow-up).
+**Research:** durable-execution guidance (Temporal/Inngest/Zylos; claims 27/40/103) — enough.
 
 ---
 
 ## Tier 4 — keep / don't-regress / evaluate
 
-### 14. [V] Keep control-flow deterministic in code — ✅ already true (guard against regress)
+### 14. [V] Keep control-flow deterministic in code — ✅ done (regress guard added)
 The coordinator/tool-worker structure + durable bus + dispatch-and-park are deterministic code control-flow, and
-QA-loop termination/gating live in code. **Action = a wiring guard** so this can't silently regress. Low effort.
+QA-loop termination/gating live in code. **Regress guard added** to the suite: asserts the auditor close-call
+gate stays code-driven in both QA callers (`grep close_call`), so a refactor can't silently move verdict gating
+into LLM discretion (premature-termination is a named MAST failure).
 
 ### 15. [E] Sign messages IF we expose cross-org/external comms — ⬜ deferred
 Not needed on the single-box internal bus today. If we ever expose agent-to-external comms, sign messages (don't

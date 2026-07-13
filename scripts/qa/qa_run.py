@@ -66,7 +66,10 @@ import qa_report      # noqa: E402  — grounded verdict + AI narrative report w
 import artifacts      # noqa: E402  — Windows-visible evidence archive paths
 import pulse          # noqa: E402  — live heartbeat plane (observability: this run is alive + what it's doing)
 
-MAX_ROUNDS = int(os.environ.get("AOS_QA_MAX_ROUNDS", "6"))     # bounded fix-and-re-run cycles
+# Rounds = fix-and-re-test cycles + coverage gap-fill cycles. This is only a RUNAWAY cap, not the real
+# terminator: the loop stops itself on coverage-complete or an honest gap-stall (a gap round that covers
+# nothing new). Liberal by default (was 6); raise/lower with AOS_QA_MAX_ROUNDS.
+MAX_ROUNDS = int(os.environ.get("AOS_QA_MAX_ROUNDS", "12"))    # runaway cap on fix + gap-fill rounds
 # NOT a target, NOT a quality cap — a pure SAFETY BACKSTOP. The explorer is COVERAGE-DRIVEN: it stops when
 # it has tested everything a real user would try (an AI judgment), not after N clicks. This number only
 # guards against a runaway loop; when it trips, the run is marked INCOMPLETE and checkpoints what's left.
@@ -230,6 +233,23 @@ def _story_report(story: dict, records: list, story_bugs: list) -> dict:
         "status": status,
         "steps": steps,
     }
+
+
+def _skey(d: dict) -> str:
+    """A stable key for a story or its report (id, else title, else name) — used to accumulate coverage
+    across rounds and to re-run just the incomplete stories on a gap-fill round."""
+    return str(d.get("id") or d.get("title") or d.get("name") or "").strip()
+
+
+def _report_incomplete(sr: dict) -> bool:
+    """A story report is INCOMPLETE when coverage aspects remain untested, or it stopped for an
+    incomplete/stalled/stuck/capped/deadline reason. This is the signal the loop uses to spawn a GAP-FILL
+    round (re-test the gaps) instead of declaring the run done — a QA coordinator does not accept a story
+    it never finished testing."""
+    if any(not c.get("covered") for c in (sr.get("coverage") or [])):
+        return True
+    stop = (sr.get("stop_reason") or "").lower()
+    return any(k in stop for k in ("incomplete", "stalled", "stuck", "cap", "deadline"))
 
 
 def _bug_report(bug: dict, story: dict, n: int, fixed: bool = False) -> dict:
@@ -401,58 +421,90 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     last_story_reports, last_bug_reports = [], []
     rounds_ran = 0
     clean = False
+    # The QA-coordinator loop. Two ways a round is NOT done: a BLOCKING bug (fix it, re-test everything) or
+    # INCOMPLETE COVERAGE (untested aspects remain -> a GAP-FILL round re-tests just those stories). It only
+    # declares the run clean when there is no blocking bug AND every story's coverage is complete. Liberal by
+    # design: it keeps going while gaps remain and progress is being made; max_rounds is only a runaway cap,
+    # and an honest "gap-stalled" stop fires if a gap-fill round covers nothing new (never an infinite loop).
+    report_by_key = {}                                   # story-key -> latest report, accumulated across rounds
+    acc_bugs = []                                        # bugs across gap-fill rounds (reset when code is fixed)
+    active = list(stories)                               # stories THIS round exercises (shrinks to the gaps)
+    prev_covered = -1                                    # total covered aspects last round (detects no-progress)
     for rnd in range(max_rounds):
         rounds_ran = rnd + 1
-        emit("round_start", {"round": rounds_ran, "stories": len(stories)})
-        pulse.beat(pulse_work_id, stage=f"round {rounds_ran}/{max_rounds}",
-                   progress=f"exploring {len(stories)} stories")
+        gap = rnd > 0 and len(active) < len(stories)
+        emit("round_start", {"round": rounds_ran, "stories": len(active), "mode": "gap-fill" if gap else "explore"})
+        pulse.beat(pulse_work_id, stage=f"round {rounds_ran}/{max_rounds} ({'gap-fill' if gap else 'explore'})",
+                   progress=f"{'filling gaps in' if gap else 'exploring'} {len(active)} stories")
         story_reports, bug_reports, blocking = _run_round(
-            target_url, vision, token, org, stories,
+            target_url, vision, token, org, active,
             max_steps=max_steps, explorer_cls=explorer_cls, bug_seq=bug_seq, on_event=emit,
             artifact_dir=evidence_dir, pulse_work_id=pulse_work_id)
-        last_story_reports, last_bug_reports = story_reports, bug_reports
+        for sr in story_reports:                          # accumulate the latest report per story across rounds
+            report_by_key[_skey(sr)] = sr
+        acc_bugs.extend(bug_reports)                       # keep bugs from complete stories across gap-fill rounds
+        last_story_reports, last_bug_reports = list(report_by_key.values()), list(acc_bugs)
 
-        if blocking is None:                              # a clean round: no blocking bug -> we're done
-            clean = True
-            emit("clean_round", {"round": rounds_ran})
-            break
-
-        if rounds_ran >= max_rounds:                      # cap hit — do NOT start a fix we can't verify
-            emit("cap_reached", {"round": rounds_ran})
-            break
-
-        # BLOCKING bug -> AI dev-fix loop (plans #agents -> spawns them -> AI judges fixed), then RESET.
-        emit("fixing", {"round": rounds_ran, "bug": blocking["report_bug"]["title"]})
-        code_context = {"repo": repo, "target_url": target_url,
-                        "story": blocking["story"], "summary": product_summary}
-        try:
-            # target_url + the failing story are MANDATORY: fix_bug always restarts (tracked PID)
-            # and re-explores the story, so its judge sees a real diff + a fresh observation.
-            fix = dev_loop.fix_bug(blocking["explorer_bug"], code_context, vision, repo=repo,
-                                   target_url=target_url, stories=[blocking["story"]],
-                                   restart_cmd=restart_cmd, health_url=health_url,
-                                   token=token, org=org)
-        except Exception as e:
-            fix = {"fixed": False, "error": str(e)}
-        blocking["report_bug"]["fixed"] = bool(fix.get("fixed"))
-        fixed_history.append(blocking["report_bug"])
-        try:
-            (evidence_dir / f"fix-round-{rounds_ran}.json").write_text(json.dumps(fix, indent=2, default=str))
-        except Exception:
-            pass
-        emit("fixed", {"round": rounds_ran, "fixed": bool(fix.get("fixed")),
-                       "files": fix.get("files")})
-
-        # RESET: restart the app so the NEXT round observes a fresh process serving the fixed code.
-        if restart_cmd:
+        # BLOCKING bug -> AI dev-fix loop (plans #agents -> spawns them -> AI judges fixed), then re-test ALL.
+        if blocking is not None:
+            if rounds_ran >= max_rounds:                  # cap hit — do NOT start a fix we can't verify
+                emit("cap_reached", {"round": rounds_ran})
+                break
+            emit("fixing", {"round": rounds_ran, "bug": blocking["report_bug"]["title"]})
+            code_context = {"repo": repo, "target_url": target_url,
+                            "story": blocking["story"], "summary": product_summary}
             try:
-                restart = dev_loop.restart_target(restart_cmd, health_url=health_url,
-                                                  cwd=repo if isinstance(repo, str) else None)
+                # target_url + the failing story are MANDATORY: fix_bug always restarts (tracked PID)
+                # and re-explores the story, so its judge sees a real diff + a fresh observation.
+                fix = dev_loop.fix_bug(blocking["explorer_bug"], code_context, vision, repo=repo,
+                                       target_url=target_url, stories=[blocking["story"]],
+                                       restart_cmd=restart_cmd, health_url=health_url,
+                                       token=token, org=org)
             except Exception as e:
-                restart = {"restarted": False, "healthy": False, "detail": str(e)}
-            emit("reset", {"round": rounds_ran, "healthy": restart.get("healthy")})
+                fix = {"fixed": False, "error": str(e)}
+            blocking["report_bug"]["fixed"] = bool(fix.get("fixed"))
+            fixed_history.append(blocking["report_bug"])
+            try:
+                (evidence_dir / f"fix-round-{rounds_ran}.json").write_text(json.dumps(fix, indent=2, default=str))
+            except Exception:
+                pass
+            emit("fixed", {"round": rounds_ran, "fixed": bool(fix.get("fixed")), "files": fix.get("files")})
+            # RESET: restart so the NEXT round observes a FRESH process serving the fixed code, and re-test
+            # EVERY story from scratch — a fix can regress anything, so coverage is rebuilt clean.
+            if restart_cmd:
+                try:
+                    restart = dev_loop.restart_target(restart_cmd, health_url=health_url,
+                                                      cwd=repo if isinstance(repo, str) else None)
+                except Exception as e:
+                    restart = {"restarted": False, "healthy": False, "detail": str(e)}
+                emit("reset", {"round": rounds_ran, "healthy": restart.get("healthy")})
+            active, report_by_key, prev_covered, acc_bugs = list(stories), {}, -1, []
+            continue
 
-    # Assemble the run for the report: the LAST round's stories + its open bugs + every earlier fix.
+        # NO blocking bug -> is COVERAGE complete? (the check the old loop skipped). A story is not accepted
+        # while aspects a real user would try remain untested.
+        incomplete = [sr for sr in report_by_key.values() if _report_incomplete(sr)]
+        total_covered = sum(1 for sr in report_by_key.values()
+                            for c in (sr.get("coverage") or []) if c.get("covered"))
+        if not incomplete:
+            clean = True
+            emit("clean_round", {"round": rounds_ran, "coverage": "complete"})
+            break
+        if rounds_ran >= max_rounds:
+            emit("cap_reached", {"round": rounds_ran, "incomplete": len(incomplete)})
+            break
+        if total_covered <= prev_covered:                 # a gap-fill round that covered NOTHING new -> honest stop
+            emit("gap_stalled", {"round": rounds_ran, "incomplete": len(incomplete)})
+            break
+        prev_covered = total_covered
+        # GAP-FILL: re-run ONLY the still-incomplete stories — another crack at the untested aspects with a
+        # fresh browser. The still-open aspects also become governed findings at the end, so nothing is lost.
+        inc_keys = {_skey(sr) for sr in incomplete}
+        active = [s for s in stories if _skey(s) in inc_keys] or list(stories)
+        untested = sum(len([c for c in (sr.get("coverage") or []) if not c.get("covered")]) for sr in incomplete)
+        emit("gap_fill", {"round": rounds_ran, "stories": len(active), "untested_aspects": untested})
+
+    # Assemble the run for the report: accumulated per-story reports + open bugs + every earlier fix.
     seen = {b["id"] for b in last_bug_reports}
     all_bugs = list(last_bug_reports) + [b for b in fixed_history if b["id"] not in seen]
     run = {

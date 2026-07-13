@@ -12,16 +12,16 @@ a **research** note (what we dug up, or that a deeper dig is still owed). Anchor
 
 ## Tier 0 — verdict integrity (auditor) — *"zero bugs reach a human / astonish a skeptic"*
 
-### 1. [V] Harden `review.py` into a true Agent-as-a-Judge — 🟡 (core landed)
+### 1. [V] Harden `review.py` into a true Agent-as-a-Judge — ✅ done (one optional deepening left)
 **Done:** master-key **sanitization** (`_sanitize` neutralizes verdict-priming openers like "Thought process:"
 and symbol-only fields in agent-written evidence before the auditor reads them); a configurable mid-sized judge
-model via `AOS_AUDITOR_MODEL` (honours Opus default, exposes the research-recommended mid-sized judge without a
-deploy). Wired into `scripts/selftest.sh`.
-**Remaining:** ground the verdict in the **actual git diff + actual test-run output** (today it reads step
-records + screenshots + coverage; add the diff/test artifacts to the dossier), and let the auditor **run its own
-checks** (re-open a screenshot, re-run a named assertion) rather than only reading. → next sub-step.
-**Research:** master-key token list + "larger judges are MORE vulnerable, mid-sized best" from *One Token to
-Fool* (2507.08794) and the Agent-as-a-Judge survey (2601.05111) — enough to build; no further dig needed.
+model via `AOS_AUDITOR_MODEL`. **Grounded in the REAL dev work:** the dossier now surfaces the `fix-round-*.json`
+artifacts — files actually changed, dev's fixed-claim, and the **residual bugs still open** after each fix — and
+the auditor is told to cross-check claimed fixes against residuals (catches "fixed!" over a nonzero residual).
+Selftest covers all of it; wired into `scripts/selftest.sh`.
+**Optional deepening (not blocking):** let the auditor **run its own checks** (re-open a screenshot, re-run a
+named assertion) rather than only reading — deferred; the evidence-grounding above already moves us off narrative.
+**Research:** master-key list + "larger judges more vulnerable" (2507.08794); Agent-as-a-Judge survey (2601.05111).
 
 ### 2. [V] Auditor VALIDATION harness — ✅ done (needs a real labeled set to run in anger)
 **Done:** `scripts/qa/auditor_validate.py` implements the Minimum Viable Validation Protocol from *Reliability
@@ -76,14 +76,16 @@ task-verification) as a checklist the spawn gate + auditor consult. Mostly promp
 
 ## Tier 2 — memory & context (the biggest architectural gap)
 
-### 9. [E] Explicit agent-MEMORY layer — 🔬 RESEARCH FIRST (biggest new build)
-**Approach (draft):** an org-level + role-level memory store, distinct from the event bus and from RAG,
-permissioned per tenant, with cross-run learning. Note: a `scripts/companymemory.py` "memory spine" already
-exists (in the selftest) — **first task is to audit what it already does** vs the gap.
-**Research owed — YES, deep:** the mined claims point at concrete designs — three realizations (token/parametric/
-latent) and factual/experiential/working taxonomy (2512.13564); two-tier private/shared + provenance metadata
-(Collaborative Memory 2505.18279); transactive "who knows what" index + 5 challenge classes (LLM-MAS 2604.03295);
-MemAct learnable delete/insert (2510.12635). *A focused research run + a design doc precede any code.*
+### 9. [E] Explicit agent-MEMORY layer — 🟡 design done → building
+**Design:** [`docs/MEMORY-LAYER-DESIGN.md`](MEMORY-LAYER-DESIGN.md) (from a grounded research+audit pass). Key
+finding: agent-os already has the substrate + 2 of 3 memory functions — `companymemory.py` (factual + experiential
+tables) and `orchestra_actors.memory` (working). It's an **extend, not greenfield**. The gap: provenance,
+per-role/two-tier access control, an experiential writer that's built but **never called in prod**, and
+plan/summary checkpoints. Build order: (1) `52-memory.sql` migration capturing current tables + additive columns
+w/ safe defaults; (2) provenance + `audit.append` on every write; (3) **activate the dead experiential writer**
+(`distill_lesson`/`add_lesson` at the fix-loop post-mortem — highest ROI); (4) item-10 checkpoints.
+**Research owed:** open questions in the design doc (global-vs-tenant lessons; whether coordinators actually
+truncate today → gates item 11; MemAct RL curation deferred to item 17; retention/GDPR).
 
 ### 10. [V] External-memory checkpoint of coordinator PLAN + per-phase SUMMARY — ⬜ not started
 **Approach:** persist each coordinator's plan + phase summaries as distinct rows (not buried in event history) so
@@ -149,7 +151,8 @@ The full **133 unique claims** are now mined from the deep-research subagent tra
   master-key sanitization + mid-sized-judge knob (item 1 core), perspective-diverse jury with
   disagreement→escalate (item 3 ✅); both QA callers treat a close call as not-a-pass. Built the auditor
   **validation harness** (item 2 ✅): kappa / position-bias / test-retest / confidently-biased FAIL flag, with
-  selftest + suite wiring. Launched a background design-research agent for item 9 (memory layer) to audit the
-  existing `companymemory.py` spine + turn the mined memory claims into a concrete design before any code.
-  Next: item 1's diff/test-grounding sub-step; land item-9 design → smallest useful memory slice; then items
-  10/11 (PLAN/SUMMARY checkpoint + compaction).
+  selftest + suite wiring. **Item 1 completed**: auditor dossier now grounds in the real `fix-round-*.json` dev
+  work (files changed + residual bugs) and cross-checks claimed fixes against residuals. **Item 9 design landed**
+  ([`MEMORY-LAYER-DESIGN.md`](MEMORY-LAYER-DESIGN.md)) from a grounded research+audit pass — it's an extend of
+  `companymemory.py`, not greenfield. Next: build the item-9 first slice (`52-memory.sql` + provenance + activate
+  the dead experiential writer), then items 10/11 (PLAN/SUMMARY checkpoint + compaction), then Tier-1 contracts.

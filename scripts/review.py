@@ -90,12 +90,24 @@ def _load(evidence_dir: Path) -> dict:
         except Exception:
             return default
     run_final = _j("run-final.json", {})
+    # The REAL dev work, not the self-report: each fix-round-N.json records what dev actually changed (files),
+    # whether its own fix-judge said fixed, and the RESIDUAL bugs still open after the fix + restart. Grounding
+    # the auditor in these catches the classic dishonest stop — "fixed!" while a residual bug remained.
+    fix_rounds = []
+    for p in sorted(evidence_dir.glob("fix-round-*.json")):
+        fr = _j(p.name, {})
+        if fr:
+            fix_rounds.append({"round": p.stem.split("-")[-1], "fixed": fr.get("fixed"),
+                               "files": fr.get("files") or [], "residual": fr.get("residual") or [],
+                               "reason": ((fr.get("verdict") or {}).get("reason")
+                                          or (fr.get("verdict") or {}).get("summary") or fr.get("error"))})
     return {
         "dir": evidence_dir,
         "input": _j("run-input.json", {}),
         "run": run_final,
         "coverage": _j("coverage.json", []),
         "checkpoint": _j("checkpoint.json", {}),
+        "fix_rounds": fix_rounds,
         "stories": run_final.get("stories", []),
         "screenshots": sorted(str(p) for p in (evidence_dir / "screenshots").glob("*.png")),
         "video": next((str(p) for p in (evidence_dir / "videos").glob("*.mp4")
@@ -113,6 +125,14 @@ def dossier(evidence_dir) -> dict:
          f"**Vision:** {d['input'].get('vision', '(none)')}", "",
          f"**Screenshots on disk:** {len(d['screenshots'])} · **Session video:** "
          f"{d['session_video'] or '(none)'}", ""]
+    if d.get("fix_rounds"):
+        L += ["## Dev-fix rounds (the ACTUAL changes + residual bugs — cross-check claims against these)", "",
+              "| round | dev claims fixed | files changed | RESIDUAL bugs still open | fix-judge reason |",
+              "|---|---|---|---|---|"]
+        for fr in d["fix_rounds"]:
+            L.append(f"| {fr['round']} | {fr.get('fixed')} | {_clip('; '.join(fr.get('files') or []), 60)} | "
+                     f"**{len(fr.get('residual') or [])}** | {_clip(fr.get('reason'), 80)} |")
+        L.append("")
     for cov in d["coverage"]:
         L += [f"## Story: {cov.get('story', '?')}",
               f"- reported stop reason: **{cov.get('stop_reason', '?')}**",
@@ -149,6 +169,9 @@ Your job is to catch what a rigorous human reviewer would catch:
   * VAGUE / UNVERIFIABLE REPORTING — status or reasoning so hand-wavy you cannot tell from it whether a
     specific flow really happened. Vagueness that hides a gap is itself a finding.
   * DISHONEST STOP — stopped claiming success while the evidence shows it was stuck or gave up.
+  * CLAIMED-FIX vs RESIDUAL — if a dev-fix round says fixed=true but its RESIDUAL-bugs count is >0, the fix did
+    NOT hold; a run reported 'passed' over a nonzero residual is a dishonest stop. Cross-check the fix-round
+    table against the final story verdicts.
 
 DEFAULT POSTURE: if the evidence does not SHOW it, it did NOT happen. Do not give benefit of the doubt.
 You MAY open specific screenshots (their filenames are in the table; they live in ./screenshots/) to verify
@@ -304,10 +327,15 @@ def _selftest():
         "expected": "plan shows", "actual": "plan shown", "verdict": "pass", "covers": ["generate"]}]}]}))
     (ev / "coverage.json").write_text(json.dumps([{"story": "generate a plan", "stop_reason": "covered",
         "tested": ["generate"], "yet_to_test": []}]))
+    # a dev-fix round that CLAIMS fixed but left a residual bug — the auditor must be able to see this
+    (ev / "fix-round-1.json").write_text(json.dumps({"fixed": True, "files": ["app.py"],
+        "residual": [{"title": "save still 500s"}], "verdict": {"reason": "diff applied"}}))
 
-    # 1b. The dossier must NOT contain the raw priming token (it was sanitized before the auditor sees it).
+    # 1b. The dossier must NOT contain the raw priming token (it was sanitized before the auditor sees it),
+    #     and it MUST surface the dev-fix round + its residual count (grounding in the real changes).
     md = dossier(ev)["md"]
     assert "Thought process: obviously fine" not in md and "priming-opener" in md, "dossier not sanitized"
+    assert "Dev-fix rounds" in md and "app.py" in md, "dossier must ground the auditor in the real fix rounds"
 
     _real = sys.modules.get("factory")
     fake = types.ModuleType("factory")

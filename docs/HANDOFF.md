@@ -136,10 +136,12 @@ silence → reconcile re-dispatches).
    findings arrive as separate `finding` events (not in `done`), but a tool-worker's `done` now carries
    `story` + `blocking_found` for per-story tracking.
 
-3. **Phase 6 — prove the agentic path at PARITY on a LIVE app, then flip the default.** `qa_run(agentic=True)`
-   should call `run_agentic_qa` and produce the SAME artifacts as the procedural loop (evidence dir,
-   COVERAGE.md, honest QA-VERDICT.json, findings.py items, pulse). Run both against the live console; when the
-   agentic verdict matches, make it default. Until then `qa_run.py` stays default.
+3. **Phase 6 — parity + flip the default.** ✅ 6a (`5f88a50`): an agentic run now persists a `qa_runs` row +
+   `docs/QA-VERDICT.json` (the gate artifact), reusing `qa_run._persist_run`/`write_verdict`. Remaining: (i)
+   also write the evidence dir + COVERAGE.md + file still-open findings via `findings.py` (reuse
+   `qa_run._file_open_bugs`); (ii) add `qa_run(agentic=True)` that calls `run_agentic_qa`; (iii) run BOTH
+   paths against the LIVE console and confirm the agentic verdict/artifacts match the procedural loop; (iv)
+   then flip the default. Until (iii) passes, `qa_run.py` (procedural) stays the default.
 3. **Phase 5 — agentic entrypoint.** `qa_run(..., agentic=True)` creates the QA org: `create_org(tenant,
    vision)` → the controller/plan spawns a qa-coordinator whose memory.context carries
    {vision, target_url, token, org, product, stories (from story_gen), artifact_dir, repo, restart_cmd,

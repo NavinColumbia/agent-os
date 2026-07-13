@@ -22,6 +22,7 @@ function; the rest is largely *replicating that template* across functions + tur
 | **CEO → org directive routing** (production callsite; the orchestra IS the engine) | `loopcontroller.py` behind the `orchestra_on()` flag | ✅ wired, flag-gated |
 | **CEO reporting** — founder's digest to your phone | `digest.py`, ntfy | ✅ |
 | **A full function working END-TO-END** — QA/dev: coordinator → workers → real TOOLS → hand-off → fix → re-test → honest verdict → auditor → artifacts | `qa/qa_agentic.py` + `orchestra/{tools,jobrunner}.py` | ✅ this session (the template) |
+| **The generic pattern for ANY function** + a FULL multi-function company org (CEO-coordinator → function coordinators → tool-worker teams → reports up) | `orchestra/company.py`, `tools.py` (research/finance), `_coordinator_specs` company+generic branches | ✅ this session (offline-proven) |
 | **Human-in-the-loop escalation** (a coordinator consults the CEO when it's truly a person's call) | `run_org(human_hook=...)`, `_CONTROLLER_PROMPT` consult_human | ✅ |
 
 So: coordinators, comms, visibility, 92 functions' charters, org-planning, CEO routing, CEO reporting — **all
@@ -56,12 +57,13 @@ a real multi-team run at parity with the legacy "fleet", then flip the flag. (Sa
 phase 6-iii for QA.)
 
 ### 3. Exercise + validate a FULL company run end-to-end (the integration proof)
-Drive one real CEO directive through a *multi-function* org: e.g. *"launch product X"* → product-manager
-coordinator specs it → research team gathers market intel → finance projects cost/price → legal reviews →
-build team builds → QA/dev org (done) verifies → launch — with each coordinator **reporting up** and the CEO
-**briefed via digest / consulted on the calls that matter**. The substrate supports every arrow; this is the
-first end-to-end *drive* + hardening pass (expect to find the same kind of "under-stubbed / timing" issues we
-found and fixed in the QA drive).
+✅ DEMONSTRATED OFFLINE (`1849dc0`): `scripts/orchestra/company.py` `run_company_org(vision, functions)` drives
+a CEO-coordinator → function coordinators (research + finance) → tool-worker teams → reports aggregating up to
+the CEO, `run=done`, reliably (stubs the tool + factory seams). The multi-level, multi-function, report-up
+shape works on the real runtime. **Remaining = the LIVE run** (Codex): real research/finance tools + real AI,
+a richer directive (e.g. *"launch product X"* → product → research → finance → legal → build → QA/dev(done) →
+launch), each coordinator reporting up, the CEO briefed via `digest` / consulted on the calls that matter.
+Expect the same "under-stubbed/timing" fixes we made in the QA drive.
 
 ### 4. Deepen whole-org visibility + human-pattern CEO comms in the CONSOLE
 `pulse`/dashboard already show every agent; surface the **whole standing org tree** (all teams, every action,

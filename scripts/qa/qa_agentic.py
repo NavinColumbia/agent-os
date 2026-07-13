@@ -131,9 +131,10 @@ def run_agentic_qa(target_url, vision, *, product="app", token=None, org="0", su
             import review
             av = review.review(str(evidence_dir), write=True)
             report["audit"] = av
-            if av.get("passed_audit") is False:
+            if av.get("passed_audit") is False or av.get("close_call"):   # reject OR jury-split close call → not a pass
                 report["passed"] = report["clean"] = False
-                report["verdict"] = f"AUDIT REJECTED (score {av.get('score', '?')}/10) — {(av.get('summary') or '')[:160]}"
+                tag = "AUDIT CLOSE-CALL → ESCALATE" if av.get("close_call") else "AUDIT REJECTED"
+                report["verdict"] = f"{tag} (score {av.get('score', '?')}/10) — {(av.get('summary') or '')[:160]}"
         except Exception as e:
             report["audit_error"] = str(e)
 

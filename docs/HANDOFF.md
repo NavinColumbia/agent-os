@@ -31,6 +31,20 @@ Individual module selftests (fast, offline, no API/browser — run the one you t
 
 Newest → oldest. Each is committed, tested, and green.
 
+### SOTA research → improvement backlog → execution (NEW)
+- **Deep-research** of the 2024–26 agentic-AI field → [`docs/AGENTIC-AI-RESEARCH.md`](AGENTIC-AI-RESEARCH.md):
+  9 three-vote-verified findings, 9 extracted signals, and an **Appendix mining all 133 claims** from the
+  research subagent transcripts (themed). Every finding tagged ADOPT/ADAPT/ALREADY-DO/AVOID for us.
+- **[`docs/IMPROVEMENTS-PLAN.md`](IMPROVEMENTS-PLAN.md)** — the **live execution tracker** for the 18
+  prioritized improvements: per-item status / approach / research-owed. **Start here to continue the research-
+  driven work.** Items flagged 🔬 need a design/research dig before coding (called out in the doc).
+- **Tier-0 auditor hardening shipped** (`scripts/review.py`): (1) **master-key sanitization** — neutralizes
+  verdict-priming tokens ("Thought process:", symbol-only fields) in agent-written evidence before the auditor
+  reads them; (2) **perspective-diverse JURY** (skeptic / user-flow / evidence lenses, `AOS_AUDITOR_ENSEMBLE`
+  default 3) that **ESCALATES on a split** (`close_call`) instead of auto-accepting — a single-pass judge is
+  research-proven unsafe. Both QA callers (`qa_run.py`, `qa_agentic.py`) treat a close call as **not a pass**.
+  Mid-sized-judge knob `AOS_AUDITOR_MODEL`. Selftest: `python scripts/review.py --selftest` (wired into suite).
+
 ### QA is now coverage-driven and honest
 - **`75834fd` coverage-driven QA** — the explorer no longer stops at a hardcoded step count. It enumerates a
   **coverage ledger** ("everything a user would try") and tests until covered, checkpointing every step

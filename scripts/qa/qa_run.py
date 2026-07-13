@@ -608,11 +608,15 @@ def qa_run(target_url, vision, token, org, product_summary, *,
             import review
             av = review.review(str(evidence_dir), write=True)
             report["audit"] = av
-            if av.get("passed_audit") is False:               # the skeptic rejected it -> honestly not a pass
+            # The jury rejected it (unanimous no) OR split on a close call — either way NOT a clean pass. A
+            # close call must not clear a launch gate; it escalates (zero bugs reach a human). (findings 7-9)
+            if av.get("passed_audit") is False or av.get("close_call"):
                 report["passed"] = False
-                report["verdict"] = (f"AUDIT REJECTED (score {av.get('score', '?')}/10) — "
+                tag = "AUDIT CLOSE-CALL → ESCALATE" if av.get("close_call") else "AUDIT REJECTED"
+                report["verdict"] = (f"{tag} (score {av.get('score', '?')}/10) — "
                                      f"{(av.get('summary') or '')[:180]}")
-                emit("audit_rejected", {"score": av.get("score"),
+                emit("audit_rejected", {"score": av.get("score"), "close_call": bool(av.get("close_call")),
+                                        "jury_vote": av.get("jury_vote"),
                                         "skipped_flows": len(av.get("skipped_flows") or []),
                                         "unbacked_claims": len(av.get("unbacked_claims") or [])})
         except Exception as e:

@@ -226,6 +226,7 @@ ckp "qa browser bridge (real browser proto)" "NODE_PATH=\$HOME/projects/products
 # stage / gate_check LAUNCH / loopcontroller TESTQA stop consuming the qa verdict JSON (passed,
 # blocking_open==0, stories>0), or if a self-grading `qa_run` shadow reappears in factory.py.
 ckp "QA ship-gate wired (verdict JSON consumed)" "$PY scripts/test_qa_gate_wired.py | grep -q '^PASS'"
+ckp "auditor: master-key sanitize + jury escalate" "$PY scripts/review.py --selftest | grep -q 'review.py selftest: PASS'"
 
 # Fire the bounded concurrent pool for everything enqueued above.
 run_pool

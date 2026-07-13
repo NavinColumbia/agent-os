@@ -302,6 +302,7 @@ def _next_persona() -> str:
 # ─────────────────────────────────────────────────────────────────────────────────────────────────────
 def run_once(persona: str = None, base: str = BASE) -> dict:
     import audit
+    import artifacts
     import qa_explorer
     persona = persona if persona in PERSONAS else (persona or _next_persona())
     if persona not in PERSONAS:
@@ -309,6 +310,28 @@ def run_once(persona: str = None, base: str = BASE) -> dict:
     run_id = uuid.uuid4().hex[:6]
     counters = {"filed": 0, "deduped": 0, "alerts": 0, "file_errors": 0, "alert_errors": 0}
     started = time.time()
+    evidence_dir = artifacts.run_dir(f"dogfood-{persona}", started)
+    events_path = evidence_dir / "events.jsonl"
+
+    def _write_json(name, payload):
+        try:
+            (evidence_dir / name).write_text(json.dumps(payload, indent=2, default=str))
+        except Exception:
+            pass
+
+    def _event(kind, payload=None):
+        try:
+            with events_path.open("a") as f:
+                f.write(json.dumps({"ts": time.time(), "kind": kind, "data": payload or {}},
+                                   default=str) + "\n")
+        except Exception:
+            pass
+
+    _write_json("run-input.json", {
+        "persona": persona, "run": run_id, "base": base,
+        "budget_s": BUDGET_S, "max_steps": MAX_STEPS,
+        "vision": _vision(persona),
+    })
 
     # The live console being DOWN is itself a blocking product finding — file + alert, don't skip.
     if not _console_up(base):
@@ -318,7 +341,8 @@ def run_once(persona: str = None, base: str = BASE) -> dict:
                    "severity": "critical", "blocking": True, "expected": "console serves /health",
                    "url": base}, counters, run_id)
         summary = {"persona": persona, "run": run_id, "console_up": False, "stories": 0, "bugs": 1,
-                   **counters}
+                   "evidence_dir": str(evidence_dir), **counters}
+        _write_json("summary.json", summary)
         audit.append(actor=SOURCE, action="DogfoodPass", resource=persona, decision="console_down",
                      payload=summary)
         return summary
@@ -326,9 +350,11 @@ def run_once(persona: str = None, base: str = BASE) -> dict:
     tok, org, tid = _seed_tenant(base, persona)
     vision = _vision(persona)
     stories = _journeys(run_id)
+    _write_json("stories.json", stories)
     bugs_found = 0
     stories_run = 0
     story_status = {}
+    story_results = []
     # Fair-share the budget ACROSS stories so a bounded run SAMPLES every journey instead of one deep
     # journey eating the whole budget (seen live: J1 consumed all 991s, J2-J5 were skipped-budget). Give
     # each story a fair slice of the REMAINING budget (computed per-story, not once) so the LAST journey —
@@ -344,10 +370,23 @@ def run_once(persona: str = None, base: str = BASE) -> dict:
         token = None if story.get("fresh") else tok
         ex = None
         collected = []
-        cb = lambda bug, _s=story: (collected.append(bug),
-                                    _file_bug(persona, _s, bug, counters, run_id))
+        story_dir = evidence_dir / f"{idx + 1:02d}-{story['id']}"
+        story_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(f"{idx + 1:02d}-{story['id']}.input.json", story)
+
+        def cb(bug, _s=story):
+            collected.append(bug)
+            _event("bug", {"story": _s.get("id"), "bug": bug})
+            _file_bug(persona, _s, bug, counters, run_id)
+
         try:
-            ex = qa_explorer.Explorer(base, vision, token=token, org=str(org))
+            _event("story_start", {"story": story.get("id"), "title": story.get("title"),
+                                   "artifact_dir": str(story_dir)})
+            try:
+                ex = qa_explorer.Explorer(base, vision, token=token, org=str(org),
+                                          artifact_dir=story_dir)
+            except TypeError:
+                ex = qa_explorer.Explorer(base, vision, token=token, org=str(org))
             # per-story deadline (its fair slice) AND the global cap — whichever comes first — so every
             # story gets a turn and the whole run still stops on time.
             ex.explore(story, max_steps=MAX_STEPS, on_bug=cb,
@@ -368,12 +407,24 @@ def run_once(persona: str = None, base: str = BASE) -> dict:
                     ex.close()
                 except Exception:
                     pass
+        story_result = {"story": story.get("id"), "title": story.get("title"),
+                        "status": story_status.get(story["id"]), "bugs": collected,
+                        "artifact_dir": str(story_dir)}
+        story_results.append(story_result)
+        try:
+            (story_dir / "result.json").write_text(json.dumps(story_result, indent=2, default=str))
+        except Exception:
+            pass
+        _event("story_done", story_result)
         bugs_found += len(collected)
         stories_run += 1
 
     summary = {"persona": persona, "run": run_id, "console_up": True, "tenant": tid, "org": str(org),
                "stories": stories_run, "story_status": story_status, "bugs": bugs_found,
-               "elapsed_s": int(time.time() - started), **counters}
+               "elapsed_s": int(time.time() - started), "evidence_dir": str(evidence_dir),
+               "story_results": story_results, **counters}
+    _write_json("summary.json", summary)
+    _event("summary", summary)
     audit.append(actor=SOURCE, action="DogfoodPass", resource=persona, decision="filed",
                  payload=summary)
     return summary

@@ -259,6 +259,39 @@ def resolve(tid):
     return {"engine": meta["engine"], "provider": provider, "key": key, "auth_mode": auth_mode}
 
 
+def resolve_provider(tid, provider):
+    """Resolve one specific provider for fallback/secondary use, ignoring priority order.
+
+    resolve() returns the tenant's primary provider. Factory failover needs a different question:
+    "does this tenant also have OpenAI/Codex connected so Claude can fall over to THEIR Codex account?"
+    This returns connected=False when absent or when an api_key row lost its vault secret; subscription
+    rows are connected with key=None because the host CLI login is the credential.
+    """
+    if provider not in _BY_SLUG:
+        return {"connected": False, "provider": provider, "engine": None, "key": None, "auth_mode": None}
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""SELECT auth_mode FROM tenant_providers
+                       WHERE tenant_id=%s AND provider=%s AND has_key""", (tid, provider))
+        row = cur.fetchone()
+    meta = _BY_SLUG[provider]
+    if not row:
+        return {"connected": False, "provider": provider, "engine": meta["engine"], "key": None, "auth_mode": None}
+    auth_mode = row[0] or "api_key"
+    key = None
+    if auth_mode == "api_key":
+        try:
+            v = vault.get_secret(_secret_name(provider), f"tenant:{tid}", "prod", "builder", tenant_id=tid)
+            key = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
+        except Exception:
+            key = None
+        if not key:
+            return {"connected": False, "provider": provider, "engine": meta["engine"], "key": None,
+                    "auth_mode": auth_mode}
+    return {"connected": True, "provider": provider, "engine": meta["engine"], "key": key,
+            "auth_mode": auth_mode}
+
+
 def build_kwargs(tid):
     """factory.build_product(**build_kwargs(tid)) routing for this tenant."""
     r = resolve(tid)

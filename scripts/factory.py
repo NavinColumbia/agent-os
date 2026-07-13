@@ -542,6 +542,40 @@ def _agent_codex(role, repo, prompt, codex_key, timeout=600):
     return {"rc": 1, "out": (last_out or "")[-1500:], "out_full": last_out or "", "failed": True, "reason": "codex exhausted"}
 
 
+def _codex_fallback_env():
+    """Return (env, source) for Codex failover, or (None, reason) when it is not allowed.
+
+    Rules:
+      * no Codex CLI / disabled fallback -> no fallback;
+      * explicit _ctx.codex_key wins (tenant primary Codex path and tests);
+      * tenant Claude runs may fall over only to THAT tenant's connected OpenAI/Codex provider
+        (api_key or subscription), never silently to platform OpenAI;
+      * platform/internal runs with no tenant keep the old behavior: use the host Codex auth.
+    """
+    if FALLBACK_ENGINE != "codex":
+        return None, "disabled"
+    if not shutil.which("codex"):
+        return None, "codex-cli-missing"
+    cenv = {**os.environ}
+    explicit = getattr(_ctx, "codex_key", None)
+    if explicit:
+        cenv["OPENAI_API_KEY"] = explicit
+        return cenv, "ctx-codex-key"
+    tenant = getattr(_ctx, "tenant", None)
+    if tenant:
+        try:
+            import tenantproviders
+            r = tenantproviders.resolve_provider(tenant, "openai")
+        except Exception:
+            r = None
+        if r and r.get("connected") and r.get("engine") == "codex":
+            if r.get("auth_mode") == "api_key":
+                cenv["OPENAI_API_KEY"] = r.get("key") or ""
+            return cenv, f"tenant-openai-{r.get('auth_mode') or 'unknown'}"
+        return None, "tenant-has-no-codex"
+    return cenv, "platform-codex"
+
+
 def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None,
           tools: list = None, spawner: str = None, light: bool = False) -> dict:
     """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry from the CALLEE's
@@ -799,16 +833,18 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
         except subprocess.TimeoutExpired:
             saw_transient = True
     # PROVIDER FAILOVER — Claude exhausted its retries on transient/overload/timeout (Anthropic likely
-    # degraded or down): run the SAME task once on Codex before giving up. Skipped for BYO-key tenants
-    # (we don't silently spend platform OpenAI on their behalf) and when Codex isn't installed/enabled.
-    if FALLBACK_ENGINE == "codex" and saw_transient and not key and shutil.which("codex"):
+    # degraded or down): run the SAME task once on Codex before giving up. Tenant Claude runs only fall
+    # over to that tenant's connected OpenAI/Codex provider; platform/internal runs use host Codex auth.
+    codex_env, codex_source = _codex_fallback_env()
+    if saw_transient and codex_env is not None:
         print(f"[factory] Claude exhausted on transient errors — failing over to Codex for {role}", flush=True)
         try:
             with _AGENT_SEM:
-                rc, out_text, cost, tin, tout, used = _run_once_codex(role, repo, prompt, timeout, env)
+                rc, out_text, cost, tin, tout, used = _run_once_codex(role, repo, prompt, timeout, codex_env)
             _trace("agent", role, prompt, out_text, rc, 0.0, cost, tin, tout, used)
             audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
-                         decision="executed-failover", payload={"engine": "codex", "rc": rc, "model": used})
+                         decision="executed-failover",
+                         payload={"engine": "codex", "rc": rc, "model": used, "source": codex_source})
             if rc == 0 and out_text.strip():
                 try:
                     import notify
@@ -2294,12 +2330,67 @@ def _main(a):
             audit.append = _orig_audit2
             shutil.rmtree(_c1repo, ignore_errors=True)
 
+        # --- CROSS-PROVIDER FAILOVER: a Claude/API-key run must still be able to fall over to Codex when
+        # Codex credentials are explicitly available. This is the regression guard for the old `not key`
+        # condition, which skipped Codex whenever ANTHROPIC_API_KEY was set.
+        _orig_run_once, _orig_run_codex, _orig_which, _orig_audit3, _orig_trace, _orig_halt = (
+            globals()["_run_once"], globals()["_run_once_codex"], shutil.which, audit.append,
+            globals()["_trace"], killswitch.is_halted)
+        failover_ok = fallback_env_ok = False
+        _old_ctx = {k: getattr(_ctx, k, None) for k in ("tenant", "engine", "api_key", "codex_key", "product")}
+        try:
+            audit.append = lambda **k: None
+            globals()["_trace"] = lambda *a, **k: None
+            killswitch.is_halted = lambda scope="global": {"halted": False}
+            shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else _orig_which(name)
+            _ctx.tenant = None
+            _ctx.engine = "claude"
+            _ctx.api_key = "sk-ant-selftest"
+            _ctx.codex_key = "sk-codex-selftest"
+            _ctx.product = None
+            calls = []
+            globals()["_run_once"] = lambda *a, **k: (1, "529 overloaded", 0.0, 0, 0, BUILD_MODEL)
+
+            def _fake_codex(role, repo, prompt, timeout, env):
+                calls.append(env.get("OPENAI_API_KEY"))
+                return 0, "CODEX_OK", 0.0, 11, 3, CODEX_MODEL
+
+            globals()["_run_once_codex"] = _fake_codex
+            rc3 = agent("builder", str(PRODUCTS), "tiny task", timeout=1, retries=0, model=BUILD_MODEL, tools=[])
+            failover_ok = (rc3.get("rc") == 0 and rc3.get("engine") == "codex"
+                           and rc3.get("out_full") == "CODEX_OK"
+                           and calls == ["sk-codex-selftest"])
+
+            # The tenant-specific fallback resolver must prefer the tenant's OpenAI/Codex key, not platform
+            # Codex, when a tenant is in context.
+            import tenantproviders as _tp
+            _real_resolve_provider = getattr(_tp, "resolve_provider")
+            _tp.resolve_provider = lambda tid, provider: {"connected": True, "provider": "openai",
+                                                          "engine": "codex", "key": "sk-tenant-codex",
+                                                          "auth_mode": "api_key"}
+            _ctx.tenant = "t-selftest"
+            _ctx.codex_key = None
+            env4, src4 = _codex_fallback_env()
+            fallback_env_ok = (env4 and env4.get("OPENAI_API_KEY") == "sk-tenant-codex"
+                               and src4 == "tenant-openai-api_key")
+            _tp.resolve_provider = _real_resolve_provider
+        except Exception as e:
+            print(f"Codex failover selftest error: {e}")
+        finally:
+            globals()["_run_once"] = _orig_run_once; globals()["_run_once_codex"] = _orig_run_codex
+            shutil.which = _orig_which; audit.append = _orig_audit3; globals()["_trace"] = _orig_trace
+            killswitch.is_halted = _orig_halt
+            for k, v in _old_ctx.items():
+                setattr(_ctx, k, v)
+
         ok = (ok and cost_ok and pool_ok and sig_ok and cancel_ok and success_ok
-              and gate_ok and indep_pass_ok and indep_fail_ok and artifact_ok)
+              and gate_ok and indep_pass_ok and indep_fail_ok and artifact_ok
+              and failover_ok and fallback_env_ok)
         print(f"warm-HTTP: cost={cost_ok} pool={pool_ok} | stop: sig={sig_ok} cancel-discarded={cancel_ok} "
               f"stream-success={success_ok}")
         print(f"C1 ship gate: verdict-condition={gate_ok} independent-qa-pass={indep_pass_ok} "
               f"fail-closed={indep_fail_ok} launch-artifact={artifact_ok}")
+        print(f"Codex failover: claude-key-to-codex={failover_ok} tenant-codex-env={fallback_env_ok}")
         print("PASS: factory prompt assembly + governance wiring + fast-path/stop + C1 grounded ship gate ✅"
               if ok else "FAIL")
         sys.exit(0 if ok else 1)

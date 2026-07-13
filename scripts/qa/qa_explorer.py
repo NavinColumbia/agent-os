@@ -45,6 +45,10 @@ BRIDGE_JS = Path(__file__).resolve().parent / "browser_bridge.js"
 NODE_PATH = os.environ.get("NODE_PATH") or str(
     Path.home() / "projects" / "products" / "noupload" / "node_modules")
 ROLE = "qa-security"
+try:
+    import artifacts
+except Exception:
+    artifacts = None
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -100,13 +104,16 @@ class BrowserBridge:
     (goto/state/click/fill/eval/inject/seedToken/close). This wrapper hides the protocol behind a small
     `state()` / `act(action)` surface the state-based loop uses, plus goto/seed for session setup."""
 
-    def __init__(self, target_url, token=None, org="0", timeout=45, autostart=True):
+    def __init__(self, target_url, token=None, org="0", timeout=45, autostart=True, shot_dir=None):
         self.timeout = timeout
         self._id = 0
         self.proc = None
         if not autostart:
             return
         env = {**os.environ, "NODE_PATH": NODE_PATH}
+        if shot_dir:
+            env["AOS_QA_SHOT_DIR"] = str(shot_dir)
+            env["AOS_QA_VIDEO_DIR"] = str(Path(shot_dir).parent / "videos")
         self.proc = subprocess.Popen(
             ["node", str(BRIDGE_JS)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
@@ -549,7 +556,7 @@ Reply with ONLY a JSON object, no prose:
 # The Explorer.
 # ----------------------------------------------------------------------------------------------------
 class Explorer:
-    def __init__(self, target_url, vision, token=None, org="0", autostart=True):
+    def __init__(self, target_url, vision, token=None, org="0", autostart=True, artifact_dir=None):
         self.target_url = target_url
         self.vision = vision
         self.token = token
@@ -560,7 +567,10 @@ class Explorer:
         self.bugs = []
         self.bridge = None
         if autostart:
-            self.bridge = BrowserBridge(target_url, token=token, org=org)
+            if artifact_dir is None and artifacts is not None:
+                artifact_dir = artifacts.run_dir("qa-explorer")
+            shot_dir = Path(artifact_dir) / "screenshots" if artifact_dir else None
+            self.bridge = BrowserBridge(target_url, token=token, org=org, shot_dir=shot_dir)
 
     # --- the two AI decisions (EVERY one is a real model call via factory.agent) -----------------
     def _ai_decide(self, story, state, history):

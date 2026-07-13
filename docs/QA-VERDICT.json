@@ -1,0 +1,18 @@
+{
+  "schema": "aos.qa.verdict/1",
+  "product": "agent-os-console",
+  "passed": true,
+  "stories": 5,
+  "blocking_open": 0,
+  "open_bugs": 0,
+  "verdict": "ALL 5 STORIES PASSED",
+  "summary": "ALL 5 STORIES PASSED",
+  "report_md": "/mnt/c/Users/navin/Documents/agent-os-qa-evidence/agent-os-console/20260705-014738/report-agent-os-console-20260705-032959.md",
+  "report_json": "/mnt/c/Users/navin/Documents/agent-os-qa-evidence/agent-os-console/20260705-014738/report-agent-os-console-20260705-032959.json",
+  "report_sha256": "f5e2eecb8e10205f2ffdbdef09f44d2cfb95dce0d744e74813c4eae9a604da5b",
+  "qa_run_id": 334,
+  "rounds": 1,
+  "target_url": "http://127.0.0.1:8099",
+  "producer": "qa_run",
+  "generated_at": 1783247411.7212024
+}

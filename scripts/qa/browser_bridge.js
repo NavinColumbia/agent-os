@@ -52,7 +52,8 @@ const SETTLE_NETIDLE_MS = 2000;      // bounded, best-effort networkidle wait (a
 const SETTLE_MAX_MS = 3500;          // hard cap on the poll-until-stable loop (skeletons gone + DOM stable)
 const SETTLE_SAMPLE_MS = 250;        // gap between the two consecutive stability samples
 const SETTLE_REOBSERVE_MS = 700;     // extra paint grace when the loop explicitly re-observes a late control
-const SHOT_DIR = '/tmp/aos-qa';
+const SHOT_DIR = process.env.AOS_QA_SHOT_DIR || process.env.AOS_QA_DIR || '/tmp/aos-qa';
+const VIDEO_DIR = process.env.AOS_QA_VIDEO_DIR || '';
 const MAX_REQUESTS = 25;             // ring buffer of recent network requests surfaced in `state`
 const MAX_CONSOLE = 25;
 
@@ -167,9 +168,12 @@ class Bridge {
   async start() {
     if (!chromium) throw new Error('playwright not found — set NODE_PATH=' + nodePathHint());
     this.browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-    this.ctx = await this.browser.newContext({
-      viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1,
-    });
+    const ctxOpts = { viewport: { width: 1280, height: 800 }, deviceScaleFactor: 1 };
+    if (VIDEO_DIR) {
+      ensureDir(VIDEO_DIR);
+      ctxOpts.recordVideo = { dir: VIDEO_DIR, size: { width: 1280, height: 800 } };
+    }
+    this.ctx = await this.browser.newContext(ctxOpts);
     // PERCEPTION RECORDER: a human notices the screen JUMP — a full page reload, or the SPA wiping the main
     // view to a skeleton (the 'page refresh' flash) — even when the SETTLED DOM ends up correct. The old QA
     // only saw the settled end-state, so it missed transient/perceptual defects (the reload-after-reply bug).
@@ -451,7 +455,7 @@ async function runBridge() {
     process.exit(1);
     return;
   }
-  writeLine({ ok: true, cmd: 'ready', pid: process.pid, shot_dir: SHOT_DIR });
+  writeLine({ ok: true, cmd: 'ready', pid: process.pid, shot_dir: SHOT_DIR, video_dir: VIDEO_DIR || null });
 
   // Serialize commands: one in flight at a time so responses map cleanly to requests (the AI loop is
   // strictly observe->act->observe, never concurrent).

@@ -63,6 +63,7 @@ import story_gen      # noqa: E402  — AI enumerates the user-story coverage se
 import qa_explorer    # noqa: E402  — the state-based AI explorer (observe->decide->act->observe->evaluate)
 import dev_loop       # noqa: E402  — AI dev-fix loop + app restart/reset
 import qa_report      # noqa: E402  — grounded verdict + AI narrative report writer
+import artifacts      # noqa: E402  — Windows-visible evidence archive paths
 
 MAX_ROUNDS = int(os.environ.get("AOS_QA_MAX_ROUNDS", "6"))     # bounded fix-and-re-run cycles
 MAX_STEPS = int(os.environ.get("AOS_QA_MAX_STEPS", "25"))      # per-story exploration ceiling
@@ -244,7 +245,7 @@ def _bug_report(bug: dict, story: dict, n: int, fixed: bool = False) -> dict:
 # one round — explore EVERY story fresh, returning (story_reports, bug_reports, first_blocking_bug).
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
 def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_cls,
-               bug_seq, on_event=None):
+               bug_seq, on_event=None, artifact_dir=None):
     """Drive all stories once against the live app. Stops the round EARLY on the first BLOCKING bug
     (the app will be fixed + reset + re-run from scratch, so finishing the round is wasted work)."""
     story_reports, bug_reports, first_blocking = [], [], None
@@ -252,7 +253,10 @@ def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_c
         collected = []
         ex = None
         try:
-            ex = explorer_cls(target_url, vision, token=token, org=org)
+            try:
+                ex = explorer_cls(target_url, vision, token=token, org=org, artifact_dir=artifact_dir)
+            except TypeError:
+                ex = explorer_cls(target_url, vision, token=token, org=org)
         except Exception as e:                            # a browser/bridge failure is itself a blocking bug
             bug = {"bug": f"could not launch the explorer/browser: {e}", "expected": "app is reachable",
                    "blocking": True, "severity": "critical", "url": target_url, "action": {"cmd": "goto"}}
@@ -315,6 +319,37 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     started = time.time()
     repo = repo or str(factory.PRODUCTS)
     explorer_cls = qa_explorer.Explorer                   # module attr -> patchable in the offline selftest
+    evidence_dir = Path(out_dir) if out_dir else artifacts.run_dir(product, started)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    (evidence_dir / "screenshots").mkdir(parents=True, exist_ok=True)
+    events_path = evidence_dir / "events.jsonl"
+
+    def emit(kind, data=None):
+        payload = {"ts": time.time(), "kind": kind, "data": data or {}}
+        try:
+            with events_path.open("a") as f:
+                f.write(json.dumps(payload, default=str) + "\n")
+        except Exception:
+            pass
+        if on_event:
+            on_event(kind, data or {})
+
+    try:
+        (evidence_dir / "run-input.json").write_text(json.dumps({
+            "product": product,
+            "target_url": target_url,
+            "vision": vision,
+            "org": org,
+            "product_summary": product_summary,
+            "repo": repo,
+            "restart_cmd": restart_cmd,
+            "health_url": health_url,
+            "max_rounds": max_rounds,
+            "max_steps": max_steps,
+            "started_at": started,
+        }, indent=2, default=str))
+    except Exception:
+        pass
 
     # AI DECISION #0: enumerate the exhaustive user-story coverage set from the vision (unless supplied).
     # RETRY on an empty result (a prose-instead-of-JSON reply, a failed call): one flaky completion must
@@ -332,8 +367,11 @@ def qa_run(target_url, vision, token, org, product_summary, *,
         print(f"[qa_run] AOS_QA_MAX_STORIES={MAX_STORIES}: exercising the first {MAX_STORIES} of "
               f"{len(stories)} enumerated stories", flush=True)
         stories = stories[:MAX_STORIES]
-    if on_event:
-        on_event("stories", {"count": len(stories)})
+    try:
+        (evidence_dir / "stories.json").write_text(json.dumps(stories or [], indent=2, default=str))
+    except Exception:
+        pass
+    emit("stories", {"count": len(stories), "evidence_dir": str(evidence_dir)})
 
     bug_seq = [0]
     fixed_history = []                                    # bugs fixed across earlier rounds (shown in report)
@@ -342,27 +380,24 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     clean = False
     for rnd in range(max_rounds):
         rounds_ran = rnd + 1
-        if on_event:
-            on_event("round_start", {"round": rounds_ran, "stories": len(stories)})
+        emit("round_start", {"round": rounds_ran, "stories": len(stories)})
         story_reports, bug_reports, blocking = _run_round(
             target_url, vision, token, org, stories,
-            max_steps=max_steps, explorer_cls=explorer_cls, bug_seq=bug_seq, on_event=on_event)
+            max_steps=max_steps, explorer_cls=explorer_cls, bug_seq=bug_seq, on_event=emit,
+            artifact_dir=evidence_dir)
         last_story_reports, last_bug_reports = story_reports, bug_reports
 
         if blocking is None:                              # a clean round: no blocking bug -> we're done
             clean = True
-            if on_event:
-                on_event("clean_round", {"round": rounds_ran})
+            emit("clean_round", {"round": rounds_ran})
             break
 
         if rounds_ran >= max_rounds:                      # cap hit — do NOT start a fix we can't verify
-            if on_event:
-                on_event("cap_reached", {"round": rounds_ran})
+            emit("cap_reached", {"round": rounds_ran})
             break
 
         # BLOCKING bug -> AI dev-fix loop (plans #agents -> spawns them -> AI judges fixed), then RESET.
-        if on_event:
-            on_event("fixing", {"round": rounds_ran, "bug": blocking["report_bug"]["title"]})
+        emit("fixing", {"round": rounds_ran, "bug": blocking["report_bug"]["title"]})
         code_context = {"repo": repo, "target_url": target_url,
                         "story": blocking["story"], "summary": product_summary}
         try:
@@ -376,9 +411,12 @@ def qa_run(target_url, vision, token, org, product_summary, *,
             fix = {"fixed": False, "error": str(e)}
         blocking["report_bug"]["fixed"] = bool(fix.get("fixed"))
         fixed_history.append(blocking["report_bug"])
-        if on_event:
-            on_event("fixed", {"round": rounds_ran, "fixed": bool(fix.get("fixed")),
-                               "files": fix.get("files")})
+        try:
+            (evidence_dir / f"fix-round-{rounds_ran}.json").write_text(json.dumps(fix, indent=2, default=str))
+        except Exception:
+            pass
+        emit("fixed", {"round": rounds_ran, "fixed": bool(fix.get("fixed")),
+                       "files": fix.get("files")})
 
         # RESET: restart the app so the NEXT round observes a fresh process serving the fixed code.
         if restart_cmd:
@@ -387,8 +425,7 @@ def qa_run(target_url, vision, token, org, product_summary, *,
                                                   cwd=repo if isinstance(repo, str) else None)
             except Exception as e:
                 restart = {"restarted": False, "healthy": False, "detail": str(e)}
-            if on_event:
-                on_event("reset", {"round": rounds_ran, "healthy": restart.get("healthy")})
+            emit("reset", {"round": rounds_ran, "healthy": restart.get("healthy")})
 
     # Assemble the run for the report: the LAST round's stories + its open bugs + every earlier fix.
     seen = {b["id"] for b in last_bug_reports}
@@ -404,7 +441,11 @@ def qa_run(target_url, vision, token, org, product_summary, *,
         "rounds": rounds_ran,
         "clean": clean,
     }
-    report = qa_report.build_report(run, out_dir=out_dir)
+    try:
+        (evidence_dir / "run-final.json").write_text(json.dumps(run, indent=2, default=str))
+    except Exception:
+        pass
+    report = qa_report.build_report(run, out_dir=evidence_dir)
     report["rounds"] = rounds_ran
     report["clean"] = clean
     # DURABLE HISTORY (REBUILD-PLAN C1): every run is a qa_runs row in Postgres — the evidence chain
@@ -418,21 +459,37 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     # own docs/ so gate_check's REVIEW/LAUNCH gates bind to real QA evidence — never prose, never /tmp.
     report["verdict_json"] = write_verdict(repo, report, product=product, target_url=target_url,
                                            qa_run_id=report["qa_run_id"])
-    if on_event:
-        on_event("persisted", {"qa_run_id": report["qa_run_id"],
-                               "verdict_json": report["verdict_json"]})
+    emit("persisted", {"qa_run_id": report["qa_run_id"],
+                       "verdict_json": report["verdict_json"],
+                       "evidence_dir": str(evidence_dir)})
     # THE SHIP BAR (REBUILD-PLAN C1): ANY bug still open — blocking or not — becomes a governed,
     # AI-routed, SLA-tracked finding with its originating story stored for gated re-verification.
     report["findings_filed"] = (_file_open_bugs(
         report, run, stories, {"target_url": target_url, "vision": vision, "token": token,
                                "org": org, "summary": product_summary, "max_steps": max_steps})
         if file_findings else [])
-    if on_event and report["findings_filed"]:
-        on_event("findings_filed", {"count": len(report["findings_filed"]),
-                                    "ids": [f.get("finding_id") for f in report["findings_filed"]]})
-    if on_event:
-        on_event("report", {"md": report["md"], "verdict": report["verdict"],
-                            "verdict_json": report["verdict_json"]})
+    if report["findings_filed"]:
+        emit("findings_filed", {"count": len(report["findings_filed"]),
+                                "ids": [f.get("finding_id") for f in report["findings_filed"]]})
+    report["evidence_dir"] = str(evidence_dir)
+    try:
+        (evidence_dir / "manifest.json").write_text(json.dumps({
+            "product": product,
+            "qa_run_id": report.get("qa_run_id"),
+            "verdict": report.get("verdict"),
+            "passed": report.get("passed"),
+            "rounds": report.get("rounds"),
+            "report_md": report.get("md"),
+            "report_json": report.get("json"),
+            "verdict_json": report.get("verdict_json"),
+            "events_jsonl": str(events_path),
+            "screenshots_dir": str(evidence_dir / "screenshots"),
+        }, indent=2, default=str))
+    except Exception:
+        pass
+    emit("report", {"md": report["md"], "verdict": report["verdict"],
+                    "verdict_json": report["verdict_json"],
+                    "evidence_dir": str(evidence_dir)})
     return report
 
 

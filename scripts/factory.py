@@ -466,7 +466,13 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
         json.dump(_mcpcfg, _mcpf); _mcpf.close()
         cmd += ["--mcp-config", _mcpf.name, "--strict-mcp-config"]
     try:
-        p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=genv)
+        # CROSS-PROCESS GATE (deeper F12 fix): hold one of a global N-slot pool for the duration of the claude
+        # call, so TOTAL concurrent claude calls across ALL processes (build/QA/jobd/console/…) is capped —
+        # the per-process semaphore above can't do that. Fail-open: if no slot frees in time it runs ungated
+        # (brief over-subscription beats a deadlocked fleet).
+        import claude_gate
+        with claude_gate.slot(f"{role}:{os.getpid()}"):
+            p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=genv)
     finally:
         if _mcpf:
             try:

@@ -81,6 +81,17 @@ ad-hoc drivers racing rows; inferring "process alive" from work progress.
    *drivers* of the same build.
 5. **[Step 5] Delete the hand-rolled loopcontroller durability** once every phase runs on the engine.
 
+## Concurrency & liveness of `claude` calls (F12 — shipped)
+The single Claude subscription was being over-subscribed and calls hung:
+- **Reaper** (`clauded.py`): kills orphaned/hung headless `claude` calls (a dead parent orphans its child, which
+  runs forever) older than 15 min — safe (never touches an interactive session); runs in jobd + the scheduler.
+- **Cross-process gate** (`claude_gate.py`): the per-process semaphore (8) couldn't cap across the many driver
+  processes (8×N processes → throttle). A Postgres-backed **global N-slot pool** (default 6) now caps TOTAL
+  concurrent `claude` calls across the whole box; every `factory._run_once` holds a slot for its duration.
+  Lease-based (a crashed holder's slot is reclaimed after 20 min); fail-open (a DB hiccup never deadlocks). This
+  is the concurrency half of Step 2 (the "central way to spawn claude" the owner asked for) — done ahead of the
+  full single-owner refactor.
+
 ## Status
 - [x] **Step 1 — DONE** — output-independent heartbeat + reaper-on-lapse/ceiling (not output-silence) + fencing
   token + a LIBERAL 6h runaway ceiling (Opus builds are slow). Proven by `loopcontroller.py liveness`. Kills F8.

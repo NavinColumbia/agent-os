@@ -70,15 +70,16 @@ a richer directive (e.g. *"launch product X"* → product → research → finan
 launch), each coordinator reporting up, the CEO briefed via `digest` / consulted on the calls that matter.
 Expect the same "under-stubbed/timing" fixes we made in the QA drive.
 
-### 4. Deepen whole-org visibility + human-pattern CEO comms — IN PROGRESS
-✅ `pulse`/dashboard show every agent live; ✅ an **Org chart** panel now renders each running org's nested
-CEO → coordinators → workers hierarchy (role, name, status, assignment) on the dashboard (`124fc24`); ✅ a
-`data_query` external-action tool (real read-only DB) as the connectors template (`c2b1412`). Remaining:
-surface the org chart in the CEO CONSOLE too (`console.py`, :8099), not just the ops dashboard; add the other
-specialized external-action tools per function (legal doc-scan against policy, live connectors, marketing/
-design asset generation); and round out human-pattern CEO comms — briefing, status-on-a-cadence,
-clarification, **disagreement**, hand-offs (pieces in `loopcontroller`/`digest`/ask-await; make them cohesive
-and CEO-facing).
+### 4. Deepen whole-org visibility + human-pattern CEO comms — MOSTLY DONE
+✅ `pulse`/dashboard show every agent live; ✅ an **Org chart** panel on the dashboard (`124fc24`); ✅ the CEO
+CONSOLE already has the living org chart (`orgview.py` area B2 → `store.org_tree`, `/api/org/live`); ✅
+specialized external-action tools: `data_query` (`c2b1412`), `legal_scan` + `connector_ingest` (`e7111e6`) —
+the org's tool set now spans qa/dev/research/finance/knowledge_work/data/legal/connectors; ✅ human-pattern
+CEO reporting: the founder digest now includes a **"YOUR ORG (LIVE)"** section — what agents are doing + a
+"⚠ NEEDS YOU" flag for silent/stuck work (`194af72`). Remaining (nice-to-have): a first-class **disagreement**
+pattern (an agent/coordinator pushing back on a directive it believes is wrong — today it can `blocked`/
+`question`/`escalate`; a dedicated posture would be more human), and per-function output tools where a
+function produces artifacts (marketing/design asset generation).
 
 ### 5. Standing org that persists across directives
 Confirm the org is a **standing company** (persists, takes directives over time, grows/shrinks) vs ephemeral

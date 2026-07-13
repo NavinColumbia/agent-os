@@ -194,6 +194,31 @@ def _parse_stories(text: str) -> list:
     raise ValueError("no JSON story array found in agent reply")
 
 
+def _stories_from_repo(repo) -> list:
+    """RECOVERY (F13): some agents WRITE the story set to a JSON file in the repo and reply with only a prose
+    summary ('written to docs/qa-user-stories.json'), so the inline parse finds nothing. The work isn't lost —
+    read it off disk instead of paying for an expensive Opus regeneration. Returns the newest parseable stories
+    file's list, or [] if none. Best-effort."""
+    if not repo:
+        return []
+    from pathlib import Path
+    root = Path(repo)
+    try:
+        cands = [p for p in (list(root.glob("**/*stor*.json")) + list(root.glob("**/*user-stories*.json")))
+                 if "node_modules" not in p.parts and ".git" not in p.parts]
+    except Exception:
+        return []
+    for p in sorted(set(cands), key=lambda x: x.stat().st_mtime, reverse=True):
+        try:
+            lst = _coerce_list(json.loads(p.read_text()))
+            if lst:
+                print(f"[story_gen] recovered {len(lst)} stories from {p.name} the agent wrote (no retry)", flush=True)
+                return lst
+        except Exception:
+            continue
+    return []
+
+
 def _coerce_list(obj):
     """Accept a bare list, or an object that wraps the list under a common key."""
     if isinstance(obj, list):
@@ -387,8 +412,10 @@ def generate_stories(vision: str, product_summary: str, role: str = None, existi
     try:
         raw = _parse_stories(text)
     except ValueError as e:
-        print(f"[story_gen] parse miss: {e}. REPLY HEAD:\n{text[:400]!r}", flush=True)
-        return []
+        raw = _stories_from_repo(repo)          # F13: the agent may have WRITTEN the stories to a file + replied prose
+        if not raw:
+            print(f"[story_gen] parse miss: {e}. REPLY HEAD:\n{text[:400]!r}", flush=True)
+            return []
     stories = _normalize(raw)
     print(f"[story_gen] generated {len(stories)} user-stories (role={role})", flush=True)
     return stories

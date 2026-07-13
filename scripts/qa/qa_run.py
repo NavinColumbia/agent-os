@@ -435,7 +435,9 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     # build does not ship, but only after the enumeration genuinely could not be obtained.
     if stories is None:
         for attempt in range(1, max(1, STORY_GEN_ATTEMPTS) + 1):
-            stories = story_gen.generate_stories(vision, product_summary)
+            # pass the product repo so story_gen can RECOVER stories the agent WROTE to a file (F13) instead of
+            # a bare prose reply — otherwise a flaky JSON reply forces expensive Opus re-generation.
+            stories = story_gen.generate_stories(vision, product_summary, repo=repo)
             if stories:
                 break
             print(f"[qa_run] story enumeration returned nothing (attempt {attempt}/{STORY_GEN_ATTEMPTS})"

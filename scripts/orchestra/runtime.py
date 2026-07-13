@@ -887,7 +887,7 @@ def run_org(run_id, tenant_id, repo=".", workers=2, human_hook=None, max_steps=N
 GRANT = "serviceX-cred=LIVE-OK (use v3 endpoint)"
 
 
-def make_offline_agent(sleep_refunds=0.6):
+def make_offline_agent():
     """Deterministic offline stand-in for factory.agent driving the canonical storyline:
     payments domain -> lead -> charge worker (blocks on serviceX creds) + refunds worker."""
     def agent(role, repo, task, **kw):
@@ -926,7 +926,12 @@ def make_offline_agent(sleep_refunds=0.6):
                 return {"rc": 0, "out_full": json.dumps(
                     {"action": "emit", "kind": "blocked",
                      "payload": {"reason": "no API creds for serviceX"}})}
-            time.sleep(sleep_refunds)            # the SIBLING is deliberately slow (interrupt test)
+            # The SIBLING is deliberately slow (ONE long step, then finishes) so it is provably LIVE while the
+            # lead processes the escalate->resolve chain and broadcasts the correction — the broadcast (a
+            # context_update event) is created while the sibling is a live child. 2.0s comfortably exceeds the
+            # ~1s escalation chain, so the interrupt-broadcast-to-sibling assertion can't flake; and because it
+            # FINISHES (not loops), standalone scenarios with no broadcast stay fast.
+            time.sleep(2.0)
             return {"rc": 0, "out_full": json.dumps(
                 {"action": "finish", "result": "refunds endpoint built"})}
         return {"rc": 0, "out_full": json.dumps({"action": "finish", "result": f"done: {t[:40]}"})}

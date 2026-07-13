@@ -259,6 +259,7 @@ def _worker_step(ctx, a, evs):
     me, sup = a["actor_id"], a["supervisor_id"]
     step = _Step()
     work = False
+    tool_result = None                          # set when our dispatched tool finished (jobrunner emitted it)
 
     for ev in evs:
         k, p, corr = ev["kind"], (ev["payload"] or {}), ev["corr_id"]
@@ -266,6 +267,9 @@ def _worker_step(ctx, a, evs):
             if p.get("task"):
                 assignment = p["task"]
                 step.assignment = assignment
+            work = True
+        elif k == "tool_result":                # our dispatched tool finished -> report it up + finish
+            tool_result = p
             work = True
         elif k == "next":                       # own continuation token — keep the loop alive
             work = True
@@ -291,7 +295,19 @@ def _worker_step(ctx, a, evs):
     # the job to jobrunner (runs off-loop, browser lives there) and park (blocked). The job emits done+finding
     # to our supervisor and flips us terminal on completion; a crashed job is re-dispatched by reconcile.
     tool = (context or {}).get("tool")
-    if work and a["status"] not in TERMINAL and tool and not context.get("tool_dispatched"):
+    if work and a["status"] not in TERMINAL and tool_result is not None:
+        # the dispatched tool finished: report its findings + a done up to the supervisor, then FINISH. Only
+        # the pool (here) writes this actor's row — the job thread merely emitted the tool_result event.
+        for f in (tool_result.get("findings") or []):
+            if sup:
+                step.emits.append((me, sup, "finding", f, None))
+        if sup:
+            step.emits.append((me, sup, "done", {"task": assignment, "tool": tool_result.get("tool"),
+                               "status": tool_result.get("status"), "result": tool_result.get("result")}, None))
+        step.status = "done"
+        step.result = {"tool": tool_result.get("tool"), "status": tool_result.get("status"),
+                       "result": tool_result.get("result")}
+    elif work and a["status"] not in TERMINAL and tool and not context.get("tool_dispatched"):
         try:
             import jobrunner
             jobrunner.dispatch({"run_id": ctx.run_id, "tenant": ctx.tenant, "actor_id": me,

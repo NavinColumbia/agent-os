@@ -74,41 +74,57 @@ def run_agentic_qa(target_url, vision, *, product="app", token=None, org="0", su
 
 
 def _selftest():
-    """Deterministic check of the Phase-5 wiring: a qa-coordinator, on its task, hires one qa-explorer
-    TOOL-worker per story (each carrying tool=qa_explore in memory.context). Drives ONE coordinator step
-    directly (no async pool) so it is fast and never flaky. The FULL async drive (run_agentic_qa) works but
-    has a claim/emit race that occasionally hangs the pool — that is phase-5 HARDENING (see docs/HANDOFF.md),
-    verified live, not in this unit test."""
+    """FULL async agentic drive, offline: stub BOTH seams — the tool (no browser) AND factory.agent (no real
+    CLI, so the coordinator's decide/aggregate steps are instant) — then drive the real org to completion and
+    assert it hired one qa-explorer per story, the tool-workers dispatched (dispatch-and-park), their findings
+    flowed back over the bus (via `tool_result` -> the worker -> `finding`/`done` up), and the run finished."""
+    import types
+    import json as _json
     import store
-    import runtime as rt
 
-    tenant = "agentic-selftest"
-    stories = [{"id": "US1", "title": "sign in"}, {"id": "US2", "title": "send message"}]
-    run = store.start_run(tenant, "A console the user signs into and messages an assistant.")
-    rid = run["run_id"]
+    _real_factory = sys.modules.get("factory")
+    fake = types.ModuleType("factory")
+
+    def fake_agent(role, repo, task, **k):        # instant, deterministic coordinator AI (ack / aggregate)
+        body = _json.dumps({"action": "ack", "result": "qa complete", "ok": True})
+        return {"rc": 0, "out": body, "out_full": body}
+    fake.agent = fake_agent
+    fake.PRODUCTS = "/tmp"
+    sys.modules["factory"] = fake
+
+    import tools
+    import jobrunner
+    _orig_tool = tools.run_tool
+
+    def fake_tool(name, args):
+        sid = (args.get("story") or {}).get("id")
+        return {"status": "done", "findings": [{"kind": "bug", "title": f"bug {sid}", "blocking": True,
+                "story": sid}], "result": {"story": sid, "stop_reason": "coverage-complete"}}
+    tools.run_tool = fake_tool
+    jobrunner._default_run_tool = lambda: fake_tool
+
+    out = None
     try:
-        context = {"vision": "console", "target_url": "http://app.test", "token": "t", "org": "1",
-                   "product": "agentic-selftest", "stories": stories, "repo": "."}
-        coord = store.spawn_actor(rid, tenant, "qa-coordinator", "qa-coordinator", kind="supervisor",
-                                  memory={"context": context, "repo": "."})
-        store.emit(rid, tenant, None, coord["actor_id"], "task", {"task": "QA the console against its vision"})
-
-        ctx = rt._Ctx(rid, tenant, ".", None, store.CLAIM_LEASE_S, None)
-        evs = store.claim_events(coord["actor_id"], tenant)
-        rt._supervisor_step(ctx, store.actor(coord["actor_id"], tenant), evs)   # decompose + hire (deterministic)
-
-        explorers = [a for a in store.actors(rid, tenant) if a.get("role") == "qa-explorer"]
-        assert len(explorers) == 2, f"qa-coordinator must hire ONE qa-explorer per story, got {len(explorers)}"
-        for e in explorers:
-            c = ((e.get("memory") or {}).get("context")) or {}
-            assert c.get("tool") == "qa_explore", f"explorer must be a tool-worker, got {c}"
-            assert (c.get("tool_args") or {}).get("story", {}).get("id") in ("US1", "US2")
-        assert {(((e.get("memory") or {}).get("context")) or {}).get("tool_args", {}).get("story", {}).get("id")
-                for e in explorers} == {"US1", "US2"}
-        print("qa_agentic selftest: PASS (qa-coordinator hired 2 qa-explorer TOOL-workers, one per story)")
+        out = run_agentic_qa("http://app.test", "A console the user signs in to and messages an assistant.",
+                             product="agentic-selftest", stories=[{"id": "US1"}, {"id": "US2"}],
+                             tenant="agentic-selftest", repo=".", workers=2, drive_budget_s=40, stall_s=2.0)
+        assert out["status"] == "done", f"the org run must finish; got {out['status']}"
+        assert len(out["explorers"]) == 2, f"one qa-explorer per story; got {len(out['explorers'])}"
+        assert all(a.get("status") in ("done", "dead") for a in out["explorers"]), \
+            "every explorer must reach terminal (tool_result -> done)"
+        assert len(out["findings"]) == 2, f"both explorers' findings must flow back over the bus; got {out['findings']}"
+        assert sorted(f.get("story") for f in out["findings"]) == ["US1", "US2"]
+        print(f"qa_agentic selftest: PASS (full async org drive -> {out['status']}: 2 explorers, "
+              f"dispatch-and-park, 2 findings over the bus)")
         return 0
     finally:
-        _cleanup(rid, tenant)
+        tools.run_tool = _orig_tool
+        jobrunner._default_run_tool = lambda: __import__("tools").run_tool
+        if _real_factory is not None:
+            sys.modules["factory"] = _real_factory
+        else:
+            sys.modules.pop("factory", None)
+        _cleanup(out["run_id"] if isinstance(out, dict) else -1, "agentic-selftest")
 
 
 def _cleanup(run_id, tenant):

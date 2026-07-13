@@ -86,21 +86,16 @@ def _run(jid, job, store, run_tool):
 
 
 def _complete(jid, job, out, store) -> bool:
-    """Write the tool's outcome onto the bus: a `finding` per bug to the supervisor, then a `done` that flips
-    the parked worker terminal so the supervisor's normal interrupt-driven step reacts. Fail-soft."""
-    aid, sup = job.get("actor_id"), job.get("supervisor_id")
-    run_id, tenant = job.get("run_id"), job.get("tenant")
+    """Report the tool's outcome by emitting ONE `tool_result` event to the WORKER ITSELF. The worker's next
+    decide-step turns it into finding(s)+done up to its supervisor and finishes. This is deliberate: only the
+    POOL ever writes an actor row (via the decide-loop) — the job thread NEVER touches actor state, so there
+    is no job-thread/pool-thread lock race on the worker's row (that race hung run_org). Fail-soft."""
+    aid = job.get("actor_id")
     try:
-        for i, f in enumerate(out.get("findings") or []):
-            if sup is not None:
-                store.emit(run_id, tenant, aid, sup, "finding", f, f"job-{jid}-{i}")
-        status = out.get("status", "done")
-        if sup is not None:
-            store.emit(run_id, tenant, aid, sup, "done",
-                       {"task": job.get("assignment"), "tool": job.get("tool"),
-                        "status": status, "result": out.get("result")}, f"job-{jid}-done")
-        store.update_actor(aid, tenant, status="done",
-                           result={"tool": job.get("tool"), "status": status, "result": out.get("result")})
+        store.emit(job.get("run_id"), job.get("tenant"), aid, aid, "tool_result",
+                   {"tool": job.get("tool"), "status": out.get("status", "done"),
+                    "findings": out.get("findings") or [], "result": out.get("result"),
+                    "assignment": job.get("assignment")}, f"job-{jid}-result")
         return True
     except Exception:
         return False
@@ -153,7 +148,9 @@ def _selftest():
         def update_actor(self, aid, tenant, status=None, result=None):
             self.updates.append({"aid": aid, "status": status, "result": result})
 
-    # a tool that finds one blocking bug -> the job must emit finding + done and flip the actor done.
+    # a tool that finds one blocking bug -> the job emits ONE tool_result to the WORKER ITSELF (to==actor_id),
+    # carrying the findings + status. It must NEVER write an actor row (no update_actor) — that's the fix for
+    # the pool/job lock race.
     def fake_run_tool(name, args):
         assert name == "qa_explore"
         return {"status": "done",
@@ -165,19 +162,20 @@ def _selftest():
            "assignment": "verify story US1", "args": {"story": {"id": "US1"}}}
     jid = dispatch(job, st, run_tool=fake_run_tool, sync=True)
 
-    kinds = [e["kind"] for e in st.emits]
-    assert kinds == ["finding", "done"], kinds
-    assert st.emits[0]["to"] == 5 and st.emits[0]["payload"]["blocking"] is True
-    assert st.emits[1]["payload"]["status"] == "done" and st.emits[1]["payload"]["tool"] == "qa_explore"
-    assert st.updates and st.updates[-1]["status"] == "done", st.updates
+    assert [e["kind"] for e in st.emits] == ["tool_result"], st.emits
+    r = st.emits[0]
+    assert r["to"] == 10, "tool_result must go to the WORKER itself, not the supervisor"
+    assert r["payload"]["status"] == "done" and r["payload"]["tool"] == "qa_explore"
+    assert len(r["payload"]["findings"]) == 1 and r["payload"]["findings"][0]["blocking"] is True
+    assert st.updates == [], "the job thread must NOT write any actor row (avoids the lock race)"
     assert _JOBS[jid]["state"] == "done"
 
-    # a raising tool -> failed result, still emits a done (never leaves the worker parked forever), no crash.
+    # a raising tool -> a tool_result with status=failed (never leaves the worker parked forever), no crash.
     def boom(name, args):
         raise RuntimeError("browser died")
     st2 = FakeStore()
-    dispatch({**job, "actor_id": 11, "tool": "qa_explore"}, st2, run_tool=boom, sync=True)
-    assert [e["kind"] for e in st2.emits] == ["done"] and st2.emits[0]["payload"]["status"] == "failed"
+    dispatch({**job, "actor_id": 11}, st2, run_tool=boom, sync=True)
+    assert [e["kind"] for e in st2.emits] == ["tool_result"] and st2.emits[0]["payload"]["status"] == "failed"
 
     # reconcile re-dispatches only jobs NOT currently running here (idempotent).
     with _LOCK:
@@ -185,19 +183,18 @@ def _selftest():
     st3 = FakeStore()
     n = reconcile([job], st3, run_tool=fake_run_tool)
     assert n == 1, n
-    # give the re-dispatched (async) job a moment, then confirm it completed
-    for _ in range(50):
-        if [e["kind"] for e in st3.emits] == ["finding", "done"]:
+    for _ in range(50):                               # give the re-dispatched (async) job a moment
+        if [e["kind"] for e in st3.emits] == ["tool_result"]:
             break
         time.sleep(0.02)
-    assert [e["kind"] for e in st3.emits] == ["finding", "done"], st3.emits
+    assert [e["kind"] for e in st3.emits] == ["tool_result"], st3.emits
 
     # a job already running is NOT re-dispatched.
     with _LOCK:
         _JOBS[job_id_for(job)]["state"] = "running"
     assert reconcile([job], FakeStore(), run_tool=fake_run_tool) == 0
 
-    print("jobrunner selftest: PASS (dispatch->finding+done+flip; tool-crash still done; reconcile idempotent)")
+    print("jobrunner selftest: PASS (dispatch->tool_result to worker, NO actor write; crash->failed; reconcile idempotent)")
     return 0
 
 

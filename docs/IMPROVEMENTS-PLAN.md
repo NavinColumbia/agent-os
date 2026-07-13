@@ -76,7 +76,14 @@ task-verification) as a checklist the spawn gate + auditor consult. Mostly promp
 
 ## Tier 2 — memory & context (the biggest architectural gap)
 
-### 9. [E] Explicit agent-MEMORY layer — 🟡 design done → building
+### 9. [E] Explicit agent-MEMORY layer — 🟡 first slice SHIPPED, later tiers pending
+**Shipped:** `52-memory.sql` + `companymemory.py` extended — two-tier visibility (`shared`/`private`), per-role
+scope, provenance (`author_actor`/`run_id`/`sources`) written into the tamper-evident audit chain, and
+`memory_checkpoints` + `checkpoint()`/`plan()`/`summaries()` (item 10). **The dead experiential writer is now
+ACTIVATED**: `learn_from_fix()` distills a role lesson at the QA fix-loop post-mortem (`qa_run.py`), env-gated +
+best-effort. All selftested + suite-wired.
+**Later tiers (deferred, per design doc §5):** `note()`/`share()` two-tier promotion UX; `memory_directory` +
+`who_knows()` transactive index; semantic `recall` (pgvector). Plus the open questions in the design doc.
 **Design:** [`docs/MEMORY-LAYER-DESIGN.md`](MEMORY-LAYER-DESIGN.md) (from a grounded research+audit pass). Key
 finding: agent-os already has the substrate + 2 of 3 memory functions — `companymemory.py` (factual + experiential
 tables) and `orchestra_actors.memory` (working). It's an **extend, not greenfield**. The gap: provenance,
@@ -87,10 +94,11 @@ w/ safe defaults; (2) provenance + `audit.append` on every write; (3) **activate
 **Research owed:** open questions in the design doc (global-vs-tenant lessons; whether coordinators actually
 truncate today → gates item 11; MemAct RL curation deferred to item 17; retention/GDPR).
 
-### 10. [V] External-memory checkpoint of coordinator PLAN + per-phase SUMMARY — ⬜ not started
-**Approach:** persist each coordinator's plan + phase summaries as distinct rows (not buried in event history) so
-a context truncation can't lose the plan. Small, well-scoped; can land before the full item-9 layer.
-**Research:** Anthropic multi-agent — enough to build.
+### 10. [V] External-memory checkpoint of coordinator PLAN + per-phase SUMMARY — 🟡 storage done, wiring pending
+**Done:** the durable store + API (`memory_checkpoints`, `checkpoint()`/`plan()`/`summaries()`) shipped with the
+item-9 slice. **Remaining:** wire the CALLS — controller's first decide step writes `checkpoint('plan', …)` and
+reads it back each turn; `loopcontroller` phase transitions write `checkpoint('phase_summary', …)`. (Design doc §3.)
+**Research:** none owed.
 
 ### 11. [E] Context COMPACTION against "context rot" — ⬜ not started
 **Approach:** when a coordinator's context nears the limit, summarize completed phases out of the live window and

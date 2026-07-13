@@ -504,6 +504,17 @@ def qa_run(target_url, vision, token, org, product_summary, *,
             except Exception:
                 pass
             emit("fixed", {"round": rounds_ran, "fixed": bool(fix.get("fixed")), "files": fix.get("files")})
+            # EXPERIENTIAL WRITE (memory item 9): distill ONE reusable lesson from this bug+fix for the dev role
+            # so the fleet stops repeating the class of mistake. Best-effort + env-gated; never disturbs the loop.
+            try:
+                import companymemory
+                companymemory.learn_from_fix(
+                    _route_role(blocking.get("report_bug") or {}) or "builder",
+                    {"bug": blocking.get("report_bug"), "fix_verdict": fix.get("verdict"),
+                     "files": fix.get("files"), "residual": fix.get("residual"), "fixed": fix.get("fixed")},
+                    tenant_id=org, run_id=str(Path(evidence_dir).name), author_actor=f"qa-dev-fix:{product}")
+            except Exception:
+                pass
             # RESET: restart so the NEXT round observes a FRESH process serving the fixed code, and re-test
             # EVERY story from scratch — a fix can regress anything, so coverage is rebuilt clean.
             if restart_cmd:

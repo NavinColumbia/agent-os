@@ -189,9 +189,10 @@ def lessons_for(role, limit=_LESSON_LIMIT):
     return rows
 
 
-def distill_lesson(role, incident, api_key=None):
+def distill_lesson(role, incident, api_key=None, *, tenant_id=None, run_id=None, author_actor=None):
     """AI-distill ONE reusable, generalizable lesson from a failure/fix incident, and store it for the role.
-    Every distill is a model call — the fleet learning from its own mistakes. Best-effort: never raises."""
+    Every distill is a model call — the fleet learning from its own mistakes. Best-effort: never raises.
+    Provenance kwargs are recorded on the stored lesson (which run/actor/tenant it came from)."""
     try:
         import factory
         if api_key is not None:
@@ -207,11 +208,22 @@ def distill_lesson(role, incident, api_key=None):
         text = ((r or {}).get("out_full") or (r or {}).get("out") or "").strip().strip('"').strip()
         text = text.splitlines()[0].strip() if text else ""
         if text and text.upper() != "NONE" and len(text) > 8:
-            add_lesson(role, text, source="fix-loop")
+            add_lesson(role, text, source="fix-loop", tenant_id=tenant_id, run_id=run_id, author_actor=author_actor)
             return text
     except Exception:
         pass
     return None
+
+
+def learn_from_fix(role, incident, *, tenant_id=None, run_id=None, author_actor=None):
+    """The EXPERIENTIAL-WRITE hook the fix/QA loops call at a bug post-mortem so the fleet learns. Env-gated
+    (AOS_MEMORY_LEARN, default on) + fully best-effort so it can never disturb the loop it observes."""
+    if os.environ.get("AOS_MEMORY_LEARN", "1").lower() in ("0", "false", "no"):
+        return None
+    try:
+        return distill_lesson(role, incident, tenant_id=tenant_id, run_id=run_id, author_actor=author_actor)
+    except Exception:
+        return None
 
 
 # ── the brief injection ─────────────────────────────────────────────────────────────────────────────
@@ -291,6 +303,30 @@ def _selftest():
         chk(plan("run-xyz") and "REVISED" in plan("run-xyz"), "plan() returns the LATEST plan checkpoint")
         chk(len(summaries("run-xyz")) == 1 and summaries("run-xyz")[0]["phase"] == "research",
             "phase-summary checkpoints round-trip (the compaction unit for item 11)")
+
+        # EXPERIENTIAL WRITER activation: learn_from_fix respects the env gate, and (with a stub model) distills
+        # + stores a provenanced lesson — the previously-dead fleet-learning path, now wired.
+        import types as _types
+        lrole2 = f"role-{uuid.uuid4().hex[:6]}"
+        os.environ["AOS_MEMORY_LEARN"] = "0"
+        chk(learn_from_fix(lrole2, {"bug": "x"}) is None, "learn_from_fix is a no-op when AOS_MEMORY_LEARN=0")
+        os.environ["AOS_MEMORY_LEARN"] = "1"
+        _real_factory = sys.modules.get("factory")
+        fake = _types.ModuleType("factory")
+        fake.CHEAP_MODEL = "m"
+        fake._ctx = _types.SimpleNamespace(api_key=None)
+        fake.agent = lambda *a, **k: {"out_full": "Always restart the target before re-observing a fix."}
+        sys.modules["factory"] = fake
+        try:
+            got = learn_from_fix(lrole2, {"bug": "save 500s", "fixed": True}, tenant_id=tid,
+                                 run_id="run-xyz", author_actor="qa-dev-fix")
+            chk(bool(got) and "restart" in got.lower() and got in lessons_for(lrole2),
+                "learn_from_fix distills + stores a role lesson (fleet-learning writer activated)")
+        finally:
+            if _real_factory is not None:
+                sys.modules["factory"] = _real_factory
+            else:
+                sys.modules.pop("factory", None)
 
         print("PASS: companymemory — company memory (scoped) + role lessons (dedup, self-reinforcing) "
               "injected into agent briefs; two-tier visibility + role-scope + provenance + plan/summary "

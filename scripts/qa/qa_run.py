@@ -357,8 +357,14 @@ def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_c
 def qa_run(target_url, vision, token, org, product_summary, *,
            product="app", repo=None, restart_cmd=None, health_url=None,
            stories=None, max_rounds=MAX_ROUNDS, max_steps=MAX_STEPS,
-           on_event=None, out_dir=None, file_findings=True):
+           on_event=None, out_dir=None, file_findings=True, agentic=False):
     """Autonomously QA a product from its VISION until it is bug-free (or a round cap trips), then report.
+
+    agentic=True routes to the AGENTIC ORG path (scripts/qa/qa_agentic.run_agentic_qa): a qa-coordinator
+    actor spawns qa-explorer tool-workers, hands blocking bugs to a dev-coordinator, re-tests after fixes,
+    and emits an honest verdict — all as durable actors over the message bus (docs/AGENTIC-QA-ORG.md). It
+    persists the same qa_runs row + docs/QA-VERDICT.json. Default is the proven procedural loop below until
+    the agentic path is confirmed at parity on a live app (see docs/HANDOFF.md phase 6).
 
       target_url       — the running app to exercise (the explorer drives a real browser against it).
       vision           — the ORIGINAL product vision; held in context so every AI call judges intent.
@@ -376,6 +382,11 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     Returns qa_report.build_report(run)'s dict (md/json paths + grounded verdict). EVERY decision inside
     — story enumeration, each explore step, each fix plan/judge, the report narrative — is a real
     factory.agent call (resilient: overload retry + Codex failover)."""
+    if agentic:                                   # AGENTIC ORG path (opt-in; procedural stays default)
+        import qa_agentic
+        return qa_agentic.run_agentic_qa(target_url, vision, product=product, token=token, org=org,
+                                         summary=product_summary, repo=repo, stories=stories,
+                                         restart_cmd=restart_cmd, health_url=health_url)
     started = time.time()
     repo = repo or str(factory.PRODUCTS)
     explorer_cls = qa_explorer.Explorer                   # module attr -> patchable in the offline selftest

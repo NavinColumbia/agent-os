@@ -45,7 +45,9 @@ if str(QA) not in sys.path:
 BASE = "http://127.0.0.1:8099"
 SOURCE = "dogfood"
 LOG = "/tmp/aos-dogfood.log"
-MAX_STEPS = int(os.environ.get("AOS_DOGFOOD_MAX_STEPS", "20"))      # per-story exploration ceiling
+MAX_STEPS = int(os.environ.get("AOS_DOGFOOD_MAX_STEPS", "150"))    # SAFETY backstop only — the explorer is
+# coverage-driven (stops when everything a user would try is tested), not capped at N steps. The per-persona
+# BUDGET_S wall-clock is the real bound here; this just guards a runaway. Env-overridable; was 20.
 BUDGET_S = int(os.environ.get("AOS_DOGFOOD_BUDGET_S", "3600"))      # per-persona wall-clock budget
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────────

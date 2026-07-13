@@ -86,11 +86,36 @@ def _extract_json(text):
     return {}
 
 
-def _call_agent(role, repo, task):
+# TIERED MODELS (speed): the NAVIGATION decision (`_ai_decide`) is high-volume and low-stakes — the fast
+# model in factory 'light' mode is plenty and keeps the loop moving like a human clicking around. The
+# EXPECTED-vs-ACTUAL JUDGMENT (`_ai_evaluate`) is the zero-bugs-reach-a-human call, so it stays on the full
+# default model (Opus). Toggle nav back to the heavy model with AOS_QA_DECIDE_LIGHT=0.
+_DECIDE_LIGHT = os.environ.get("AOS_QA_DECIDE_LIGHT", "1").lower() not in ("0", "false", "no", "off")
+# COVERAGE-DRIVEN TERMINATION (not a step count): the loop stops when the coverage ledger is exhausted.
+# The backstops below are deliberately PATIENT — a real tester navigates several screens to reach a deep
+# aspect, so only genuinely-stuck behaviour stops the run early:
+#   * STALL: this many consecutive steps that neither cover a new aspect NOR reach a new view (url) — i.e.
+#     truly wandering in circles. Kept well ABOVE a typical aspect count so multi-step navigation toward a
+#     deep aspect is never punished. (A 12-aspect story needs ~30-40 steps; 12 would have cut it off.)
+#   * DEAD: this many consecutive steps where the action had NO effect at all (clicking dead controls /
+#     nothing responds) — a fast stop for a genuinely broken/frozen surface.
+# Both stop HONESTLY as 'incomplete' (checkpointed), never as a false 'done'. Env-overridable; 0 disables.
+_STALL_LIMIT = int(os.environ.get("AOS_QA_STALL_STEPS", "30"))
+_DEAD_LIMIT = int(os.environ.get("AOS_QA_DEAD_STEPS", "6"))
+
+
+def _call_agent(role, repo, task, light=False):
     """The single seam to the LLM. Imported lazily so the module loads (and self-tests) without pulling
     in the heavy factory runtime, and so a stubbed `factory` in sys.modules is honoured. factory.agent
-    owns all resilience (529/overload retry, Codex failover) and governance."""
+    owns all resilience (529/overload retry, Codex failover) and governance. `light` requests the fast
+    path; a stubbed or older factory that doesn't accept it just falls back to the plain call (fail-open,
+    so a test double or a signature change can never break the loop)."""
     import factory  # noqa: E402 — lazy on purpose (see docstring)
+    if light:
+        try:
+            return factory.agent(role, repo, task, light=True)
+        except TypeError:
+            pass
     return factory.agent(role, repo, task)
 
 
@@ -108,6 +133,7 @@ class BrowserBridge:
         self.timeout = timeout
         self._id = 0
         self.proc = None
+        self.video_path = None            # webm path the bridge reports on close() (for mp4 transcode)
         if not autostart:
             return
         env = {**os.environ, "NODE_PATH": NODE_PATH}
@@ -229,7 +255,9 @@ class BrowserBridge:
 
     def close(self):
         try:
-            self._send({"cmd": "close"})
+            reply = self._send({"cmd": "close"})            # the bridge returns {closed, video:<webm path>}
+            if isinstance(reply, dict) and reply.get("video"):
+                self.video_path = reply["video"]
         except Exception:
             pass
         try:
@@ -390,11 +418,55 @@ def _effect_registered(before, after, act_result):
     return False
 
 
-def _decide_prompt(vision, story, state, history):
+def _coverage_prompt(vision, story, state):
+    return f"""ROLE: You are the QA-SECURITY explorer. Task: PLAN COVERAGE for one user story.
+
+Before testing, a thorough QA engineer lists everything a REAL user would try for this story — the happy
+path AND the edge cases, empty/invalid inputs, error states, cancel/back, re-entry, and anything the VISION
+implies should work. This list is the yardstick for 'done': testing continues until every item is exercised.
+
+=== ORIGINAL PRODUCT VISION ===
+{vision}
+
+=== STORY ===
+title: {story.get('title', story.get('name', 'exploration'))}
+goal: {story.get('goal', story.get('description', ''))}
+EXPECTED OUTCOME: {story.get('expected', story.get('expected_outcome', ''))}
+
+=== STARTING STATE ===
+{_fmt_state(state)}
+
+List the aspects a real user would try. Be thorough but not redundant (typically 4-12 items). Each aspect is
+a short imperative phrase (e.g. "submit with an empty field", "open then cancel the dialog").
+
+Reply with ONLY JSON, no prose:
+{{"aspects": ["<aspect 1>", "<aspect 2>", "..."]}}"""
+
+
+def _fmt_checklist(checklist):
+    """Render the coverage ledger (what a user would try -> tested yet?) so DECIDE targets what's LEFT."""
+    if not checklist:
+        return "(no explicit coverage plan — exercise the story's expected outcome and any edge cases)"
+    lines = []
+    for c in checklist:
+        mark = "[x]" if c.get("covered") else "[ ]"
+        lines.append(f"  {mark} {c.get('aspect', '')}")
+    return "\n".join(lines)
+
+
+def _decide_prompt(vision, story, state, history, checklist=None):
+    remaining = [c.get("aspect", "") for c in (checklist or []) if not c.get("covered")]
     return f"""ROLE: You are the QA-SECURITY explorer. Task: DECIDE the single next action.
 
 You are exercising a product as an adversarial, thorough QA engineer. Judge everything against the
 ORIGINAL VISION and the STORY's EXPECTED behaviour — you are here to find where reality diverges.
+
+=== COVERAGE LEDGER (everything a real user would try in this story — [x]=tested, [ ]=still to test) ===
+{_fmt_checklist(checklist)}
+STILL UNTESTED: {', '.join(remaining) if remaining else '(nothing outstanding — confirm, then you may be done)'}
+Pick the action that exercises a STILL-UNTESTED aspect (prefer edge/error cases a lazy tester would skip).
+You are NOT bounded by a step count — a real QA engineer keeps going until everything a user would try is
+covered. Only set done=true when the ledger is genuinely exhausted (every aspect tested or unreachable).
 
 === ORIGINAL PRODUCT VISION ===
 {vision}
@@ -435,7 +507,10 @@ Reply with ONLY a JSON object, no prose:
   "expected_control": "<optional: if this action should make a SPECIFIC control appear (e.g. the message
                        composer textarea, a Save button), give that control's LABEL/placeholder here so the
                        explorer can wait for it to paint before judging. Leave '' if no specific control is expected>",
-  "done": <true only if the story's expected outcome is fully satisfied OR further exploration is pointless>
+  "covers": ["<zero or more aspect strings COPIED VERBATIM from the coverage ledger above that THIS action
+              exercises — this is how the run tracks tested-vs-untested; [] if it advances nothing on the list>"],
+  "done": <true ONLY when every ledger aspect is tested or genuinely unreachable — NOT because you've taken
+           'enough' steps. A real QA engineer is not done until coverage is exhausted.>
 }}"""
 
 
@@ -566,16 +641,35 @@ class Explorer:
         self.repo = tempfile.mkdtemp(prefix=f"aos-qa-{uuid.uuid4().hex[:8]}-")
         self.bugs = []
         self.bridge = None
+        self.artifact_dir = None
+        self.video_mp4 = None             # scrollable session clip for this story (set on close())
+        self.coverage = None              # coverage ledger [{aspect, covered}] — the tested-vs-untested record
+        self.stop_reason = None           # why explore() stopped (coverage-complete / blocking-wall / incomplete)
         if autostart:
             if artifact_dir is None and artifacts is not None:
                 artifact_dir = artifacts.run_dir("qa-explorer")
-            shot_dir = Path(artifact_dir) / "screenshots" if artifact_dir else None
+            self.artifact_dir = Path(artifact_dir) if artifact_dir else None
+            shot_dir = self.artifact_dir / "screenshots" if self.artifact_dir else None
             self.bridge = BrowserBridge(target_url, token=token, org=org, shot_dir=shot_dir)
 
     # --- the two AI decisions (EVERY one is a real model call via factory.agent) -----------------
-    def _ai_decide(self, story, state, history):
-        prompt = _decide_prompt(self.vision, story, state, history)
-        res = _call_agent(ROLE, self.repo, prompt)
+    def _ai_coverage_plan(self, story, state):
+        """Enumerate 'everything a real user would try' for this story ONCE, up front — the coverage ledger
+        the loop tests against. Fail-open: on any error, fall back to a single aspect (the story's expected
+        outcome) so the loop still runs, just without a rich checklist."""
+        fallback = [{"aspect": (story.get("expected") or story.get("expected_outcome")
+                                or story.get("goal") or "the story's expected outcome"), "covered": False}]
+        try:
+            res = _call_agent(ROLE, self.repo, _coverage_prompt(self.vision, story, state), light=_DECIDE_LIGHT)
+            j = _extract_json(res.get("out_full") or res.get("out") or "")
+            aspects = [str(a).strip() for a in (j.get("aspects") or []) if str(a).strip()]
+            return [{"aspect": a, "covered": False} for a in aspects] or fallback
+        except Exception:
+            return fallback
+
+    def _ai_decide(self, story, state, history, checklist=None):
+        prompt = _decide_prompt(self.vision, story, state, history, checklist=checklist)
+        res = _call_agent(ROLE, self.repo, prompt, light=_DECIDE_LIGHT)   # fast model for navigation
         j = _extract_json(res.get("out_full") or res.get("out") or "")
         # defensive defaults so a malformed reply can't crash the loop; a missing action becomes a no-op
         # that the next evaluate will flag as "nothing happened".
@@ -583,6 +677,7 @@ class Explorer:
             "reasoning": j.get("reasoning", ""),
             "next_action": j.get("next_action") or {"cmd": "noop"},
             "expected": j.get("expected", ""),
+            "covers": [str(c).strip() for c in (j.get("covers") or []) if str(c).strip()],
             # the LABEL of a control this action should make appear — lets explore() wait for a
             # late-painting control before evaluating (anti RACE-CONDITION false positive).
             "expected_control": (j.get("expected_control") or "").strip(),
@@ -664,20 +759,42 @@ class Explorer:
         }
 
     # --- the state-based loop --------------------------------------------------------------------
-    def explore(self, story, max_steps=25, on_bug=None, deadline=None):
-        """Run the observe -> AI-decide -> act -> (retry-on-miss) -> observe -> AI-evaluate loop for one
-        story. Returns a list of step-records. Fires on_bug(bug_record) for each real bug the AI finds.
-        `deadline` (epoch secs) bounds WALL-CLOCK: each AI step is a real (slow) model call, so a bounded
-        run must be able to stop MID-story, not only between stories — else one story blows the whole
-        budget (seen live: a 10-min budget overran to 14min+)."""
+    def explore(self, story, max_steps=None, on_bug=None, deadline=None, resume_covered=None):
+        """Drive observe -> AI-decide -> act -> (retry-on-miss) -> observe -> AI-evaluate to COVERAGE
+        COMPLETION, the way a real QA engineer works — NOT to a step count. Up front the AI enumerates
+        'everything a user would try' (the coverage ledger); the loop keeps going while untested aspects
+        remain and progress is being made. Returns the list of step-records; fires on_bug(bug) per real bug.
+
+        Stops on (priority order): a BLOCKING bug (a wall); COVERAGE COMPLETE (ledger exhausted or the AI
+        judges nothing more a user would try remains); STALL (no new coverage for _STALL_LIMIT steps). The
+        `max_steps`/`deadline` args are SAFETY BACKSTOPS ONLY (runaway/cost guards) — default None
+        (unbounded); tripping one marks the run INCOMPLETE and checkpoints what's left, never a silent 'done'.
+        `resume_covered`: aspect strings already tested in an earlier checkpointed run (resume where it left off)."""
         if self.bridge is None:
             raise RuntimeError("Explorer has no browser bridge (constructed with autostart=False)")
         records, history = [], []
-        for step in range(max_steps):
-            if deadline and time.time() > deadline:              # wall-clock budget stop (mid-story)
+        self.coverage = None                                     # planned lazily from the first observation
+        self.stop_reason = None
+        resume_covered = set(resume_covered or [])
+        seen_views = set()                                       # distinct views (urls) reached — genuine navigation
+        step, no_progress, dead_streak = 0, 0, 0
+        while True:
+            # SAFETY BACKSTOPS (runaway guards, NOT quality caps): a real tester who runs out of time hands
+            # off a "still to test" note — never a false "all done". Both default None (unbounded); the
+            # coverage ledger + stall guard are the real bound.
+            if max_steps and step >= max_steps:
+                self.stop_reason = "safety-cap-incomplete"
+                break
+            if deadline and time.time() > deadline:
+                self.stop_reason = "deadline-incomplete"
                 break
             state = self.bridge.state()                          # OBSERVE
-            decision = self._ai_decide(story, state, history)    # AI DECIDES
+            if self.coverage is None:                            # PLAN COVERAGE once, reusing this observation
+                self.coverage = self._ai_coverage_plan(story, state)
+                for c in self.coverage:
+                    if c.get("aspect") in resume_covered:
+                        c["covered"] = True
+            decision = self._ai_decide(story, state, history, checklist=self.coverage)  # AI DECIDES (coverage-aware)
             raw_action = decision["next_action"]
             action, aim = self._prepare_action(raw_action, state.get("elements"))  # BIND INTENT->CONTROL
             act_result = self.bridge.act(action)                 # ACT
@@ -760,6 +877,7 @@ class Explorer:
                 "verdict": {k: verdict[k] for k in
                             ("matches_expected", "verdict", "target_confirmed", "bug", "severity", "blocking")},
                 "done": decision["done"],
+                "covers": decision.get("covers", []),
                 "act_result": act_result,
             }
             records.append(record)
@@ -769,13 +887,79 @@ class Explorer:
                 "bug": verdict["bug"],
             })
 
-            if decision["done"] or verdict["blocking"]:          # story satisfied, or a wall — stop
+            # COVERAGE UPDATE: a step only TESTS an aspect if it actually did something (effect) and the
+            # evaluator judged it (pass or a real bug) — a no-op click covers nothing. Mark those aspects.
+            effect = _effect_registered(state, after, act_result)
+            newly = 0
+            if effect and verdict["verdict"] in ("pass", "bug"):
+                for asp in decision.get("covers", []):
+                    for c in self.coverage:
+                        if not c.get("covered") and (asp == c["aspect"] or asp in c["aspect"] or c["aspect"] in asp):
+                            c["covered"] = True
+                            newly += 1
+            # PROGRESS = covered a new aspect OR reached a view we hadn't seen (genuine navigation toward a
+            # deep aspect). Only steps that do NEITHER count toward the stall guard, so setup-navigation is
+            # never mistaken for wandering. A step with no effect at all also feeds the (faster) DEAD guard.
+            after_view = after.get("url") or ""
+            new_view = bool(after_view) and after_view not in seen_views
+            if after_view:
+                seen_views.add(after_view)
+            no_progress = 0 if (newly or new_view) else no_progress + 1
+            dead_streak = 0 if effect else dead_streak + 1
+            self._checkpoint(story, records)                     # DURABLE: tested-vs-untested persisted each step
+
+            remaining = [c for c in self.coverage if not c.get("covered")]
+            if verdict["blocking"]:                              # a wall — fixing must precede more testing
+                self.stop_reason = "blocking-wall"
                 break
+            if not remaining:                                    # everything a user would try has been tested
+                self.stop_reason = "coverage-complete"
+                break
+            if decision.get("done"):                             # AI judges nothing more a user would try remains
+                self.stop_reason = "coverage-complete-ai-judged"
+                break
+            if _STALL_LIMIT and no_progress >= _STALL_LIMIT:     # wandering known views, no new coverage
+                self.stop_reason = "stalled-incomplete"
+                break
+            if _DEAD_LIMIT and dead_streak >= _DEAD_LIMIT:       # nothing responds — a frozen/broken surface
+                self.stop_reason = "stuck-no-effect-incomplete"
+                break
+            step += 1
+        self._checkpoint(story, records)                         # final checkpoint carries the stop_reason
         return records
+
+    def _checkpoint(self, story, records):
+        """Persist the tested-vs-yet-to-be-tested ledger + progress after every step, so a crash/shutdown
+        loses nothing and a later run can resume the untested aspects. Fail-open; no-op without an artifact
+        dir (offline self-tests)."""
+        if not self.artifact_dir:
+            return
+        cov = self.coverage or []
+        try:
+            (self.artifact_dir / "checkpoint.json").write_text(json.dumps({
+                "ts": time.time(),
+                "story": story.get("title", story.get("name", "")),
+                "steps_done": len(records),
+                "stop_reason": self.stop_reason,
+                "tested": [c["aspect"] for c in cov if c.get("covered")],
+                "yet_to_test": [c["aspect"] for c in cov if not c.get("covered")],
+                "coverage": cov,
+            }, indent=2, default=str))
+        except Exception:
+            pass
 
     def close(self):
         if self.bridge:
             self.bridge.close()
+            # Transcode this story's raw .webm recording to a scrollable .mp4 next to the screenshots, so the
+            # evidence folder holds player-friendly clips. Fail-open — a video is evidence, never a gate.
+            webm = getattr(self.bridge, "video_path", None)
+            if webm and self.artifact_dir is not None and artifacts is not None:
+                try:
+                    out = self.artifact_dir / "videos" / (Path(webm).stem + ".mp4")
+                    self.video_mp4 = artifacts.webm_to_mp4(webm, out)
+                except Exception:
+                    self.video_mp4 = None
             self.bridge = None
 
 
@@ -827,7 +1011,12 @@ def _selftest():
                 body = json.dumps({"target_confirmed": True, "matches_expected": True, "verdict": "pass",
                                    "bug": None, "severity": "none", "blocking": False})
             return {"rc": 0, "out": body, "out_full": body}
-        raise AssertionError("unexpected agent task (neither decide nor evaluate):\n" + task[:200])
+        elif "PLAN COVERAGE for one user story" in task:
+            calls["plan"] = calls.get("plan", 0) + 1
+            assert "everything a REAL user would try" in task
+            return {"rc": 0, "out": json.dumps({
+                "aspects": ["click Go and see a result", "submit with an empty input"]}), "out_full": ""}
+        raise AssertionError("unexpected agent task (not plan/decide/evaluate):\n" + task[:200])
 
     fake.agent = fake_agent
     sys.modules["factory"] = fake
@@ -873,6 +1062,13 @@ def _selftest():
     # --- assertions -------------------------------------------------------------------------------
     # loop must have run: it stops after the 2nd step because the seeded bug is blocking.
     assert len(records) == 2, f"expected 2 steps (blocking bug on step 2), got {len(records)}"
+
+    # COVERAGE-DRIVEN, NOT COUNT-DRIVEN: the explorer plans 'everything a user would try' exactly once and
+    # stops for a REASON (the blocking wall here), never because a step counter ran out.
+    assert calls.get("plan") == 1, f"coverage must be planned once per story, got {calls.get('plan')}"
+    assert [c["aspect"] for c in ex.coverage] == ["click Go and see a result", "submit with an empty input"]
+    assert ex.stop_reason == "blocking-wall", f"stop reason should be the wall, got {ex.stop_reason!r}"
+    assert all("covers" in r for r in records), "each step records which coverage aspects it exercised"
 
     # per step the order MUST be: observe(state) -> decide -> act -> observe(state) -> evaluate.
     # so the bridge sees state,act,state,act (2 states + 1 act per step) and the agent sees

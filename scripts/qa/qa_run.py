@@ -66,7 +66,12 @@ import qa_report      # noqa: E402  — grounded verdict + AI narrative report w
 import artifacts      # noqa: E402  — Windows-visible evidence archive paths
 
 MAX_ROUNDS = int(os.environ.get("AOS_QA_MAX_ROUNDS", "6"))     # bounded fix-and-re-run cycles
-MAX_STEPS = int(os.environ.get("AOS_QA_MAX_STEPS", "25"))      # per-story exploration ceiling
+# NOT a target, NOT a quality cap — a pure SAFETY BACKSTOP. The explorer is COVERAGE-DRIVEN: it stops when
+# it has tested everything a real user would try (an AI judgment), not after N clicks. This number only
+# guards against a runaway loop; when it trips, the run is marked INCOMPLETE and checkpoints what's left.
+# Default 250 (very high — a real end-to-end journey rarely needs it). Set AOS_QA_MAX_STEPS=0 for unbounded.
+_SAFETY_STEPS = int(os.environ.get("AOS_QA_MAX_STEPS", "250"))
+MAX_STEPS = _SAFETY_STEPS or None                              # None => unbounded (ledger + stall guard bound it)
 # One AI reply occasionally comes back as prose instead of the JSON story array; a single flaky reply
 # must not collapse the whole gate into a 0-story NO VERDICT — retry the enumeration (each attempt is a
 # fresh factory.agent call) before failing closed.
@@ -276,7 +281,13 @@ def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_c
                 except Exception:
                     pass
 
-        story_reports.append(_story_report(story, records, collected))
+        sr = _story_report(story, records, collected)
+        # carry the coverage ledger (tested-vs-yet-to-test), why the story stopped, and its scrollable clip.
+        if ex is not None:
+            sr["coverage"] = getattr(ex, "coverage", None)
+            sr["stop_reason"] = getattr(ex, "stop_reason", None)
+            sr["video"] = str(getattr(ex, "video_mp4", None) or "") or None
+        story_reports.append(sr)
         for b in collected:
             bug_seq[0] += 1
             br = _bug_report(b, story, bug_seq[0])
@@ -448,6 +459,41 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     report = qa_report.build_report(run, out_dir=evidence_dir)
     report["rounds"] = rounds_ran
     report["clean"] = clean
+    # SESSION RECORDING: stitch every per-story .mp4 clip (written by each Explorer.close) into ONE
+    # scrollable video of the whole QA run — the CEO/dev can watch QA drive the product end to end, like
+    # reviewing a real QA team's screen recording. Fail-open: absent ffmpeg/clips just leaves it unset.
+    try:
+        clips = sorted((evidence_dir / "videos").glob("*.mp4")) if (evidence_dir / "videos").exists() else []
+        clips = [c for c in clips if c.name != "qa-session.mp4"]
+        report["session_video"] = str(artifacts.stitch_mp4s(clips, evidence_dir / "qa-session.mp4") or "") or None
+        report["story_videos"] = [str(c) for c in clips]
+    except Exception:
+        report["session_video"] = None
+    emit("session_video", {"path": report.get("session_video"), "clips": len(report.get("story_videos") or [])})
+    # TESTED-vs-YET-TO-BE-TESTED ledger — the hand-off doc a human/dev/coordinator reads to see EXACTLY what
+    # QA covered, what it did NOT, and WHY each story stopped. This is the coverage audit, not a step count.
+    try:
+        cov_json, lines = [], [f"# QA Coverage — {product}", "",
+                               f"Rounds: {rounds_ran} · Verdict: {report.get('verdict', '')}", ""]
+        for sr in last_story_reports:
+            cov = sr.get("coverage") or []
+            tested = [c["aspect"] for c in cov if c.get("covered")]
+            untested = [c["aspect"] for c in cov if not c.get("covered")]
+            name = sr.get("title") or sr.get("story") or sr.get("id") or "story"
+            cov_json.append({"story": name, "stop_reason": sr.get("stop_reason"),
+                             "tested": tested, "yet_to_test": untested})
+            lines.append(f"## {name}")
+            lines.append(f"- stop reason: **{sr.get('stop_reason', '?')}**")
+            lines.append(f"- tested ({len(tested)}):")
+            lines += ([f"  - [x] {a}" for a in tested] or ["  - (none)"])
+            lines.append(f"- yet to test ({len(untested)}):")
+            lines += ([f"  - [ ] {a}" for a in untested] or ["  - (none — fully covered)"])
+            lines.append("")
+        (evidence_dir / "coverage.json").write_text(json.dumps(cov_json, indent=2, default=str))
+        (evidence_dir / "COVERAGE.md").write_text("\n".join(lines))
+        report["coverage_doc"], report["coverage"] = str(evidence_dir / "COVERAGE.md"), cov_json
+    except Exception:
+        report["coverage_doc"] = None
     # DURABLE HISTORY (REBUILD-PLAN C1): every run is a qa_runs row in Postgres — the evidence chain
     # survives reboots. A persistence failure is surfaced on the report, never swallowed silently.
     try:

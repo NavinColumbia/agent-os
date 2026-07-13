@@ -44,12 +44,15 @@
 
 'use strict';
 
-const CMD_TIMEOUT_MS = 2500;         // hard per-command ceiling for ACTIONS — nothing may hang the loop
+// Ceilings are generous enough for a REAL app (a human waits several seconds for a heavy view), but still
+// hard — nothing may hang the loop. All env-overridable so a slow target can be tuned WITHOUT a code change.
+// Raised from the original 2.5s/9s (owner: those starved real journeys — QA gave up before the app settled).
+const CMD_TIMEOUT_MS = +(process.env.AOS_QA_CMD_TIMEOUT_MS || 8000);   // hard per-command ceiling for ACTIONS
 // `state`/`settle` SNAPSHOT the SPA only AFTER it stops painting, so they get a longer ceiling than an
 // action: settle can spend up to networkidle + the poll cap before we even screenshot.
-const STATE_TIMEOUT_MS = 9000;       // hard ceiling for state/settle (settle budget + screenshot + parse)
-const SETTLE_NETIDLE_MS = 2000;      // bounded, best-effort networkidle wait (a chatty SPA just times out)
-const SETTLE_MAX_MS = 3500;          // hard cap on the poll-until-stable loop (skeletons gone + DOM stable)
+const STATE_TIMEOUT_MS = +(process.env.AOS_QA_STATE_TIMEOUT_MS || 15000); // hard ceiling for state/settle
+const SETTLE_NETIDLE_MS = +(process.env.AOS_QA_SETTLE_NETIDLE_MS || 4000); // bounded best-effort networkidle
+const SETTLE_MAX_MS = +(process.env.AOS_QA_SETTLE_MAX_MS || 7000);     // hard cap on the poll-until-stable loop
 const SETTLE_SAMPLE_MS = 250;        // gap between the two consecutive stability samples
 const SETTLE_REOBSERVE_MS = 700;     // extra paint grace when the loop explicitly re-observes a late control
 const SHOT_DIR = process.env.AOS_QA_SHOT_DIR || process.env.AOS_QA_DIR || '/tmp/aos-qa';
@@ -411,8 +414,17 @@ class Bridge {
   }
 
   async close() {
+    // Return the recorded video's path so the Python side can transcode it to a scrollable .mp4. The file
+    // is only FINALIZED when the context closes, and video.path() only resolves after that — so grab the
+    // handle first, close the context, THEN read the path. Fail-open: a missing video is never an error.
+    let videoPath = null;
+    try {
+      const v = (this.page && this.page.video) ? this.page.video() : null;
+      if (this.ctx) await this.ctx.close();
+      if (v) { try { videoPath = await v.path(); } catch (_) {} }
+    } catch (_) {}
     try { if (this.browser) await this.browser.close(); } catch (_) {}
-    return { closed: true };
+    return { closed: true, video: videoPath };
   }
 
   // Dispatch one parsed command under the hard timeout. Returns a response object (never throws).

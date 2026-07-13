@@ -116,10 +116,13 @@ CLIENT vs INTERNAL) + core attrs (`gen_ai.*`), so traces are portable (Grafana/J
 **Research owed:** exact v1.41 attribute names + the three content-recording modes (mined claims 74/128/129 give
 the shape; confirm current field names before wiring). *Light dig, then map the schema.*
 
-### 13. [E] Provable side-effects (durable EFFECT records) — ⬜ not started
-**Approach:** every external action (`produce_artifact` write, `connector_ingest` egress, git commit) writes a
-tamper-evident effect record (with artifact hash), so the org can **prove** what happened. Idempotency keys so a
-retried step doesn't double-fire. Extends the existing `audit.py` tamper-evident chain.
+### 13. [E] Provable side-effects (durable EFFECT records) — 🟡 core shipped
+**Done:** `tools.effect_record(action, resource, content=…)` writes a tamper-evident EFFECT into the audit chain
+with a **sha256 content hash** + an **idempotency key**, so the org can *prove* what actually happened and a
+retried step is recognisable. Wired into `produce_artifact` (file writes) and `connector_ingest` (egress); the
+effect rides back on the tool result. Selftest binds the hash to the real bytes.
+**Remaining:** wire git-commit effects (the build/dev path) + actually USE the idempotency key to short-circuit a
+proven-duplicate side-effect (today it's recorded, not yet enforced). Extends the durable-execution model.
 **Research:** durable-execution guidance (Temporal/Inngest/Zylos; claims 27/40/103) — enough to build.
 
 ---
@@ -163,5 +166,12 @@ The full **133 unique claims** are now mined from the deep-research subagent tra
   selftest + suite wiring. **Item 1 completed**: auditor dossier now grounds in the real `fix-round-*.json` dev
   work (files changed + residual bugs) and cross-checks claimed fixes against residuals. **Item 9 design landed**
   ([`MEMORY-LAYER-DESIGN.md`](MEMORY-LAYER-DESIGN.md)) from a grounded research+audit pass — it's an extend of
-  `companymemory.py`, not greenfield. Next: build the item-9 first slice (`52-memory.sql` + provenance + activate
-  the dead experiential writer), then items 10/11 (PLAN/SUMMARY checkpoint + compaction), then Tier-1 contracts.
+  `companymemory.py`, not greenfield.
+- **2026-07-13 (cont.)** — Shipped the item-9 first slice (memory core + provenance + two-tier visibility +
+  role-scope + plan/summary checkpoints), **activated the dead experiential writer** (item 9), **wired coordinator
+  PLAN + phase-summary checkpoints into loopcontroller** (item 10 ✅), and shipped the **provable EFFECT-record
+  core** (item 13 🟡: sha256 hash + idempotency key on `produce_artifact`/`connector_ingest`). **Done: items
+  1,2,3,10,18 ✅; 9,13 🟡.** Next candidates: item 11 compaction (CONDITIONAL — measure coordinator context first
+  per design §6), Tier-1 (item 5 task contracts — needs bus-schema design; item 8 MAST checklist — low-risk),
+  item 13 remainder (git-commit effects + enforce idempotency). Codex: run `bash scripts/selftest.sh` to confirm
+  the new checks (auditor sanitize/jury/validation, memory spine, effect records, wiring guards) are green e2e.

@@ -29,6 +29,38 @@ for _p in (str(_QA), str(_SCRIPTS)):
         sys.path.insert(0, _p)
 
 
+def effect_record(action: str, resource: str, *, content=None, artifact=None, tenant=None,
+                  actor="tool-worker", extra=None) -> dict:
+    """PROVABLE side-effect (IMPROVEMENTS-PLAN item 13). Every REAL external action — a file written, an egress
+    fetched, a commit — records a tamper-evident EFFECT into the audit chain with a content HASH + an
+    IDEMPOTENCY key, so the org can PROVE what actually happened (not just that an agent said it did) and a
+    retried step is recognisable. Returns {hash, idempotency_key, effect_id}. Best-effort: never raises — an
+    observability write must not break the work it observes."""
+    import hashlib
+    body = content
+    if body is None and artifact:
+        try:
+            body = Path(artifact).read_bytes()
+        except Exception:
+            body = None
+    if isinstance(body, str):
+        body = body.encode("utf-8", "replace")
+    digest = hashlib.sha256(body).hexdigest() if body is not None else None
+    idem = hashlib.sha256(f"{action}|{resource}|{digest}".encode()).hexdigest()[:16]
+    eid = None
+    try:
+        import audit
+        payload = {"artifact": str(resource), "sha256": digest, "idempotency_key": idem,
+                   "bytes": len(body) if body is not None else None}
+        if extra:
+            payload.update(extra)
+        eid = audit.append(actor=actor, action=f"Effect:{action}", resource=str(resource),
+                           payload=payload, tenant_id=tenant)[0]
+    except Exception:
+        pass
+    return {"hash": digest, "idempotency_key": idem, "effect_id": eid}
+
+
 def qa_explore(args: dict) -> dict:
     """Explore ONE story to coverage-completion. The browser lives only for this call (the dispatch-and-park
     job), never across decide-steps. Bugs become findings; the coverage ledger + stop reason + video go in
@@ -176,11 +208,14 @@ def connector_ingest(args: dict) -> dict:
                                     role=args.get("role", "data-engineer"))
     except Exception as e:
         return {"status": "failed", "findings": [], "result": {"error": f"connector denied/failed: {e}"}}
+    eff = effect_record("connector_ingest", url, content=str(content),
+                        tenant=args.get("org") or args.get("tenant"),
+                        actor=f"tool:{args.get('role', 'data-engineer')}", extra={"egress": True})
     s = _agent_tool(args.get("role", "data-engineer"),
                     f"Summarise this content fetched from {url} for the CEO (2-4 honest lines):\n"
                     + str(content)[:5000], args)
     return {"status": "done", "findings": [],
-            "result": {"url": url, "summary": (s.get("result") or {}).get("report")}}
+            "result": {"url": url, "summary": (s.get("result") or {}).get("report"), "effect": eff}}
 
 
 def data_query(args: dict) -> dict:
@@ -228,8 +263,10 @@ def produce_artifact(args: dict) -> dict:
         path.write_text(content)
     except Exception as e:
         return {"status": "failed", "findings": [], "result": {"error": f"write failed: {e}"}}
+    eff = effect_record("produce_artifact", str(path), content=content,
+                        tenant=args.get("org") or args.get("tenant"), actor=f"tool:{role}")
     return {"status": "done", "findings": [],
-            "result": {"artifact": str(path), "role": role, "format": fmt, "bytes": len(content)}}
+            "result": {"artifact": str(path), "role": role, "format": fmt, "bytes": len(content), "effect": eff}}
 
 
 def design_asset(args: dict) -> dict:
@@ -374,6 +411,11 @@ def _selftest():
                                        "filename": "landing.md", "product": "demo"})
     assert pa["status"] == "done" and Path(pa["result"]["artifact"]).exists(), pa
     assert Path(pa["result"]["artifact"]).read_text().startswith("# Launch copy"), "content written to the file"
+    # item 13: a provable EFFECT record — content hash + idempotency key — accompanies the real file write.
+    eff = pa["result"].get("effect") or {}
+    assert eff.get("hash") and len(eff["hash"]) == 64 and eff.get("idempotency_key"), f"effect record: {eff}"
+    import hashlib as _h
+    assert eff["hash"] == _h.sha256(b"# Launch copy\nBuy our thing.").hexdigest(), "effect hash must bind the real bytes"
     fake_f.agent = lambda role, repo, task, **k: {"rc": 0, "out_full": "<svg xmlns='http://www.w3.org/2000/svg'/>"}
     da = run_tool("design_asset", {"spec": "a logo", "product": "demo"})
     assert da["status"] == "done" and da["result"]["artifact"].endswith(".svg") and Path(da["result"]["artifact"]).exists(), da

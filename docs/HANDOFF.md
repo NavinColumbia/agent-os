@@ -128,7 +128,9 @@ silence → reconcile re-dispatches).
    Optional remaining: (e) at aggregate also run `review.review` (needs the agentic org to assemble a review
    dossier from the explorers' results). Role manifests (governance hygiene; fail-open works without them):
    `~/projects/control-plane/roles/{qa-coordinator,dev-coordinator}.yaml` (`can_spawn:true`),
-   `{qa-explorer,dev-fixer}.yaml` (`can_spawn:false`).
+   `{qa-explorer,dev-fixer}.yaml` (`can_spawn:false`). ✅ (e) AUDITOR sign-off gate on the agentic path
+   (`9d81e09`): per-step evidence is propagated (tools.qa_explore → run-final.json in review's dossier shape)
+   and `review.review` runs as a gate (rejected → passed=False). **Phase 4b is now fully DONE.**
 
    **Pattern for adding coordinator behaviors** (all of the above use it): coordinator state lives in the
    supervisor's `mem` and MUST be persisted in `step.memory` (see `qa_findings`/`story_status`/`retests` in
@@ -151,10 +153,9 @@ silence → reconcile re-dispatches).
    health_url} → `run_org(...)`. **Keep the procedural loop as the default** until the agentic path is proven
    AT PARITY (same honest verdict + auditor gate + findings on the same target).
 
-**KNOWN FLAKY TEST (fix me):** `scripts/orchestra/runtime.py selftest` → "correction was broadcast to the
-sibling too" fails ~1/3 of runs on a clean tree (a 2-worker-pool timing race in the escalate→broadcast path,
-NOT caused by the agentic-org changes). De-flake it (e.g. deterministic step ordering or a barrier in the
-test) so `selftest.sh` is reliably 0-fail.
+**~~KNOWN FLAKY TEST~~ FIXED (`f095076`):** the runtime selftest's "correction was broadcast to the sibling"
+race is de-flaked — the sibling now does one 2.0s step (> the ~1s escalate→broadcast chain) then finishes, so
+it's provably live when the broadcast fires (4/4 reliable, ~19.5s). `selftest.sh` should now be reliably 0-fail.
 
 ### Medium-term (polish / breadth — independent of the above)
 4. Surface `pulse.live()` + QA quality in the **CONSOLE** (`scripts/console.py`, :8099, the actual CEO app),

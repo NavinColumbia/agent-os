@@ -102,6 +102,29 @@ def up(name):
         ar.set_url(name, "dev", url)
         return {"name": name, "already_up": True, "url": url, "pid": pid}
     log = open(f"/tmp/devserve-{name}.log", "a")
+    import os
+    # NODE/JS app with its OWN server (F11): a package.json `start` script means the app runs a real backend
+    # (API + SPA), so RUN it — a Python static file server would 404 every /api/* call. This is the serving
+    # counterpart to the stack-aware VERIFIER (F10): the QA harness must bring an app up in its own language.
+    if (repo / "package.json").exists():
+        try:
+            import json as _json
+            pkg = _json.loads((repo / "package.json").read_text())
+        except Exception:
+            pkg = {}
+        if (pkg.get("scripts") or {}).get("start"):
+            env = {**os.environ, "PORT": str(port), "HOST": "127.0.0.1"}
+            cmd = ["npm", "start", "--silent"]
+            cwd = str(repo)
+            proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
+            _pidfile(name).write_text(str(proc.pid))
+            import time
+            ok = any(_port_listening(port) or time.sleep(0.5) for _ in range(60))   # node start can take longer
+            if ok:
+                ar.set_url(name, "dev", url)
+            return {"name": name, "kind": "node", "url": url if ok else None, "pid": proc.pid,
+                    "up": ok, **({} if ok else {"error": "node app did not start — see /tmp/devserve-%s.log" % name})}
     if kind == "web":
         cmd = [VENV_PY, "-m", "http.server", str(port), "--bind", "127.0.0.1", "--directory", _web_root(repo)]
         cwd = str(repo)

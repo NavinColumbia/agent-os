@@ -45,12 +45,31 @@ def qa_explore(args: dict) -> dict:
                  "severity": b.get("severity", "medium"), "blocking": bool(b.get("blocking")),
                  "story": story.get("id") or story.get("title"), "screenshot": b.get("shot") or b.get("screenshot"),
                  "url": b.get("url")} for b in bugs]
+    # compact per-step record (the same shape qa_run._story_report emits) so the AGENTIC evidence is
+    # auditable by review.py — reasoning + action + expected + ACTUAL + verdict + screenshot per step.
+    def _actual(r):
+        a = r.get("actual") or {}
+        return f"{a.get('url', '')} {('; '.join(a.get('console_errors') or []))}".strip()
+    steps_detail = [{"action": _fmt_action(r.get("action")), "reasoning": r.get("reasoning", ""),
+                     "expected": r.get("expected", ""), "actual": _actual(r),
+                     "verdict": "match" if (r.get("verdict") or {}).get("matches_expected") else "mismatch",
+                     "covers": r.get("covers", []),
+                     "screenshot": (r.get("actual") or {}).get("screenshot")} for r in (records or [])]
     return {"status": "done", "findings": findings,
             "result": {"story": story.get("id") or story.get("title"),
+                       "title": story.get("title") or story.get("id"),
                        "coverage": getattr(ex, "coverage", None),
                        "stop_reason": getattr(ex, "stop_reason", None),
                        "video": getattr(ex, "video_mp4", None),
-                       "steps": len(records or []), "bugs": len(bugs)}}
+                       "steps": len(records or []), "steps_detail": steps_detail, "bugs": len(bugs)}}
+
+
+def _fmt_action(action) -> str:
+    if not isinstance(action, dict):
+        return str(action)
+    tgt = action.get("selector") or (f"idx={action['idx']}" if action.get("idx") is not None else "")
+    val = action.get("value")
+    return f"{action.get('cmd', '?')} {tgt}{(' =' + repr(val)[:40]) if val else ''}".strip()
 
 
 def dev_fix(args: dict) -> dict:

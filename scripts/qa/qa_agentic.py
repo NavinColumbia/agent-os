@@ -100,12 +100,18 @@ def run_agentic_qa(target_url, vision, *, product="app", token=None, org="0", su
         lines += [f"## {sid}", f"- stop reason: **{res.get('stop_reason', '?')}**",
                   f"- tested ({len(tested)}): " + ("; ".join(tested) or "(none recorded)"),
                   f"- yet to test ({len(untested)}): " + ("; ".join(untested) or "(none)"), ""]
+    # run-final.json in the review.py dossier shape (stories[] with per-step records) so the auditor can
+    # scrutinise the AGENTIC run's actual work, not just its verdict.
+    stories_report = [{"id": sid, "title": res.get("title") or sid,
+                       "status": "blocked" if sid in set(map(str, blocking)) else "passed", "expected": "",
+                       "steps": res.get("steps_detail") or [], "coverage": res.get("coverage"),
+                       "stop_reason": res.get("stop_reason")} for sid, res in per_story.items()]
     try:
         (evidence_dir / "COVERAGE.md").write_text("\n".join(lines))
         (evidence_dir / "coverage.json").write_text(json.dumps(cov_json, indent=2, default=str))
         (evidence_dir / "run-final.json").write_text(json.dumps(
-            {"product": product, "verdict": v.get("result"), "passed": bool(v.get("passed")),
-             "story_status": v.get("blocking_stories"), "findings": findings}, indent=2, default=str))
+            {"product": product, "vision": vision, "url": target_url, "verdict": v.get("result"),
+             "passed": bool(v.get("passed")), "stories": stories_report, "bugs": findings}, indent=2, default=str))
     except Exception:
         pass
 
@@ -115,6 +121,21 @@ def run_agentic_qa(target_url, vision, *, product="app", token=None, org="0", su
               "clean": bool(v.get("passed")), "rounds": 1, "evidence_dir": str(evidence_dir),
               "coverage_doc": str(evidence_dir / "COVERAGE.md"),
               "md": str(evidence_dir / "COVERAGE.md"), "json": str(evidence_dir / "run-final.json")}
+
+    # AUDITOR SIGN-OFF (same skeptical gate as the procedural loop): review the agentic run's ACTUAL work
+    # (per-step records + coverage in the evidence dir) — a rejected run can't be reported 'passed'. Runs
+    # before the persist below so the downgrade reaches QA-VERDICT.json. Env-gated + fail-open.
+    report["audit"] = None
+    if file_findings and os.environ.get("AOS_QA_AUDIT_GATE", "1").lower() not in ("0", "false", "no"):
+        try:
+            import review
+            av = review.review(str(evidence_dir), write=True)
+            report["audit"] = av
+            if av.get("passed_audit") is False:
+                report["passed"] = report["clean"] = False
+                report["verdict"] = f"AUDIT REJECTED (score {av.get('score', '?')}/10) — {(av.get('summary') or '')[:160]}"
+        except Exception as e:
+            report["audit_error"] = str(e)
 
     # SHIP BAR: any STILL-blocking bug (unfixed after the bounded re-test loop) becomes a governed finding —
     # so nothing broken reaches a human as a footnote, exactly like the procedural loop.
@@ -185,6 +206,7 @@ def _selftest():
     tmprepo = tempfile.mkdtemp(prefix="agentic-qa-")   # a throwaway repo so write_verdict never clobbers ours
     _prev_ev = os.environ.get("AOS_QA_EVIDENCE_DIR")
     os.environ["AOS_QA_EVIDENCE_DIR"] = tempfile.mkdtemp(prefix="agentic-ev-")   # evidence in a throwaway dir
+    os.environ["AOS_QA_AUDIT_GATE"] = "0"          # offline test: skip the real auditor call (own test covers it)
     out = None
     try:
         out = run_agentic_qa("http://app.test", "A console the user signs in to and messages an assistant.",

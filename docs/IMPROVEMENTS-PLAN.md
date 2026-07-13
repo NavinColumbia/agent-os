@@ -23,13 +23,14 @@ checks** (re-open a screenshot, re-run a named assertion) rather than only readi
 **Research:** master-key token list + "larger judges are MORE vulnerable, mid-sized best" from *One Token to
 Fool* (2507.08794) and the Agent-as-a-Judge survey (2601.05111) — enough to build; no further dig needed.
 
-### 2. [V] Auditor VALIDATION harness — ⛳ next
-**Approach:** a new `scripts/qa/auditor_validate.py` — the Minimum Viable Validation Protocol from *Reliability
-without Validity* (2606.19544): report **Cohen's kappa** vs a human-labeled set (not exact-match), a
-**position-bias** probe (swap evidence order AB↔BA — verdict must not flip), **test-retest ≥3 runs**, and a
-**high-stability + high-bias → FAIL** flag surfaced in `pulse`. Needs a small human-labeled fixture set of
-past QA runs (labels = accept/reject) to compute kappa against.
-**Research:** protocol fully specified by the finding; **no further research needed**, only a labeled fixture set.
+### 2. [V] Auditor VALIDATION harness — ✅ done (needs a real labeled set to run in anger)
+**Done:** `scripts/qa/auditor_validate.py` implements the Minimum Viable Validation Protocol from *Reliability
+without Validity* (2606.19544): **Cohen's kappa** vs a human-labeled set (not raw agreement), a **position-bias**
+probe (`_swap_order` reorders the evidence sections — a verdict that flips is biased), **test-retest** over ≥3
+runs, and the killer **high-stability + high-bias → FAIL** flag surfaced on `pulse`. Selftest proves all four on
+an order-sensitive stub auditor. Wired into `scripts/selftest.sh`.
+**Remaining:** assemble a real **human-labeled fixture set** (past QA evidence dirs + accept/reject labels) and
+run it against the live jury auditor to get a real kappa; feed that into CI as a periodic auditor health check.
 
 ### 3. [E] Ensemble auditor for close calls — ✅ done
 **Done:** `review.review()` now runs a **perspective-diverse jury** (lenses: skeptic / user-flow / evidence),
@@ -146,6 +147,9 @@ The full **133 unique claims** are now mined from the deep-research subagent tra
 ## Session log
 - **2026-07-13** — Mined all 133 claims → research-doc Appendix (item 18 ✅). Shipped Tier-0 auditor hardening:
   master-key sanitization + mid-sized-judge knob (item 1 core), perspective-diverse jury with
-  disagreement→escalate (item 3 ✅); both QA callers treat a close call as not-a-pass; selftest + suite wiring
-  added. Next: item 2 (validation harness) and item 1's diff/test-grounding sub-step; then a focused research
-  run for item 9 (memory layer) before any code there.
+  disagreement→escalate (item 3 ✅); both QA callers treat a close call as not-a-pass. Built the auditor
+  **validation harness** (item 2 ✅): kappa / position-bias / test-retest / confidently-biased FAIL flag, with
+  selftest + suite wiring. Launched a background design-research agent for item 9 (memory layer) to audit the
+  existing `companymemory.py` spine + turn the mined memory claims into a concrete design before any code.
+  Next: item 1's diff/test-grounding sub-step; land item-9 design → smallest useful memory slice; then items
+  10/11 (PLAN/SUMMARY checkpoint + compaction).

@@ -52,10 +52,14 @@ the **tool-worker pattern proven this session** (`orchestra/tools.py` + `jobrunn
 Each is: a role manifest (exists) + one `run_tool` entry + (optionally) a coordinator branch. ~a day each,
 same shape as `qa_explore`/`dev_fix`.
 
-### 2. Turn the orchestra engine ON by default, at parity
-The org engine is flag-gated (`loopcontroller.orchestra_on()`), like `qa_run(agentic=True)` is opt-in. Prove
-a real multi-team run at parity with the legacy "fleet", then flip the flag. (Same discipline as HANDOFF
-phase 6-iii for QA.)
+### 2. Turn the orchestra engine ON by default, at parity — DONE (default) + live-start verified
+✅ The orchestra engine is **already ON by default** (`AOS_ORCHESTRA` defaults to "1"; `research.py orchestra_on()`)
+— it's the production research engine via `loopcontroller`. ✅ A LIVE start of the full company org was verified
+(real factory + real tools): `CEO-coordinator (working) → research-coordinator (working) → researcher
+tool-worker (blocked = dispatch-and-parked, running the real tool)`. Remaining: a full live company run to
+completion at parity (Codex — the long-running validation), and wiring `company.run_company_org` as a
+`loopcontroller` production callsite for arbitrary CEO directives (today `loopcontroller` routes the RESEARCH
+phase to orchestra; extend to the multi-function company org).
 
 ### 3. Exercise + validate a FULL company run end-to-end (the integration proof)
 ✅ DEMONSTRATED OFFLINE (`1849dc0`): `scripts/orchestra/company.py` `run_company_org(vision, functions)` drives
@@ -66,11 +70,15 @@ a richer directive (e.g. *"launch product X"* → product → research → finan
 launch), each coordinator reporting up, the CEO briefed via `digest` / consulted on the calls that matter.
 Expect the same "under-stubbed/timing" fixes we made in the QA drive.
 
-### 4. Deepen whole-org visibility + human-pattern CEO comms in the CONSOLE
-`pulse`/dashboard already show every agent; surface the **whole standing org tree** (all teams, every action,
-each coordinator's subtree, live) in the CEO console (`console.py`, :8099) — not just the ops dashboard. Round
-out the human-pattern comms: briefing, status-on-a-cadence, clarification, **disagreement**, hand-offs (some
-in `loopcontroller`/`digest`/ask-await; make them cohesive and CEO-facing).
+### 4. Deepen whole-org visibility + human-pattern CEO comms — IN PROGRESS
+✅ `pulse`/dashboard show every agent live; ✅ an **Org chart** panel now renders each running org's nested
+CEO → coordinators → workers hierarchy (role, name, status, assignment) on the dashboard (`124fc24`); ✅ a
+`data_query` external-action tool (real read-only DB) as the connectors template (`c2b1412`). Remaining:
+surface the org chart in the CEO CONSOLE too (`console.py`, :8099), not just the ops dashboard; add the other
+specialized external-action tools per function (legal doc-scan against policy, live connectors, marketing/
+design asset generation); and round out human-pattern CEO comms — briefing, status-on-a-cadence,
+clarification, **disagreement**, hand-offs (pieces in `loopcontroller`/`digest`/ask-await; make them cohesive
+and CEO-facing).
 
 ### 5. Standing org that persists across directives
 Confirm the org is a **standing company** (persists, takes directives over time, grows/shrinks) vs ephemeral

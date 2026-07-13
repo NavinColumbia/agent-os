@@ -1409,13 +1409,35 @@ def sla_watchdog():
 
 
 MAX_BUILD_RETRY = int(os.environ.get("AOS_MAX_BUILD_RETRY", "3"))
+BUILD_BUDGET_USD = float(os.environ.get("AOS_BUILD_BUDGET_USD", "40"))   # hard $ ceiling for ONE product's build
+
+
+def _spend_usd(product):
+    """Real cumulative $ this product's build has spent (from the same traces ledger appguard reads)."""
+    try:
+        import appguard
+        return float(appguard.economics(product).get("spend") or 0.0)
+    except Exception:
+        return 0.0
 
 
 def _autoloop_build(thread_id, tid, product, reason=""):
     """A failed/unverifiable build routes back to the DEV/builder AUTOMATICALLY (bounded), and escalates to the
     CEO ONLY when the autonomous loop is exhausted — never bothering the human before then (North Star: the
     human is the last resort, not the first responder). Leaves the thread runnable so jobd/advance re-dispatches
-    the build in a long-lived process."""
+    the build in a long-lived process. HARD BUDGET GATE: a non-converging build must not bleed money — if
+    cumulative spend has crossed BUILD_BUDGET_USD, STOP retrying and escalate regardless of the retry count."""
+    spent = _spend_usd(product)
+    if spent >= BUILD_BUDGET_USD:                   # hard money stop — stop spawning, hand it to the human
+        _set(thread_id, awaiting="user_feedback"); _to(thread_id, "IMPLEMENT")
+        _report(tid, thread_id,
+                f"🛑 I paused this build — it's spent ${spent:.0f} (budget ${BUILD_BUDGET_USD:.0f}) and still "
+                f"isn't passing verification ({str(reason)[:120]}). I stopped before spending more. Say "
+                f"\"keep going\" to raise the budget and continue, or tell me how you'd like to proceed.",
+                {"kind": "budget_stop", "spent": round(spent, 2)}, urgent=True)
+        audit.append(actor="loopcontroller", action="BuildBudgetStop", resource=str(product),
+                     decision="halted", payload={"spent": round(spent, 2), "budget": BUILD_BUDGET_USD})
+        return
     try:
         import productregistry as _preg
         n = _preg.attempt(product, "build_retry")

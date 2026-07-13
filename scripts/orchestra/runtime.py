@@ -81,6 +81,8 @@ TERMINAL = {"done", "dead"}          # actor statuses that end its decide-loop
 MAX_ACTOR_STEPS = 64                 # runaway guard per actor (matches the old Actor default)
 _MAX_RETEST = int(os.environ.get("AOS_QA_MAX_RETEST", "2"))   # qa-coordinator: re-tests per story after a fix
                                      # (bounds the find->fix->re-test loop so a bad fix can't cycle forever)
+_MAX_GAPFILL = int(os.environ.get("AOS_QA_MAX_GAPFILL", "3"))  # qa-coordinator: gap-fill re-runs per story when
+                                     # an explorer stops with INCOMPLETE coverage (bounded so it terminates)
 
 
 # ------------------------------------------------------------------------------ small helpers
@@ -572,6 +574,30 @@ def _supervisor_step(ctx, a, evs):
                         ss = dict(mem.get("story_status") or {})
                         ss[str(p["story"])] = "blocking" if p.get("blocking_found") else "clean"
                         mem["story_status"] = ss
+                        # GAP-FILL: an explorer that stopped with INCOMPLETE coverage (not a bug) gets another
+                        # qa-explorer hired to CONTINUE that story — bounded per story so it always terminates.
+                        stop = ((p.get("result") or {}).get("stop_reason") or "").lower()
+                        incomplete = any(x in stop for x in ("incomplete", "stalled", "stuck", "cap", "deadline"))
+                        gf = dict(mem.get("gapfills") or {})
+                        if (incomplete and not p.get("blocking_found")
+                                and gf.get(str(p["story"]), 0) < _MAX_GAPFILL):
+                            gf[str(p["story"])] = gf.get(str(p["story"]), 0) + 1
+                            mem["gapfills"] = gf
+                            cc = dict((a.get("memory") or {}).get("context") or {})
+                            sobj = next((s for s in (cc.get("stories") or [])
+                                         if (s.get("id") or s.get("title")) == p["story"]), None)
+                            if sobj is not None:
+                                _hire_or_request(ctx, a, [{
+                                    "name": f"{a['name']}.gapfill-{p['story']}-{gf[str(p['story'])]}",
+                                    "role": "qa-explorer", "kind": "worker",
+                                    "task": f"GAP-FILL untested aspects of story {p['story']}",
+                                    "tool": "qa_explore", "tool_args": {"target_url": cc.get("target_url"),
+                                        "vision": cc.get("vision"), "token": cc.get("token"),
+                                        "org": cc.get("org", "0"), "story": sobj}}], step, corr)
+                                children = {c["actor_id"]: c for c in store.actors(ctx.run_id, tid)
+                                            if c["supervisor_id"] == me}
+                                _audit(a["name"], "QaGapFill", "executed",
+                                       {"story": p["story"], "attempt": gf[str(p["story"])]})
                     elif childrole == "dev-coordinator":
                         # RE-TEST LOOP (closed loop): a fix finished -> hire a FRESH qa-explorer to re-verify
                         # the fixed story, bounded per story so a bad fix can't cycle find<->fix forever.
@@ -727,7 +753,8 @@ def _supervisor_step(ctx, a, evs):
                    "aggregated": mem.get("aggregated", False),
                    "qa_findings": mem.get("qa_findings", []),   # qa-coordinator's honest-verdict tally
                    "story_status": mem.get("story_status", {}),  # latest pass/blocking per story
-                   "retests": mem.get("retests", {})}           # re-test attempts per story (bounded loop)
+                   "retests": mem.get("retests", {}),           # re-test attempts per story (bounded loop)
+                   "gapfills": mem.get("gapfills", {})}         # gap-fill attempts per story (bounded loop)
     if mem.get("pending_specs") and phase == "hiring":
         step.memory["pending_specs"] = mem["pending_specs"]
     if step.status is None and phase != "new" and a["status"] == "idle":

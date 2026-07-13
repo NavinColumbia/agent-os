@@ -70,6 +70,35 @@ def _backup_age_h():
     return round((time.time() - newest) / 3600, 1)
 
 
+def _org_trees(limit=3):
+    """The live agent ORG TREE(s): each running orchestra run's nested CEO → coordinators → workers hierarchy,
+    flattened to (depth, role, name, status, assignment) rows for rendering. Read-only; fail-open."""
+    try:
+        import sys
+        _orch = str(Path(__file__).resolve().parent / "orchestra")
+        if _orch not in sys.path:
+            sys.path.insert(0, _orch)
+        import store
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT run_id, tenant_id, vision FROM orchestra_runs
+                           WHERE status='running' ORDER BY created_at DESC LIMIT %s""", (limit,))
+            runs = cur.fetchall()
+        out = []
+        for rid, tid, vision in runs:
+            rows = []
+
+            def _walk(nodes, depth):
+                for n in nodes or []:
+                    rows.append({"depth": depth, "role": n.get("role"), "name": n.get("name"),
+                                 "status": n.get("status"), "assignment": (n.get("assignment") or "")[:60]})
+                    _walk(n.get("reports"), depth + 1)
+            _walk(store.org_tree(rid, tid).get("tree", []), 0)
+            out.append({"run_id": rid, "vision": (vision or "")[:90], "rows": rows})
+        return out
+    except Exception:
+        return []
+
+
 def _recent_qa(limit=8):
     """Latest QA verdict per product — the CEO's product-quality glance: passed vs AUDIT REJECTED vs
     INCOMPLETE, and how recently. Read-only; fail-open if qa_runs isn't there yet."""
@@ -218,6 +247,7 @@ def state():
         alerts.append({"level": "warn", "msg": f"{out['throughput']['denies_1h']} policy denials/hr"})
     for cf in confs:
         alerts.append({"level": "warn", "msg": f"conflict: {cf['agents'][0]} & {cf['agents'][1]} on {cf['resource']}"})
+    out["org_trees"] = _org_trees()              # live CEO -> coordinators -> workers hierarchy per running org
     out["qa"] = _recent_qa()                     # latest QA verdict per product (passed / rejected / incomplete)
     out["alerts"] = alerts or [{"level": "ok", "msg": "all systems nominal"}]
     # LIVE PULSE: every in-flight unit of agentic work (QA runs, builds, fleet actors) in one glance, with
@@ -341,6 +371,9 @@ font-weight:600;cursor:pointer}button:hover{filter:brightness(1.08)}
   <div class="card col12"><h2>Live agent work <span class=mut>· every in-flight unit — QA runs · builds · fleet actors · beat age · STALLED if silent</span></h2>
      <div id=pulse class=feed style="max-height:200px"></div></div>
 
+  <div class="card col12"><h2>Org chart <span class=mut>· CEO-coordinator → function coordinators → workers · who owns what · live status</span></h2>
+     <div id=orgtrees class=feed style="max-height:240px"></div></div>
+
   <div class="card col12"><h2>QA quality <span class=mut>· latest verdict per product · a run the auditor REJECTED or that left coverage INCOMPLETE cannot ship</span></h2>
      <div id=qa class=feed style="max-height:170px"></div></div>
 
@@ -379,6 +412,8 @@ async function tick(){
  $('#qa').innerHTML=(s.qa&&s.qa.length)?s.qa.map(q=>`<div class=row><span class="dot ${q.level==='ok'?'d-ok':q.level==='crit'?'d-crit':'d-warn'}"></span><b>${esc(q.product)}</b><span class=grow></span><span class=mut>${esc(q.verdict||(q.passed?'passed':'not passed'))} · ${q.rounds} round(s) · ${q.age_min}m ago</span></div>`).join(''):'<div class=mut>no QA runs yet</div>';
  const fmtAge=x=>x<90?x+'s':Math.floor(x/60)+'m'+String(x%60).padStart(2,'0')+'s';
  $('#pulse').innerHTML=(s.pulse&&s.pulse.length)?s.pulse.map(w=>`<div class=row><span class="dot ${w.stalled?'d-crit':w.status==='active'?'d-ok':'d-off'}"></span><b>${esc(w.kind)}</b> <span class=tag>${esc(w.stage||'-')}</span> <span class=mut>${esc(w.progress||w.label||w.work_id)}</span><span class=grow></span><span class=mut>${w.stalled?'STALLED · ':''}♥ ${fmtAge(w.beat_age_s)}</span></div>`).join(''):'<div class=mut>no agentic work in flight right now</div>';
+ const stdot=st=>st==='working'||st==='done'?'d-ok':st==='blocked'||st==='parked'?'d-warn':st==='dead'?'d-crit':'d-off';
+ $('#orgtrees').innerHTML=(s.org_trees&&s.org_trees.length)?s.org_trees.map(o=>`<div style="margin-bottom:8px"><div class=mut style="font-size:12px">▸ ${esc(o.vision)}</div>`+o.rows.map(r=>`<div class=row style="padding-left:${r.depth*18}px"><span class="dot ${stdot(r.status)}"></span><b>${esc(r.role)}</b> <span class=mut>${esc(r.name)}</span><span class=grow></span><span class=mut>${esc(r.assignment||r.status)}</span></div>`).join('')+'</div>').join(''):'<div class=mut>no live org right now</div>';
  const conf=new Set((s.conflicts||[]).flatMap(c=>c.agents));
  $('#directory').innerHTML=(s.directory&&s.directory.length)?s.directory.map(d=>`<div class=row><span class="dot ${conf.has(d.agent_id)?'d-crit':'d-ok'}"></span><b>${esc(d.agent_id)}</b> <span class=tag>${esc(d.role)}</span><span class=grow></span><span class=mut>${esc(d.product||'-')} · ${esc(d.task||'-')} · ${esc((d.resources||[]).join(' '))}</span></div>`).join(''):'<div class=mut>no active agents right now</div>';
  drawGraph(s.graph,s.waits);

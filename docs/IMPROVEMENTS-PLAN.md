@@ -120,11 +120,14 @@ reinitiate; keep each `decide` prompt scoped to the step. Uses item 10's summari
 
 ## Tier 3 — observability & durability hardening
 
-### 12. [E] Adopt OpenTelemetry GenAI span conventions — 🔬 light research
-**Approach:** map `pulse`/audit events onto OTel GenAI spans (`create_agent`/`invoke_agent`/`invoke_workflow`,
-CLIENT vs INTERNAL) + core attrs (`gen_ai.*`), so traces are portable (Grafana/Jaeger) instead of bespoke.
-**Research owed:** exact v1.41 attribute names + the three content-recording modes (mined claims 74/128/129 give
-the shape; confirm current field names before wiring). *Light dig, then map the schema.*
+### 12. [E] Adopt OpenTelemetry GenAI span conventions — ✅ done (mapper) → exporter wiring is the follow-up
+**Done:** `scripts/otel.py` — a pure mapper from our work kinds → OTel GenAI operations
+(`create_agent`/`invoke_agent`/`invoke_workflow`), the `gen_ai.*` attribute namespace (operation.name / agent.name
+/ provider.name / request.model / usage.*), and CLIENT vs INTERNAL span kind. `pulse_to_span(row)` +
+`active_spans()` turn the live pulse plane into portable spans; `python scripts/otel.py active` dumps in-flight
+work as OTel spans. Selftest + suite wiring.
+**Remaining (follow-up):** an actual OTel EXPORTER/bridge that ships `active_spans()` to a collector (Tempo/Jaeger),
+and stamping `model`/token usage into pulse `meta` so the spans carry them. The mapping (the hard/portable part) is done.
 
 ### 13. [E] Provable side-effects (durable EFFECT records) — 🟡 core shipped
 **Done:** `tools.effect_record(action, resource, content=…)` writes a tamper-evident EFFECT into the audit chain

@@ -57,7 +57,7 @@ The CEO pipeline (`loopcontroller`) is a **third, hand-rolled, inferior** durabi
   result and a **typed handoff contract** (the product registry + boundary contracts already built are this).
 - **Dispatch-and-park** for the long subprocess: the owner starts `claude`, durably records its handle, releases
   its worker slot, and resumes on completion (exit hook flips a row) — no thread held hostage for 40 min.
-- **Liveness:** a background heartbeat (every ~45s, decoupled from `claude` output) + a hard ceiling (~90 min).
+- **Liveness:** a background heartbeat (every ~45s, decoupled from `claude` output) + a LIBERAL hard ceiling (~6h — Opus builds are slow; the heartbeat catches real deaths in ~3 min regardless).
   Reap only on heartbeat-lapse or ceiling. Fencing token on every write.
 
 ### Keep vs discard
@@ -82,7 +82,8 @@ ad-hoc drivers racing rows; inferring "process alive" from work progress.
 5. **[Step 5] Delete the hand-rolled loopcontroller durability** once every phase runs on the engine.
 
 ## Status
-- [ ] **Step 1** — output-independent heartbeat + reaper fix + fencing — *in progress*
+- [x] **Step 1 — DONE** — output-independent heartbeat + reaper-on-lapse/ceiling (not output-silence) + fencing
+  token + a LIBERAL 6h runaway ceiling (Opus builds are slow). Proven by `loopcontroller.py liveness`. Kills F8.
 - [ ] Step 2 — single owner per build
 - [ ] Step 3 — phases as dispatch-and-park activities
 - [ ] Step 4 — consolidate engine

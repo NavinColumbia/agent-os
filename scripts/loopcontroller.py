@@ -1195,7 +1195,11 @@ STALL_SILENT_MIN = int(os.environ.get("AOS_JOB_SILENT_MIN", "12"))       # (lega
 # killed a healthy-but-quiet build (F8).
 HEARTBEAT_S = int(os.environ.get("AOS_JOB_HEARTBEAT_S", "45"))           # worker beats this often (timer, not output)
 HEARTBEAT_TIMEOUT_S = int(os.environ.get("AOS_JOB_HEARTBEAT_TIMEOUT_S", "180"))  # missed ~4 beats = worker dead
-HARD_CEILING_MIN = int(os.environ.get("AOS_JOB_CEILING_MIN", "120"))     # hard duration ceiling (runaway guard)
+# Hard ceiling = a LIBERAL runaway backstop, deliberately generous: real Opus builds (build + quality loop + QA)
+# legitimately run for hours, and the heartbeat above already catches a genuinely DEAD worker in ~3 min regardless
+# of this ceiling. So this only guards a worker that is ALIVE and beating but stuck looping forever (rare) — keep
+# it big so it never cuts off slow-but-healthy work (per the "backstops must not be conservative" principle).
+HARD_CEILING_MIN = int(os.environ.get("AOS_JOB_CEILING_MIN", "360"))     # 6h runaway backstop (liberal)
 
 
 def _reap_dead_jobs():
@@ -1241,9 +1245,9 @@ def liveness_selftest():
             cur.execute("SELECT status FROM controller_jobs WHERE id=%s", (jid,)); return cur.fetchone()[0]
     ok = True
     try:
-        alive = mk(40, 20)                 # 40 min old but beat 20s ago → ALIVE (quiet build), must NOT reap
+        alive = mk(120, 20)                # 2h old but beat 20s ago → ALIVE (slow Opus build), must NOT reap
         dead = mk(40, 600)                 # 40 min old, last beat 10 min ago → worker dead, MUST reap
-        runaway = mk(200, 10)              # beating, but 200 min old → past hard ceiling, MUST reap
+        runaway = mk(HARD_CEILING_MIN + 30, 10)   # beating, but past the liberal hard ceiling → MUST reap
         young = mk(5, 600)                 # heartbeat lapsed but under the floor → too young, must NOT reap
         _reap_dead_jobs()
         checks = [(status(alive) == "running", "quiet-but-beating build is NOT reaped (F8 fixed)"),

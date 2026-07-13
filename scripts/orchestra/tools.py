@@ -21,8 +21,10 @@ import sys
 from pathlib import Path
 
 _QA = Path(__file__).resolve().parent.parent / "qa"
-if str(_QA) not in sys.path:
-    sys.path.insert(0, str(_QA))
+_SCRIPTS = Path(__file__).resolve().parent.parent          # for pulse, factory, etc.
+for _p in (str(_QA), str(_SCRIPTS)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 def qa_explore(args: dict) -> dict:
@@ -125,6 +127,30 @@ def finance_report(args: dict) -> dict:
     return r
 
 
+def data_query(args: dict) -> dict:
+    """A data function's REAL external action: run a READ-ONLY query against the platform DB and summarise the
+    result for the CEO. Refuses anything but a single SELECT (no writes, no semicolons) — a data agent reads,
+    it never mutates. This is the template for external-action tools (connectors, live systems)."""
+    sql = (args.get("sql") or "").strip().rstrip(";")
+    if not sql.lower().startswith("select") or ";" in sql:
+        return {"status": "failed", "findings": [], "result": {"error": "data_query runs ONE read-only SELECT"}}
+    try:
+        import psycopg
+        import pulse
+        with psycopg.connect(pulse.DB) as c, c.cursor() as cur:
+            cur.execute(sql + ("" if "limit" in sql.lower() else " LIMIT 200"))
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as e:
+        return {"status": "failed", "findings": [], "result": {"error": f"query failed: {e}"}}
+    s = _agent_tool("data-analyst", "Summarise this query result for the CEO in 2-3 honest lines (call out "
+                    f"anything notable).\nQUERY: {sql}\nROWS ({len(rows)}): {json.dumps(rows, default=str)[:3000]}",
+                    args)
+    return {"status": "done", "findings": [],
+            "result": {"sql": sql, "row_count": len(rows), "rows": rows[:20],
+                       "summary": (s.get("result") or {}).get("report")}}
+
+
 def knowledge_work(args: dict) -> dict:
     """The catch-all for any KNOWLEDGE-WORK function — a product-manager writing a spec, a legal-compliance
     review of a provided doc, a strategy memo, an analysis. Runs the given role agent on the task and returns
@@ -140,7 +166,7 @@ def knowledge_work(args: dict) -> dict:
 
 
 _TOOLS = {"qa_explore": qa_explore, "dev_fix": dev_fix, "research": research,
-          "finance_report": finance_report, "knowledge_work": knowledge_work}
+          "finance_report": finance_report, "knowledge_work": knowledge_work, "data_query": data_query}
 
 
 def run_tool(name: str, args: dict) -> dict:
@@ -216,6 +242,14 @@ def _selftest():
     assert kw["status"] == "done" and kw["result"]["role"] == "product-manager", kw
     lg = run_tool("knowledge_work", {"role": "legal-compliance-checklist", "task": "review the ToS", "context": {"doc": "..."}})
     assert lg["status"] == "done" and "deliverable" in lg["result"]["report"], lg
+    # data_query: a REAL read-only DB query (external action) + write-refusal.
+    fake_f.agent = lambda role, repo, task, **k: {"rc": 0, "out_full": "summary"}
+    import pulse as _pulse
+    if _pulse.DB:                                 # a real SELECT against the platform DB
+        dq = run_tool("data_query", {"sql": "SELECT 1 AS one"})
+        assert dq["status"] == "done" and dq["result"]["row_count"] == 1, dq
+    assert run_tool("data_query", {"sql": "DELETE FROM agent_pulse"})["status"] == "failed", "writes refused"
+    assert run_tool("data_query", {"sql": "SELECT 1; DROP TABLE x"})["status"] == "failed", "multi-stmt refused"
     fake_f.agent = lambda role, repo, task, **k: {"rc": 1, "out_full": ""}   # a failed agent -> failed tool
     assert run_tool("research", {"topic": "x"})["status"] == "failed"
 

@@ -90,7 +90,9 @@ def start(tenant_id, org_id, thread_id, question, api_key=None, engine=None):
             if not q["within_quota"]:
                 block = f"quota reached ({q['builds']})"
         except Exception as e:
-            block = f"quota_check_failed: {str(e)[:120]}"
+            # An EXCEPTION verifying quota (e.g. 'no such tenant') is an INTERNAL error, NOT an over-quota
+            # condition — label it so downstream never mis-renders it as a billing "upgrade your plan" message.
+            block = f"internal_error: quota check failed ({str(e)[:100]})"
     status = "failed" if block else "running"
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO research_runs (tenant_id, org_id, thread_id, question, status)

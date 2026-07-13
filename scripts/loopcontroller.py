@@ -652,9 +652,16 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         return {"phase": phase, "awaiting": "fleet", "running": True, "queued_intent": queued}
 
     if phase == "DISCOVER":
-        sysp = ("You are a product controller scoping a build for a non-technical CEO. Ask ONE focused "
-                "clarifying question at a time. When you understand the goal well enough to research it, end "
-                "with EXACTLY:\n[[RESEARCH]]\n<the research question to investigate>\n[[/RESEARCH]]")
+        # DECISIVE gate (G2): the AGENT judges "do I know enough? then GO" — it must NOT be perky/chatty. Bias
+        # HARD toward proceeding: at most ONE clarifying question total, and only if the brief is genuinely
+        # unactionable. No plan/option drafting here (that's later phases). The moment a research question is
+        # nameable, emit the block — so the controller never has to force the transition.
+        sysp = ("You are a decisive product controller scoping a build for a non-technical CEO. Your DEFAULT is "
+                "to PROCEED, not to chat. If the brief is already actionable (it usually is), do NOT ask anything "
+                "— immediately emit the research block. Ask AT MOST ONE short clarifying question, and only when "
+                "you genuinely cannot form a research question without it. Do NOT draft plans, option lists, or "
+                "tech-stack choices here — that happens in later phases. The MOMENT you can name what to research, "
+                "end your reply with EXACTLY:\n[[RESEARCH]]\n<the research question to investigate>\n[[/RESEARCH]]")
         reply = _llm(tid, thread_id, sysp, s, on_delta=on_delta)
         rq = _parse_block(reply, "RESEARCH")
         clean = re.sub(r"\[\[RESEARCH\]\].*?\[\[/RESEARCH\]\]", "", reply, flags=re.S | re.I).strip()
@@ -854,7 +861,9 @@ def advance(thread_id, job_result=None):
                     "it in Settings → Privacy (it names the provider your text is sent to), then say \"ready\" "
                     "and I'll pick up right where we left off.")
             meta_kind = "consent_required"
-        elif "quota" in es:
+        elif "quota reached" in es or "quota exceeded" in es or "over quota" in es:
+            # ONLY a genuine over-quota (research.py emits "quota reached (...)"); an internal spend-gate error
+            # ("internal_error: quota check failed …") must NOT be mis-rendered as a billing/upgrade message.
             text = ("⚠️ You've hit your plan's build quota, so I paused before spending anything. Upgrade your "
                     "plan (or wait for it to reset) in Settings → Billing, then say \"ready\" to continue.")
             meta_kind = "quota_reached"
@@ -1342,6 +1351,7 @@ def _llm(tid, thread_id, sysp, s, on_delta=None):
     # ANY stream failure we fall back to the proven blocking path so a streamed reply is never worse. The
     # console's on_delta hides leading control markup ([[RESEARCH]]/[[PLAN]]) from the wire — the FULL text
     # returned here (incl. those blocks) is what we parse/persist below, identical to the non-stream path.
+    # STREAMING fast path (first attempt only): stream token-by-token when the caller wants it.
     r = None
     if on_delta is not None and hasattr(factory, "agent_stream"):
         r = factory.agent_stream("research-growth", str(factory.PRODUCTS), task, on_delta, tools=[])
@@ -1350,9 +1360,25 @@ def _llm(tid, thread_id, sysp, s, on_delta=None):
             # raise so say() never persists a reply for it and never falls back to a fresh (billed) run.
             raise factory.StreamStopped("conversational turn cancelled by user")
         if r.get("failed") or r.get("rc") not in (0,) or not (r.get("out_full") or r.get("out")):
-            r = None    # stream errored/empty -> fall through to the blocking call (no double-stream risk)
-    if r is None:
-        r = factory.agent("research-growth", str(factory.PRODUCTS), task, tools=[], light=True)
+            r = None    # stream errored/empty -> fall through to the blocking (retried) path
+    # RESILIENT blocking call (F1): a single transient CLI timeout must NOT strand the thread with a bare
+    # "timeout" reply and no phase change. Retry with backoff + a longer timeout each attempt; only on genuine
+    # exhaustion return an HONEST, RESUMABLE message (no control block, so the phase safely holds).
+    def _ok(res):
+        out = (res.get("out_full") or res.get("out") or "").strip()
+        return res.get("rc") in (0,) and out and out.lower() != "timeout"
+    for attempt in range(3):
+        if r is not None and _ok(r):
+            break
+        r = factory.agent("research-growth", str(factory.PRODUCTS), task, tools=[], light=True,
+                          timeout=90 + attempt * 60)
+        if _ok(r):
+            break
+        time.sleep(2 * (attempt + 1))
+    if not _ok(r):
+        # exhausted — surface an actionable, resumable message (NEVER a bare "timeout"); phase stays put so the
+        # CEO can just say "retry" and pick up exactly here.
+        return "⚠️ The model call kept timing out for a moment — say \"retry\" and I'll pick right back up."
     # Use the COMPLETE output (out_full) — never the tail-truncated 'out'. The controller's reply carries
     # leading control blocks ([[RESEARCH]]/[[PLAN]]); a >1500-char plan would lose its OPENING tag under
     # front-truncation, so _parse_block fails (plan never persists) and a dangling [[/PLAN]] leaks to chat.

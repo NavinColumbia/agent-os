@@ -50,12 +50,15 @@ actually optimize against the auditor.
 
 ## Tier 1 — coordination integrity (structural multi-agent failures)
 
-### 5. [V] Mandatory task CONTRACT in the message-bus schema — 🔬 needs design
-**Approach:** every `task`/`need_agent` event must carry `{objective, output_format, allowed_tools/sources,
-boundaries}`; the runtime **refuses/flags** a spawn whose task lacks them. Touches `orchestra/bus.py` (schema),
-`store.emit`/`spawn_actor`, and the coordinator prompts that mint tasks.
-**Research owed:** confirm the least-disruptive enforcement point (validate at `emit` vs at `_hire`) and a
-fail-open default so a missing field degrades to a warning, not a dead org. *Spawn a design agent before coding.*
+### 5. [V] Mandatory task CONTRACT in the message-bus schema — ✅ done (fail-open at `_hire`)
+**Done:** enforcement point resolved to `runtime._hire` — the single choke point every child `task` event flows
+through. `_task_contract(spec)` ALWAYS populates `{objective, output_format, allowed_tools, boundaries}` (filling
+sensible defaults where the coordinator under-specified), rides the contract in both the task event payload and
+the worker's `memory.context`, and **journals** (`TaskContractDefaulted` audit) any defaulted field so
+under-specifying coordinators are visible — without ever blocking a hire (fail-open). Runtime selftest green;
+logic guard in the suite.
+**Optional:** surface the contract fields explicitly in `_WORKER_PROMPT` (today they ride in context, which the
+prompt already prints).
 
 ### 6. [V] Share FULL traces across coordinators — 🔬 needs design
 **Approach:** propagate full agent traces (not just summarized `done`/`finding`) to any coordinator/worker whose

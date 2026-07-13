@@ -215,17 +215,38 @@ def _persist(ctx, a, step, evs):
     # path added latency that perturbed the timing-sensitive supervisor/sibling race. Heartbeat already exists.
 
 
+def _task_contract(spec):
+    """Item 5: every hire carries an explicit task CONTRACT — {objective, output_format, allowed_tools,
+    boundaries} — the thing Anthropic found subagents need or they 'duplicate work, leave gaps, or spawn
+    excessively'. FAIL-OPEN: a field the coordinator didn't specify is filled with a sensible default (so the
+    contract is ALWAYS structurally present and a hire never dies on a missing field); the defaulted fields are
+    returned so the caller can JOURNAL under-specification without blocking."""
+    given = spec.get("contract") if isinstance(spec.get("contract"), dict) else {}
+    task = spec.get("task") or ""
+    tool = spec.get("tool")
+    defaults = {
+        "objective": task or f"deliver the '{spec.get('role', 'assigned')}' work",
+        "output_format": "report the concrete result up via a 'done' event (no vague status)",
+        "allowed_tools": (tool if tool else "only what your role needs; request more via need_agent"),
+        "boundaries": "stay within THIS task; don't do a sibling's job; escalate/disagree rather than drift",
+    }
+    contract = {k: (given.get(k) or defaults[k]) for k in defaults}
+    missing = [k for k in defaults if not given.get(k)]
+    return contract, missing
+
+
 def _hire(ctx, supervisor_id, spec):
-    """One governance-passed hire: a durable child row + its kickoff `task` event.
+    """One governance-passed hire: a durable child row + its kickoff `task` event (carrying the task CONTRACT).
     Returns the new actor_id (or None on a store refusal, which is journaled)."""
     kind = "supervisor" if spec.get("kind") == "supervisor" else "worker"
     mem = {"repo": ctx.repo}
+    contract, missing = _task_contract(spec)
     cblob = dict(spec.get("context") or {})   # a context blob (e.g. a bug handed to a dev-coordinator)
+    cblob["contract"] = contract              # the worker reads its boundaries/output-format from context
     if spec.get("tool"):                      # a TOOL-worker: tool + args ride in memory.context so its
         cblob["tool"] = spec["tool"]          # step dispatch-and-parks
         cblob["tool_args"] = spec.get("tool_args") or {}
-    if cblob:
-        mem["context"] = cblob
+    mem["context"] = cblob
     child = store.spawn_actor(ctx.run_id, ctx.tenant, spec.get("name") or spec.get("role") or "agent",
                               spec.get("role") or "engineer", kind=kind,
                               supervisor_id=supervisor_id, assignment=spec.get("task"),
@@ -233,8 +254,11 @@ def _hire(ctx, supervisor_id, spec):
     if child.get("error"):
         _audit(f"actor:{supervisor_id}", "HireFailed", "error", {"spec": spec, "err": child["error"]})
         return None
+    if missing:                               # under-specified hand-off — journaled, NOT blocked (fail-open)
+        _audit(f"actor:{supervisor_id}", "TaskContractDefaulted", "warn",
+               {"child": child["actor_id"], "role": child["role"], "missing": missing})
     store.emit(ctx.run_id, ctx.tenant, supervisor_id, child["actor_id"], "task",
-               {"task": spec.get("task")}, corr_id=f"spawn-{child['actor_id']}")
+               {"task": spec.get("task"), "contract": contract}, corr_id=f"spawn-{child['actor_id']}")
     _audit(child["name"], "Hired", "executed",
            {"actor_id": child["actor_id"], "role": child["role"], "kind": kind,
             "supervisor": supervisor_id})

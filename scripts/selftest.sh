@@ -231,6 +231,7 @@ ckp "auditor VALIDATION (kappa/bias/retest)"        "$PY scripts/qa/auditor_vali
 ckp "experiential writer wired (fix-loop -> memory)" "grep -q 'companymemory.learn_from_fix' scripts/qa/qa_run.py"
 ckp "coordinator plan/phase checkpoints wired (item10)" "grep -q 'companymemory.checkpoint' scripts/loopcontroller.py"
 ckp "MAST failure-mode taxonomy (14 modes)"          "$PY scripts/orchestra/mast.py | grep -q 'mast selftest: PASS'"
+ckp "task CONTRACT on every hire (item 5, fail-open)" "$PY -c \"import sys;sys.path.insert(0,'scripts/orchestra');import runtime;c,m=runtime._task_contract({'task':'x'});assert set(c)=={'objective','output_format','allowed_tools','boundaries'} and 'objective' in m;c2,m2=runtime._task_contract({'task':'x','contract':{'objective':'o','output_format':'f','allowed_tools':'t','boundaries':'b'}});assert not m2 and c2['boundaries']=='b';print('PASS')\" | grep -q PASS"
 
 # Fire the bounded concurrent pool for everything enqueued above.
 run_pool

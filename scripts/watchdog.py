@@ -113,6 +113,20 @@ def check():
             if age and age > 1800:            # >30 min (ticker beats every 15m; a dead loop is caught by pgrep too)
                 issues.append({"sig": f"heartbeat:{comp}", "level": "warn",
                                "msg": f"{comp} heartbeat stale ({round(age/60)}m)"})
+    # 5) IN-FLIGHT AGENTIC WORK gone silent (the pulse plane): a QA run / build / fleet task that stopped
+    # beating past its promised cadence — the North Star's "silence is itself a failure signal". This is the
+    # gap the old watchdog couldn't see: agentic work in progress, not just daemons. sweep() marks them so
+    # the live view agrees; each becomes an incident (deduped by watchdog_alerts like everything else).
+    try:
+        import pulse
+        pulse.sweep()
+        for w in pulse.stalled():
+            issues.append({"sig": f"pulse:{w['work_id']}", "level": "warn",
+                           "msg": f"{w['kind']} '{w.get('label') or w['work_id']}' silent "
+                                  f"{round(w['beat_age_s'] / 60)}m at stage '{w.get('stage') or '?'}' "
+                                  f"({w.get('progress') or 'no progress reported'})"})
+    except Exception as e:
+        issues.append({"sig": "pulse:self", "level": "warn", "msg": f"pulse check failed: {e}"})
     return issues
 
 

@@ -64,6 +64,7 @@ import qa_explorer    # noqa: E402  — the state-based AI explorer (observe->de
 import dev_loop       # noqa: E402  — AI dev-fix loop + app restart/reset
 import qa_report      # noqa: E402  — grounded verdict + AI narrative report writer
 import artifacts      # noqa: E402  — Windows-visible evidence archive paths
+import pulse          # noqa: E402  — live heartbeat plane (observability: this run is alive + what it's doing)
 
 MAX_ROUNDS = int(os.environ.get("AOS_QA_MAX_ROUNDS", "6"))     # bounded fix-and-re-run cycles
 # NOT a target, NOT a quality cap — a pure SAFETY BACKSTOP. The explorer is COVERAGE-DRIVEN: it stops when
@@ -250,7 +251,7 @@ def _bug_report(bug: dict, story: dict, n: int, fixed: bool = False) -> dict:
 # one round — explore EVERY story fresh, returning (story_reports, bug_reports, first_blocking_bug).
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
 def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_cls,
-               bug_seq, on_event=None, artifact_dir=None):
+               bug_seq, on_event=None, artifact_dir=None, pulse_work_id=None):
     """Drive all stories once against the live app. Stops the round EARLY on the first BLOCKING bug
     (the app will be fixed + reset + re-run from scratch, so finishing the round is wasted work)."""
     story_reports, bug_reports, first_blocking = [], [], None
@@ -262,6 +263,8 @@ def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_c
                 ex = explorer_cls(target_url, vision, token=token, org=org, artifact_dir=artifact_dir)
             except TypeError:
                 ex = explorer_cls(target_url, vision, token=token, org=org)
+            if ex is not None and pulse_work_id:
+                setattr(ex, "pulse_work_id", pulse_work_id)   # per-step heartbeat during explore
         except Exception as e:                            # a browser/bridge failure is itself a blocking bug
             bug = {"bug": f"could not launch the explorer/browser: {e}", "expected": "app is reachable",
                    "blocking": True, "severity": "critical", "url": target_url, "action": {"cmd": "goto"}}
@@ -335,6 +338,13 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     (evidence_dir / "screenshots").mkdir(parents=True, exist_ok=True)
     events_path = evidence_dir / "events.jsonl"
 
+    # LIVE PULSE: register this run so the observability plane + watchdog can see it's alive and what phase
+    # it's in — every explore step beats, and the finalize phases below beat too (they used to go dark).
+    pulse_work_id = f"qa:{evidence_dir.name}"
+    pulse.start(pulse_work_id, "qa-run", label=f"QA: {product}", tenant_id=(org or None), stage="planning",
+                expected_cadence_s=int(os.environ.get("AOS_QA_PULSE_CADENCE_S", "150")),
+                meta={"evidence_dir": str(evidence_dir), "target_url": target_url})
+
     def emit(kind, data=None):
         payload = {"ts": time.time(), "kind": kind, "data": data or {}}
         try:
@@ -392,10 +402,12 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     for rnd in range(max_rounds):
         rounds_ran = rnd + 1
         emit("round_start", {"round": rounds_ran, "stories": len(stories)})
+        pulse.beat(pulse_work_id, stage=f"round {rounds_ran}/{max_rounds}",
+                   progress=f"exploring {len(stories)} stories")
         story_reports, bug_reports, blocking = _run_round(
             target_url, vision, token, org, stories,
             max_steps=max_steps, explorer_cls=explorer_cls, bug_seq=bug_seq, on_event=emit,
-            artifact_dir=evidence_dir)
+            artifact_dir=evidence_dir, pulse_work_id=pulse_work_id)
         last_story_reports, last_bug_reports = story_reports, bug_reports
 
         if blocking is None:                              # a clean round: no blocking bug -> we're done
@@ -456,6 +468,7 @@ def qa_run(target_url, vision, token, org, product_summary, *,
         (evidence_dir / "run-final.json").write_text(json.dumps(run, indent=2, default=str))
     except Exception:
         pass
+    pulse.beat(pulse_work_id, stage="report", progress="writing verdict + narrative")   # was the DARK phase
     report = qa_report.build_report(run, out_dir=evidence_dir)
     report["rounds"] = rounds_ran
     report["clean"] = clean
@@ -510,6 +523,7 @@ def qa_run(target_url, vision, token, org, product_summary, *,
                        "evidence_dir": str(evidence_dir)})
     # THE SHIP BAR (REBUILD-PLAN C1): ANY bug still open — blocking or not — becomes a governed,
     # AI-routed, SLA-tracked finding with its originating story stored for gated re-verification.
+    pulse.beat(pulse_work_id, stage="filing", progress="routing open findings")   # also a former dark phase
     report["findings_filed"] = (_file_open_bugs(
         report, run, stories, {"target_url": target_url, "vision": vision, "token": token,
                                "org": org, "summary": product_summary, "max_steps": max_steps})
@@ -536,6 +550,11 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     emit("report", {"md": report["md"], "verdict": report["verdict"],
                     "verdict_json": report["verdict_json"],
                     "evidence_dir": str(evidence_dir)})
+    # PULSE TERMINAL: a clean run is 'done'; anything else (open bugs, incomplete coverage, cap hit) is
+    # 'incomplete' — honest, and it leaves the live view so the observer stops watching it.
+    pulse.finish(pulse_work_id, status=("done" if clean and not report.get("findings_filed") else "incomplete"),
+                 result={"verdict": report.get("verdict"), "rounds": rounds_ran,
+                         "open_findings": len(report.get("findings_filed") or [])})
     return report
 
 

@@ -645,6 +645,7 @@ class Explorer:
         self.video_mp4 = None             # scrollable session clip for this story (set on close())
         self.coverage = None              # coverage ledger [{aspect, covered}] — the tested-vs-untested record
         self.stop_reason = None           # why explore() stopped (coverage-complete / blocking-wall / incomplete)
+        self.pulse_work_id = None         # if set, each step beats a live heartbeat into the pulse plane
         if autostart:
             if artifact_dir is None and artifacts is not None:
                 artifact_dir = artifacts.run_dir("qa-explorer")
@@ -932,9 +933,20 @@ class Explorer:
         """Persist the tested-vs-yet-to-be-tested ledger + progress after every step, so a crash/shutdown
         loses nothing and a later run can resume the untested aspects. Fail-open; no-op without an artifact
         dir (offline self-tests)."""
+        cov = self.coverage or []
+        tested = sum(1 for c in cov if c.get("covered"))
+        # LIVE HEARTBEAT: emit a pulse beat every step so the observability plane (and the watchdog) can see
+        # this run is alive + exactly what it's doing — silence past cadence then reads as a real stall.
+        if self.pulse_work_id:
+            try:
+                import pulse                          # SCRIPTS is already on sys.path (module load)
+                pulse.beat(self.pulse_work_id, stage="explore",
+                           progress=f"step {len(records)} · {tested}/{len(cov)} covered"
+                                    + (f" · {self.stop_reason}" if self.stop_reason else ""))
+            except Exception:
+                pass
         if not self.artifact_dir:
             return
-        cov = self.coverage or []
         try:
             (self.artifact_dir / "checkpoint.json").write_text(json.dumps({
                 "ts": time.time(),

@@ -1086,6 +1086,15 @@ def advance(thread_id, job_result=None):
                 import project
                 log = project.build_complex(product, charter)
                 return {"product": product, "result": (log or {}).get("result")}
+            # SCAFFOLD-THEN-IMPROVE (root-cause fix): qualityloop/verify/improve only IMPROVE an EXISTING product
+            # (they return "no such product" otherwise) — so the product must be BUILT first. Nothing did that,
+            # which is why the build errored and QA found nothing. Build it from the charter at the REGISTERED
+            # path, THEN run the quality loop to raise it to the bar.
+            import pathlib
+            import productregistry as _preg
+            repo = pathlib.Path(_preg.path(product))
+            if not repo.exists() or not any(repo.iterdir()):
+                factory.build_product(product, charter, kind=plan.get("kind", "web"))
             import qualityloop
             return qualityloop.run(product, bar="high")
         _dispatch(thread_id, "build", _do_build, eta_min=_estimate_runtime("IMPLEMENT", plan),
@@ -1645,8 +1654,20 @@ def _selftest():
     tid = billing.signup("loopctl-selftest", "free")["tenant_id"]
     org = _orgs.create(tid, "Test Org", "a test")["org_id"]
     real_agent = factory.agent
+    real_build = getattr(factory, "build_product", None)
     import research as _r, design_fleet as _d, qualityloop as _q
     real = (_r.start, _r.run_state, _r.select, _d.prototype, _q.run, factory.run_grounded_qa)
+    # the IMPLEMENT phase now SCAFFOLDS via build_product before the quality loop — stub it to scaffold the
+    # registered path (a real build's job), so no real spend and the boundary contract sees a real artifact.
+    def _fake_build_product(product, charter, **k):
+        try:
+            import productregistry as _preg, pathlib
+            d = pathlib.Path(_preg.path(product)); d.mkdir(parents=True, exist_ok=True)
+            (d / "app.py").write_text("# scaffolded by selftest")
+        except Exception:
+            pass
+        return {"product": product, "shipped": True}
+    factory.build_product = _fake_build_product
 
     tasks = []                                          # every prompt _llm hands the model (for #3.4 checks)
 
@@ -1959,6 +1980,8 @@ def _selftest():
               " + consent-reask/sla/status-honesty + A2 agentic-intent-gate ✅" if ok else "FAIL")
     finally:
         factory.agent = real_agent
+        if real_build is not None:
+            factory.build_product = real_build
         _r.start, _r.run_state, _r.select, _d.prototype, _q.run, factory.run_grounded_qa = real
         with psycopg.connect(DB) as c, c.cursor() as cur:
             for t in ("controller_jobs", "controller_state", "chat_messages", "chat_threads", "orgs",

@@ -57,6 +57,22 @@ the agent should exit the gate when good-enough. Applies to DISCOVER (→RESEARC
 - [x] F3 — precise quota-vs-integrity error mapping (only a real "quota reached" → billing message).
 - [x] F5 — tenant/plan/provider set up for the e2e.
 
+## Second wave (surfaced after the pipeline ran end-to-end)
+- **F6 — product-name mismatch / F7 — build-error-ignored → ROOT CAUSE found.** The IMPLEMENT phase called
+  `qualityloop.run` (a quality-IMPROVE loop) on a product **that was never scaffolded**. Both `verify.verify` and
+  `improve.improve_once` return `"no such product"` when the repo doesn't exist — so the build errored (score 0.0)
+  and QA had nothing to test. *Same disease:* a phase assumed a precondition ("product exists") that no prior
+  step guaranteed. **Fixed** two ways: (1) `productregistry` + boundary contracts surface it honestly instead of
+  "QA found 0 stories"; (2) `_do_build` now **scaffolds via `factory.build_product` at the registered path if the
+  repo is missing, THEN runs the quality loop** — so the product actually gets built before it's improved/verified.
+- **QA→human instead of dev → FIXED.** `_autoloop_build`: a failed/unverifiable build routes back to the builder
+  automatically (bounded `AOS_MAX_BUILD_RETRY=3`), escalating to the CEO only when exhausted.
+
+## Architecture
+See [`ARCHITECTURE-ROOT-CAUSE.md`](ARCHITECTURE-ROOT-CAUSE.md): all of these are one disease — the older pipeline
+re-derived shared truth and trusted handoffs. The cure (single-source-of-truth registry + validated boundary
+contracts + auto-loop) is now shipped and is the law for the pipeline going forward.
+
 ## Live run
 Baseline build (pre-fix): thread 1561, tenant `ceo-e2e` — research fleet ran green after the tenant fix; used
 to surface downstream (design/dev/QA) findings while the fixes land.

@@ -250,11 +250,13 @@ RECENT PROGRESS: {progress}
 
 Decide your NEXT action and reply with ONE JSON object:
   {{"action":"continue","note":"what you did this step"}}
-  {{"action":"emit","kind":"blocked|finding|question|need_agent|need_context","payload":{{...}},"note":"..."}}
+  {{"action":"emit","kind":"blocked|finding|question|need_agent|need_context|disagree","payload":{{...}},"note":"..."}}
   {{"action":"finish","result":"the final result","note":"..."}}
 Emit 'blocked' the MOMENT you hit a wall you cannot pass alone (e.g. missing API creds); your
 supervisor will resolve it and you will resume. Emit 'finding' to propagate a correction. Emit
-'need_agent' (payload {{"role","task"}}) if the work needs another hire. Reply with JSON only."""
+'need_agent' (payload {{"role","task"}}) if the work needs another hire. Emit 'disagree' (payload
+{{"reason":"..."}}) if you professionally believe the ASSIGNMENT ITSELF is wrong, unwise, or harmful —
+you don't just execute a bad directive; you object and it goes UP to the CEO to rule on. Reply with JSON only."""
 
 
 def _worker_step(ctx, a, evs):
@@ -363,9 +365,10 @@ def _worker_step(ctx, a, evs):
                     payload["note"] = d["note"]
                 if sup:
                     step.emits.append((me, sup, kind, payload, f"ev-{me}-{steps}"))
-                if kind == "blocked":
-                    step.status = "blocked"     # PARK; memory is the resume handle
-                    _audit(a["name"], "WorkerBlocked", "blocked", payload)
+                if kind in ("blocked", "disagree"):
+                    step.status = "blocked"     # PARK; memory is the resume handle. A disagreement parks the
+                    _audit(a["name"], "WorkerBlocked" if kind == "blocked" else "WorkerDisagree",
+                           "blocked", payload)   # agent until the CEO rules (proceed / revise the directive).
                 else:
                     step.emits.append((me, me, "next", {}, None))   # keep working after a finding
                     step.status = "working"
@@ -658,6 +661,28 @@ def _supervisor_step(ctx, a, evs):
                                        {"note": f"expansion declined: {dec.get('rationale')}"}, corr))
                     act = "declined"
                 handled.append({"frm": frm, "kind": k, "action": act,
+                                "outstanding": _live_children()})
+                continue
+
+            # DISAGREEMENT: a child professionally objects to the directive. NEVER a local supervisor decide —
+            # it always goes UP to the CEO's tier to rule on (proceed / revise); the child parks until the
+            # ruling flows back (via resolve -> broadcast). This is the human-pattern "an agent won't just
+            # execute a bad directive; it pushes back and the boss decides".
+            if k == "disagree":
+                blocked_child = frm
+                reason = p.get("reason") or p.get("note") or "objects to the assignment"
+                if is_top:                          # CEO tier -> consult the human, then resolve the ruling down
+                    ruling = (ctx.human_hook(ev, {"disagreement": reason})
+                              if callable(getattr(ctx, "human_hook", None)) else "proceed as directed")
+                    step.emits.append((me, frm, "resolve",
+                                       {"note": f"CEO ruling on the objection: {ruling}",
+                                        "grant": {"ruling": ruling}, "context": {"ruling": ruling}}, corr))
+                    escalations.append({"frm": frm, "kind": "disagree", "resolved_with": str(ruling)[:200]})
+                elif a["supervisor_id"]:            # route the objection further up toward the CEO
+                    step.emits.append((me, a["supervisor_id"], "disagree",
+                                       {"reason": reason, "from": frm, "payload": p}, corr))
+                _audit(a["name"], "Disagreement", "escalated", {"frm": frm, "reason": str(reason)[:160]})
+                handled.append({"frm": frm, "kind": k, "action": "disagreement_up",
                                 "outstanding": _live_children()})
                 continue
 

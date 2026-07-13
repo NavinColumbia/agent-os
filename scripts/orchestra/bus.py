@@ -60,6 +60,9 @@ KINDS = {
     "resolve",         # supervisor/controller -> down: here's the unblock / next task / correction
     "context_update",  # any -> siblings: shared-context change to propagate
     "broadcast",       # generic fan-out marker (context_update to a whole sibling set)
+    "disagree",        # child -> up: a professional OBJECTION to the directive (not a capability blocker) —
+                       # the agent thinks the assignment is wrong/unwise; routed UP to the CEO to rule on
+                       # (proceed / revise). The agent parks until the ruling. Human-pattern disagreement.
     "tool_result",     # jobrunner -> the tool-worker ITSELF: a dispatched tool finished (the worker's next
                        # step reports its findings+done up and finishes). Event-based so ONLY the pool ever
                        # writes an actor row — the job thread never touches actor state (avoids a lock race).

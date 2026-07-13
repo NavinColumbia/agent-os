@@ -14,6 +14,7 @@ run finishes) is wired and tested here end-to-end with a stubbed instant tool. F
 procedural qa_run (gap-fill hires, dev-coordinator hand-off, auditor sign-off at aggregate, honest verdict +
 findings.py) is phase 4b — until then `qa_run.py` stays the default. See docs/AGENTIC-QA-ORG.md.
 """
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,7 +27,7 @@ for p in (str(_HERE), str(_HERE.parent), str(_HERE.parent / "orchestra")):
 
 def run_agentic_qa(target_url, vision, *, product="app", token=None, org="0", summary="", repo=None,
                    stories=None, artifact_dir=None, restart_cmd=None, health_url=None,
-                   tenant="agentic-qa", workers=2, drive_budget_s=1800, stall_s=3.0):
+                   tenant="agentic-qa", workers=2, drive_budget_s=1800, stall_s=3.0, file_findings=True):
     """Create the QA org and drive it to completion. Returns the run id, terminal status, and the findings
     (bugs) the explorers reported over the bus. Drives run_org in a loop because tool jobs run ASYNC — a
     single run_org can return while a browser job is still going; we re-enter until the run is terminal or
@@ -77,10 +78,56 @@ def run_agentic_qa(target_url, vision, *, product="app", token=None, org="0", su
     coord = next((a for a in acts if a.get("role") == "qa-coordinator"), None)
     v = (coord or {}).get("result") or {}
     blocking = v.get("blocking_stories") or []
+
+    # EVIDENCE (parity with the procedural loop): a Windows-visible evidence dir with COVERAGE.md
+    # (tested-vs-untested per story, from the explorers' coverage ledgers — latest per story) + run-final.json.
+    import artifacts
+    evidence_dir = artifacts.run_dir(product, started)
+    cov_json, lines = [], [f"# QA Coverage (agentic) — {product}", "", f"Verdict: {v.get('result', '')}", ""]
+    per_story = {}
+    for act in acts:
+        if act.get("role") != "qa-explorer":
+            continue
+        res = ((act.get("result") or {}).get("result")) or {}
+        if res.get("story") is not None:
+            per_story[str(res["story"])] = res                # a re-test overwrites the initial explore
+    for sid, res in per_story.items():
+        cov = res.get("coverage") or []
+        tested = [c["aspect"] for c in cov if c.get("covered")]
+        untested = [c["aspect"] for c in cov if not c.get("covered")]
+        cov_json.append({"story": sid, "stop_reason": res.get("stop_reason"),
+                         "tested": tested, "yet_to_test": untested})
+        lines += [f"## {sid}", f"- stop reason: **{res.get('stop_reason', '?')}**",
+                  f"- tested ({len(tested)}): " + ("; ".join(tested) or "(none recorded)"),
+                  f"- yet to test ({len(untested)}): " + ("; ".join(untested) or "(none)"), ""]
+    try:
+        (evidence_dir / "COVERAGE.md").write_text("\n".join(lines))
+        (evidence_dir / "coverage.json").write_text(json.dumps(cov_json, indent=2, default=str))
+        (evidence_dir / "run-final.json").write_text(json.dumps(
+            {"product": product, "verdict": v.get("result"), "passed": bool(v.get("passed")),
+             "story_status": v.get("blocking_stories"), "findings": findings}, indent=2, default=str))
+    except Exception:
+        pass
+
     report = {"verdict": v.get("result") or f"agentic QA: {status}", "summary": v.get("result") or "",
               "passed": bool(v.get("passed")), "total_stories": v.get("stories") or len(stories or []),
               "total_bugs": len(findings), "open_bugs": len(blocking), "blocking_open": len(blocking),
-              "clean": bool(v.get("passed")), "rounds": 1, "md": None, "json": None}
+              "clean": bool(v.get("passed")), "rounds": 1, "evidence_dir": str(evidence_dir),
+              "coverage_doc": str(evidence_dir / "COVERAGE.md"),
+              "md": str(evidence_dir / "COVERAGE.md"), "json": str(evidence_dir / "run-final.json")}
+
+    # SHIP BAR: any STILL-blocking bug (unfixed after the bounded re-test loop) becomes a governed finding —
+    # so nothing broken reaches a human as a footnote, exactly like the procedural loop.
+    if file_findings and blocking:
+        try:
+            import json as _j
+            import findings as _findings
+            for f in [ff for ff in findings if ff.get("blocking") and str(ff.get("story")) in set(map(str, blocking))]:
+                _findings.file(f"qa-agentic:{product}", "builder",
+                               f"[{product}] {f.get('title') or 'blocking defect'}",
+                               _j.dumps(f, default=str), severity="high", priority=2)
+        except Exception:
+            pass
     try:
         import qa_run
         report["qa_run_id"] = qa_run._persist_run(report, {
@@ -136,6 +183,8 @@ def _selftest():
 
     import tempfile
     tmprepo = tempfile.mkdtemp(prefix="agentic-qa-")   # a throwaway repo so write_verdict never clobbers ours
+    _prev_ev = os.environ.get("AOS_QA_EVIDENCE_DIR")
+    os.environ["AOS_QA_EVIDENCE_DIR"] = tempfile.mkdtemp(prefix="agentic-ev-")   # evidence in a throwaway dir
     out = None
     try:
         out = run_agentic_qa("http://app.test", "A console the user signs in to and messages an assistant.",
@@ -156,6 +205,7 @@ def _selftest():
         rep = out.get("report") or {}
         assert rep.get("qa_run_id"), f"agentic run must persist a qa_runs row; got {rep}"
         assert (Path(tmprepo) / "docs" / "QA-VERDICT.json").exists(), "QA-VERDICT.json (the LAUNCH artifact) must be written"
+        assert rep.get("coverage_doc") and Path(rep["coverage_doc"]).exists(), "COVERAGE.md evidence must be written"
         print(f"qa_agentic selftest: PASS (CLOSED LOOP find->fix->re-test->passed; "
               f"{roles.count('qa-explorer')} explorers, {roles.count('dev-fixer')} fixers; "
               f"durable verdict persisted qa_run_id={rep.get('qa_run_id')} + QA-VERDICT.json written)")
@@ -170,6 +220,11 @@ def _selftest():
         _cleanup(out["run_id"] if isinstance(out, dict) else -1, "agentic-selftest")
         import shutil
         shutil.rmtree(tmprepo, ignore_errors=True)
+        shutil.rmtree(os.environ.get("AOS_QA_EVIDENCE_DIR", ""), ignore_errors=True)
+        if _prev_ev is None:
+            os.environ.pop("AOS_QA_EVIDENCE_DIR", None)
+        else:
+            os.environ["AOS_QA_EVIDENCE_DIR"] = _prev_ev
         if isinstance(out, dict) and (out.get("report") or {}).get("qa_run_id"):
             try:                                        # drop the selftest's qa_runs row
                 import psycopg

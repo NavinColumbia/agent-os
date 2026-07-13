@@ -175,6 +175,30 @@ def _file_open_bugs(report: dict, run: dict, stories: list, ctx: dict) -> list:
     return filed
 
 
+def _file_audit_gaps(av: dict, product: str, report: dict, evidence_dir) -> list:
+    """The AUDITOR's found gaps -> governed, owned, SLA-tracked findings, so a REJECTED audit becomes real
+    dev/QA work, not just a blocked gate. Each skipped flow + unbacked coverage claim becomes an item,
+    AI-routed to the owning role exactly like a QA bug (with the AUDIT.md as evidence)."""
+    import findings
+    gaps = ([("skipped-flow", g) for g in (av.get("skipped_flows") or [])]
+            + [("unbacked-coverage-claim", g) for g in (av.get("unbacked_claims") or [])])
+    filed = []
+    for kind, g in gaps:
+        pseudo = {"title": f"audit {kind}", "detail": str(g), "actual": av.get("recommendation", "")}
+        detail = json.dumps({"audit_finding": g, "kind": kind, "auditor_score": av.get("score"),
+                             "recommendation": av.get("recommendation"),
+                             "audit_md": str(Path(evidence_dir) / "AUDIT.md"),
+                             "qa_run_id": report.get("qa_run_id"), "report_md": report.get("md")},
+                            default=str)
+        try:
+            r = findings.file(f"audit:{product}", _route_role(pseudo),
+                              f"[{product}] audit gap: {str(g)[:80]}", detail, severity="high", priority=3)
+        except Exception as e:
+            r = {"error": str(e), "gap": str(g)[:80]}
+        filed.append(r)
+    return filed
+
+
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
 # record shaping — turn Explorer step-records + accumulated bugs into the qa_report `run` contract.
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -606,6 +630,13 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     if report["findings_filed"]:
         emit("findings_filed", {"count": len(report["findings_filed"]),
                                 "ids": [f.get("finding_id") for f in report["findings_filed"]]})
+    # AUDIT REJECTION -> governed dev work: the auditor's found gaps become owned, SLA-tracked findings,
+    # so "the skeptic rejected it" doesn't just block the gate — it hands dev/QA a concrete, tracked list.
+    report["audit_findings"] = []
+    if file_findings and (report.get("audit") or {}).get("passed_audit") is False:
+        report["audit_findings"] = _file_audit_gaps(report["audit"], product, report, evidence_dir)
+        if report["audit_findings"]:
+            emit("audit_findings_filed", {"count": len(report["audit_findings"])})
     report["evidence_dir"] = str(evidence_dir)
     try:
         (evidence_dir / "manifest.json").write_text(json.dumps({

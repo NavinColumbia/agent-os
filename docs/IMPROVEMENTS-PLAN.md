@@ -111,10 +111,14 @@ the plan + progress survive a context truncation. Best-effort (never breaks a tr
 selftest green.
 **Optional:** have the controller decide-prompt READ `plan()` back each turn instead of re-deriving (small follow-up).
 
-### 11. [E] Context COMPACTION against "context rot" — ⬜ not started
-**Approach:** when a coordinator's context nears the limit, summarize completed phases out of the live window and
-reinitiate; keep each `decide` prompt scoped to the step. Uses item 10's summaries as the compaction unit.
-**Research:** compaction + note-taking + just-in-time retrieval all from Anthropic context-engineering — enough.
+### 11. [E] Context COMPACTION against "context rot" — 🟡 capability done; live-context wiring measurement-gated
+**Done:** `companymemory.compact_summaries(tenant, run, keep_last)` rolls the OLDER phase summaries into ONE
+compacted summary (AI when a model's available, deterministic join otherwise) and marks the originals superseded,
+so `summaries()`/the injected context stay bounded regardless of run length. `AOS_MEMORY_KEEP_LAST` threshold.
+Selftest proves 9→(3 kept + 1 compacted).
+**Deliberately NOT wired to live coordinator context** — design §6 open-Q #2: `factory.py:705` delegates context
+mgmt to the CLI, so aggressive auto-compaction only earns its keep once real coordinator context sizes justify it.
+The safe, unconditional part (bounding the durable checkpoint store) is shipped; measure before turning on more.
 
 ---
 

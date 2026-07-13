@@ -148,12 +148,52 @@ def plan(run_id):
 
 
 def summaries(run_id, limit=20):
-    """The per-phase SUMMARY checkpoints for a run, in order — the compaction unit item 11 reuses."""
+    """The LIVE per-phase SUMMARY checkpoints for a run, in order (superseded/compacted-away rows excluded) —
+    the compaction unit item 11 reuses."""
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT phase, content FROM memory_checkpoints WHERE run_id=%s AND kind='phase_summary'
+        cur.execute("""SELECT phase, content FROM memory_checkpoints
+                       WHERE run_id=%s AND kind='phase_summary' AND superseded_by IS NULL
                        ORDER BY seq ASC, ts ASC LIMIT %s""", (str(run_id), limit))
         return [{"phase": p, "content": t} for p, t in cur.fetchall()]
+
+
+def compact_summaries(tenant_id, run_id, keep_last=None):
+    """Item 11 — COMPACTION against 'context rot': when a run has accumulated many phase summaries, roll the
+    OLDER ones into ONE compacted summary and mark the originals superseded, so the injected context stays
+    bounded regardless of run length. AI-summarises when a model is available, else falls back to a
+    deterministic join (so it always makes progress + is offline-testable). Returns {compacted, new_id}.
+    NOTE (design §6): the LIVE-context wiring is measurement-gated — this operates on the durable checkpoint
+    store, which is unconditionally safe; only turn on aggressive auto-compaction once real coordinator context
+    sizes justify it."""
+    keep_last = int(keep_last if keep_last is not None else os.environ.get("AOS_MEMORY_KEEP_LAST", "6"))
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""SELECT id, phase, content FROM memory_checkpoints
+                       WHERE run_id=%s AND kind='phase_summary' AND superseded_by IS NULL
+                       ORDER BY seq ASC, ts ASC""", (str(run_id),))
+        rows = cur.fetchall()
+    if len(rows) <= keep_last:
+        return {"compacted": 0, "new_id": None}
+    old = rows[:len(rows) - keep_last]
+    joined = "\n".join(f"[{p or '?'}] {t}" for _id, p, t in old)
+    rolled = None
+    try:
+        import factory
+        r = factory.agent("classifier", ".", "Compress these completed-phase summaries into ONE tight paragraph "
+                          "that preserves every decision, result, and open item (no fluff):\n" + joined[:6000],
+                          light=True, model=factory.CHEAP_MODEL)
+        rolled = ((r or {}).get("out_full") or (r or {}).get("out") or "").strip() or None
+    except Exception:
+        rolled = None
+    if not rolled:
+        rolled = "COMPACTED earlier phases:\n" + joined[:4000]
+    new_id = checkpoint(tenant_id, run_id, "phase_summary", rolled, phase="(compacted)")
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("UPDATE memory_checkpoints SET superseded_by=%s WHERE id = ANY(%s)",
+                    (new_id, [r[0] for r in old]))
+        c.commit()
+    return {"compacted": len(old), "new_id": new_id}
 
 
 # ── role lessons ────────────────────────────────────────────────────────────────────────────────────
@@ -303,6 +343,27 @@ def _selftest():
         chk(plan("run-xyz") and "REVISED" in plan("run-xyz"), "plan() returns the LATEST plan checkpoint")
         chk(len(summaries("run-xyz")) == 1 and summaries("run-xyz")[0]["phase"] == "research",
             "phase-summary checkpoints round-trip (the compaction unit for item 11)")
+
+        # item 11: COMPACTION rolls older phase summaries into one, marks originals superseded (bounded context).
+        # Stub the model to the empty reply so it takes the DETERMINISTIC fallback (offline-stable assertion).
+        import types as _t
+        crun = f"crun-{uuid.uuid4().hex[:6]}"
+        for i in range(9):
+            checkpoint(tid, crun, "phase_summary", f"phase {i} did work {i}", phase=f"p{i}")
+        _rf = sys.modules.get("factory")
+        _fk = _t.ModuleType("factory"); _fk.CHEAP_MODEL = "m"; _fk.agent = lambda *a, **k: {"out_full": ""}
+        sys.modules["factory"] = _fk
+        try:
+            comp = compact_summaries(tid, crun, keep_last=3)
+        finally:
+            if _rf is not None:
+                sys.modules["factory"] = _rf
+            else:
+                sys.modules.pop("factory", None)
+        after = summaries(crun)
+        chk(comp["compacted"] == 6 and len(after) == 4 and after[-1]["phase"] == "(compacted)"
+            and "work 0" in after[-1]["content"] and after[0]["phase"] == "p6",
+            f"compaction rolls 6 old summaries into 1, keeps last 3 (now {len(after)})")
 
         # EXPERIENTIAL WRITER activation: learn_from_fix respects the env gate, and (with a stub model) distills
         # + stores a provenanced lesson — the previously-dead fleet-learning path, now wired.

@@ -214,9 +214,11 @@ def _story_report(story: dict, records: list, story_bugs: list) -> dict:
         v = r.get("verdict") or {}
         steps.append({
             "action": _fmt_action(r.get("action")),
+            "reasoning": r.get("reasoning", ""),                 # WHY — so an auditor can judge intent, not just outcome
             "expected": r.get("expected", ""),
             "actual": _actual_str(r.get("actual"), v),
             "verdict": "match" if v.get("matches_expected") else "mismatch",
+            "covers": r.get("covers", []),                       # which ledger aspects this step CLAIMED to exercise
             "screenshot": (r.get("actual") or {}).get("screenshot"),
         })
     blocking = any(b.get("blocking") for b in story_bugs)

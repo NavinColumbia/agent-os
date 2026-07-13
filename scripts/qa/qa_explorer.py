@@ -869,6 +869,7 @@ class Explorer:
                 "step": step,
                 "state": {k: state.get(k) for k in ("url", "title", "screenshot", "console_errors")},
                 "action": action,
+                "reasoning": decision.get("reasoning", ""),      # WHY it chose this action — the audit needs the intent
                 "expected": decision["expected"],
                 "actual": {k: after.get(k) for k in ("url", "title", "screenshot", "console_errors")},
                 "bug": bug,

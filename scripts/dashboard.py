@@ -198,6 +198,19 @@ def state():
     for cf in confs:
         alerts.append({"level": "warn", "msg": f"conflict: {cf['agents'][0]} & {cf['agents'][1]} on {cf['resource']}"})
     out["alerts"] = alerts or [{"level": "ok", "msg": "all systems nominal"}]
+    # LIVE PULSE: every in-flight unit of agentic work (QA runs, builds, fleet actors) in one glance, with
+    # beat age + a stalled flag — the "what is every agent doing right now, is anything stuck?" view.
+    try:
+        import pulse
+        out["pulse"] = pulse.live(include_done_s=90)
+    except Exception:
+        out["pulse"] = []
+    # a stalled pulse is itself an alert (silence = failure) so it shows in the top banner too.
+    for w in out["pulse"]:
+        if w.get("stalled"):
+            out["alerts"].append({"level": "warn",
+                                  "msg": f"{w['kind']} '{w.get('label') or w['work_id']}' silent "
+                                         f"{round(w['beat_age_s'] / 60)}m at '{w.get('stage') or '?'}'"})
     out["overall"] = ("crit" if any(a["level"] == "crit" for a in out["alerts"])
                       else "warn" if any(a["level"] == "warn" for a in out["alerts"]) else "ok")
     return out
@@ -303,6 +316,9 @@ font-weight:600;cursor:pointer}button:hover{filter:brightness(1.08)}
      <div class=mut style="margin-top:6px;font-size:12px" id=sendnote>needs AOS_API_TOKEN (saved locally once)</div>
      <h2 style="margin-top:14px">What's blocked</h2><div id=waits class=feed style="max-height:120px"></div></div>
 
+  <div class="card col12"><h2>Live agent work <span class=mut>· every in-flight unit — QA runs · builds · fleet actors · beat age · STALLED if silent</span></h2>
+     <div id=pulse class=feed style="max-height:200px"></div></div>
+
   <div class="card col12"><h2>Agent directory <span class=mut>· live presence · who's working on what · direct-contact (no sockets, brokered mailboxes)</span></h2>
      <div id=directory class=feed style="max-height:180px"></div></div>
 
@@ -335,6 +351,8 @@ async function tick(){
  const to=$('#to');const cur=to.value;const names=[...new Set(s.graph.nodes.map(n=>n.id).filter(n=>!n.startsWith('human')))].sort();
  to.innerHTML=names.map(n=>`<option>${esc(n)}</option>`).join('');if(cur)to.value=cur;
  $('#runs').innerHTML=(s.runs&&s.runs.length)?s.runs.map(r=>`<div class=row style="cursor:pointer" onclick="showTrace('${esc(r.product)}')"><span class="dot ${r.errors?'d-warn':'d-ok'}"></span><b>${esc(r.product)}</b><span class=grow></span><span class=mut>${r.steps} steps · ${r.total_s}s · errs ${r.errors} ▸</span></div>`).join(''):'<div class=mut>no traced runs yet (only new builds are traced)</div>';
+ const fmtAge=x=>x<90?x+'s':Math.floor(x/60)+'m'+String(x%60).padStart(2,'0')+'s';
+ $('#pulse').innerHTML=(s.pulse&&s.pulse.length)?s.pulse.map(w=>`<div class=row><span class="dot ${w.stalled?'d-crit':w.status==='active'?'d-ok':'d-off'}"></span><b>${esc(w.kind)}</b> <span class=tag>${esc(w.stage||'-')}</span> <span class=mut>${esc(w.progress||w.label||w.work_id)}</span><span class=grow></span><span class=mut>${w.stalled?'STALLED · ':''}♥ ${fmtAge(w.beat_age_s)}</span></div>`).join(''):'<div class=mut>no agentic work in flight right now</div>';
  const conf=new Set((s.conflicts||[]).flatMap(c=>c.agents));
  $('#directory').innerHTML=(s.directory&&s.directory.length)?s.directory.map(d=>`<div class=row><span class="dot ${conf.has(d.agent_id)?'d-crit':'d-ok'}"></span><b>${esc(d.agent_id)}</b> <span class=tag>${esc(d.role)}</span><span class=grow></span><span class=mut>${esc(d.product||'-')} · ${esc(d.task||'-')} · ${esc((d.resources||[]).join(' '))}</span></div>`).join(''):'<div class=mut>no active agents right now</div>';
  drawGraph(s.graph,s.waits);

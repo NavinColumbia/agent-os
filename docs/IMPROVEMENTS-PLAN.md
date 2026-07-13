@@ -67,10 +67,13 @@ decisions could conflict with a sibling's; force a shared upfront decision-spec 
 decision-coupled; single-thread the latter. Fan-out ≈ 15× tokens, so the gate is also a cost control.
 **Research:** motivation solid (Anthropic 90.2%/15×); heuristic for "is this task decomposable?" needs a small dig.
 
-### 8. [V] MAST failure-mode checklist in spawn gates + auditor — ⬜ not started
-**Approach:** encode the 14 MAST modes (3 categories: system-design / inter-agent-misalignment /
-task-verification) as a checklist the spawn gate + auditor consult. Mostly prompt/rule work.
-**Research:** the 14-mode taxonomy is in MAST (2503.13657); enough to build.
+### 8. [V] MAST failure-mode checklist in spawn gates + auditor — ✅ done (auditor); spawn-gate consult available
+**Done:** `scripts/orchestra/mast.py` encodes the 14 MAST modes in 3 categories with a promptable `checklist()`.
+The auditor now consults the **task-verification** category explicitly in its prompt (it's the backstop for
+exactly those modes). Selftest + suite wiring.
+**Optional:** a runtime spawn-time pre-flight consulting the **coordination** category on a hand-off (the module
+already exposes `checklist(['inter-agent misalignment (coordination)'])`); deferred — the auditor is the primary
+verification backstop and the AI-call-in-hot-path risk isn't worth it yet.
 
 ---
 

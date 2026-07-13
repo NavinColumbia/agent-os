@@ -230,6 +230,7 @@ ckp "auditor: master-key sanitize + jury escalate" "$PY scripts/review.py --self
 ckp "auditor VALIDATION (kappa/bias/retest)"        "$PY scripts/qa/auditor_validate.py --selftest | grep -q 'auditor_validate selftest: PASS'"
 ckp "experiential writer wired (fix-loop -> memory)" "grep -q 'companymemory.learn_from_fix' scripts/qa/qa_run.py"
 ckp "coordinator plan/phase checkpoints wired (item10)" "grep -q 'companymemory.checkpoint' scripts/loopcontroller.py"
+ckp "MAST failure-mode taxonomy (14 modes)"          "$PY scripts/orchestra/mast.py | grep -q 'mast selftest: PASS'"
 
 # Fire the bounded concurrent pool for everything enqueued above.
 run_pool

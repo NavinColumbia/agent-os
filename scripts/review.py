@@ -157,6 +157,19 @@ def _clip(s, n=90):
     return (s[:n] + "…") if len(s) > n else s
 
 
+def _mast_block():
+    """The MAST task-verification failure modes (item 8) as an explicit checklist for the auditor — it is the
+    backstop for exactly this category. Fail-soft: if the module isn't importable, the prompt just omits it."""
+    try:
+        if str(SCRIPTS / "orchestra") not in sys.path:
+            sys.path.insert(0, str(SCRIPTS / "orchestra"))
+        import mast
+        return ("=== KNOWN FAILURE MODES to check for (MAST, task-verification category) ===\n"
+                + mast.checklist(["task verification/termination"]) + "\n")
+    except Exception:
+        return ""
+
+
 def _audit_prompt(doss_md, rubric):
     return f"""ROLE: You are a demanding, SKEPTICAL work-execution AUDITOR (like a FAANG QA lead reviewing a
 report). You are reviewing HOW a QA agent did its job — from the GROUND-TRUTH EVIDENCE below (its per-step
@@ -176,6 +189,8 @@ Your job is to catch what a rigorous human reviewer would catch:
 DEFAULT POSTURE: if the evidence does not SHOW it, it did NOT happen. Do not give benefit of the doubt.
 You MAY open specific screenshots (their filenames are in the table; they live in ./screenshots/) to verify
 a suspicious claim — cite the screenshot when you do.
+
+{_mast_block()}
 
 {("=== EXTRA RUBRIC — specific things this audit MUST check ===\n" + rubric + "\n") if rubric else ""}
 === EVIDENCE ===

@@ -96,12 +96,17 @@ def _selftest():
     import jobrunner
     _orig_tool = tools.run_tool
 
+    _seen = {}
+
     def fake_tool(name, args):
         if name == "dev_fix":                     # the dev-fixer tool-worker (spawned via the dev-handoff)
             return {"status": "done", "findings": [], "result": {"fixed": True, "files": ["src/x.js"]}}
-        sid = (args.get("story") or {}).get("id")
-        return {"status": "done", "findings": [{"kind": "bug", "title": f"bug {sid}", "blocking": True,
-                "story": sid}], "result": {"story": sid, "stop_reason": "coverage-complete"}}
+        sid = (args.get("story") or {}).get("id")  # qa_explore: first test finds a bug; RE-TEST after fix is clean
+        _seen[sid] = _seen.get(sid, 0) + 1
+        findings = ([{"kind": "bug", "title": f"bug {sid}", "blocking": True, "story": sid}]
+                    if _seen[sid] == 1 else [])
+        return {"status": "done", "findings": findings,
+                "result": {"story": sid, "stop_reason": "coverage-complete"}}
     tools.run_tool = fake_tool
     jobrunner._default_run_tool = lambda: fake_tool
 
@@ -112,19 +117,17 @@ def _selftest():
                              tenant="agentic-selftest", repo=".", workers=2, drive_budget_s=60, stall_s=2.0)
         roles = [a.get("role") for a in store.actors(out["run_id"], "agentic-selftest")]
         assert out["status"] == "done", f"the org run must finish; got {out['status']}"
-        assert roles.count("qa-explorer") == 2, f"one qa-explorer per story; got {roles.count('qa-explorer')}"
-        assert len(out["findings"]) == 2, f"both explorers' findings must flow back over the bus; got {out['findings']}"
-        # dev-handoff: each BLOCKING finding -> a dev-coordinator hired, which spawns a dev-fixer.
+        # the CLOSED LOOP: 2 initial explorers find bugs -> 2 dev-coordinators -> 2 dev-fixers fix them ->
+        # qa-coordinator RE-TESTS each story (2 more explorers) -> re-test is CLEAN -> verdict PASSED.
         assert roles.count("dev-coordinator") == 2, f"a dev-coordinator per blocking bug; got {roles.count('dev-coordinator')}"
         assert roles.count("dev-fixer") == 2, f"a dev-fixer per dev-coordinator; got {roles.count('dev-fixer')}"
-        # honest agentic verdict: bugs were found, so NOT passed, and it says the fixes are re-verify-pending.
+        assert roles.count("qa-explorer") == 4, f"2 initial + 2 re-test explorers; got {roles.count('qa-explorer')}"
         coord = next(a for a in store.actors(out["run_id"], "agentic-selftest") if a["role"] == "qa-coordinator")
         v = (coord.get("result") or {})
-        assert v.get("passed") is False and v.get("blocking") == 2, f"honest verdict expected, got {v}"
-        assert "re-verify pending" in (v.get("result") or ""), v
-        print(f"qa_agentic selftest: PASS (full async org -> {out['status']}: 2 explorers found bugs, "
-              f"qa-coordinator handed off to 2 dev-coordinators -> 2 dev-fixers; honest verdict: "
-              f"passed={v.get('passed')} blocking={v.get('blocking')})")
+        assert v.get("passed") is True, f"re-test was clean -> verdict must PASS; got {v}"
+        assert not v.get("blocking_stories"), v
+        print(f"qa_agentic selftest: PASS (CLOSED LOOP: find -> hand-off -> fix -> re-test -> "
+              f"{roles.count('qa-explorer')} explorers, {roles.count('dev-fixer')} fixers; honest verdict passed={v.get('passed')})")
         return 0
     finally:
         tools.run_tool = _orig_tool

@@ -55,6 +55,7 @@ Run with the agent-os venv python. Library + selftest only — binds no server.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -78,6 +79,8 @@ except Exception:   # pragma: no cover
 
 TERMINAL = {"done", "dead"}          # actor statuses that end its decide-loop
 MAX_ACTOR_STEPS = 64                 # runaway guard per actor (matches the old Actor default)
+_MAX_RETEST = int(os.environ.get("AOS_QA_MAX_RETEST", "2"))   # qa-coordinator: re-tests per story after a fix
+                                     # (bounds the find->fix->re-test loop so a bad fix can't cycle forever)
 
 
 # ------------------------------------------------------------------------------ small helpers
@@ -302,12 +305,17 @@ def _worker_step(ctx, a, evs):
     if work and a["status"] not in TERMINAL and tool_result is not None:
         # the dispatched tool finished: report its findings + a done up to the supervisor, then FINISH. Only
         # the pool (here) writes this actor's row — the job thread merely emitted the tool_result event.
-        for f in (tool_result.get("findings") or []):
+        _findings = tool_result.get("findings") or []
+        for f in _findings:
             if sup:
                 step.emits.append((me, sup, "finding", f, None))
         if sup:
+            # the done carries the story + whether a BLOCKING bug was found, so the qa-coordinator can track
+            # per-story status (and thus give an honest verdict + drive the re-test loop) from the done alone.
             step.emits.append((me, sup, "done", {"task": assignment, "tool": tool_result.get("tool"),
-                               "status": tool_result.get("status"), "result": tool_result.get("result")}, None))
+                               "status": tool_result.get("status"), "result": tool_result.get("result"),
+                               "story": (tool_result.get("result") or {}).get("story"),
+                               "blocking_found": any(f.get("blocking") for f in _findings)}, None))
         step.status = "done"
         step.result = {"tool": tool_result.get("tool"), "status": tool_result.get("status"),
                        "result": tool_result.get("result")}
@@ -557,6 +565,34 @@ def _supervisor_step(ctx, a, evs):
             if k == "done":
                 results[str(frm)] = p
                 children[frm] = store.actor(frm, tid) or children[frm]
+                if (a.get("role") or "").lower() == "qa-coordinator":
+                    childrole = (children.get(frm) or {}).get("role")
+                    if childrole == "qa-explorer" and p.get("story") is not None:
+                        # authoritative LATEST status for this story (a re-tested-fixed story flips to clean).
+                        ss = dict(mem.get("story_status") or {})
+                        ss[str(p["story"])] = "blocking" if p.get("blocking_found") else "clean"
+                        mem["story_status"] = ss
+                    elif childrole == "dev-coordinator":
+                        # RE-TEST LOOP (closed loop): a fix finished -> hire a FRESH qa-explorer to re-verify
+                        # the fixed story, bounded per story so a bad fix can't cycle find<->fix forever.
+                        cc = dict((a.get("memory") or {}).get("context") or {})
+                        bug = ((children[frm].get("memory") or {}).get("context") or {}).get("bug") or {}
+                        story = bug.get("story")
+                        sobj = next((s for s in (cc.get("stories") or [])
+                                     if (s.get("id") or s.get("title")) == story), None)
+                        rt_ = dict(mem.get("retests") or {})
+                        if sobj is not None and rt_.get(str(story), 0) < _MAX_RETEST:
+                            rt_[str(story)] = rt_.get(str(story), 0) + 1
+                            mem["retests"] = rt_
+                            _hire_or_request(ctx, a, [{
+                                "name": f"{a['name']}.retest-{story}-{rt_[str(story)]}", "role": "qa-explorer",
+                                "kind": "worker", "task": f"RE-TEST story {story} after fix",
+                                "tool": "qa_explore", "tool_args": {"target_url": cc.get("target_url"),
+                                    "vision": cc.get("vision"), "token": cc.get("token"),
+                                    "org": cc.get("org", "0"), "story": sobj}}], step, corr)
+                            children = {c["actor_id"]: c for c in store.actors(ctx.run_id, tid)
+                                        if c["supervisor_id"] == me}
+                            _audit(a["name"], "QaRetest", "executed", {"story": story, "attempt": rt_[str(story)]})
                 handled.append({"frm": frm, "kind": k, "action": "record",
                                 "outstanding": _live_children()})
                 continue
@@ -660,16 +696,16 @@ def _supervisor_step(ctx, a, evs):
             # blocking bugs; blocking bugs handed to dev report the fix as CLAIMED (re-verification after fix
             # is the phase-4b refinement, so we say so plainly rather than pretend it's confirmed).
             qf = mem.get("qa_findings") or []
-            blocking = [f for f in qf if f.get("blocking")]
-            explorers = [c for c in children.values() if c.get("role") == "qa-explorer"]
+            ss = mem.get("story_status") or {}          # LATEST status per story (re-tested-fixed -> clean)
+            blocking_stories = [s for s, st in ss.items() if st == "blocking"]
             devs = [c for c in children.values() if c.get("role") == "dev-coordinator"]
-            passed = not blocking
-            verdict = (f"AGENTIC QA — ALL CLEAR: no blocking bugs across {len(explorers)} stories"
-                       if passed else
-                       f"AGENTIC QA — {len(blocking)} blocking bug(s) across {len(explorers)} stories, "
-                       f"handed to {len(devs)} dev-coordinator(s) (fix claimed, re-verify pending)")
-            agg = {"result": verdict, "ok": True, "passed": passed, "stories": len(explorers),
-                   "bugs": len(qf), "blocking": len(blocking), "handed_to_dev": len(devs)}
+            passed = not blocking_stories               # honest: passed only if NO story is still blocking
+            verdict = (f"AGENTIC QA — ALL CLEAR: {len(ss)} stories, no blocking bugs remain "
+                       f"(after {len(devs)} fix hand-off(s) + re-test)" if passed else
+                       f"AGENTIC QA — {len(blocking_stories)} story(ies) STILL blocking after "
+                       f"{len(devs)} fix hand-off(s): {', '.join(map(str, blocking_stories))}")
+            agg = {"result": verdict, "ok": True, "passed": passed, "stories": len(ss),
+                   "bugs": len(qf), "blocking_stories": blocking_stories, "handed_to_dev": len(devs)}
             _audit(a["name"], "QaVerdict", "executed", agg)
         else:
             d = _ai_json(a["role"], ctx.repo, _AGGREGATE_PROMPT.format(
@@ -689,7 +725,9 @@ def _supervisor_step(ctx, a, evs):
     step.memory = {"phase": phase, "results": results, "handled": handled[-60:],
                    "escalations": escalations, "blocked_child": blocked_child,
                    "aggregated": mem.get("aggregated", False),
-                   "qa_findings": mem.get("qa_findings", [])}   # qa-coordinator's honest-verdict tally
+                   "qa_findings": mem.get("qa_findings", []),   # qa-coordinator's honest-verdict tally
+                   "story_status": mem.get("story_status", {}),  # latest pass/blocking per story
+                   "retests": mem.get("retests", {})}           # re-test attempts per story (bounded loop)
     if mem.get("pending_specs") and phase == "hiring":
         step.memory["pending_specs"] = mem["pending_specs"]
     if step.status is None and phase != "new" and a["status"] == "idle":

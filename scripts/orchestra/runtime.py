@@ -579,6 +579,12 @@ def _supervisor_step(ctx, a, evs):
                                 "outstanding": _live_children()})
                 continue
 
+            # QA-COORDINATOR records every finding (for its honest aggregate verdict), then hands blocking ones off.
+            if k == "finding" and (a.get("role") or "").lower() == "qa-coordinator":
+                mem.setdefault("qa_findings", []).append(
+                    {"title": p.get("title") or p.get("bug"), "story": p.get("story"),
+                     "blocking": bool(p.get("blocking"))})
+
             # QA-COORDINATOR dev-handoff (phase 4b): a BLOCKING finding from an explorer is handed to a
             # dev-coordinator — the coordinator-to-coordinator conversation. Deterministic: hire a
             # dev-coordinator with the bug + repo/vision in its context; it spawns a dev-fixer, fixes on the
@@ -649,14 +655,31 @@ def _supervisor_step(ctx, a, evs):
     # ---- aggregate: the ONLY join point, reached by events (never a barrier) --------------
     if (phase == "delegating" and children and not mem.get("aggregated")
             and all(c["status"] in TERMINAL for c in children.values())):
-        d = _ai_json(a["role"], ctx.repo, _AGGREGATE_PROMPT.format(
-            results=json.dumps(results)[:2000], escalations=json.dumps(escalations)[:800]),
-            spawner=a["role"])
-        agg = {"result": d.get("result", ""), "ok": bool(d.get("ok", True)),
-               "children": len(children), "escalations": len(escalations)}
+        if (a.get("role") or "").lower() == "qa-coordinator":
+            # HONEST agentic QA verdict — deterministic, not an AI aggregate. A run is only 'passed' with NO
+            # blocking bugs; blocking bugs handed to dev report the fix as CLAIMED (re-verification after fix
+            # is the phase-4b refinement, so we say so plainly rather than pretend it's confirmed).
+            qf = mem.get("qa_findings") or []
+            blocking = [f for f in qf if f.get("blocking")]
+            explorers = [c for c in children.values() if c.get("role") == "qa-explorer"]
+            devs = [c for c in children.values() if c.get("role") == "dev-coordinator"]
+            passed = not blocking
+            verdict = (f"AGENTIC QA — ALL CLEAR: no blocking bugs across {len(explorers)} stories"
+                       if passed else
+                       f"AGENTIC QA — {len(blocking)} blocking bug(s) across {len(explorers)} stories, "
+                       f"handed to {len(devs)} dev-coordinator(s) (fix claimed, re-verify pending)")
+            agg = {"result": verdict, "ok": True, "passed": passed, "stories": len(explorers),
+                   "bugs": len(qf), "blocking": len(blocking), "handed_to_dev": len(devs)}
+            _audit(a["name"], "QaVerdict", "executed", agg)
+        else:
+            d = _ai_json(a["role"], ctx.repo, _AGGREGATE_PROMPT.format(
+                results=json.dumps(results)[:2000], escalations=json.dumps(escalations)[:800]),
+                spawner=a["role"])
+            agg = {"result": d.get("result", ""), "ok": bool(d.get("ok", True)),
+                   "children": len(children), "escalations": len(escalations)}
+            _audit(a["name"], "Aggregate", "executed", agg)
         mem["aggregated"] = True
         step.status, step.result = "done", agg
-        _audit(a["name"], "Aggregate", "executed", agg)
         if a["supervisor_id"]:
             step.emits.append((me, a["supervisor_id"], "done",
                                {"task": a["assignment"], "result": agg}, None))
@@ -665,7 +688,8 @@ def _supervisor_step(ctx, a, evs):
 
     step.memory = {"phase": phase, "results": results, "handled": handled[-60:],
                    "escalations": escalations, "blocked_child": blocked_child,
-                   "aggregated": mem.get("aggregated", False)}
+                   "aggregated": mem.get("aggregated", False),
+                   "qa_findings": mem.get("qa_findings", [])}   # qa-coordinator's honest-verdict tally
     if mem.get("pending_specs") and phase == "hiring":
         step.memory["pending_specs"] = mem["pending_specs"]
     if step.status is None and phase != "new" and a["status"] == "idle":

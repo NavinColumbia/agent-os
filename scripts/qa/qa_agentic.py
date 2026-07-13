@@ -117,8 +117,14 @@ def _selftest():
         # dev-handoff: each BLOCKING finding -> a dev-coordinator hired, which spawns a dev-fixer.
         assert roles.count("dev-coordinator") == 2, f"a dev-coordinator per blocking bug; got {roles.count('dev-coordinator')}"
         assert roles.count("dev-fixer") == 2, f"a dev-fixer per dev-coordinator; got {roles.count('dev-fixer')}"
+        # honest agentic verdict: bugs were found, so NOT passed, and it says the fixes are re-verify-pending.
+        coord = next(a for a in store.actors(out["run_id"], "agentic-selftest") if a["role"] == "qa-coordinator")
+        v = (coord.get("result") or {})
+        assert v.get("passed") is False and v.get("blocking") == 2, f"honest verdict expected, got {v}"
+        assert "re-verify pending" in (v.get("result") or ""), v
         print(f"qa_agentic selftest: PASS (full async org -> {out['status']}: 2 explorers found bugs, "
-              f"qa-coordinator handed off to 2 dev-coordinators -> 2 dev-fixers fixed them)")
+              f"qa-coordinator handed off to 2 dev-coordinators -> 2 dev-fixers; honest verdict: "
+              f"passed={v.get('passed')} blocking={v.get('blocking')})")
         return 0
     finally:
         tools.run_tool = _orig_tool

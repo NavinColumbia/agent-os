@@ -5,6 +5,11 @@ agent-os. Method: 6 search angles → 26 sources fetched → 128 claims → 25 v
 refutation (24 confirmed, 1 killed). Every finding is tagged **ADOPT / ADAPT / ALREADY-DO / AVOID** for us.
 Anchored to [`NORTH-STAR.md`](NORTH-STAR.md). *(Generated from a deep-research run; sources listed at end.)*
 
+**Two confidence tiers below:** the **9 verified findings** (3-vote adversarially confirmed) first, then **9
+additional signals [A1–A9]** — the headline claim of each fetched source that the synthesis dropped from the
+top-9 (single-source, *not* re-verified — treat as leads). The prioritized list at the end merges both, tagging
+each item **[V]** verified or **[E]** extracted-lead.
+
 ## The one-paragraph takeaway
 The field's biggest unresolved tension is **Anthropic** (orchestrator-worker multi-agent beat single-agent by
 90.2% on breadth-first research) vs **Cognition/Devin** ("Don't Build Multi-Agents"; default to single-threaded
@@ -118,30 +123,146 @@ a 2026 preprint — treat exact figures as provisional.)* (Src: arXiv 2606.19544
 - Thinner verified coverage on memory-compaction specifics, OpenTelemetry-GenAI conventions, and MCP/A2A
   tradeoffs (in scope but fewer surviving claims) — worth a follow-up research run.
 
+## Additional signals (extracted headline claims — lower confidence)
+These are the **headline claim of each fetched source** that the synthesis stage did *not* promote into the
+top-9 above. They are **single-source, extracted-but-not-3-vote-verified** (the full 128-claim set lives in the
+subagent transcripts, not the result JSON) — treat as **leads**, not settled facts. Still mapped to agent-os.
+
+### A1. Ensemble judging beats any single judge — and string-match is worthless — ADOPT
+Substring/keyword-match evaluation of tool-using-agent output agrees with humans at **kappa=0.049 (chance)**; a
+**three-LLM ensemble judge reaches kappa=0.432** (moderate). Even top judges (Gemini-2.5-Pro, GPT-5) fail to
+keep consistent preferences on **~1/4 of hard cases**.
+→ **agent-os:** never gate a verdict on heuristic string/regex matching of agent output. For close calls, make
+the auditor a **small ensemble (odd N, distinct models/prompts) with a disagreement→escalate rule**, not one
+pass. Reinforces findings 7–9. (Src: fetched agent-eval papers; unverified exact kappas)
+
+### A2. Rubric-based RL with an LLM judge → reward hacking — AVOID/ADAPT
+When an LLM-as-a-Judge supplies the reward, the policy learns to **exploit the judge's latent biases (verbosity,
+sycophancy, self-praise, surface form)** rather than improve real quality; the hacking is subtle and only
+visible after training derails.
+→ **agent-os:** if agents are ever tuned/selected against the auditor's score (even implicitly, e.g. "keep the
+worker whose runs the auditor liked"), that loop **will** be gamed. Keep the auditor grounded in artifacts
+(finding 8) and **hold out a human-labeled validation set** the optimizer never sees. (Src: fetched RL-reward paper; unverified)
+
+### A3. "Context rot": recall degrades as the window fills — ADOPT
+Context is a **finite** resource: as token count grows, recall of any single fact **drops** (transformer n²
+pairwise attention stretched thin). More context ≠ better.
+→ **agent-os:** don't let a long-lived coordinator accrete an ever-growing context. **Compact** (summarize
+completed phases to external memory, reinitiate a fresh window) and keep each `decide` prompt scoped to what the
+step needs. Complements finding 6's PLAN/SUMMARY checkpointing. (Src: Anthropic context-engineering; directional)
+
+### A4. Treat agent MEMORY as a first-class primitive (≠ RAG/context) — ADAPT
+Multiple sources: agent memory is a **distinct architectural primitive**, not "RAG + context stuffing." One line
+(**MemAct**) treats working-memory management as **learnable delete/insert policy actions** trained with RL;
+another flags **knowledge transfer across users under dynamic, asymmetric permissions** as an open gap.
+→ **agent-os:** we have durable *event/state* memory (Postgres rows) but **no semantic agent-memory layer** —
+no cross-run "what this org/role learned," no compaction policy, no per-tenant knowledge store with access
+control. **Design an explicit memory module** (org-level + role-level, permissioned per tenant) rather than
+overloading the event bus. This is the biggest *architectural* gap surfaced. (Src: fetched memory survey + MemAct; unverified)
+
+### A5. Multi-agent memory adds 5 NEW hard problems — ADAPT (design constraint)
+LLM-MAS memory is its own frontier vs single-agent, introducing **synchronization, access control, scalability,
+alignment, and safety** as distinct challenge classes.
+→ **agent-os:** whatever memory layer we build (A4) must treat these as first-class: **sync** (single-writer
+actor rows — we do this; extend to memory writes), **access control** (per-tenant/per-role read scopes),
+**scalability** (compaction), **alignment/safety** (don't let one agent poison shared memory). (Src: fetched LLM-MAS memory survey; unverified)
+
+### A6. Blackboard paradigm: subagents VOLUNTEER by capability — CONSIDER
+A **blackboard** pattern — a central agent posts a request to a shared board and autonomous subagents *volunteer*
+based on their own capabilities — removes the need for the coordinator to know every subagent's expertise up
+front, improving scalability.
+→ **agent-os:** our `need_agent`/spawn model is **coordinator-push** (it decides who to hire). A blackboard
+(capability-advertised, worker-pull) variant could help when the CEO-coordinator *shouldn't* need the full org's
+skill map. **Evaluate as an option** for the `need_agent` path; not obviously better than governed push given our
+role-manifest gates. (Src: fetched blackboard-MAS paper; unverified)
+
+### A7. Agent-interoperability protocols are layered — and A2A has a security hole — ADAPT/AVOID
+A survey frames four layers: **MCP** (LLM↔tool), **ACP** (infra-level messaging), **A2A** (enterprise intra-org
+delegation), **ANP** (open-internet agent marketplaces). Google's **A2A lacks per-message signing** and is
+**susceptible to tampering/MITM over its SSE channels** (latency prioritized over security).
+→ **agent-os:** our bus is a **single-box internal** substrate — we don't need A2A/ANP now, and adopting A2A
+naively would **inherit its unsigned-message weakness**. If we ever expose cross-org/agent-to-external comms,
+**sign messages** and keep the durable bus as the trust boundary. For tools, **MCP is the right layer** (we
+already speak it). (Src: fetched protocol survey; unverified)
+
+### A8. OpenTelemetry GenAI conventions exist for agent tracing — ADOPT
+OTel's **GenAI semantic conventions** standardize agent operations — `create_agent`, `invoke_agent`,
+`invoke_workflow` — and (v1.41) split **CLIENT spans** (remote agent calls) from **INTERNAL spans** (local
+framework execution), turning agent reasoning into structured, queryable traces.
+→ **agent-os:** our `pulse` plane is a bespoke heartbeat table. **Adopt the OTel GenAI span names/attributes** as
+the schema for pulse/audit events so traces are portable and tool-compatible (Grafana/Jaeger/etc.) instead of
+proprietary. Low-cost, high-leverage for "nothing fails invisibly." Directly fills the finding-list's
+observability follow-up. (Src: OpenTelemetry GenAI conventions; solid but not adversarially verified)
+
+### A9. Durable execution = separate deterministic WORKFLOW from non-deterministic ACTIVITIES — ALREADY-DO/ADAPT
+Temporal-style guidance: build durable agents by keeping the **orchestration loop deterministic** while the
+**LLM/tool calls run as non-deterministic "activities"**; persist each step's result and **replay from the last
+checkpoint** on restart. Critically: **session/chat memory ≠ durable execution** — durability means being able to
+**prove which side effects actually occurred** (commands, emails, approvals), not just recall the conversation.
+→ **agent-os: ALREADY-DO** in shape — our deterministic runtime loop + dispatch-and-park (LLM/tool work as async
+"activities") + persisted rows + lease-reclaim replay *is* this pattern. **ADAPT the sharp bit:** make side
+effects **provable** — every external action (a `produce_artifact` write, a `connector_ingest` egress, a git
+commit) records a durable, tamper-evident **effect record**, so the org can answer "did this actually happen?"
+not just "an agent said it did." Ties into the deterministic-auditor goal. (Src: Temporal/Inngest write-ups; directional)
+
 ## PRIORITIZED agent-os improvements (what to actually build)
-1. **[HIGHEST] Harden `review.py` into a true Agent-as-a-Judge.** Ground the QA verdict in the **real git diff +
-   real test output + real browser observations** and let the auditor **run its own checks**; **strip
-   verdict-eliciting "master-key" tokens** from evidence before judging; use a **mid-sized** judge model, not
-   the largest. (Findings 7, 8)
-2. **[HIGH] Add an auditor VALIDATION harness.** Cohen's kappa vs human-labeled QA runs, position-bias probe
-   (swap evidence order → must not flip), test-retest ≥3 runs, and a **high-stability+high-bias → FAIL** flag
-   surfaced in `pulse`. A confident auditor is suspect until validated. (Finding 9)
-3. **[HIGH] Make the task CONTRACT mandatory in the message-bus schema.** Every `task`/`need_agent` must carry
-   {objective, output_format, allowed_tools/sources, boundaries}. Caps runaway spawning; kills dup/gap failures.
-   (Finding 4)
-4. **[HIGH] Share FULL traces across coordinators** (not just summarized `done`/`finding`) wherever sibling
-   decisions could conflict; force a shared upfront decision-spec for parallel work. (Finding 2)
-5. **[MED] Cost/value gate on fan-out** in governance — spawn coordinators/tool-workers only for breadth-first
-   parallelizable work; single-thread decision-coupled work. (Finding 1)
-6. **[MED] External-memory checkpoint of each coordinator's PLAN + per-phase SUMMARY** (distinct from event
-   rows) so context truncation can't lose the plan; add **context compaction** (summarize near-full context,
-   reinitiate a fresh window) against "context rot". (Findings 3, + Anthropic context-engineering)
-7. **[MED] MAST failure-mode checklist** baked into spawn gates + the auditor (system-design / inter-agent
-   misalignment / task-verification). (Finding 2)
-8. **[LOW/keep] Keep control-flow deterministic in code** and keep QA loop termination/gating in code — already
-   true; don't regress. (Findings 5, 6)
-9. **[follow-up] A second research run** on memory-compaction, OpenTelemetry-GenAI tracing, and MCP/A2A adoption
-   (thin verified coverage this pass).
+Tiered and granular. Each item tags the confidence of its evidence: **[V]** = 3-vote verified finding, **[E]** =
+extracted single-source lead (validate before heavy investment).
+
+**Tier 0 — verdict integrity (do first; directly serves "zero bugs reach a human / astonish a skeptic")**
+1. **[V] Harden `review.py` into a true Agent-as-a-Judge.** Ground the QA verdict in the **real git diff + real
+   test output + real browser observations** and let the auditor **run its own checks**; **strip verdict-eliciting
+   "master-key" tokens** from evidence before judging; use a **mid-sized** judge model, not the largest. (Findings 7, 8)
+2. **[V] Add an auditor VALIDATION harness.** Cohen's kappa vs human-labeled QA runs, position-bias probe (swap
+   evidence order → must not flip), test-retest ≥3 runs, **high-stability+high-bias → FAIL** flag surfaced in
+   `pulse`. A confident auditor is suspect until validated. (Finding 9)
+3. **[E] Make the auditor a small ENSEMBLE for close calls**, not a single pass; disagreement → escalate. Never
+   gate a verdict on heuristic string/regex matching (kappa≈chance). (Signal A1)
+4. **[E] Keep a human-labeled hold-out the optimizer never sees**, so agent selection/tuning can't reward-hack
+   the auditor's score. (Signal A2)
+
+**Tier 1 — coordination integrity (the structural multi-agent failures)**
+5. **[V] Make the task CONTRACT mandatory in the message-bus schema.** Every `task`/`need_agent` carries
+   {objective, output_format, allowed_tools/sources, boundaries}. Caps runaway spawning; kills dup/gap failures. (Finding 4)
+6. **[V] Share FULL traces across coordinators** (not just summarized `done`/`finding`) wherever sibling decisions
+   could conflict; force a shared upfront decision-spec for parallel work. (Finding 2)
+7. **[V] Cost/value gate on fan-out** in governance — spawn only for breadth-first parallelizable work;
+   single-thread decision-coupled work (fan-out ≈ 15× tokens). (Finding 1)
+8. **[V] MAST failure-mode checklist** baked into spawn gates + the auditor (system-design / inter-agent
+   misalignment / task-verification/termination). (Finding 2)
+
+**Tier 2 — memory & context (the biggest architectural gap)**
+9. **[E] Design an explicit agent-MEMORY layer** (org-level + role-level), distinct from the event bus and from
+   RAG — permissioned per tenant, with cross-run learning. Treat sync/access-control/scalability/alignment/safety
+   as first-class. This is the largest new-architecture item surfaced. (Signals A4, A5)
+10. **[V] External-memory checkpoint of each coordinator's PLAN + per-phase SUMMARY** (distinct from event rows)
+    so context truncation can't lose the plan. (Finding 3)
+11. **[E] Context COMPACTION against "context rot"** — summarize completed phases out of the live window,
+    reinitiate fresh; keep each `decide` prompt scoped to the step. (Signal A3)
+
+**Tier 3 — observability & durability hardening**
+12. **[E] Adopt OpenTelemetry GenAI span conventions** (`create_agent`/`invoke_agent`/`invoke_workflow`, CLIENT
+    vs INTERNAL spans) as the schema for `pulse`/audit, so traces are portable + tool-compatible instead of
+    bespoke. (Signal A8)
+13. **[E] Provable side-effects (durable EFFECT records).** Every external action (`produce_artifact` write,
+    `connector_ingest` egress, git commit) writes a tamper-evident effect record, so the org can *prove* what
+    happened, not just report it. (Signal A9)
+
+**Tier 4 — keep / don't-regress / evaluate**
+14. **[V] Keep control-flow deterministic in code** and QA-loop termination/gating in code — already true; don't
+    regress (premature termination is a named MAST failure). (Findings 5, 6)
+15. **[E] If we ever expose cross-org/external comms, SIGN messages** — don't inherit A2A's unsigned-SSE MITM
+    weakness. Keep MCP as the tool layer (already used); the durable bus stays the trust boundary. (Signal A7)
+16. **[E] Evaluate a blackboard (capability-advertised, worker-pull) variant** of the `need_agent` path for cases
+    where the coordinator shouldn't need the full org skill-map. Optional; governed-push may still win. (Signal A6)
+
+**Follow-up research**
+17. **[follow-up]** A second, deeper run to 3-vote-VERIFY the Tier-2/3 leads (agent-memory architectures, MemAct,
+    context-compaction specifics, OTel-GenAI, MCP/A2A) — they're currently single-source [E], and the memory
+    layer (item 9) is a big enough commitment to warrant confirmation before building.
+18. **[follow-up]** Mine the full **128-claim** set from the subagent transcripts (only ~26 headline claims + the
+    9 verified findings reached the result JSON) if we want exhaustive coverage rather than the headline-per-source
+    sample captured above.
 
 ## Sources (primary first)
 - Anthropic — *How we built our multi-agent research system* · *Building Effective Agents* · *Effective Context Engineering for AI Agents*

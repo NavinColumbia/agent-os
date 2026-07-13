@@ -233,6 +233,7 @@ ckp "coordinator plan/phase checkpoints wired (item10)" "grep -q 'companymemory.
 ckp "MAST failure-mode taxonomy (14 modes)"          "$PY scripts/orchestra/mast.py | grep -q 'mast selftest: PASS'"
 ckp "OTel GenAI span mapping (portable traces)"      "$PY scripts/otel.py | grep -q 'otel selftest: PASS'"
 ckp "central execution daemon (jobd drives builds)"  "$PY scripts/jobd.py selftest | grep -q 'jobd selftest: PASS'"
+ckp "claude reaper (kills hung agent calls, F12)"    "$PY scripts/clauded.py selftest | grep -q 'clauded selftest: PASS'"
 ckp "product registry + phase-boundary contracts"    "$PY scripts/productregistry.py selftest | grep -q 'productregistry selftest: PASS'"
 ckp "durable liveness (heartbeat, not output-silence)" "$PY scripts/loopcontroller.py liveness | grep -q 'liveness_selftest: PASS'"
 ckp "stack-aware verifier (node vs python — F10)"    "$PY -c \"import sys,tempfile;sys.path.insert(0,'scripts');import factory;from pathlib import Path;d=Path(tempfile.mkdtemp());(d/'package.json').write_text('{}');assert factory.detect_stack(str(d))=='node';d2=Path(tempfile.mkdtemp());(d2/'pyproject.toml').write_text('');assert factory.detect_stack(str(d2))=='python';print('PASS')\" | grep -q PASS"

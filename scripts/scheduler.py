@@ -48,6 +48,10 @@ DEFAULT_SCHEDULES = [
     ("resume-sweep",      f"{VENV_PY} {SCRIPTS / 'factory.py'} resume-sweep", 600),
     ("tasksweep",         f"{VENV_PY} {SCRIPTS / 'tasksweep.py'} run", 600),
     ("reap-orphans",      f"{VENV_PY} {SCRIPTS / 'reap.py'} run", 600),
+    # F12: kill hung/orphaned `claude` agent calls (a dead parent orphans its claude child, which then holds
+    # subscription capacity forever → new calls throttle+hang). Tight cadence; jobd also reaps every tick, this
+    # is the always-on backstop for when jobd itself is down.
+    ("claude-reap",       f"{VENV_PY} {SCRIPTS / 'clauded.py'} reap", 120),
     # Standing acceptance/dogfood pass (DAILY): a rotating demanding-user persona DRIVES the live
     # console through the qa explorer on the real journeys and FILES findings (blockers alert at once).
     # `cron` detaches the real run so JOB_TIMEOUT can't guillotine a long browser pass.

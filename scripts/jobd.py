@@ -51,7 +51,17 @@ def runnable_threads():
 def tick():
     """One central-driver tick. Returns a small summary. Best-effort: a hiccup in one part never blocks the rest."""
     import loopcontroller as lc
-    recovered = driven = 0
+    recovered = driven = reaped = 0
+    # F12: reap orphaned/hung `claude` agent calls every tick. When a driver dies (G1) its claude child is
+    # orphaned and runs forever, holding subscription capacity so new calls throttle+hang. This central,
+    # always-on kill of stale headless calls is what stops the pile-up (no more manual killing).
+    try:
+        import clauded
+        reaped = clauded.reap().get("reaped", 0)
+        if reaped:
+            _log(f"reaped {reaped} hung/orphaned claude agent call(s)")
+    except Exception as e:
+        _log(f"clauded.reap error: {e}")
     try:
         lc.resume_stalled()
         recovered = 1
@@ -72,7 +82,7 @@ def tick():
                     cur.execute("SELECT pg_advisory_unlock(841000, %s)", (int(tid),))
         except Exception as e:
             _log(f"advance({tid}) error: {e}")
-    return {"recovered": recovered, "driven": driven}
+    return {"recovered": recovered, "driven": driven, "reaped": reaped}
 
 
 def _log(msg):

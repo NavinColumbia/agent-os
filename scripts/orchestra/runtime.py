@@ -510,10 +510,29 @@ def _decompose_specs(ctx, a, task):
     return specs or [{"name": f"{a['name']}.c0", "role": a["role"], "kind": "worker", "task": task}]
 
 
+# Fan-out ≈ 15× the tokens of a single call (Anthropic; token use explains ~80% of perf variance). Item 7:
+# fanning out is a COST decision, only justified for breadth-first, independently-parallelizable work. We don't
+# hard-cap (that would kill legitimate breadth-first fan-out; governance + MAX_ACTOR_STEPS are the hard
+# backstops) — we make a WIDE fan-out VISIBLE (nothing fails invisibly) so a runaway can't happen silently.
+_FANOUT_WARN = int(os.environ.get("AOS_FANOUT_WARN", "8"))
+
+
+def _fanout_gate(a, specs):
+    """Cost/value VISIBILITY gate on a fan-out: journal width + the ~15× token-cost signal when a single hire
+    batch is unusually wide, so an over-eager coordinator is observable. Returns the width. Never blocks."""
+    width = len(specs)
+    if width >= _FANOUT_WARN:
+        _audit(a["name"], "WideFanout", "warn",
+               {"width": width, "est_cost_x": "~15x/agent vs single call",
+                "guidance": "justified only for breadth-first parallelizable work; single-thread decision-coupled work"})
+    return width
+
+
 def _hire_or_request(ctx, a, specs, step, corr=None):
     """Governance-gated hiring. Allowed -> hire directly. Denied (manifest role without
     can_spawn) -> file a hire REQUEST up the tree as `need_agent` (only the controller spawns).
     Returns 'hired' | 'requested' | 'denied' (top-of-tree denial = hard failure)."""
+    _fanout_gate(a, specs)
     deny = _spawn_gate(a["role"])
     if deny is None:
         for spec in specs:

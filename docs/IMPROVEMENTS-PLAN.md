@@ -65,10 +65,14 @@ prompt already prints).
 decisions could conflict with a sibling's; force a shared upfront decision-spec for parallel work.
 **Research owed:** how much trace to propagate without blowing context (ties into Tier 2 compaction) — design dig.
 
-### 7. [V] Cost/value gate on fan-out — ⬜ not started
-**Approach:** in the role-manifest governance layer, gate a spawn on breadth-first-parallelizable vs
-decision-coupled; single-thread the latter. Fan-out ≈ 15× tokens, so the gate is also a cost control.
-**Research:** motivation solid (Anthropic 90.2%/15×); heuristic for "is this task decomposable?" needs a small dig.
+### 7. [V] Cost/value gate on fan-out — ✅ done (visibility gate)
+**Done:** `runtime._fanout_gate` at the `_hire_or_request` choke point journals a **WideFanout** signal (width +
+the ~15× token-cost note) when a single hire batch is unusually wide (`AOS_FANOUT_WARN`, default 8), so a runaway
+fan-out is VISIBLE (nothing fails invisibly). Deliberately does NOT hard-cap — that would kill legitimate
+breadth-first fan-out; governance + `MAX_ACTOR_STEPS` remain the hard backstops, and item-5 task boundaries
+discourage coupled siblings. Runtime selftest green.
+**Optional (follow-up):** a coordinator-declared `parallelizable` hint to auto-single-thread decision-coupled
+work — needs coordinator-prompt cooperation; deferred (can't safely infer coupling programmatically).
 
 ### 8. [V] MAST failure-mode checklist in spawn gates + auditor — ✅ done (auditor); spawn-gate consult available
 **Done:** `scripts/orchestra/mast.py` encodes the 14 MAST modes in 3 categories with a promptable `checklist()`.

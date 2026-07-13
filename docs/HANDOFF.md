@@ -100,25 +100,37 @@ silence → reconcile re-dispatches).
   re-dispatches silent jobs (idempotent). Unit-tested.
 - ✅ **Phase 3b — runtime hook** (`52da513`): `_worker_step` detects a tool-worker (`memory.context.tool`) and
   dispatch-and-parks via jobrunner instead of an inline AI call; `run_org` calls `jobrunner.reconcile_parked`
-  at startup (crash-resume). Additive + guarded — the text-worker path is unchanged; `runtime.py selftest`
-  stays 0-fail (incl. the timing-sensitive sibling race).
+  at startup (crash-resume). Additive + guarded — the text-worker path is unchanged.
+- ✅ **Phase 4 — coordinators spawn tool-workers** (`a8aed28`): `_hire` carries a child's `tool`/`tool_args`
+  into memory.context (→ tool-worker); `_decompose_specs` → `_coordinator_specs` makes qa-coordinator spawn
+  one qa-explorer per story and dev-coordinator spawn one dev-fixer per bug (run params from the
+  coordinator's memory.context). Generic supervisor step then reacts to their finding/done + aggregates.
 
 ---
 
 ## Part 3 — What's REMAINING (do IN ORDER; test each)
 
 ### Short-term (finish the agentic org — the current thrust)
-1. ✅ DONE — Phase 3b (the worker hook), committed `52da513`. See Part 2.
-2. **Phase 4 — coordinator actors (NEXT).** Define `qa-coordinator` and `dev-coordinator` as **supervisor** roles
-   whose `_decompose_specs` spawns tool-workers (extend it to allow a child spec carrying a `tool` + `args`
-   in memory). The qa-coordinator: story → one qa-explorer tool-worker each; collect `finding`/`done`;
-   blocking bug → hand off (`need_agent`/`task`) to the dev-coordinator; incomplete coverage → spawn more
-   explorers; then the auditor sign-off; then `done` (the verdict). The dev-coordinator: bug handoff →
-   dev-fixer tool-workers → `done` back → qa-coordinator re-tests. Role manifests go in
-   `~/projects/control-plane/roles/*.yaml` (`can_spawn: true` for the two coordinators, false for workers).
-3. **Phase 5 — agentic entrypoint.** `qa_run(..., agentic=True)` creates the QA org via
-   `create_org` + `run_org` instead of the procedural loop. **Keep the procedural loop as the default** until
-   the agentic path is proven AT PARITY (same honest verdict + auditor gate + findings on the same target).
+1. ✅ DONE — Phase 3b (worker hook, `52da513`) + Phase 4 (coordinators spawn tool-workers, `a8aed28`). See Part 2.
+2. **Phase 4b — coordinator DECISION logic (NEXT).** The generic supervisor step already spawns children,
+   reacts to `finding`/`done` via `_DECIDE_PROMPT`, and aggregates. Add the QA-specific decisions on top:
+   (a) qa-coordinator receives a BLOCKING `finding` → hand off to a dev-coordinator (spawn one, or emit a
+   `task` carrying the bug in its context) rather than a generic AI decide; (b) on incomplete coverage in a
+   child's `done`, spawn more qa-explorers (gap-fill as real hires); (c) at aggregate, run the auditor
+   (`review.review`) sign-off before emitting the verdict `done`; (d) dev-coordinator's fixer `done` → tell
+   qa-coordinator to re-test. Likely a small role-branch in `_supervisor_step`'s finding/aggregate handling.
+   Role manifests: `~/projects/control-plane/roles/{qa-coordinator,dev-coordinator}.yaml` (`can_spawn:true`),
+   `{qa-explorer,dev-fixer}.yaml` (`can_spawn:false`).
+3. **Phase 5 — agentic entrypoint.** `qa_run(..., agentic=True)` creates the QA org: `create_org(tenant,
+   vision)` → the controller/plan spawns a qa-coordinator whose memory.context carries
+   {vision, target_url, token, org, product, stories (from story_gen), artifact_dir, repo, restart_cmd,
+   health_url} → `run_org(...)`. **Keep the procedural loop as the default** until the agentic path is proven
+   AT PARITY (same honest verdict + auditor gate + findings on the same target).
+
+**KNOWN FLAKY TEST (fix me):** `scripts/orchestra/runtime.py selftest` → "correction was broadcast to the
+sibling too" fails ~1/3 of runs on a clean tree (a 2-worker-pool timing race in the escalate→broadcast path,
+NOT caused by the agentic-org changes). De-flake it (e.g. deterministic step ordering or a barrier in the
+test) so `selftest.sh` is reliably 0-fail.
 
 ### Medium-term (polish / breadth — independent of the above)
 4. Surface `pulse.live()` + QA quality in the **CONSOLE** (`scripts/console.py`, :8099, the actual CEO app),

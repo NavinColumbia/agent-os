@@ -1248,27 +1248,44 @@ def detect_stack(repo: str) -> str:
     return "unknown"
 
 
+def _npm_install_safe(repo: str) -> None:
+    """Install deps for an UNTRUSTED generated repo with lifecycle scripts DISABLED. `npm install`/`npm ci` on
+    an attacker-controlled package.json is a classic RCE sink: a `postinstall`/`preinstall` hook (or a malicious
+    dep's install script) runs arbitrary code on the factory host. `--ignore-scripts` blocks every lifecycle
+    hook, so installing only downloads packages — no code executes at install time. Any dependency CODE runs
+    only when the tests import it, and that execution is jailed in the srt sandbox (see _exec_tests). argv form
+    (no `bash -c`) so the repo path is never shell-interpolated. Best-effort + bounded."""
+    if (Path(repo) / "node_modules").exists():
+        return
+    for cmd in (["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+                ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund"]):
+        try:
+            p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=420)
+            audit.append(actor="factory:qa-security", action="NpmInstall", resource=Path(repo).name,
+                         decision="executed", payload={"cmd": cmd[1], "rc": p.returncode, "ignore_scripts": True})
+            if p.returncode == 0:
+                return
+        except Exception:
+            continue
+
+
 def _run_node_tests(repo: str) -> tuple[bool, str]:
     """Grade a Node/JS/TS product with ITS OWN declared test command (package.json 'test' script → `npm test`),
-    falling back to the framework-free node test files. Ensures deps are installed first (a fresh build repo has
-    no node_modules), since 'no tests ran' must not masquerade as a pass."""
+    falling back to the framework-free node test files. Deps are installed with lifecycle scripts DISABLED
+    (_npm_install_safe — no install-time RCE), and the tests THEMSELVES run inside the srt sandbox (network
+    denied, writes limited to the repo) via _exec_tests — so untrusted node code can never escape the jail,
+    exactly like the pytest path."""
     r = Path(repo)
     try:
         pkg = json.loads((r / "package.json").read_text())
     except Exception:
         pkg = {}
-    has_test_script = bool((pkg.get("scripts") or {}).get("test"))
-    if not has_test_script:
-        return run_js_tests(repo)                        # no declared script → the framework-free node runner
-    # ensure deps present (a just-built repo often has none) — best-effort, bounded.
-    if not (r / "node_modules").exists():
-        subprocess.run(["bash", "-c", f"cd {repo} && (npm ci || npm install) --no-audit --no-fund"],
-                       capture_output=True, text=True, timeout=420)
-    p = subprocess.run(["bash", "-c", f"cd {repo} && npm test --silent"], capture_output=True, text=True, timeout=420)
-    out = (p.stdout or "") + (p.stderr or "")
-    audit.append(actor="factory:qa-security", action="RunTests", resource=r.name,
-                 decision="executed", payload={"rc": p.returncode, "stack": "node"})
-    return p.returncode == 0, out[-2500:]
+    if not (pkg.get("scripts") or {}).get("test"):
+        return run_js_tests(repo)                        # no declared script → the framework-free node runner (sandboxed)
+    _npm_install_safe(repo)                              # deps WITHOUT lifecycle scripts (RCE-safe), outside jail
+    # run the app's own test command INSIDE the sandbox; --ignore-scripts blocks pre/post-test lifecycle hooks
+    # (the `test` script itself still runs via `npm run test`), so only the intended tests execute — jailed.
+    return _exec_tests(repo, f"cd {repo} && npm run test --silent --ignore-scripts", action="RunTests-node")
 
 
 def run_tests(repo: str, sandboxed: bool = True, target: str = "", python: str = "") -> tuple[bool, str]:
@@ -1283,31 +1300,37 @@ def run_tests(repo: str, sandboxed: bool = True, target: str = "", python: str =
         return _run_node_tests(repo)
     py = python or VENV_PY
     pytest_cmd = f"cd {repo} && {py} -m pytest -q {target}".rstrip()
+    return _exec_tests(repo, pytest_cmd, sandboxed)
+
+
+def _exec_tests(repo: str, test_cmd: str, sandboxed: bool = True, action: str = "RunTests") -> tuple[bool, str]:
+    """Run a test COMMAND against untrusted generated code inside the srt sandbox (write-limited to the repo,
+    network denied). This is the ONE place untrusted tests execute — pytest AND node both route through here so
+    neither can escape the jail. Falls back to a flagged direct run ONLY if the sandbox infra itself is
+    unavailable (never to mask a real failure)."""
     if sandboxed and shutil.which("srt"):                # srt binary present? (missing = real infra signal)
         # SANDBOX-ESCAPE GUARD: decide "infra broken -> re-run UNSANDBOXED" ONLY on signals the untrusted
         # child cannot forge. The child's stdout/stderr is fully attacker-controlled (a generated test can
         # print anything), so substring-matching the captured output let a malicious product print an
         # "infra" string to trigger its OWN unsandboxed re-run. Instead we echo a per-run random SENTINEL
-        # as the FIRST thing inside the sandbox: srt setup failures (bad settings, spawn failure, fatal —
-        # all `console.error`+exit, inner command never runs) exit 1 just like a pytest failure, so the
-        # sentinel's PRESENCE is the only reliable proof srt actually executed the command. The child can't
-        # un-emit a line printed before pytest starts, and can't guess the random token to fake it.
+        # as the FIRST thing inside the sandbox: srt setup failures (all `console.error`+exit, inner command
+        # never runs) exit 1 just like a test failure, so the sentinel's PRESENCE is the only reliable proof
+        # srt actually executed the command. The child can't un-emit a line printed before it starts, and
+        # can't guess the random token to fake it.
         import uuid
         sentinel = f"__AOS_SBX_{uuid.uuid4().hex}__"
-        inner = f"echo {sentinel}; {pytest_cmd}"
+        inner = f"echo {sentinel}; {test_cmd}"
         sf = tempfile.NamedTemporaryFile("w", suffix=".srt.json", delete=False)
         json.dump(_sandbox_config(repo), sf); sf.close()
         try:
-            p = subprocess.run(["srt", "-s", sf.name, "-c", inner], capture_output=True, text=True, timeout=300)
+            p = subprocess.run(["srt", "-s", sf.name, "-c", inner], capture_output=True, text=True, timeout=420)
             sandbox_ran = sentinel in (p.stdout or "")   # the sandbox set up AND ran our inner command
             out = ((p.stdout or "") + (p.stderr or "")).replace(sentinel + "\n", "").replace(sentinel, "")
             if sandbox_ran:
-                audit.append(actor="factory:qa-security", action="RunTests", resource=Path(repo).name,
+                audit.append(actor="factory:qa-security", action=action, resource=Path(repo).name,
                              decision="executed", payload={"rc": p.returncode, "sandboxed": True})
                 return p.returncode == 0, out[-2500:]
-            # sentinel absent -> srt failed to start the command (genuine sandbox-infra failure), NOT a
-            # test failure: fall through to the flagged direct run.
-            audit.append(actor="factory:qa-security", action="RunTests", resource=Path(repo).name,
+            audit.append(actor="factory:qa-security", action=action, resource=Path(repo).name,
                          decision="sandbox-unavailable", payload={"rc": p.returncode, "sandboxed": True})
         except FileNotFoundError:
             pass                                         # srt vanished after the which() check — infra gone
@@ -1316,9 +1339,9 @@ def run_tests(repo: str, sandboxed: bool = True, target: str = "", python: str =
         finally:
             os.unlink(sf.name)
     # sandbox unavailable — best-effort direct run, clearly flagged in the audit
-    p = subprocess.run(["bash", "-c", pytest_cmd], capture_output=True, text=True, timeout=300)
+    p = subprocess.run(["bash", "-c", test_cmd], capture_output=True, text=True, timeout=420)
     out = (p.stdout or "") + (p.stderr or "")
-    audit.append(actor="factory:qa-security", action="RunTests", resource=Path(repo).name,
+    audit.append(actor="factory:qa-security", action=action, resource=Path(repo).name,
                  decision="executed", payload={"rc": p.returncode, "sandboxed": False})
     return p.returncode == 0, out[-2500:]
 
@@ -1334,16 +1357,14 @@ def run_js_tests(repo: str) -> tuple[bool, str]:
     if not files:
         return False, "NO functional tests found — expected tests/*.test.js exercising every operation, "\
                       "error path, and edge case (a smoke-load is not QA)."
-    env = {**os.environ, "NODE_PATH": str(Path.home() / "projects" / "products" / "noupload" / "node_modules")}
-    outs, ok_all = [], True
-    for f in files:
-        p = subprocess.run(["node", str(f)], cwd=repo, capture_output=True, text=True, timeout=120, env=env)
-        ok_all = ok_all and (p.returncode == 0)
-        outs.append(f"{f.relative_to(root)}: {'PASS' if p.returncode == 0 else 'FAIL'}\n"
-                    f"{((p.stdout or '') + (p.stderr or ''))[-700:]}")
+    # These test files are UNTRUSTED generated node code — run them INSIDE the srt sandbox (network denied,
+    # writes limited to the repo) via _exec_tests, exactly like pytest, so they can't touch the factory host.
+    node_path = str(Path.home() / "projects" / "products" / "noupload" / "node_modules")
+    rels = " && ".join(f"node {f.relative_to(root)}" for f in files)
+    ok, out = _exec_tests(repo, f"cd {repo} && NODE_PATH={node_path} sh -c '{rels}'", action="JsTests")
     audit.append(actor="factory:qa-security", action="JsTests", resource=root.name,
-                 decision="executed", payload={"files": len(files), "ok": ok_all})
-    return ok_all, "\n".join(outs)
+                 decision="executed", payload={"files": len(files), "ok": ok})
+    return ok, out
 
 
 def _serve_static(repo: str):

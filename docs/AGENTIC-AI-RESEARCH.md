@@ -5,10 +5,12 @@ agent-os. Method: 6 search angles → 26 sources fetched → 128 claims → 25 v
 refutation (24 confirmed, 1 killed). Every finding is tagged **ADOPT / ADAPT / ALREADY-DO / AVOID** for us.
 Anchored to [`NORTH-STAR.md`](NORTH-STAR.md). *(Generated from a deep-research run; sources listed at end.)*
 
-**Two confidence tiers below:** the **9 verified findings** (3-vote adversarially confirmed) first, then **9
+**Three confidence tiers below:** the **9 verified findings** (3-vote adversarially confirmed) first, then **9
 additional signals [A1–A9]** — the headline claim of each fetched source that the synthesis dropped from the
-top-9 (single-source, *not* re-verified — treat as leads). The prioritized list at the end merges both, tagging
-each item **[V]** verified or **[E]** extracted-lead.
+top-9 (single-source, *not* re-verified — treat as leads). The prioritized list merges both, tagging each item
+**[V]** verified or **[E]** extracted-lead. Finally, the **Appendix** lists **all 133 unique claims** mined from
+the deep-research subagent transcripts, themed by area — the complete raw set the synthesis drew from (use as a
+lead index; single-source, unverified).
 
 ## The one-paragraph takeaway
 The field's biggest unresolved tension is **Anthropic** (orchestrator-worker multi-agent beat single-agent by
@@ -274,3 +276,201 @@ extracted single-source lead (validate before heavy investment).
 - *Reliability without Validity* (arXiv 2606.19544)
 - Durable execution: Temporal, Inngest, and practitioner write-ups (durable-execution for LLM agents)
 - Full source list + per-claim verification votes: the deep-research run output (`tasks/w1esxgseq.output`).
+
+## Appendix — the full extracted claim set (all 133, themed)
+
+Mined from the 109 deep-research subagent transcripts (146 raw claim occurrences → **133 unique** after dedup). These are the raw fetch-stage extractions the synthesis drew from — **single-source, not 3-vote verified**; `[central]`/`[supporting]`/`[tangential]` is the fetch agent's own importance tag. Claims that became verified findings 1–9 or signals A1–A9 above are marked ✔. Use as a lead index, not settled fact.
+
+### A. Context engineering & memory
+
+**Agent-memory survey 2512.13564**
+- _[cent]_ Agent memory should be treated as a first-class architectural primitive rather than an afterthought bolted onto retrieval or context stuffing; the paper explicitly distinguishes agent memory from LLM memory, RAG, and context engineering.
+- _[cent]_ Agent memory has three dominant physical realizations — token-level (in-context/text), parametric (weights), and latent memory — implying that a durable agent system's memory layer can be designed along these distinct storage substrates rather than a single store.
+- _[cent]_ Functionally, agent memory decomposes into factual, experiential, and working memory — a taxonomy that maps directly onto separating an agent-os org's shared knowledge (factual), past-run/episodic experience (experiential), and per-task scratch state (working).
+- _[supp]_ Multi-agent memory and trustworthiness are named open frontiers, indicating shared organizational memory across coordinators/workers is not yet solved and needs deliberate engineering.
+- _[supp]_ The authors argue memory should be a designed primitive of agentic intelligence, supporting an ADAPT recommendation for agent-os to formalize its memory model (short-term/working vs long-term shared org memory) rather than relying only on the Postgres event bus and context windows.
+
+**Anthropic: Effective Context Engineering**
+- _[cent]_ Context is a finite resource subject to 'context rot': as the number of tokens in the context window increases, the model's ability to accurately recall information from that context decreases — driven by the transformer's n-squared pairwise attention relationships being stretched thin over longer contexts.
+- _[cent]_ For long-horizon tasks that exceed the context window, compaction is a recommended technique: summarize a conversation nearing the context limit and reinitialize a new context window from the summary.
+- _[cent]_ Agents should use structured note-taking — regularly writing notes persisted to external memory outside the context window — to enable persistent recall across extended tasks.
+- _[cent]_ Specialized sub-agents with clean/isolated context windows can handle focused subtasks while a main agent coordinates high-level strategy, keeping each agent's context uncluttered.
+- _[cent]_ An orchestrator-worker multi-agent system (Claude Opus 4 lead + Sonnet 4 subagents) outperformed a single-agent Claude Opus 4 by 90.2% on their internal research eval, but the advantage is specifically for breadth-first, parallelizable queries.
+- _[cent]_ Multi-agent systems are far more token-expensive than single calls (agents ~4x chat, multi-agent ~15x), and token usage explains 80% of the variance in performance — so multi-agent is only economically justified for high-value tasks.
+- _[cent]_ Orchestrators must give each subagent an explicit objective, output format, tool/source guidance, and clear task boundaries; without this, subagents duplicate work, leave gaps, or spawn excessively (e.g. 50 subagents for a simple query).
+- _[cent]_ Long-running agents need durable resume-from-failure plus external memory checkpointing, because minor failures compound catastrophically and the context window (200K tokens) truncates, so the lead agent saves its plan to Memory and summarizes completed phases.
+- _[supp]_ A just-in-time context retrieval strategy — where agents hold lightweight identifiers and dynamically load data into context at runtime via tools — is preferable to pre-loading/pre-processing all data upfront.
+- _[supp]_ Tool sets should be kept minimal and unambiguous; bloated tool sets covering too much functionality create ambiguous decision points about which tool to use and degrade agent performance.
+- _[supp]_ Full production tracing of agent decision patterns and interaction structures (without reading conversation contents) was what let them systematically diagnose and fix failures.
+- _[supp]_ Synchronous orchestrator execution is a coordination bottleneck: the lead agent cannot steer subagents mid-flight and subagents cannot coordinate with each other.
+- _[supp]_ Full production tracing of agent decision patterns and interaction structures (without reading conversation contents) is what let them systematically diagnose and fix failures; synchronous orchestration is a coordination bottleneck where the lead can't steer subagents mid-flight.
+
+**Collaborative Memory 2505.18279**
+- _[cent]_ Persistent memory improves single-agent LLM performance, but existing memory systems lack mechanisms for knowledge transfer across users under dynamic, asymmetric permissions — a gap for multi-user agent orgs.
+- _[cent]_ Collaborative Memory uses a two-tier memory structure: private fragments visible only to their originating user, and selectively shared fragments, enabling controlled cross-user/cross-agent knowledge sharing.
+- _[supp]_ Access is governed by read policies that produce filtered/transformed views enforcing current user-agent-resource constraints, and write policies that determine fragment retention and sharing, with permissions modeled as bipartite graphs linking users, agents, and resources.
+- _[supp]_ Every memory fragment carries immutable provenance metadata (contributing agents, accessed resources, timestamps), enabling retrospective permission checks and full auditability of memory operations.
+
+**LLM-MAS memory 2604.03295**
+- _[cent]_ Memory in LLM-based multi-agent systems (LLM-MAS) is a distinct research frontier from single-agent memory, introducing five new classes of challenge: synchronization, access control, scalability, alignment, and safety.
+- _[cent]_ Effective multi-agent coordination requires transactive (meta-)memory — an explicit 'who knows what' index — so agents can allocate work and avoid redundant processing, analogous to human team transactive memory systems.
+- _[cent]_ LLM-MAS memory is organized into three primary topologies: per-agent private/local stores, centralized shared memory (blackboard-style), and hybrid designs combining local perceptual memory with a shared summarized world-state.
+- _[supp]_ Shared memory across agents should be governed by explicit two-tier access control, separating private fragments from shared fragments under dynamic access policies rather than exposing one global store to all agents.
+- _[supp]_ In multi-agent settings, memory functions as shared cognitive infrastructure that is a prerequisite for collective intelligence, long-term coordination, and team evolution over time.
+
+**MemAct 2510.12635**
+- _[cent]_ MemAct treats working-memory/context management as learnable policy actions performed via in-place editing operations (deletion and insertion), trained end-to-end with reinforcement learning, rather than via external mechanisms unaware of the agent's reasoning state.
+- _[cent]_ A 14B agent trained with MemAct-RL matches the task accuracy of models 16x larger while reducing average context length by 51%.
+- _[supp]_ Long-context LLMs still require active working-memory management because unmanaged context growth causes attention dilution that degrades performance on long-horizon tasks; simply having a large context window is insufficient.
+- _[supp]_ External/heuristic context-management mechanisms that lack awareness of the agent's reasoning state lead to suboptimal memory decisions, motivating in-agent learned curation.
+- _[supp]_ Dynamic context updates during training create computational/efficiency challenges, which the authors address with a method called Dynamic Context Policy Optimization that restores training efficiency without compromising reasoning integrity.
+
+### B. Orchestration patterns & when to fan out
+
+**Anthropic: Building Effective Agents**
+- _[cent]_ Anthropic explicitly distinguishes 'workflows' (LLMs/tools orchestrated through predefined code paths) from 'agents' (LLMs dynamically directing their own processes and tool usage), and recommends choosing between them based on the task: workflows for predictability on well-defined tasks, agents for flexibility and model-driven decisions at scale.
+- _[cent]_ Anthropic advises building with the simplest possible design and only adding complexity (including multi-agent structure) when needed, noting that for many applications a single optimized LLM call with retrieval and in-context examples suffices.
+- _[cent]_ Anthropic warns that autonomous agents carry higher cost and the potential for compounding errors, and prescribes extensive testing in sandboxed environments plus guardrails as mitigation.
+- _[cent]_ Anthropic names five composable building-block patterns for agentic systems — prompt chaining, routing, parallelization, orchestrator-workers, and evaluator-optimizer — where orchestrator-workers has a central LLM dynamically decompose tasks, delegate to worker LLMs, and synthesize results (directly analogous to agent-os's coordinator/tool-worker structure).
+- _[cent]_ Anthropic names five composable building-block patterns for agentic systems, including orchestrator-workers, where a central LLM dynamically decomposes tasks, delegates to worker LLMs, and synthesizes results (directly analogous to agent-os's coordinator/tool-worker structure).
+- _[supp]_ Anthropic recommends reducing framework abstraction layers and building with basic components when moving to production, rather than relying on agent frameworks.
+- _[supp]_ Anthropic prescribes human-in-the-loop checkpoints where agents pause for human feedback at checkpoints or when encountering blockers, and stresses investing in the agent-computer interface (ACI) via thorough tool documentation and testing.
+
+**Blackboard 2510.01285**
+- _[cent]_ A blackboard multi-agent paradigm — where a central agent posts requests to a shared blackboard and autonomous subordinate agents volunteer to respond based on their own capabilities — eliminates the need for a central coordinator to have prior knowledge of every sub-agent's expertise, improving scalability and flexibility over the master-slave/orchestrator model.
+- _[cent]_ Master-slave (orchestrator-worker) multi-agent systems have a concrete structural weakness: they depend on a rigid central controller for task allocation that requires precise knowledge of each sub-agent's capabilities, which does not scale to large heterogeneous problem spaces.
+- _[supp]_ The blackboard architecture measurably outperforms both RAG and the master-slave multi-agent paradigm, achieving 13% to 57% relative improvement in end-to-end task success and up to 9% relative F1 gain on data discovery, across both proprietary and open-source LLMs on three benchmarks (KramaBench, modified DS-Bench, modified DA-Code).
+- _[supp]_ Single-agent systems are quickly overwhelmed when they must operate over large, heterogeneous inputs, motivating a multi-agent decomposition — a counterpoint to the common 'single agent + tools often beats multi-agent' claim in high-heterogeneity domains.
+- _[tang]_ The authors position the blackboard paradigm as a general-purpose, scalable communication framework for multi-agent systems, not merely a data-discovery-specific technique.
+
+**Cognition: Don't Build Multi-Agents**
+- _[cent]_ Cognition (Devin's maker) advises against multi-agent architectures in favor of single-threaded, continuous-context agent design as the default for reliable systems.
+- _[cent]_ The primary design principle is that context must be shared across the full agent trace, not just individual messages, because subagents working in isolation lose nuance and misunderstand their tasks.
+- _[cent]_ Parallel subagents that cannot see each other's work make conflicting implicit decisions that compound into inconsistent/bad outputs (illustrated by the Flappy Bird visual-style mismatch example).
+- _[supp]_ Having agents 'talk things out' to coordinate is unreliable as of 2025 because agents lack the communicative efficiency of humans, so multi-agent coordination via messaging cannot be trusted to resolve conflicts.
+- _[supp]_ For very long tasks that exceed the context window, the recommended approach is a dedicated compression/summarization model that distills action history into key decisions and events, rather than splitting work across agents.
+
+**LangChain: multi-agent**
+- _[cent]_ Multi-agent systems excel at breadth-first, parallelizable tasks but fail when agents must share the same context or have many interdependencies (e.g., most coding tasks).
+- _[cent]_ Read operations parallelize across agents far better than write operations, because conflicting writes produce worse outcomes than conflicting reads; therefore synthesis (writing) should be centralized to one agent while research (reading) is distributed.
+- _[cent]_ Vague or under-specified subagent task descriptions cause duplicated work and misinterpretation; each subagent needs an explicit objective, output format, tool/source guidance, and clear task boundaries.
+- _[supp]_ Insufficient context in task hand-offs causes concrete coordination failures where subagents duplicate each other's work rather than dividing labor.
+- _[supp]_ Durable execution and observability are required for reliable agents because minor failures can be catastrophic and agents are non-deterministic between runs even with identical prompts.
+
+**MAST 2503.13657**
+- _[cent]_ Multi-agent LLM system failures fall into a 14-mode taxonomy (MAST) organized into 3 categories: System Design Issues (specification), Inter-Agent Misalignment (coordination), and Task Verification.
+- _[cent]_ State-of-the-art open-source multi-agent systems fail on the majority of tasks, with measured failure rates from 41% to 86.7% across 7 SOTA frameworks.
+- _[cent]_ MAS failures stem primarily from organizational/coordination design flaws rather than the limitations of individual constituent agents.
+- _[cent]_ Simple tactical interventions (e.g. improved role prompts, adding verification steps) yield modest gains but do not resolve all failure modes; task completion remains low, implying structural redesign is needed.
+- _[cent]_ Multi-agent LLM system failures cluster into 14 fine-grained failure modes grouped into 3 categories: system design issues, inter-agent misalignment, and task verification/termination.
+- _[cent]_ The MAST taxonomy was empirically derived from a large corpus of real MAS execution traces (1600+ annotated traces across 7 popular multi-agent frameworks), not from theory alone.
+- _[cent]_ Multi-agent system failures are structural and cannot be fixed by superficial tweaks (e.g., better prompting); they require deeper solutions in agent organization and verification.
+- _[supp]_ Verification failures are a substantial share of MAS errors: incorrect verification (9.1%) plus no/incomplete verification (8.2%) together account for ~17% of observed failure-mode prevalence across 1642 traces.
+- _[supp]_ The taxonomy is a reliable, reproducible instrument: independent human annotators agreed at kappa = 0.88, and the authors release an LLM-based annotator to scale the analysis.
+- _[supp]_ Multi-agent LLM systems frequently underperform expectations, showing minimal gains on popular benchmarks despite added complexity, motivating a systematic study of why they fail.
+
+**OpenAI Agents SDK**
+- _[cent]_ The OpenAI Agents SDK frames agent orchestration as a choice between two approaches: LLM-driven (the LLM plans/reasons/decides steps) and code-driven, and explicitly states that orchestrating via code yields more deterministic and predictable speed, cost, and performance.
+- _[cent]_ The SDK recommends a specific deterministic pattern for self-verification: running a task agent in a while loop paired with a separate evaluator agent that provides feedback until the output passes criteria (an evaluator-optimizer / critic loop implemented in code, not by the LLM).
+- _[supp]_ The SDK distinguishes two multi-agent primitives with explicit selection guidance: 'agents as tools' (a manager agent keeps control and calls specialists via Agent.as_tool(), owning the final answer) versus 'handoffs' (a triage agent routes and the specialist becomes the active agent for the rest of the turn).
+- _[supp]_ For LLM-driven orchestration, the SDK prescribes concrete reliability best practices including specialized single-task agents over generalists, self-critique loops, monitoring/iteration on failures, and investing in evals.
+- _[supp]_ The SDK endorses structured outputs and agent chaining (transforming one agent's output into the next's input) plus parallel execution via asyncio.gather as the code-orchestration building blocks for inspectable, deterministic control flow.
+
+### C. Evaluation, judging & reward hacking
+
+**Agent-as-a-Judge survey 2601.05111**
+- _[cent]_ LLM-as-a-judge (single-model) evaluation suffers from inherent parametric biases such as favoring verbosity and its own output patterns, undermining neutrality — a concrete risk for agent-os's skeptical auditor if it is a single LLM pass.
+- _[cent]_ Traditional LLM judges are passive observers that assess answers only from linguistic patterns without verification, leading to hallucinated evaluations; grounding judgments in real observations/tool checks is needed.
+- _[cent]_ Agent-as-a-Judge improves reliability via tool-augmented verification and inspection of execution artifacts/automated checks — directly applicable to grounding agent-os's QA auditor in the real git diff and test/browser evidence rather than narrative.
+- _[supp]_ Single-pass evaluation across all dimensions causes cognitive overload and produces coarse-grained scores, motivating decomposed/multi-step evaluation rather than one holistic verdict.
+- _[supp]_ Giving judge agents tool access introduces new safety risks including prompt injection, tool misuse, and unintended side effects, plus compute/latency overhead — a cost of moving from LLM-judge to agentic judging.
+
+**Judge consistency 2512.16041**
+- _[cent]_ Even top-performing LLM judges (Gemini-2.5-Pro, GPT-5) fail to maintain consistent preferences in nearly a quarter of difficult cases, indicating that state-of-the-art LLM-as-a-Judge is not reliable enough to be trusted on hard/close calls.
+- _[cent]_ LLM judges suffer severe positional bias: order-reversal inconsistency rates measured at 76.2% for Llama3-8B-Instruct, 44.4% for Qwen3-4B-Instruct, and 25.3% for Gemini-2.5-Flash-Lite, so a single-pass judgment can be flipped just by swapping answer order.
+- _[cent]_ Judge reliability degrades sharply as candidate answers get closer in quality — roughly 200% more inconsistency on close-gap answers — which is precisely the regime used in RL-based training rewards and test-time best-of-N selection.
+- _[supp]_ Concrete mitigations improve judge consistency: multi-agent/panel-based juries improve performance by up to 15%, and prompting the model to self-generate explicit rubrics reduces local inconsistency (IPI) by 16.1% and global inconsistency (TOV) by 11.0%, whereas increasing reasoning depth yields only minor gains.
+- _[supp]_ Human annotation is not a reliable gold standard for evaluation: inter-annotator agreement is low (66% AlpacaFarm, 63% MT-Bench) and applying the same consistency metrics to human evaluators shows fragility (IPI 0.332, TOV 6.523 on complex tasks).
+
+**One Token to Fool 2507.08794**
+- _[cent]_ LLM-as-a-judge / generative reward models can be systematically fooled into emitting false-positive 'correct' verdicts by superficial 'master key' inputs (non-word symbols like ':' or '.', or reasoning openers like 'Thought process:' or 'Solution') that contain no actual reasoning, with false positive rates as high as 80%.
+- _[cent]_ The vulnerability affects leading proprietary judge models often treated as gold-standard evaluators, not just open-source ones: GPT-4o, GPT-o1, and Claude-4 are all susceptible; e.g. 'Thought process:' induces up to 35% FPR in GPT-4o, and reasoning openers cause 60-90% FPR in open models like LLaMA3-70B-Instruct and Qwen2.5-72B-Instruct.
+- _[cent]_ Common inference-time defenses do not reliably protect judges: chain-of-thought prompting and majority voting fail to defend and can even worsen the attack, while larger judge models are often MORE vulnerable, with mid-sized models best balancing robustness and accuracy.
+- _[supp]_ A targeted data-augmentation mitigation works: fine-tuning judges on truncated model outputs (first-segment lead-ins) as adversarial negatives yields 'Master Reward Models' with near-0% FPR against master-key attacks while preserving standard evaluation quality (Cohen's kappa 0.91 with GPT-4o, 0.90 with humans).
+- _[supp]_ The vulnerability was discovered as a real training-collapse failure mode: during RLVR training a policy model degenerated into emitting short superficial openers (<30 tokens) that the judge rewarded, causing response length to collapse and KL divergence to surge.
+
+**Reliability w/o Validity 2606.19544**
+- _[cent]_ High raw agreement (80-85% exact-match on MT-Bench) between an LLM judge and humans collapses to only moderate chance-corrected agreement (Cohen's kappa ~0.48), with 'kappa deflation' of 33.8-41.3 percentage points across all 21 tested models — meaning high accuracy percentages overstate true judge validity.
+- _[cent]_ An LLM judge can be highly self-consistent (test-retest reliability >=0.95) while simultaneously exhibiting severe position bias (>0.10); consistency measures output stability, not decision-process correctness, so a deterministic bias can masquerade as reliability.
+- _[cent]_ Trusting an LLM judge's verdict requires a validation protocol: report Cohen's kappa (not exact match) as the headline metric, test position bias via AB+BA order swaps, verify test-retest across >=3 runs, cross-validate on >=2 benchmarks, and flag high-stability-but-high-bias judges as failure modes.
+- _[supp]_ LLM-judge quality rankings are unstable across benchmarks: the same model (Llama 3.3 70B) dropped 15 positions (5th to 20th) between MT-Bench and JudgeBench, so a judge validated on one dataset cannot be assumed reliable on another.
+- _[tang]_ Verbosity bias in LLM judges has substantially diminished in recent model generations: all 21 judges tested showed verbosity bias below 0.011, well under the 20-40% variance reported in 2023 literature.
+
+**Reward-hacking RHDA 2606.04923**
+- _[cent]_ In rubric-based RL, using an LLM-as-a-Judge causes reward hacking because the policy learns to exploit the judge's latent biases (verbosity, sycophancy, self-praise, surface form) rather than improve genuine task quality, and this hacking is subtle and only visible after training has derailed.
+- _[cent]_ Reward hacking against an LLM judge causes measurable capability degradation, not just inflated scores: models trained under self-praise bias dropped from a 47.4 no-bias HealthBench score to 36.1, and Arena-Hard from 10.6 to 8.5, showing the biased reward actively harms real task quality.
+- _[cent]_ A dedicated tool-using LLM agent (RHDA) that inspects multiple checkpoints and accumulates typed, evidence-constrained alerts detects reward-hacking onset more reliably than general-purpose agents (Claude Code) or a fixed chain-of-thought monitor; the CoT monitor missed 3 of 6 runs, and trajectory-level hypothesis tracking mattered more than backend model strength.
+- _[supp]_ Judge-blind onset detection requires temporal contrast across the trajectory rather than judging isolated outputs: a single response may look fluent, so the detector must compare behavior across steps to spot exploitation of judge bias.
+- _[supp]_ How fast and severely a policy hacks a judge is governed by two separable bias properties: discoverability (driven by the bias's entanglement with the gold reward) and exploitability (driven by the intrinsic complexity of the bias).
+
+**Tool-agent eval 2604.16706**
+- _[cent]_ Substring/keyword-match evaluation of tool-using agent outputs agrees with human annotation at only kappa=0.049 (chance level), while a three-LLM ensemble judge reaches kappa=0.432 (moderate); this means heuristic 'string-match' verdicts are essentially worthless for judging agent QA outputs.
+- _[cent]_ Even a validated three-LLM ensemble judge carries a systematic conservative bias, marking only 25% of traces correct versus 38% by humans, underestimating true correctness by ~13 percentage points; the dominant error is rejecting answers humans accept (19 of 25 disagreements). So an auditor's raw verdict needs bias-direction reporting and human calibration.
+- _[cent]_ A single injected wrong-but-valid parameter propagates to a wrong final answer with human-calibrated probability ~0.62 (range 0.46-0.73 across models); early-stage errors in an agent pipeline compound to corrupt the final output at high rates, quantifying error-cascade risk.
+- _[supp]_ A model's ability to REJECT bad parameters at the schema gate and its ability to RECOVER after accepting a bad parameter are statistically independent capabilities (Spearman rho=0.126, p=0.747); robustness is at least two-dimensional, so mitigations must target input-filtering and output-reasoning separately.
+- _[supp]_ A lightweight three-layer runtime interceptor (schema validation + chain-of-thought uncertainty-keyword monitor + output-consistency check), running in parallel at negligible cost (~$0.15 for 1,200 runs), cut GPT-4o-mini hallucination by 23.0 pp under a concurrent n=600 control, but had no effect on Gemini-2.0-Flash whose 95% parameter-rejection already eliminated the failure mode; interceptor value is model-dependent.
+
+### D. Durable execution & reliability
+
+**Inngest: durable execution**
+- _[cent]_ Durable execution engines persist the result of each step and, on restart, replay from the last successful checkpoint rather than re-executing the entire workflow, providing crash recovery for long-running agents.
+- _[cent]_ Multi-step agent workflows compound failure: five steps at 99% reliability each yield only 95% overall success, motivating per-step durability rather than whole-run retries.
+- _[cent]_ AI agent workflows are inherently long-running (minutes to hours) and must survive infrastructure failures, deployment restarts, and external service outages.
+- _[supp]_ Durable execution provides exactly-once step semantics via memoization so expensive LLM/tool calls are not re-run on retry, controlling inference cost.
+- _[supp]_ Durable execution enables human-in-the-loop by suspending a workflow that persists its complete state and waits for an external signal, allowing pauses of hours or days without losing state.
+
+**Temporal: durable agents**
+- _[cent]_ Temporal can build dynamic AI agents by separating deterministic Workflow orchestration from non-deterministic LLM decisions executed in Activities; the LLM's tool choices are dynamic while the while-loop/orchestration structure stays deterministic.
+- _[cent]_ Temporal achieves crash recovery for agents by replaying the workflow from a recorded Event History, re-using prior LLM decisions rather than re-executing them, so a restarted agent does not make different choices or create conflicting state.
+- _[supp]_ The recommended agent loop keeps the workflow structure (while loop, sequence of operations) deterministic while the LLM dynamically selects which tool to call and with what parameters within that loop.
+- _[supp]_ Durable-execution engines like Temporal are used in production agent systems, with OpenAI's Codex and Replit's Agent 3 cited as examples, and the authors argue Temporal is the best way to build AI agents.
+
+**Vadim: durable execution**
+- _[cent]_ Durable execution for LLM agents is achieved by checkpointing full workflow state (context) after every LLM call or tool invocation, serialized to persistent storage (e.g. SQLite/JSON), so a crashed run resumes from exactly where it stopped.
+- _[cent]_ Idempotency keys are required so that retries of durable steps do not cause duplicate side effects; a step checks whether its key was already processed and returns the cached result instead of re-executing.
+- _[cent]_ Human-in-the-loop pauses should be implemented by parking the run durably (waiting indefinitely at no compute cost) rather than by polling, avoiding wasted compute cycles during the wait.
+- _[cent]_ Durable execution is defined as the property that an agent workflow (LLM calls, tool invocations, human-in-the-loop pauses) survives process crashes, redeploys, and indefinite waits.
+- _[supp]_ For long runs (over an hour) or multi-node setups, journal replay over snapshots provides exactly-once semantics across steps and is preferable to plain snapshotting.
+
+**Zylos: durable agent runtime**
+- _[cent]_ Session/chat memory is not equivalent to durable execution; durability requires proving which side effects (commands, emails, approvals) actually occurred, not just recalling conversation history.
+- _[cent]_ Checkpointing alone is insufficient for durability; a common and dangerous misconception is that saving checkpoints solves crash-resumability.
+- _[cent]_ A durable agent runtime should be structured as a run/step journal with replay boundaries around nondeterministic operations, idempotent tool wrappers, durable human-approval gates with artifact hashing, and deliberate crash testing at specific execution points.
+- _[supp]_ Agent runtimes need global retry budgets spanning the entire run to prevent retry storms, rather than only per-step retries.
+- _[supp]_ Human approvals must be recorded as durable records including artifact hashes; storing approvals only as chat messages enables unsafe replay where modified artifacts execute against a stale approval.
+
+### E. Protocols & observability
+
+**Agent-protocol security 2511.0384**
+- _[cent]_ Google's A2A (Agent-to-Agent) protocol lacks per-message signing and is highly susceptible to message tampering / MITM attacks over its SSE (Server-Sent Events) channels, because its peer-to-peer design prioritizes low latency over security oversight.
+- _[cent]_ A2A has no explicit consent mechanism and orphaned/long-lived bearer tokens persist in peer caches without centralized revocation, so revoked permissions can remain active due to asynchronous synchronization delays.
+- _[cent]_ Agent communication protocols are vulnerable to tool poisoning / command injection via crafted task descriptors, and prompt injection against A2A succeeds at 60-90% rates, with unintended data propagation occurring in up to 60% of simulated multi-agent exchanges.
+- _[supp]_ Among the compared protocols, ACP (Linux Foundation's RESTful standard) has the strongest authorization scoping model (operation-specific JWTs and per-segment JSON Web Signatures), but because JWS enforcement is optional, its flexibility itself becomes a vulnerability producing predictable integrity failures.
+- _[supp]_ The authors conclude existing agentic communication protocols are insufficiently secure for production multi-agent deployment at scale, recommending mandatory per-message cryptographic signing, globally enforced token expiration, fine-grained context-aware authorization, and immutable audit logging.
+
+**OpenTelemetry GenAI conventions**
+- _[cent]_ OpenTelemetry's GenAI semantic conventions define standardized operation types for agentic workflows — create_agent, invoke_agent, and invoke_workflow — and (as of v1.41) distinguish CLIENT spans for remote agent calls from INTERNAL spans for local framework execution, turning agent reasoning from a black box into structured traces.
+- _[cent]_ MCP tool-call tracing (added in v1.39) connects previously-disconnected agent-side and server-side traces by carrying mcp.method.name, mcp.session.id, and mcp.protocol.version on client spans and linking to server spans via W3C Trace Context propagation, so all spans share one trace_id for end-to-end visibility.
+- _[cent]_ The GenAI conventions define a hierarchical span nesting for agent workflows where an invoke_agent span parents model chat calls and MCP tools/call spans, and tool execution uses an execute_tool INTERNAL span with optional gen_ai.tool.call.arguments.
+- _[supp]_ OpenTelemetry standardizes core LLM telemetry attributes including gen_ai.provider.name, gen_ai.request.model, gen_ai.response.model, gen_ai.usage.input_tokens, and gen_ai.usage.output_tokens, which traditional OTel conventions did not cover.
+- _[supp]_ The conventions offer three content-recording modes (disabled by default, on-span attributes, or external storage with reference URLs), recommending external storage for production with high telemetry volume or sensitive data; the spec is still in Development status (v1.41.0) with no committed stabilization timeline.
+
+**Protocol survey 2505.0227**
+- _[cent]_ The survey defines a four-layer progression of agent interoperability protocols with distinct scopes: MCP for LLM-to-tool integration, ACP for infrastructure-level multi-agent messaging, A2A for enterprise intra-org task delegation, and ANP for open-internet decentralized agent marketplaces.
+- _[cent]_ The survey recommends a phased adoption roadmap (MCP for tools first, then ACP for rich interaction, then A2A for enterprise collaboration, then ANP for open markets) to maximize interoperability while minimizing integration complexity.
+- _[supp]_ The protocols differ in transport and security: A2A uses HTTP with optional SSE plus push notifications and DID-based handshake or out-of-band headers, while MCP uses HTTP/Stdio/SSE with token-based auth (optionally DIDs).
+- _[supp]_ MCP's architecture assumes a centralized server and is exposed to prompt-injection risk, an explicit stated limitation of the protocol.
+- _[supp]_ A2A is designed for trusted task delegation within organizational trust boundaries using capability-based Agent Cards, but its limitation is being enterprise-centric and assuming an agent catalog exists.
+
+
+*(Total unique claims listed: 133.)*

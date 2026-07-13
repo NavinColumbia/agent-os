@@ -17,6 +17,7 @@ Tools:
               -> plan+spawn fixers, judge on the REAL git diff + a fresh observation. result = the fix dict.
 """
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -127,6 +128,60 @@ def finance_report(args: dict) -> dict:
     return r
 
 
+_LEGAL_RISKS = [(r"(?i)\bunlimited\s+liability\b", "unlimited liability", "high"),
+                (r"\b\d{3}-\d{2}-\d{4}\b", "possible SSN / PII in the document", "high"),
+                (r"(?i)\bperpetual\b.*\b(?:license|right)s?\b", "perpetual grant — review", "medium"),
+                (r"(?i)\bindemnif", "indemnification clause — review scope", "medium"),
+                (r"(?i)\bauto[- ]?renew", "auto-renewal — confirm notice period", "low")]
+
+
+def legal_scan(args: dict) -> dict:
+    """A legal/compliance function's REAL action: scan a document against policy. Deterministic first (required
+    clauses that are MISSING = blocking; risky/PII patterns = flagged), then an AI compliance review. Findings
+    flow to the coordinator exactly like QA bugs. `doc`/`text` inline or `path` to a file; `policy` = required
+    clauses/keywords."""
+    doc = args.get("doc") or args.get("text") or ""
+    if not doc and args.get("path"):
+        try:
+            doc = Path(args["path"]).read_text(errors="ignore")[:40000]
+        except Exception:
+            doc = ""
+    policy = args.get("policy") or []
+    findings = []
+    for req in policy:                            # required clause missing -> a BLOCKING finding
+        if str(req).lower() not in doc.lower():
+            findings.append({"kind": "missing-clause", "title": f"policy requires '{req}' — not present",
+                             "severity": "high", "blocking": True})
+    for pat, label, sev in _LEGAL_RISKS:
+        if re.search(pat, doc):
+            findings.append({"kind": "risk", "title": label, "severity": sev, "blocking": False})
+    review = _agent_tool("legal-compliance-checklist",
+                         "Review this document for legal/compliance risk: missing protections, risky terms, "
+                         f"and PII. Policy requirements: {policy}. Be specific.\n\nDOC:\n{doc[:6000]}", args)
+    blocking = any(f["blocking"] for f in findings)
+    return {"status": "failed" if blocking else "done", "findings": findings,
+            "result": {"issues": len(findings), "blocking": blocking,
+                       "review": (review.get("result") or {}).get("report")}}
+
+
+def connector_ingest(args: dict) -> dict:
+    """Reach a LIVE external source through the GOVERNED connector (DNS-pinned, allowlisted egress — the same
+    egress policy the platform enforces), then summarise it. This is how research/data/intel agents pull real
+    external data safely. Denied/blocked egress is a failed result, never a crash."""
+    url = args.get("url") or ""
+    try:
+        import connectors
+        content = connectors.ingest(url, args.get("product", "platform"),
+                                    role=args.get("role", "data-engineer"))
+    except Exception as e:
+        return {"status": "failed", "findings": [], "result": {"error": f"connector denied/failed: {e}"}}
+    s = _agent_tool(args.get("role", "data-engineer"),
+                    f"Summarise this content fetched from {url} for the CEO (2-4 honest lines):\n"
+                    + str(content)[:5000], args)
+    return {"status": "done", "findings": [],
+            "result": {"url": url, "summary": (s.get("result") or {}).get("report")}}
+
+
 def data_query(args: dict) -> dict:
     """A data function's REAL external action: run a READ-ONLY query against the platform DB and summarise the
     result for the CEO. Refuses anything but a single SELECT (no writes, no semicolons) — a data agent reads,
@@ -166,7 +221,8 @@ def knowledge_work(args: dict) -> dict:
 
 
 _TOOLS = {"qa_explore": qa_explore, "dev_fix": dev_fix, "research": research,
-          "finance_report": finance_report, "knowledge_work": knowledge_work, "data_query": data_query}
+          "finance_report": finance_report, "knowledge_work": knowledge_work, "data_query": data_query,
+          "legal_scan": legal_scan, "connector_ingest": connector_ingest}
 
 
 def run_tool(name: str, args: dict) -> dict:
@@ -250,6 +306,27 @@ def _selftest():
         assert dq["status"] == "done" and dq["result"]["row_count"] == 1, dq
     assert run_tool("data_query", {"sql": "DELETE FROM agent_pulse"})["status"] == "failed", "writes refused"
     assert run_tool("data_query", {"sql": "SELECT 1; DROP TABLE x"})["status"] == "failed", "multi-stmt refused"
+
+    # legal_scan: a MISSING required clause = blocking finding; risky patterns (PII, unlimited liability) flagged.
+    fake_f.agent = lambda role, repo, task, **k: {"rc": 0, "out_full": "legal review"}
+    ls = run_tool("legal_scan", {"doc": "This has unlimited liability and SSN 123-45-6789.",
+                                 "policy": ["limitation of liability", "governing law"]})
+    assert ls["status"] == "failed", ls          # required clauses missing -> blocking
+    ts = " ".join(f["title"] for f in ls["findings"])
+    assert "limitation of liability" in ts and "liability" in ts.lower() and ("PII" in ts or "SSN" in ts), ts
+    lok = run_tool("legal_scan", {"doc": "limitation of liability applies; governing law is X.",
+                                  "policy": ["limitation of liability", "governing law"]})
+    assert lok["status"] == "done" and not any(f["blocking"] for f in lok["findings"]), lok
+
+    # connector_ingest: governed external fetch (stub connectors) + summary; a denial -> failed, never a crash.
+    fake_c = types.ModuleType("connectors")
+    fake_c.ingest = lambda url, product, role="data-engineer", **k: "fetched: " + url
+    sys.modules["connectors"] = fake_c
+    ci = run_tool("connector_ingest", {"url": "https://example.com/x"})
+    assert ci["status"] == "done" and ci["result"]["url"] == "https://example.com/x", ci
+    fake_c.ingest = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("egress denied"))
+    assert run_tool("connector_ingest", {"url": "http://evil"})["status"] == "failed"
+
     fake_f.agent = lambda role, repo, task, **k: {"rc": 1, "out_full": ""}   # a failed agent -> failed tool
     assert run_tool("research", {"topic": "x"})["status"] == "failed"
 
@@ -262,8 +339,8 @@ def _selftest():
     assert run_tool("boom", {})["status"] == "failed" and "browser died" in run_tool("boom", {})["result"]["error"]
     del _TOOLS["boom"]
 
-    print("tools selftest: PASS (qa_explore + dev_fix + research + finance_report + knowledge_work; "
-          "any role does real work; errors fail-soft)")
+    print("tools selftest: PASS (qa_explore, dev_fix, research, finance_report, knowledge_work, data_query, "
+          "legal_scan, connector_ingest — every function has real work; errors fail-soft)")
     return 0
 
 

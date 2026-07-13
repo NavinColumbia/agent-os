@@ -121,6 +121,25 @@ def reconcile(stale_jobs, store, run_tool=None) -> int:
     return n
 
 
+def reconcile_parked(store, run_id, tenant=None) -> int:
+    """Crash-resume hook: when a run (re)starts, re-dispatch tool jobs for workers that are PARKED with a
+    dispatched tool but whose job isn't running in THIS process (the process that ran them died). Reads the
+    job spec from the parked actor's persisted memory. Idempotent. Call from run_org at startup."""
+    try:
+        acts = store.actors(run_id, tenant)
+    except Exception:
+        return 0
+    jobs = []
+    for a in (acts or []):
+        ctxm = ((a.get("memory") or {}).get("context")) or {}
+        if a.get("status") == "blocked" and ctxm.get("tool") and ctxm.get("tool_dispatched"):
+            jobs.append({"run_id": run_id, "tenant": tenant, "actor_id": a["actor_id"],
+                         "supervisor_id": a.get("supervisor_id"), "actor_name": a.get("name"),
+                         "tool": ctxm["tool"], "args": ctxm.get("tool_args") or {},
+                         "assignment": a.get("assignment")})
+    return reconcile(jobs, store)
+
+
 def _selftest():
     import time
 

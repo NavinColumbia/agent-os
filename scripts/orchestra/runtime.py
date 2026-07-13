@@ -283,7 +283,27 @@ def _worker_step(ctx, a, evs):
                                {"context": {"answer": d.get("answer") or ""}}, corr))
         # other kinds addressed to a worker are informational — completing them records receipt.
 
-    if work and a["status"] not in TERMINAL:
+    # TOOL-WORKER (agentic-org phase 3b): a worker whose memory carries a `tool` runs REAL long work (a
+    # browser QA explore, a dev fix) that must NOT block a lease-bound decide-step. DISPATCH-AND-PARK: hand
+    # the job to jobrunner (runs off-loop, browser lives there) and park (blocked). The job emits done+finding
+    # to our supervisor and flips us terminal on completion; a crashed job is re-dispatched by reconcile.
+    tool = (context or {}).get("tool")
+    if work and a["status"] not in TERMINAL and tool and not context.get("tool_dispatched"):
+        try:
+            import jobrunner
+            jobrunner.dispatch({"run_id": ctx.run_id, "tenant": ctx.tenant, "actor_id": me,
+                                "supervisor_id": sup, "actor_name": a["name"], "tool": tool,
+                                "args": context.get("tool_args") or {}, "assignment": assignment}, store)
+            context["tool_dispatched"] = True
+            step.status = "blocked"                 # PARK; memory (tool + tool_dispatched) is the resume handle
+            _audit(a["name"], "ToolDispatched", "executed", {"tool": tool})
+        except Exception as e:                      # dispatch failed -> escalate, don't silently hang
+            step.status = "blocked"
+            if sup:
+                step.emits.append((me, sup, "blocked", {"reason": f"tool dispatch failed: {e}"}, None))
+    elif work and a["status"] not in TERMINAL and tool and context.get("tool_dispatched"):
+        pass                                        # dispatched; waiting on the job to emit done (no work call)
+    elif work and a["status"] not in TERMINAL:
         steps += 1
         if steps > MAX_ACTOR_STEPS:
             step.status, step.result = "dead", {"failed": True, "reason": "max steps exhausted"}
@@ -672,6 +692,13 @@ def run_org(run_id, tenant_id, repo=".", workers=2, human_hook=None, max_steps=N
     non-terminal actor from its persisted rows; events claimed by dead workers reappear after
     `lease_s`."""
     store.ensure()
+    # CRASH-RESUME for tool jobs: re-dispatch any tool-worker that's parked with a dispatched tool but whose
+    # background job died with a previous process. Idempotent; fail-open (never blocks the engine start).
+    try:
+        import jobrunner
+        jobrunner.reconcile_parked(store, run_id, tenant_id)
+    except Exception:
+        pass
     ctx = _Ctx(run_id, tenant_id, repo, human_hook, lease_s, max_steps)
     threads = [threading.Thread(target=_pool_loop, args=(ctx, f"orgw-{i}", poll_s, stall_s),
                                 daemon=True, name=f"orgw-{i}")

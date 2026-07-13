@@ -105,14 +105,28 @@ silence → reconcile re-dispatches).
   into memory.context (→ tool-worker); `_decompose_specs` → `_coordinator_specs` makes qa-coordinator spawn
   one qa-explorer per story and dev-coordinator spawn one dev-fixer per bug (run params from the
   coordinator's memory.context). Generic supervisor step then reacts to their finding/done + aggregates.
+- ✅ **Phase 5 — agentic entrypoint** (`8ad739b`): `scripts/qa/qa_agentic.py` `run_agentic_qa()` creates the
+  QA org (hire qa-coordinator → spawn qa-explorer tool-workers per story → dispatch-and-park → findings over
+  the bus → aggregate) and drives `run_org` to completion. **Verified working end-to-end** on the real
+  runtime with a stubbed instant tool. Deterministic selftest (coordinator hires 2 explorer tool-workers) is
+  reliable 3/3. ⚠️ The full ASYNC drive has a claim/emit race that occasionally hangs the pool at short
+  `stall_s` — see hardening note below.
 
 ---
 
 ## Part 3 — What's REMAINING (do IN ORDER; test each)
 
 ### Short-term (finish the agentic org — the current thrust)
-1. ✅ DONE — Phase 3b (worker hook, `52da513`) + Phase 4 (coordinators spawn tool-workers, `a8aed28`). See Part 2.
-2. **Phase 4b — coordinator DECISION logic (NEXT).** The generic supervisor step already spawns children,
+1. ✅ DONE — Phases 3b/4/5 (`52da513`/`a8aed28`/`8ad739b`). The agentic org spine WORKS end-to-end. See Part 2.
+2. **Phase 5-hardening — de-flake the async drive (DO FIRST, it blocks everything else here).** `run_agentic_qa`'s
+   drive loop occasionally HANGS: `run_org` doesn't cleanly stall when async tool jobs are mid-flight (a
+   claim/emit race — the pool keeps finding/creating events, or stalls before a job emits). Fix ideas: give
+   the coordinator a deterministic "waiting on N children" park (don't self-`next` while children run); or a
+   dedicated job-completion signal that emits exactly once and is idempotently claimed; or run the pool
+   single-worker for QA orgs. Repro: `python scripts/qa/qa_agentic.py` with the OLD full-drive selftest
+   (git-show `8ad739b^:scripts/qa/qa_agentic.py`) — it passes ~1-in-2 and hangs otherwise. Nail this, then the
+   full-drive selftest can go back in.
+3. **Phase 4b — coordinator DECISION logic.** The generic supervisor step already spawns children,
    reacts to `finding`/`done` via `_DECIDE_PROMPT`, and aggregates. Add the QA-specific decisions on top:
    (a) qa-coordinator receives a BLOCKING `finding` → hand off to a dev-coordinator (spawn one, or emit a
    `task` carrying the bug in its context) rather than a generic AI decide; (b) on incomplete coverage in a

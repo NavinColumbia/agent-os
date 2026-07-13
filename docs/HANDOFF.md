@@ -122,14 +122,13 @@ silence → reconcile re-dispatches).
 1. ✅ DONE — Phases 3b/4/5 + 4b hand-off (`52da513`/`a8aed28`/`8ad739b`/`f4bbcd0`/`ef0253b`). The agentic org
    WORKS end-to-end incl. **qa-coordinator → dev-coordinator → dev-fixer** hand-off, reliably tested
    (`python scripts/qa/qa_agentic.py`: 2 explorers find bugs → 2 dev-coordinators → 2 dev-fixers → done).
-2. **Phase 4b — mostly DONE.** ✅ (a) dev-handoff (`ef0253b`); ✅ (d) honest verdict (`acb1ac1`); ✅ (c) the
-   CLOSED LOOP — re-test after fix, bounded (`0dd53ab`). The agentic org now does the full find→hand-off→fix
-   →re-test→verdict cycle. Still optional: (b) gap-fill hires on INCOMPLETE coverage (an explorer's `done`
-   result carries `stop_reason`/coverage; if incomplete, hire another qa-explorer with `resume_covered` for
-   that story — same pattern as re-test, bound it); (e) at aggregate also run `review.review` (needs the
-   agentic org to assemble a review dossier from the explorers' results). Role manifests (governance hygiene;
-   fail-open works without them): `~/projects/control-plane/roles/{qa-coordinator,dev-coordinator}.yaml`
-   (`can_spawn:true`), `{qa-explorer,dev-fixer}.yaml` (`can_spawn:false`).
+2. **Phase 4b — DONE.** ✅ (a) dev-handoff (`ef0253b`); ✅ (d) honest verdict (`acb1ac1`); ✅ (c) closed-loop
+   re-test after fix (`0dd53ab`); ✅ (b) gap-fill on incomplete coverage (`117dbc6`). The qa-coordinator now
+   covers the full QA decision set: explore → gap-fill → find → hand-off → fix → re-test → honest verdict.
+   Optional remaining: (e) at aggregate also run `review.review` (needs the agentic org to assemble a review
+   dossier from the explorers' results). Role manifests (governance hygiene; fail-open works without them):
+   `~/projects/control-plane/roles/{qa-coordinator,dev-coordinator}.yaml` (`can_spawn:true`),
+   `{qa-explorer,dev-fixer}.yaml` (`can_spawn:false`).
 
    **Pattern for adding coordinator behaviors** (all of the above use it): coordinator state lives in the
    supervisor's `mem` and MUST be persisted in `step.memory` (see `qa_findings`/`story_status`/`retests` in

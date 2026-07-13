@@ -68,9 +68,33 @@ def run_agentic_qa(target_url, vision, *, product="app", token=None, org="0", su
     evs = store.events(rid, tenant)
     findings = [e["payload"] for e in evs if e["kind"] == "finding"]
     acts = store.actors(rid, tenant)
-    return {"run_id": rid, "status": (store.run(rid, tenant) or {}).get("status"),
-            "findings": findings, "actors": len(acts),
-            "explorers": [a for a in acts if a.get("role") == "qa-explorer"]}
+    status = (store.run(rid, tenant) or {}).get("status")
+
+    # PHASE 6 — durable, gate-consumable verdict: map the qa-coordinator's honest verdict onto the procedural
+    # pipeline's report shape and reuse its persistence, so an AGENTIC run leaves the SAME artifacts a build's
+    # LAUNCH gate binds to: a qa_runs row (durable history) + docs/QA-VERDICT.json (in the product repo).
+    # Fail-open — persistence must never crash the run.
+    coord = next((a for a in acts if a.get("role") == "qa-coordinator"), None)
+    v = (coord or {}).get("result") or {}
+    blocking = v.get("blocking_stories") or []
+    report = {"verdict": v.get("result") or f"agentic QA: {status}", "summary": v.get("result") or "",
+              "passed": bool(v.get("passed")), "total_stories": v.get("stories") or len(stories or []),
+              "total_bugs": len(findings), "open_bugs": len(blocking), "blocking_open": len(blocking),
+              "clean": bool(v.get("passed")), "rounds": 1, "md": None, "json": None}
+    try:
+        import qa_run
+        report["qa_run_id"] = qa_run._persist_run(report, {
+            "product": product, "url": target_url, "vision": vision, "stories": [], "bugs": [],
+            "started_at": started, "finished_at": time.time(), "rounds": 1, "clean": report["passed"]})
+        if repo:                                    # only write the gate artifact into a real product repo
+            report["verdict_json"] = qa_run.write_verdict(repo, report, product=product,
+                target_url=target_url, producer="qa_agentic", qa_run_id=report.get("qa_run_id"))
+    except Exception as e:
+        report["persist_error"] = str(e)
+
+    return {"run_id": rid, "status": status, "findings": findings, "actors": len(acts),
+            "explorers": [a for a in acts if a.get("role") == "qa-explorer"],
+            "verdict": v, "report": report}
 
 
 def _selftest():
@@ -110,11 +134,13 @@ def _selftest():
     tools.run_tool = fake_tool
     jobrunner._default_run_tool = lambda: fake_tool
 
+    import tempfile
+    tmprepo = tempfile.mkdtemp(prefix="agentic-qa-")   # a throwaway repo so write_verdict never clobbers ours
     out = None
     try:
         out = run_agentic_qa("http://app.test", "A console the user signs in to and messages an assistant.",
                              product="agentic-selftest", stories=[{"id": "US1"}, {"id": "US2"}],
-                             tenant="agentic-selftest", repo=".", workers=2, drive_budget_s=60, stall_s=2.0)
+                             tenant="agentic-selftest", repo=tmprepo, workers=2, drive_budget_s=60, stall_s=2.0)
         roles = [a.get("role") for a in store.actors(out["run_id"], "agentic-selftest")]
         assert out["status"] == "done", f"the org run must finish; got {out['status']}"
         # the CLOSED LOOP: 2 initial explorers find bugs -> 2 dev-coordinators -> 2 dev-fixers fix them ->
@@ -126,8 +152,13 @@ def _selftest():
         v = (coord.get("result") or {})
         assert v.get("passed") is True, f"re-test was clean -> verdict must PASS; got {v}"
         assert not v.get("blocking_stories"), v
-        print(f"qa_agentic selftest: PASS (CLOSED LOOP: find -> hand-off -> fix -> re-test -> "
-              f"{roles.count('qa-explorer')} explorers, {roles.count('dev-fixer')} fixers; honest verdict passed={v.get('passed')})")
+        # phase 6: the run left a durable qa_runs row + a gate-consumable QA-VERDICT.json in the (temp) repo.
+        rep = out.get("report") or {}
+        assert rep.get("qa_run_id"), f"agentic run must persist a qa_runs row; got {rep}"
+        assert (Path(tmprepo) / "docs" / "QA-VERDICT.json").exists(), "QA-VERDICT.json (the LAUNCH artifact) must be written"
+        print(f"qa_agentic selftest: PASS (CLOSED LOOP find->fix->re-test->passed; "
+              f"{roles.count('qa-explorer')} explorers, {roles.count('dev-fixer')} fixers; "
+              f"durable verdict persisted qa_run_id={rep.get('qa_run_id')} + QA-VERDICT.json written)")
         return 0
     finally:
         tools.run_tool = _orig_tool
@@ -137,6 +168,17 @@ def _selftest():
         else:
             sys.modules.pop("factory", None)
         _cleanup(out["run_id"] if isinstance(out, dict) else -1, "agentic-selftest")
+        import shutil
+        shutil.rmtree(tmprepo, ignore_errors=True)
+        if isinstance(out, dict) and (out.get("report") or {}).get("qa_run_id"):
+            try:                                        # drop the selftest's qa_runs row
+                import psycopg
+                import pulse
+                with psycopg.connect(pulse.DB) as c, c.cursor() as cur:
+                    cur.execute("DELETE FROM qa_runs WHERE id=%s", (out["report"]["qa_run_id"],))
+                    c.commit()
+            except Exception:
+                pass
 
 
 def _cleanup(run_id, tenant):

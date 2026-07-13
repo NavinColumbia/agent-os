@@ -1231,12 +1231,56 @@ def _sandbox_config(repo: str) -> dict:
             "network": {"allowedDomains": [], "deniedDomains": []}}
 
 
+def detect_stack(repo: str) -> str:
+    """Detect a product's tech stack so the RIGHT test runner grades it (fixes F10 — a Python-only verifier
+    scored every Node/JS/TS app 0.0 forever). The fleet builds polyglot products; the grader must speak the
+    same language. Returns one of: 'node' | 'python' | 'go' | 'rust' | 'unknown'."""
+    r = Path(repo)
+    if (r / "package.json").exists():
+        return "node"
+    if (r / "pyproject.toml").exists() or (r / "requirements.txt").exists() or (r / "setup.py").exists() \
+       or any(r.rglob("test_*.py")) or any(r.rglob("*_test.py")):
+        return "python"
+    if (r / "go.mod").exists():
+        return "go"
+    if (r / "Cargo.toml").exists():
+        return "rust"
+    return "unknown"
+
+
+def _run_node_tests(repo: str) -> tuple[bool, str]:
+    """Grade a Node/JS/TS product with ITS OWN declared test command (package.json 'test' script → `npm test`),
+    falling back to the framework-free node test files. Ensures deps are installed first (a fresh build repo has
+    no node_modules), since 'no tests ran' must not masquerade as a pass."""
+    r = Path(repo)
+    try:
+        pkg = json.loads((r / "package.json").read_text())
+    except Exception:
+        pkg = {}
+    has_test_script = bool((pkg.get("scripts") or {}).get("test"))
+    if not has_test_script:
+        return run_js_tests(repo)                        # no declared script → the framework-free node runner
+    # ensure deps present (a just-built repo often has none) — best-effort, bounded.
+    if not (r / "node_modules").exists():
+        subprocess.run(["bash", "-c", f"cd {repo} && (npm ci || npm install) --no-audit --no-fund"],
+                       capture_output=True, text=True, timeout=420)
+    p = subprocess.run(["bash", "-c", f"cd {repo} && npm test --silent"], capture_output=True, text=True, timeout=420)
+    out = (p.stdout or "") + (p.stderr or "")
+    audit.append(actor="factory:qa-security", action="RunTests", resource=r.name,
+                 decision="executed", payload={"rc": p.returncode, "stack": "node"})
+    return p.returncode == 0, out[-2500:]
+
+
 def run_tests(repo: str, sandboxed: bool = True, target: str = "", python: str = "") -> tuple[bool, str]:
-    """Run the product's pytest suite. Untrusted generated code runs inside the srt sandbox (write-
-    limited to the repo, network denied). Falls back to direct exec ONLY if the sandbox infra itself
-    is unavailable (never to mask a real test failure). `target` scopes pytest to a subpath (e.g. one
-    component's tests/<pkg>) — empty means the whole repo. `python` overrides the interpreter (e.g. a
-    per-product venv when the product assembles open-source deps) — defaults to the platform venv."""
+    """Run the product's test suite with the runner that MATCHES ITS STACK (F10 fix). A Node/JS/TS app is graded
+    by its own `npm test`; a Python app by pytest (below). Untrusted generated code runs inside the srt sandbox
+    (write-limited to the repo, network denied). Falls back to direct exec ONLY if the sandbox infra itself is
+    unavailable (never to mask a real test failure). `target` scopes pytest to a subpath — empty means the whole
+    repo. `python` overrides the interpreter — defaults to the platform venv."""
+    # STACK DISPATCH: a targeted adversarial subpath (tests/adversarial) is a Python-specific tier, so only
+    # dispatch by stack for a whole-repo baseline run.
+    if not target and detect_stack(repo) == "node":
+        return _run_node_tests(repo)
     py = python or VENV_PY
     pytest_cmd = f"cd {repo} && {py} -m pytest -q {target}".rstrip()
     if sandboxed and shutil.which("srt"):                # srt binary present? (missing = real infra signal)

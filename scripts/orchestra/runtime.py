@@ -434,6 +434,18 @@ def _coordinator_specs(ctx, a, task, role):
                     "target_url": c.get("target_url"), "stories": c.get("stories"),
                     "restart_cmd": c.get("restart_cmd"), "health_url": c.get("health_url"),
                     "token": c.get("token"), "org": c.get("org")}}]
+    # COMPANY / CEO coordinator: context.functions = [{role, tool, items, worker_role, task}] -> spawn one
+    # SUPERVISOR (a FUNCTION coordinator) per function, each carrying its own tool-team context. This is the
+    # top of a full CEO-directed org: CEO-coordinator -> function coordinators -> tool-workers -> reports up.
+    funcs = c.get("functions")
+    if isinstance(funcs, list) and funcs:
+        return [{"name": f.get("role") or f"function-{i}", "role": f.get("role") or f"function-{i}",
+                 "kind": "supervisor",
+                 "task": f.get("task") or f"Deliver the '{f.get('role', 'function')}' function toward: {task}",
+                 "context": {"tool": f.get("tool"), "items": f.get("items") or [],
+                             "worker_role": f.get("worker_role")}}
+                for i, f in enumerate(funcs)]
+
     # GENERIC TOOL-TEAM: any coordinator whose context declares a `tool` + a list of `items` spawns one
     # tool-worker per item — this is how the org staffs ANY function (research, finance, legal, data, …) with
     # REAL work, reusing the proven tool-worker/dispatch-and-park pattern instead of a per-role branch.

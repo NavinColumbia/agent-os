@@ -113,6 +113,12 @@ def _ensure():
             id BIGSERIAL PRIMARY KEY, thread_id BIGINT, tenant_id TEXT, phase TEXT, kind TEXT,
             status TEXT DEFAULT 'running', result JSONB,
             started_at TIMESTAMPTZ DEFAULT now(), finished_at TIMESTAMPTZ)""")
+        # ARCHITECTURE-OVERHAUL Step 1: an OUTPUT-INDEPENDENT liveness heartbeat. The worker ticks heartbeat_at
+        # on a fixed timer (NOT when it produces output), so the reaper can tell "worker process dead" (heartbeat
+        # stopped) from "claude working quietly" (heartbeat still ticking) — killing the false-positive reap (F8).
+        # lease_token is a fencing token: a reap bumps it so a wrongly-reaped-but-alive worker's writes are rejected.
+        cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS lease_token BIGINT DEFAULT 0")
         c.commit()
 
 
@@ -331,8 +337,8 @@ def _dispatch(thread_id, kind, fn, eta_min=None, kickoff=None, status=None):
     if eta_min is None:
         eta_min = _estimate_runtime(s["phase"], s.get("plan"))
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind)
-                       VALUES (%s,%s,%s,%s) RETURNING id""", (thread_id, s["tenant_id"], s["phase"], kind))
+        cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, heartbeat_at)
+                       VALUES (%s,%s,%s,%s, now()) RETURNING id""", (thread_id, s["tenant_id"], s["phase"], kind))
         jid = cur.fetchone()[0]; c.commit()
     _set(thread_id, awaiting="fleet")
     _job_begin(thread_id, kind, eta_min, status or _KIND_LABEL.get(kind, "Working…"))
@@ -342,12 +348,30 @@ def _dispatch(thread_id, kind, fn, eta_min=None, kickoff=None, status=None):
         _report(s["tenant_id"], thread_id, kickoff + eta_txt,
                 {"kind": "working", "phase": s["phase"], "job": kind, "eta_min": eta_min})
 
+    # OUTPUT-INDEPENDENT HEARTBEAT (overhaul Step 1): a background timer that ticks heartbeat_at every ~45s while
+    # the (possibly long, quiet) phase runs — proving the worker PROCESS is alive regardless of whether `claude`
+    # is producing output. If the process dies, this thread dies with it → heartbeat stops → the reaper correctly
+    # detects a real death. A quiet-but-alive build keeps beating and is NEVER reaped. Kills F8.
+    _beat_stop = threading.Event()
+
+    def _heartbeat():
+        while not _beat_stop.wait(HEARTBEAT_S):
+            try:
+                with psycopg.connect(DB) as c, c.cursor() as cur:
+                    cur.execute("UPDATE controller_jobs SET heartbeat_at=now() WHERE id=%s AND status='running'", (jid,))
+                    c.commit()
+            except Exception:
+                pass
+    threading.Thread(target=_heartbeat, daemon=True).start()
+
     def _work():
         result, status = {}, "done"
         try:
             result = fn() or {}
         except Exception as e:
             result, status = {"error": str(e)[:200]}, "failed"
+        finally:
+            _beat_stop.set()
         # A long-but-healthy async run (e.g. a research fleet still going past the in-worker poll budget)
         # returns a 'pending' sentinel. We must NOT mark it done/failed (that would surface a FALSE timeout
         # and park the thread on a feedback gate, orphaning the eventual completion) nor advance(). Park the
@@ -1162,11 +1186,78 @@ def qa_gate(product) -> dict:
 
 
 RUNNING_TIMEOUT_MIN = 30   # (legacy constant kept for callers/tests; superseded by heartbeat liveness below)
-# HEARTBEAT LIVENESS (REBUILD-PLAN A2): a job is presumed crashed only if it is BOTH older than this floor
-# AND has been SILENT (no factory audit / orchestra heartbeat) for STALL_SILENT_MIN. A healthy hour-long
-# agentic-QA build keeps itself alive by working; only a truly dead worker gets reaped. No more 30-min guillotine.
 RUNNING_FLOOR_MIN = int(os.environ.get("AOS_JOB_FLOOR_MIN", "20"))       # never reap younger than this
-STALL_SILENT_MIN = int(os.environ.get("AOS_JOB_SILENT_MIN", "12"))       # no activity this long = actually dead
+STALL_SILENT_MIN = int(os.environ.get("AOS_JOB_SILENT_MIN", "12"))       # (legacy; retained for callers)
+# ARCHITECTURE-OVERHAUL Step 1 — the CORRECT liveness model (Temporal/Step-Functions shape):
+# the worker beats heartbeat_at every HEARTBEAT_S on a background timer, DECOUPLED from `claude` output. So a job
+# is dead ONLY if its heartbeat lapsed (HEARTBEAT_TIMEOUT_S — the worker process is gone) OR it exceeded the hard
+# ceiling (HARD_CEILING_MIN — a runaway). We NEVER reap on output silence. This kills the false-positive that
+# killed a healthy-but-quiet build (F8).
+HEARTBEAT_S = int(os.environ.get("AOS_JOB_HEARTBEAT_S", "45"))           # worker beats this often (timer, not output)
+HEARTBEAT_TIMEOUT_S = int(os.environ.get("AOS_JOB_HEARTBEAT_TIMEOUT_S", "180"))  # missed ~4 beats = worker dead
+HARD_CEILING_MIN = int(os.environ.get("AOS_JOB_CEILING_MIN", "120"))     # hard duration ceiling (runaway guard)
+
+
+def _reap_dead_jobs():
+    """Reap ONLY jobs whose worker is genuinely dead — its heartbeat lapsed (process gone) OR it blew the hard
+    ceiling (runaway) — and NEVER on output silence (overhaul Step 1; the correct Temporal/Step-Functions liveness
+    model). A long, quiet-but-alive build keeps beating heartbeat_at on its background timer, so it is never
+    falsely reaped (F8). Bumps lease_token to fence a wrongly-reaped-but-alive worker. Returns rows reaped."""
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""
+            UPDATE controller_jobs cj SET status='failed', lease_token = cj.lease_token + 1,
+                result = COALESCE(cj.result,'{}'::jsonb)
+                         || '{"error":"worker died (heartbeat lapsed or hard ceiling)","status":"failed"}'::jsonb,
+                finished_at = now()
+            WHERE cj.status='running'
+              AND cj.started_at < now() - make_interval(mins => %s)               -- past the generous floor
+              AND (
+                    COALESCE(cj.heartbeat_at, cj.started_at) < now() - make_interval(secs => %s)  -- heartbeat lapsed
+                 OR cj.started_at < now() - make_interval(mins => %s)             -- OR hard ceiling (runaway)
+              )
+        """, (RUNNING_FLOOR_MIN, HEARTBEAT_TIMEOUT_S, HARD_CEILING_MIN))
+        n = cur.rowcount; c.commit()
+        return n
+
+
+def liveness_selftest():
+    """Prove the overhaul Step-1 liveness model: a quiet-but-beating job is NEVER reaped; a job whose heartbeat
+    lapsed IS reaped; a job past the hard ceiling IS reaped. This is the fix for F8 (healthy build killed for
+    going quiet). Offline, DB-only."""
+    _ensure()
+    import psycopg as _pg
+    def mk(started_min_ago, beat_secs_ago):
+        with _pg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, status, started_at, heartbeat_at)
+                           VALUES (0,'live-selftest','IMPLEMENT','build','running',
+                                   now() - make_interval(mins => %s),
+                                   CASE WHEN %s IS NULL THEN NULL ELSE now() - make_interval(secs => %s) END)
+                           RETURNING id""",
+                        (started_min_ago, beat_secs_ago, beat_secs_ago or 0))
+            jid = cur.fetchone()[0]; c.commit(); return jid
+    def status(jid):
+        with _pg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT status FROM controller_jobs WHERE id=%s", (jid,)); return cur.fetchone()[0]
+    ok = True
+    try:
+        alive = mk(40, 20)                 # 40 min old but beat 20s ago → ALIVE (quiet build), must NOT reap
+        dead = mk(40, 600)                 # 40 min old, last beat 10 min ago → worker dead, MUST reap
+        runaway = mk(200, 10)              # beating, but 200 min old → past hard ceiling, MUST reap
+        young = mk(5, 600)                 # heartbeat lapsed but under the floor → too young, must NOT reap
+        _reap_dead_jobs()
+        checks = [(status(alive) == "running", "quiet-but-beating build is NOT reaped (F8 fixed)"),
+                  (status(dead) == "failed", "heartbeat-lapsed worker IS reaped"),
+                  (status(runaway) == "failed", "past-hard-ceiling runaway IS reaped"),
+                  (status(young) == "running", "job under the floor is NOT reaped")]
+        for cond, label in checks:
+            print(("PASS" if cond else "FAIL") + f": {label}"); ok = ok and cond
+        print("liveness_selftest: PASS (output-independent heartbeat liveness; no false reap of a quiet build)"
+              if ok else "liveness_selftest: FAIL")
+        return 0 if ok else 1
+    finally:
+        with _pg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM controller_jobs WHERE tenant_id='live-selftest'"); c.commit()
 
 
 def resume_stalled():
@@ -1229,33 +1320,8 @@ def resume_stalled():
             advanced += 1
     except Exception:
         pass
+    _reap_dead_jobs()                       # overhaul Step 1: reap by heartbeat/ceiling, NEVER by output silence
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        # 1) Reap CRASHED jobs — by HEARTBEAT LIVENESS, not a flat guillotine (REBUILD-PLAN A2). The old rule
-        #    ("running > 30m = dead") killed HEALTHY long builds — and the agentic-QA ship gate now makes a
-        #    build legitimately run ~1h. A worker proves life by writing to the audit stream (factory:%) or
-        #    beating an orchestra actor. So a job is only "crashed" when it is BOTH past a generous floor AND
-        #    has shown NO activity for STALL_SILENT_MIN. A long build that logged 2 minutes ago stays alive.
-        cur.execute("""
-            UPDATE controller_jobs cj SET status='failed',
-                result = COALESCE(cj.result,'{}'::jsonb)
-                         || '{"error":"worker crashed (silent past stall window)","status":"failed"}'::jsonb,
-                finished_at = now()
-            FROM controller_state cs
-            WHERE cs.thread_id = cj.thread_id
-              AND cj.status='running'
-              AND cj.started_at < now() - make_interval(mins => %s)          -- past the generous floor
-              AND NOT EXISTS (                                               -- and genuinely SILENT: no factory
-                    SELECT 1 FROM audit_log al                              -- audit for this product recently
-                    WHERE al.actor LIKE 'factory:%%'
-                      AND al.resource = cs.product
-                      AND al.ts > now() - make_interval(mins => %s))
-              AND NOT EXISTS (                                               -- and no live orchestra actor for
-                    SELECT 1 FROM orchestra_actors oa                       -- this TENANT beating recently
-                    WHERE oa.tenant_id = cj.tenant_id
-                      AND oa.status NOT IN ('done','dead')
-                      AND oa.last_active > now() - make_interval(mins => %s))
-        """, (RUNNING_FLOOR_MIN, STALL_SILENT_MIN, STALL_SILENT_MIN))
-        c.commit()
         # 2) For every NON-research thread parked on 'fleet', take its most recent job (any status).
         #    RESEARCH is reconciled above against its real run, so exclude it here.
         cur.execute("""SELECT DISTINCT ON (cj.thread_id) cj.thread_id, cj.result, cj.status
@@ -2019,9 +2085,11 @@ def _main(a):
         print(json.dumps(resume_stalled()))
     elif a[0] == "watchdog":
         print(json.dumps(sla_watchdog()))
+    elif a[0] == "liveness":
+        sys.exit(liveness_selftest())
     else:
         sys.exit("usage: loopcontroller.py "
-                 "start|say|choose|state|research|live|cancel|resume|watchdog|selftest ...")
+                 "start|say|choose|state|research|live|cancel|resume|watchdog|liveness|selftest ...")
 
 
 if __name__ == "__main__":

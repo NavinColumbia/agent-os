@@ -136,12 +136,14 @@ silence → reconcile re-dispatches).
    findings arrive as separate `finding` events (not in `done`), but a tool-worker's `done` now carries
    `story` + `blocking_found` for per-story tracking.
 
-3. **Phase 6 — parity + flip the default.** ✅ 6a (`5f88a50`): an agentic run now persists a `qa_runs` row +
-   `docs/QA-VERDICT.json` (the gate artifact), reusing `qa_run._persist_run`/`write_verdict`. Remaining: (i)
-   also write the evidence dir + COVERAGE.md + file still-open findings via `findings.py` (reuse
-   `qa_run._file_open_bugs`); (ii) add `qa_run(agentic=True)` that calls `run_agentic_qa`; (iii) run BOTH
-   paths against the LIVE console and confirm the agentic verdict/artifacts match the procedural loop; (iv)
-   then flip the default. Until (iii) passes, `qa_run.py` (procedural) stays the default.
+3. **Phase 6 — parity + flip the default.** ✅ 6a (`5f88a50`): agentic run persists a `qa_runs` row +
+   `docs/QA-VERDICT.json`. ✅ 6b (`f9ea7d3`): `qa_run(agentic=True)` opt-in entrypoint (procedural still
+   default). Remaining: (i) agentic run also writes the evidence dir + COVERAGE.md + files still-open findings
+   via `findings.py` (reuse `qa_run._file_open_bugs`); (iii) **run BOTH paths against the LIVE console**
+   (`.venv/bin/python -c "import sys;sys.path[:0]=['scripts','scripts/qa'];import qa_run;qa_run.qa_run(<live
+   console args>, agentic=True)"`) and confirm the agentic verdict/artifacts match the procedural loop; (iv)
+   then flip the default. **This live parity run is the key validation Codex should do** — everything up to it
+   is offline-tested. Until (iii) passes, `qa_run.py` (procedural) stays the default.
 3. **Phase 5 — agentic entrypoint.** `qa_run(..., agentic=True)` creates the QA org: `create_org(tenant,
    vision)` → the controller/plan spawns a qa-coordinator whose memory.context carries
    {vision, target_url, token, org, product, stories (from story_gen), artifact_dir, repo, restart_cmd,

@@ -18,7 +18,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path.home() / "projects" / "agent-os"
+# Derive the repo root from THIS file's location (scripts/security_scan.py -> repo root), NOT a hardcoded
+# ~/projects/agent-os. CI checks the repo out to $GITHUB_WORKSPACE (e.g. /home/runner/work/agent-os/agent-os),
+# where the hardcoded path doesn't exist — scan_sandbox's factory.py read then threw FileNotFoundError and the
+# whole scan crashed (exit 1). __file__-relative works both locally and in CI.
+ROOT = Path(__file__).resolve().parents[1]
 CODE_GLOBS = ["scripts/**/*.py", "scripts/*.sh", "platform/**/*.py", "platform/*.sh", "*.sh"]
 SECRET_RE = re.compile(r"""(?i)\b(api[_-]?key|secret|token|password|passwd)\b\s*[:=]\s*['"][A-Za-z0-9_\-/+]{16,}['"]""")
 BIND_RE = re.compile(r"""['"]0\.0\.0\.0['"]""")  # only an actual quoted bind address, not a comment

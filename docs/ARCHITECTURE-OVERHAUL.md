@@ -128,8 +128,20 @@ available under subscription/OAuth auth, so subscription tool-work stays on the 
   crash-resume idempotency (build stage-skip via `_stage_done`, research reconciled vs `research_runs`) means a
   worker death still resumes from the checkpoint. *To turn on in production:* set `AOS_DISPATCH_PARK=1` and
   validate on a live multi-hour build (kill the driver mid-stage; the parked worker completes independently).
-- [ ] Step 4 — consolidate engine
-- [ ] Step 5 — delete hand-rolled durability
+- [~] **Step 4 — RE-SCOPED (mostly obsolete).** The plan assumed we'd *replace* loopcontroller's durability
+  with the orchestra engine. We instead **repaired it in place** (Steps 1–3), and the three bugs that made it
+  "inferior" — F8, the double-driver race, G1 — are now fixed and tested. So there is no correctness reason to
+  migrate the CEO pipeline onto orchestra. Two engines still coexist (research → orchestra; build → loopcontroller),
+  and consolidating to one would be *tidier*, but it's an elegance win, not a bug — not worth a big risky rewrite.
+  The only real remaining consolidation is internal to loopcontroller (below).
+- [~] **Step 5 — RE-SCOPED (no wholesale deletion).** Deleting loopcontroller's durability only made sense when
+  it was the broken layer you'd migrate *off*; now it's a correct, single-owner, crash-durable engine, so there's
+  nothing to delete-and-replace. What genuinely remains is **small**: once dispatch-and-park is validated on real
+  builds and made the default, the redundant **in-process daemon path** becomes deletable (one execution mode
+  instead of two). That's a minor cleanup gated on the live validation — NOT a re-architecture.
+
+**Net:** the overhaul's *goal* (a correct, durable, single-owner CEO execution engine) is **achieved by
+repair**, not by the originally-planned replace-and-delete. Steps 4–5 as first written are superseded.
 
 Sources: Temporal (activity-timeouts, detecting-activity-failures, task-queue, async-completion, durable-AI-agent),
 DBOS (architecture, making-postgres-queues-scale), AWS Step Functions (HeartbeatSeconds vs TimeoutSeconds),

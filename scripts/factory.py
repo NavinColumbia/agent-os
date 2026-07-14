@@ -579,6 +579,12 @@ def _codex_fallback_env():
                 cenv["OPENAI_API_KEY"] = r.get("key") or ""
             return cenv, f"tenant-openai-{r.get('auth_mode') or 'unknown'}"
         return None, "tenant-has-no-codex"
+    # A BYO-key run (tenant paying with their OWN Anthropic key, set on _ctx.api_key even without a full
+    # tenant record) must NEVER fall over to platform-funded Codex: that would silently bill the platform
+    # for the tenant's outage AND override their explicit choice of Anthropic. Only an explicit codex_key or
+    # their own connected Codex provider (both handled above) qualifies — otherwise escalate, don't failover.
+    if getattr(_ctx, "api_key", None):
+        return None, "byo-key-no-platform-failover"
     return cenv, "platform-codex"
 
 
@@ -1376,6 +1382,8 @@ def run_js_tests(repo: str) -> tuple[bool, str]:
     ok, out = _exec_tests(repo, f"cd {shlex.quote(str(repo))} && {cmds}", action="JsTests")
     audit.append(actor="factory:qa-security", action="JsTests", resource=root.name,
                  decision="executed", payload={"files": len(files), "ok": ok})
+    if not ok:   # make the gate verdict unambiguous — the raw node stderr says "AssertionError", not "FAIL"
+        out = f"FAIL: {len(files)} functional test file(s) executed; at least one failed.\n{out}"
     return ok, out
 
 

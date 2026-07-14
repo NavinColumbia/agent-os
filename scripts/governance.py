@@ -39,7 +39,23 @@ ROLES = Path.home() / "projects" / "control-plane" / "roles"
 _HOOKS = Path.home() / "projects" / "control-plane" / "hooks"
 if str(_HOOKS) not in sys.path:
     sys.path.insert(0, str(_HOOKS))
-import manifest_policy
+try:
+    import manifest_policy
+except ModuleNotFoundError:
+    # control-plane is a SEPARATE repo. In production it is always checked out at
+    # ~/projects/control-plane so this import succeeds and behavior is unchanged. In CI
+    # (agent-os checked out alone) it is absent — importing governance/factory must still
+    # succeed so unrelated unit tests can run, but any code path that ACTUALLY derives a
+    # policy decision must FAIL LOUD, never silently allow. This stub does exactly that:
+    # import is fine; attribute access (a real policy decision) raises. (Fail-closed.)
+    class _MissingManifestPolicy:
+        def __getattr__(self, name):
+            raise RuntimeError(
+                "manifest_policy unavailable (control-plane repo not present). Policy "
+                f"decisions ({name}) cannot be made — refusing to proceed. This is expected "
+                "only in agent-os-only CI, where policy enforcement is not exercised."
+            )
+    manifest_policy = _MissingManifestPolicy()
 
 # capability name (as used by may/enforce) -> the manifest flag that grants it.
 _CAP_FLAG = {

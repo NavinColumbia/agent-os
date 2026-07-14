@@ -23,7 +23,15 @@ jobs:
       - name: deps
         run: python -m venv .venv && .venv/bin/pip install -q -r requirements.txt pytest
       - name: config
-        run: echo "DATABASE_URL=postgresql://agentos:ci@127.0.0.1:5433/agentos" > .env.local
+        # The ~85 modules that read DATABASE_URL resolve .env.local from ~/projects/agent-os/.env.local
+        # (the real production location — correct there, only "wrong" in CI where the checkout lives
+        # under $GITHUB_WORKSPACE). Write the config to BOTH the home path the code expects and the
+        # repo root, so both hardcoded-home and __file__-relative readers find it. No code change needed.
+        run: |
+          URL="postgresql://agentos:ci@127.0.0.1:5433/agentos"
+          echo "DATABASE_URL=$URL" > .env.local
+          mkdir -p "$HOME/projects/agent-os"
+          echo "DATABASE_URL=$URL" > "$HOME/projects/agent-os/.env.local"
       - name: migrations
         run: |
           for f in postgres/initdb/*.sql; do

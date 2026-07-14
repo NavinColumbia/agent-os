@@ -335,6 +335,13 @@ def _parse_block(text, tag):
 def _phase_fn(thread_id, kind):
     if kind == "__selftest__":            # trivial, side-effect-free phase used ONLY by _park_selftest
         return lambda: {"ok": True, "parked_selftest": True}
+    if kind == "__selftest_slow__":       # ~4s of "work" so the crash harness can kill the driver mid-phase
+
+        def _slow():
+            import time
+            time.sleep(4)
+            return {"ok": True, "parked_selftest": True}
+        return _slow
     s = _st(thread_id)
     tid = s["tenant_id"]
     if kind == "research":
@@ -2292,15 +2299,85 @@ def _main(a):
     elif a[0] == "run_job" and len(a) > 3:
         # dispatch-and-park worker entrypoint: run_job <thread_id> <kind> <jid>
         print(json.dumps(run_job(int(a[1]), a[2], int(a[3]))))
+    elif a[0] == "_park_crash_driver" and len(a) > 1:
+        _park_crash_driver(int(a[1]))       # test-only helper spawned by parkcrash
     elif a[0] == "watchdog":
         print(json.dumps(sla_watchdog()))
     elif a[0] == "liveness":
         sys.exit(liveness_selftest())
     elif a[0] == "parktest":
         sys.exit(_park_selftest())
+    elif a[0] == "parkcrash":
+        sys.exit(_park_crash_selftest())
     else:
         sys.exit("usage: loopcontroller.py "
                  "start|say|choose|state|research|live|cancel|resume|run_job|watchdog|liveness|parktest|selftest ...")
+
+
+def _park_crash_driver(thread_id):
+    """Test-only driver: create a SLOW parked job, launch its DETACHED worker, print the job id, then idle so
+    the harness can hard-KILL this process mid-phase and prove the worker outlives it."""
+    import time
+    _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, awaiting, updated_at)
+                       VALUES (%s,1,1,'__PARKTEST__','fleet', now())
+                       ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting='fleet'""", (thread_id,))
+        cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, status, heartbeat_at)
+                       VALUES (%s,1,'__PARKTEST__','__selftest_slow__','running', now()) RETURNING id""", (thread_id,))
+        jid = cur.fetchone()[0]; c.commit()
+    _spawn_parked_worker(thread_id, "__selftest_slow__", jid)
+    print(f"DRIVER_UP jid={jid}", flush=True)
+    time.sleep(3600)                       # idle until the harness kills us
+
+
+def _park_crash_selftest():
+    """Prove G1 is RETIRED: a driver that hard-CRASHES right after dispatching a parked phase does NOT take the
+    worker down — the detached worker (its own session) finishes the job on its own. This is the validation that
+    unlocks overhaul Steps 4-5. Uses a fake ~4s phase so there's a window to kill the driver mid-run; no claude."""
+    import time
+    _ensure()
+    tid = 950000 + int(os.urandom(2).hex(), 16) % 1000
+    driver = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "_park_crash_driver", str(tid)],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+    def _status(jid):
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT status FROM controller_jobs WHERE id=%s", (jid,))
+            r = cur.fetchone()
+            return r[0] if r else None
+
+    ok = True
+    try:
+        jid, deadline = None, time.time() + 15
+        while time.time() < deadline:
+            line = driver.stdout.readline()
+            if line.startswith("DRIVER_UP"):
+                jid = int(line.strip().split("jid=")[1]); break
+        assert jid, "driver failed to dispatch the parked job"
+        assert _status(jid) == "running", "worker should still be mid-phase when we crash the driver"
+        driver.kill(); driver.wait(timeout=5)                 # HARD-CRASH the driver mid-phase
+        print(f"PASS: driver (pid {driver.pid}) hard-killed while the phase was still running")
+        st, deadline = _status(jid), time.time() + 20
+        while time.time() < deadline and st != "done":
+            time.sleep(0.5); st = _status(jid)
+        assert st == "done", f"parked worker did NOT survive the driver crash (job status={st})"
+        print("PASS: the detached worker SURVIVED the driver crash and finished the job — G1 retired ✅")
+        print("park_crash_selftest: PASS")
+    except (AssertionError, Exception) as e:
+        ok = False
+        print(f"park_crash_selftest: FAIL — {type(e).__name__}: {e}")
+    finally:
+        try:
+            driver.kill()
+        except Exception:
+            pass
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid,))
+            cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid,))
+            c.commit()
+    return 0 if ok else 1
 
 
 def _park_selftest():

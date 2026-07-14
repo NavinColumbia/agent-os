@@ -662,3 +662,12 @@ def test_dispatch_and_park_worker_finishes_without_advancing():
             cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid,))
             cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid,))
             c.commit()
+
+
+def test_g1_retired_parked_worker_survives_driver_crash():
+    """The core dispatch-and-park guarantee: a driver process that hard-CRASHES (SIGKILL) right after
+    dispatching a parked phase does NOT take the worker down — the detached worker finishes on its own.
+    This is what retires G1. Reuses the proven crash harness (spawns a real driver + detached worker, no
+    claude); generous deadlines keep it non-flaky in CI."""
+    import loopcontroller as lc
+    assert lc._park_crash_selftest() == 0, "parked worker must survive a driver crash (see printed reason)"

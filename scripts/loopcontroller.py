@@ -336,6 +336,14 @@ def _dispatch(thread_id, kind, fn, eta_min=None, kickoff=None, status=None):
     if eta_min is None:
         eta_min = _estimate_runtime(s["phase"], s.get("plan"))
     with psycopg.connect(DB) as c, c.cursor() as cur:
+        # SINGLE-WRITER AT DISPATCH (overhaul Step 2, defense-in-depth): never create a SECOND running job for a
+        # thread that already has one in flight. In normal flow the awaiting='fleet' gate + the per-thread drive
+        # lock already serialize phases, so this is inert; it exists so a duplicate dispatch that somehow slips
+        # through (a racing driver, a double advance) can't double-RUN the phase. Dead 'running' rows are flipped
+        # to 'failed' by _reap_dead_jobs BEFORE any re-dispatch, so this never wedges a legitimately-crashed job.
+        cur.execute("SELECT id FROM controller_jobs WHERE thread_id=%s AND status='running' LIMIT 1", (thread_id,))
+        if cur.fetchone():
+            return None                              # already an in-flight job for this thread — don't double-run
         cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, heartbeat_at)
                        VALUES (%s,%s,%s,%s, now()) RETURNING id""", (thread_id, s["tenant_id"], s["phase"], kind))
         jid = cur.fetchone()[0]; c.commit()

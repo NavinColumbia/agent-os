@@ -111,10 +111,17 @@ available under subscription/OAuth auth, so subscription tool-work stays on the 
   so two sweepers (or a sweep racing jobd) can never double-advance one build. Sweepers additionally re-check the
   latest job status UNDER the lock (and research reconciles gate on the claim UPDATE's rowcount) so a stale
   pre-lock read can't re-advance. Proven by `test_thread_drive_lock_enforces_single_owner` + the jobd selftest.
-  Fail-open on a lock-infra hiccup (never wedges progress). *Remaining for full Step 2:* physically demote
-  jobd/scheduler/resume-sweeper to pure enqueuers (strip their direct build-row writes) — the lock already
-  enforces the single-writer SAFETY property that was the actual bug.
-- [ ] Step 3 — phases as dispatch-and-park activities
+  Fail-open on a lock-infra hiccup (never wedges progress). Single-writer is now enforced at BOTH chokepoints:
+  the **advance** path (the lock) AND the **dispatch** path — `_dispatch` refuses to create a second running
+  job for a thread that already has one in flight (`test_dispatch_wont_double_run_an_in_flight_thread`), so a
+  duplicate dispatch can't double-RUN a phase. *Remaining for full Step 2:* physically demote
+  jobd/scheduler/resume-sweeper to pure enqueuers (strip their direct build-row writes) — the two guards
+  already enforce the single-writer SAFETY property that was the actual bug.
+- [~] **Step 3 (partial)** — crash-resume idempotency already holds for BUILD: `build_product` skips any
+  component stage already recorded done (`factory._stage_done`), so a re-dispatch after a process death RESUMES
+  from the checkpoint instead of restarting; RESEARCH reconciles against `research_runs`. *Remaining:* true
+  dispatch-and-park (release the worker thread while `claude` runs, resume on an exit hook) so a phase survives
+  process exit without relying on re-dispatch — retires G1 fully.
 - [ ] Step 4 — consolidate engine
 - [ ] Step 5 — delete hand-rolled durability
 

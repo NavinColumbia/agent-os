@@ -596,3 +596,35 @@ def test_estimate_runtime_is_spawn_free_by_default(monkeypatch):
     assert 2 <= mins <= 60 and 0 <= rets <= 3, f"budget out of bounds: {mins},{rets}"
     short_mins, _ = factory._estimate_runtime("controller", "hi", None)
     assert short_mins <= mins, "a tiny chat task must not budget more time than a big build task"
+
+
+def test_dispatch_wont_double_run_an_in_flight_thread():
+    """Single-writer at dispatch (Step 2): _dispatch must not create a SECOND running job — nor start the
+    phase fn — for a thread that already has one in flight. Guards against a duplicate dispatch double-running
+    a phase even if a racing driver slipped past the advance lock."""
+    import psycopg
+    import loopcontroller as lc
+    tid = 970000 + int(_rid(), 16) % 1000
+    try:
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, awaiting, updated_at)
+                           VALUES (%s, 1, 1, 'IMPLEMENT', NULL, now())
+                           ON CONFLICT (thread_id) DO UPDATE SET phase='IMPLEMENT', awaiting=NULL""", (tid,))
+            cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, status, heartbeat_at)
+                           VALUES (%s, 1, 'IMPLEMENT', 'build', 'running', now())""", (tid,))
+            c.commit()
+        called = {"n": 0}
+        res = lc._dispatch(tid, "build", lambda: called.__setitem__("n", called["n"] + 1) or {"ok": True})
+        assert res is None, "guard must skip (return None) when a job is already in flight"
+        import time
+        time.sleep(0.3)                                    # if it wrongly started _work, catch it
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("SELECT count(*) FROM controller_jobs WHERE thread_id=%s", (tid,))
+            n = cur.fetchone()[0]
+        assert n == 1, f"guard must not create a second job (found {n})"
+        assert called["n"] == 0, "the phase fn must not run while a job is already in flight"
+    finally:
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid,))
+            cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid,))
+            c.commit()

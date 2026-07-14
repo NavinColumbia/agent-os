@@ -604,6 +604,7 @@ def test_dispatch_wont_double_run_an_in_flight_thread():
     a phase even if a racing driver slipped past the advance lock."""
     import psycopg
     import loopcontroller as lc
+    lc._ensure()                                           # create controller_state/controller_jobs (fresh CI DB)
     tid = 970000 + int(_rid(), 16) % 1000
     try:
         with psycopg.connect(lc.DB) as c, c.cursor() as cur:

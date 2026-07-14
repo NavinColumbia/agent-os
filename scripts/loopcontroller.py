@@ -430,10 +430,12 @@ def _rebuild_ctx(thread_id):
     return s
 
 
-# DISPATCH-AND-PARK master switch (overhaul Step 3). Default OFF: phase work runs in an in-process daemon
-# thread (the proven path). ON (AOS_DISPATCH_PARK=1): each phase runs in a DETACHED worker process that
-# survives THIS process's death — retiring G1 — while the poller (resume_stalled/jobd) advances on completion.
-_PARK = bool(os.environ.get("AOS_DISPATCH_PARK"))
+# DISPATCH-AND-PARK master switch (overhaul Step 3). DEFAULT ON: each phase runs in a DETACHED worker process
+# that survives THIS process's death — retiring G1 — while the poller (resume_stalled/jobd) advances on
+# completion. De-risked: mechanics proven (parkcrash), billing-context rebuild proven (_rebuild_ctx test),
+# worker death self-heals (crash-resume), and a launch failure FALLS BACK to the in-process path. Instant
+# rollback to the pure in-process engine: AOS_DISPATCH_PARK=0.
+_PARK = os.environ.get("AOS_DISPATCH_PARK", "1") not in ("0", "false", "no", "")
 
 
 def _start_heartbeat(jid):

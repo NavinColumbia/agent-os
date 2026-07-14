@@ -1,8 +1,21 @@
 # Dispatch-and-park — live validation runbook
 
 Dispatch-and-park (overhaul Step 3) runs each phase in a **detached worker process** that survives the
-driver's death (retires G1). It ships behind `AOS_DISPATCH_PARK` (default **off**). The mechanics are proven
-offline; this runbook validates it on a **real build** before you make it the default and unlock Steps 4–5.
+driver's death (retires G1). It is now the **default** engine (`AOS_DISPATCH_PARK=1`); instant rollback to the
+pure in-process path is `AOS_DISPATCH_PARK=0`. The mechanics + billing-context rebuild are proven offline
+(`parkcrash`, unit tests); this runbook is how you confirm it on your first **real build** and, if anything
+looks off, roll back.
+
+## One-command end-to-end demo
+The fastest way to see the whole thing run (park on by default):
+```
+.venv/bin/python scripts/demo_e2e.py --dry-run                 # validate the driver, no spend
+.venv/bin/python scripts/demo_e2e.py "a Calendly competitor for dog groomers"   # REAL run (spends)
+```
+It plays the CEO — states the product, auto-answers clarifications, picks the recommended research direction,
+approves the plan — and streams live progress phase-by-phase until DELIVER. Needs a model provider connected
+for the tenant (`AOS_DEMO_TENANT`, default `demo`), exactly like the console. Watch parked workers alongside
+it with `parkstatus` (below).
 
 ## 0. Mechanics check (no spend, ~10s)
 ```
@@ -12,13 +25,10 @@ Expect `park_crash_selftest: PASS` — a driver is SIGKILL'd mid-phase and the d
 This proves the machinery without touching claude. (Also runs in CI:
 `test_g1_retired_parked_worker_survives_driver_crash`.)
 
-## 1. Turn park mode on
-Set it in the environment the fleet actually runs in (the daemon's env / your shell before starting jobd):
-```
-export AOS_DISPATCH_PARK=1
-```
-Everything is backward-compatible: off = the proven in-process daemon path; on = detached workers. Launch
-failure auto-falls-back to in-process, so turning it on can't strand a build.
+## 1. Park mode is already on (default)
+Nothing to do — `AOS_DISPATCH_PARK` defaults to `1`. To A/B against the old engine, set `AOS_DISPATCH_PARK=0`
+in the fleet's environment and restart. Launch failure auto-falls-back to in-process, so park can't strand a
+build.
 
 ## 2. Start a small real build
 Drive the normal flow (controller `start` → `say "<a tiny product>"` → approve the plan). Keep it small so

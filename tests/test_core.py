@@ -664,6 +664,27 @@ def test_dispatch_and_park_worker_finishes_without_advancing():
             c.commit()
 
 
+def test_demo_e2e_driver_navigates_every_gate_to_deliver():
+    """The end-to-end demo harness must play the CEO correctly: choose a research option, clear both approval
+    gates, and ride the fleet phases through to DELIVER. Validated against an in-memory controller (no spend)
+    so a regression in the auto-CEO drive logic is caught in CI."""
+    import demo_e2e
+    sim = demo_e2e._SimController()
+    events = []
+    r = demo_e2e.drive(sim, "sim", 1, "a demo product", poll_s=0, max_min=1, on_event=events.append)
+    phases = [e["phase"] for e in events if e.get("event") == "state"]
+    assert r.get("ok") and r.get("phase") == "DELIVER", f"driver must reach DELIVER: {r}"
+    assert sim.saw_choose, "driver must choose a research option at OPTIONS"
+    assert sim.gate_actions >= 2, "driver must clear the approval gates"
+    assert "OPTIONS" in phases and "IMPLEMENT" in phases, f"must traverse the pipeline: {phases}"
+
+
+def test_dispatch_and_park_defaults_on():
+    """Park mode is now the default execution engine (de-risked; instant rollback via AOS_DISPATCH_PARK=0)."""
+    import loopcontroller as lc
+    assert lc._PARK is True, "dispatch-and-park should default ON"
+
+
 def test_rebuild_ctx_restores_billing_context_in_a_fresh_process(monkeypatch):
     """The one thing a DETACHED park worker must get right (the risk I flagged): rebuild factory._ctx — tenant,
     org, product, and the resolved provider's engine+key — from the thread's persisted state alone, so model

@@ -33,6 +33,8 @@ jobs:
           {
             echo "DATABASE_URL=postgresql://agentos:ci@127.0.0.1:5433/agentos"
             echo "AUDIT_HMAC_KEY=ci-nonsecret-hmac-key-for-tests-only"
+            # a VALID (throwaway) Fernet key — vault.py builds a Fernet at import; not a real secret
+            echo "VAULT_KEY=IAZ_eBnbMuj1a81QY1p-ebrjG2ZuEyM1FUJLOneibiE="
           } > .env.local
       - name: migrations
         run: |

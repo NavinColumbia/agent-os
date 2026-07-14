@@ -21,9 +21,7 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
 
-_ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-_DB = next((l.split("=", 1)[1].strip() for l in _ENV.read_text().splitlines()
-            if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV as _ENV, DB as _DB
 STATUSES = ("asked", "in_progress", "blocked", "done")
 
 _DDL = """

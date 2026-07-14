@@ -21,7 +21,7 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import appregistry as ar  # noqa: E402
 
-VENV_PY = str(Path.home() / "projects" / "agent-os" / ".venv" / "bin" / "python")
+from aoscfg import VENV_PY
 PRODUCTS = ar.PRODUCTS
 BASE_PORT = 8810
 

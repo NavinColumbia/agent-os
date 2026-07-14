@@ -28,9 +28,7 @@ import audit            # noqa: E402
 import consent          # noqa: E402
 import tenantproviders  # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 FRAMING = (
     "Welcome, CEO — you're now running a small company of AI agents, and they're ready to build for you. "

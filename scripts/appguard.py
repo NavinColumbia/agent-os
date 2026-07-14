@@ -25,9 +25,7 @@ sys.path.insert(0, str(SCRIPTS))
 import audit   # noqa: E402
 import notify  # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 PRODUCTS = Path.home() / "projects" / "products"
 RATE_PER_1K = 0.003   # $/1k tokens — operating-spend proxy
 # Liberal by default (backstops must not be conservative): a from-scratch full-stack Opus build (build + multi-

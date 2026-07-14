@@ -23,9 +23,7 @@ sys.path.insert(0, str(SCRIPTS))
 import audit    # noqa: E402
 import factory  # noqa: E402  (factory.PRODUCTS = the products dir)
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 VSTORE = factory.PRODUCTS.parent / "_versions"   # where snapshot tar.gz files live
 SKIP = {".git", "__pycache__", "node_modules"}   # never snapshot these

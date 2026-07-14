@@ -21,7 +21,7 @@ from urllib.parse import urlparse, parse_qs
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
+from aoscfg import ENV
 
 
 def _load_cfg(path):

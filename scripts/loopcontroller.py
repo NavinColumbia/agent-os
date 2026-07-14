@@ -36,9 +36,7 @@ import audit         # noqa: E402
 import factory       # noqa: E402
 import orchestrator  # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 PHASES = ["DISCOVER", "RESEARCH", "OPTIONS", "DEEP_DESIGN", "PLAN_APPROVAL",
           "PROTOTYPE", "IMPLEMENT", "TESTQA", "DELIVER"]

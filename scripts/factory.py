@@ -31,9 +31,7 @@ import audit  # noqa: E402
 import governance  # noqa: E402  — central spawn/write/action enforcement (reads the role manifests)
 import killswitch  # noqa: E402
 
-_ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-_DB = next((l.split("=", 1)[1].strip() for l in _ENV.read_text().splitlines()
-            if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV as _ENV, DB as _DB
 
 
 import threading
@@ -86,7 +84,7 @@ def _log_comm(cid, sender, recipient, intent, content):
 
 ROLES = Path.home() / "projects" / "control-plane" / "roles"
 PRODUCTS = Path.home() / "projects" / "products"
-VENV_PY = str(Path.home() / "projects" / "agent-os" / ".venv" / "bin" / "python")
+from aoscfg import VENV_PY
 MAX_FIX = 3  # bounded QA->BUILD re-flow attempts
 MAX_REVIEW = int(os.environ.get("AOS_MAX_REVIEW", "1"))  # bounded REVIEW->BUILD->re-QA->re-review cycles
 # Global backpressure: no matter how many builds run concurrently, total live agent subprocesses are

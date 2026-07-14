@@ -27,9 +27,7 @@ import billing        # noqa: E402
 import vault          # noqa: E402
 import notifications  # noqa: E402  (reuse its notification_prefs table + _ensure)
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 # the notification categories surfaced on the settings screen (mirrors notifications.py taxonomy)
 PREF_CATEGORIES = ("build", "billing", "changelog", "incident", "security")

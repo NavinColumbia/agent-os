@@ -29,9 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 import appregistry  # noqa: E402
 import audit        # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 TIMEOUT = 2.0
 # only these hosts are probed — never crawl arbitrary external hosts

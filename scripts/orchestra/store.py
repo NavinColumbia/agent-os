@@ -50,9 +50,7 @@ try:                          # the factory kill-switch gates creation of new du
 except Exception:             # pragma: no cover — store must not brick if gates are absent
     killswitch = None
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 MIGRATION = REPO / "postgres" / "initdb" / "50-orchestra.sql"
 

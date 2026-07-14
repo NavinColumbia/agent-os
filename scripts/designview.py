@@ -23,7 +23,7 @@ sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
 
 DB = next((l.split("=", 1)[1].strip()
-           for l in (Path.home() / "projects" / "agent-os" / ".env.local").read_text().splitlines()
+           for l in __import__("aoscfg").ENV.read_text().splitlines()
            if l.strip().startswith("DATABASE_URL=")), None)
 
 STATUSES = ("draft", "review", "approved")

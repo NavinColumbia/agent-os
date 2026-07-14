@@ -30,9 +30,7 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402  (kept consistent with sibling scripts; available for future use)
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 # Sensible point-estimate fallbacks when there's no history for a kind: (cost_usd, minutes, tokens).
 # NOTE: `research` is a first-class kind — a research run is a real, priced job (a fleet of ~6-8 parallel web

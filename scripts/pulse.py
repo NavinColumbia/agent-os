@@ -32,9 +32,7 @@ from pathlib import Path
 
 import psycopg
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None) if ENV.exists() else None
+from aoscfg import ENV, DB
 
 # A pulse is "stalled" once it has been silent for cadence * STALL_MULT. The multiplier tolerates one or two
 # slow beats (a heavy model call) before crying stall — silence, not slowness, is the failure signal.

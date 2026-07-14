@@ -33,9 +33,7 @@ import audit     # noqa: E402
 import verify    # noqa: E402
 import improve   # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 # Score weights: tests are the floor (does it even work?), security and independent verification split the
 # rest. The score is a continuous quality signal for the learning store; the BAR is the hard ship gate.

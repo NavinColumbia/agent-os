@@ -23,14 +23,9 @@ jobs:
       - name: deps
         run: python -m venv .venv && .venv/bin/pip install -q -r requirements.txt pytest
       - name: config
-        # The codebase assumes its real production layout: ~/projects/agent-os/{.env.local,.venv,scripts,...}
-        # (~85 modules read .env.local, factory/devserve exec ~/projects/agent-os/.venv/bin/python). Those
-        # hardcodes are CORRECT in production and only "wrong" in CI, where the checkout lives under
-        # $GITHUB_WORKSPACE. Instead of sweep-editing dozens of files, symlink the expected home path to the
-        # checkout so EVERY hardcoded ~/projects/agent-os/... path resolves at once. No production code touched.
+        # aoscfg.py resolves .env.local and the venv relative to the repo root (falling back to the prod
+        # home path), so a plain repo-root .env.local is all CI needs — no symlink, no home-path duplication.
         run: |
-          mkdir -p "$HOME/projects"
-          ln -sfn "$GITHUB_WORKSPACE" "$HOME/projects/agent-os"
           {
             echo "DATABASE_URL=postgresql://agentos:ci@127.0.0.1:5433/agentos"
             echo "AUDIT_HMAC_KEY=ci-nonsecret-hmac-key-for-tests-only"

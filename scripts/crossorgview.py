@@ -32,9 +32,7 @@ sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402,F401  (convention parity with the other surfaces)
 import orgs   # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 # A ProductComplete with one of these decisions is a SHIPPED build; everything else is a failure.
 SUCCESS_DECISIONS = ("LAUNCHED", "INTEGRATED")

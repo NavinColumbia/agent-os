@@ -19,7 +19,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from secret_filter import looks_like_secret  # noqa: E402
 
-ENV_LOCAL = Path.home() / "projects" / "agent-os" / ".env.local"
+from aoscfg import ENV as ENV_LOCAL
 
 
 def load_env():

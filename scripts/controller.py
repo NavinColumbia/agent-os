@@ -40,9 +40,7 @@ import cerbos_check     # noqa: E402
 import governance       # noqa: E402  — the PDP-of-record's role-manifest reader (same as factory/loopcontroller)
 import gate_check       # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 STAGES = ["SPEC", "BUILD", "QA", "REVIEW", "LAUNCH"]
 PRODUCTS = Path.home() / "projects" / "products"

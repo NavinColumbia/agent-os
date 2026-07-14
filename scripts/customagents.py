@@ -42,15 +42,13 @@ import sanitize          # noqa: E402
 import scheduler         # noqa: E402
 import tenantproviders   # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 # Only GOVERNED roles a tenant may stand up — each has a manifest (must_never / allowed_paths) that
 # constrains the agent. A tenant can NOT invent a role or pick a privileged one (builder/tech-lead/etc.).
 ALLOWED_ROLES = ("research-growth", "marketing-growth", "technical-writer", "data-analyst")
 
-VENV_PY = str(Path.home() / "projects" / "agent-os" / ".venv" / "bin" / "python")
+from aoscfg import VENV_PY
 
 
 def _ensure():

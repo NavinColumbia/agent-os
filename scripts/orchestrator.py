@@ -32,9 +32,7 @@ import factory     # noqa: E402
 import frontdoor   # noqa: E402
 import governance  # noqa: E402  (read side of the role manifest: enforce()/may())
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 SYS = (
     "You are the ORCHESTRATOR for a non-technical CEO who directs a company of AI agents that build and "

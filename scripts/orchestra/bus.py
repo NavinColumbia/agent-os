@@ -38,7 +38,7 @@ import psycopg
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # --- DB wiring (same convention as orchestrator.py / commfabric.py) ----------------------------------------
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
+from aoscfg import ENV
 try:
     DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
                if l.strip().startswith("DATABASE_URL=")), None)

@@ -31,9 +31,7 @@ sys.path.insert(0, str(SCRIPTS / "orchestra"))
 import audit  # noqa: E402  (audit-trail the org reads, same convention as the other surfaces)
 import store  # noqa: E402  (the durable org: real hired agents with identity/tenure/heartbeats)
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 ACTIVE_WINDOW = "15 minutes"
 
 # The static org chart of the AI-agent company: a controller at top, functional leads/specialists

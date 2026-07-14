@@ -55,7 +55,7 @@ MAX_ROUNDS = int(os.environ.get("AOS_STORY_MAX_ROUNDS", "4"))   # bounded satura
 CATEGORIES = ("happy", "edge", "empty", "error", "denied", "abuse", "latency", "a11y")
 
 # ── Postgres (same resolution pattern as findings.py, but tolerant of a missing .env.local) ─────────
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
+from aoscfg import ENV
 
 
 def _dsn():

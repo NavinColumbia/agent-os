@@ -20,7 +20,7 @@ from pathlib import Path
 
 import requests
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
+from aoscfg import ENV
 
 # Known OpenAI-compatible endpoints (users still bring their own key).
 KNOWN = {

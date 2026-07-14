@@ -24,9 +24,7 @@ sys.path.insert(0, str(SCRIPTS))
 import audit     # noqa: E402
 import appguard  # noqa: E402  — enforcement layer; we register the cap with it if it has a setter
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 
 def _ensure():

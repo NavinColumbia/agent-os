@@ -24,9 +24,7 @@ import audit          # noqa: E402
 import billing        # noqa: E402
 import notifications  # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 WINDOW_DAYS = 30          # the billing/projection window
 THRESHOLDS = [80, 100]    # pre-emptive alert points (% of projected-vs-quota)
 

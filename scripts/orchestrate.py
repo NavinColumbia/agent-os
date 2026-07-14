@@ -35,9 +35,7 @@ sys.path.insert(0, str(SCRIPTS))
 import directory   # noqa: E402
 import governance  # noqa: E402  (the read side of the governance manifest: may()/enforce())
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 ROLES_DIR = Path.home() / "projects" / "control-plane" / "roles"
 OVERLOAD = 3   # an agent with this many pending tasks is considered overloaded
 

@@ -39,9 +39,7 @@ def orchestra_on():
     AOS_ORCHESTRA=0 to fall back to the legacy in-process research_fleet path."""
     return os.environ.get("AOS_ORCHESTRA", "1").strip().lower() not in ("0", "false", "off", "no")
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 
 def _ensure():

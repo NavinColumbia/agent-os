@@ -85,9 +85,7 @@ STORY_GEN_ATTEMPTS = int(os.environ.get("AOS_QA_STORYGEN_ATTEMPTS", "3"))
 # verdict facts stay honest — stories>0 must still be REAL explored stories for the gate to pass.
 MAX_STORIES = int(os.environ.get("AOS_QA_MAX_STORIES", "0"))
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 
 # ───────────────────────────────────────────────────────────────────────────────────────────────────

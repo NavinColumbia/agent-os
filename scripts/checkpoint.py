@@ -22,7 +22,7 @@ from pathlib import Path
 
 import psycopg
 
-ENV_LOCAL = Path.home() / "projects" / "agent-os" / ".env.local"
+from aoscfg import ENV as ENV_LOCAL
 
 
 def _db_url():

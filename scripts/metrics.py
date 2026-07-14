@@ -13,9 +13,7 @@ from pathlib import Path
 
 import psycopg
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 
 
 def record(event, product=None, task_id=None, from_state=None, to_state=None,

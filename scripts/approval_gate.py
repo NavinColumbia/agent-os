@@ -21,9 +21,7 @@ import psycopg
 from dbos import DBOS, DBOSConfig, SetWorkflowID
 
 SCRIPTS = Path(__file__).resolve().parent
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 WF = Path("/tmp/approval_wf_id")
 TOPIC = "human-approval"
 

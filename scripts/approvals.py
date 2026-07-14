@@ -21,9 +21,7 @@ sys.path.insert(0, str(SCRIPTS))
 import audit    # noqa: E402
 import consent  # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
-DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from aoscfg import ENV, DB
 PRODUCTS = Path.home() / "projects" / "products"
 
 # Optional collaborators — present in this factory, but degrade gracefully if absent.

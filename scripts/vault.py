@@ -25,7 +25,7 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
 
-ENV = Path.home() / "projects" / "agent-os" / ".env.local"
+from aoscfg import ENV
 _cfg = {l.split("=", 1)[0].strip(): l.split("=", 1)[1].strip()
         for l in ENV.read_text().splitlines() if l.strip() and not l.startswith("#") and "=" in l}
 DB = _cfg["DATABASE_URL"]

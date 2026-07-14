@@ -21,6 +21,7 @@ process) — resume_stalled() (run from the scheduler) recovers a killed worker 
     loopcontroller.py selftest
 Run with the agent-os venv python.
 """
+import contextlib
 import json
 import os
 import re
@@ -1262,6 +1263,71 @@ def liveness_selftest():
             cur.execute("DELETE FROM controller_jobs WHERE tenant_id='live-selftest'"); c.commit()
 
 
+# ARCHITECTURE-OVERHAUL Step 2 — SINGLE OWNER PER BUILD. Every path that ADVANCES a thread (jobd's
+# runnable loop, a resume-sweep in ANY process, a live worker completion) first takes this per-thread
+# Postgres advisory lock. At most one driver advances a given thread at a time, so two sweepers — or a
+# sweeper racing jobd — can never double-advance the same build. jobd imports this so the lock NAMESPACE
+# is defined in exactly one place (no drifting magic numbers).
+_DRIVE_LOCK_NS = 841000
+
+
+def _close_quietly(conn):
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _latest_job_status(thread_id):
+    """Status of the thread's most recent controller_job (None if it has none). Used to re-check UNDER the
+    drive lock that a pre-lock read isn't stale — another owner may have advanced the thread and dispatched
+    the next phase (a fresh 'running' job) between our read and our lock acquisition."""
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT status FROM controller_jobs WHERE thread_id=%s ORDER BY id DESC LIMIT 1",
+                        (thread_id,))
+            r = cur.fetchone()
+            return r[0] if r else None
+    except Exception:
+        return None
+
+
+@contextlib.contextmanager
+def thread_drive_lock(thread_id):
+    """Yield True if THIS caller now owns the right to advance `thread_id` (lock acquired), False if another
+    driver already holds it (caller must skip and let the owner proceed). Session-scoped advisory lock held
+    on a dedicated connection for the whole block. FAIL-OPEN (yields True) on a DB hiccup — a lock-server
+    blip must never wedge all forward progress; the terminal-write guards remain the backstop.
+
+    Structured so the generator yields EXACTLY once on every path (setup error, not-owned, owned) and an
+    exception raised inside the caller's block propagates normally after the lock is released."""
+    conn = None
+    got = False
+    try:                                              # SETUP: acquire the lock (fail-open on infra error)
+        conn = psycopg.connect(DB)
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s, %s)", (_DRIVE_LOCK_NS, int(thread_id)))
+            got = cur.fetchone()[0]
+    except Exception:
+        _close_quietly(conn)
+        yield True                                    # lock infra down -> own it ungated rather than stall
+        return
+    if not got:
+        _close_quietly(conn)
+        yield False                                   # another driver owns this thread -> caller skips
+        return
+    try:
+        yield True                                    # we hold the lock — caller drives
+    finally:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(%s, %s)", (_DRIVE_LOCK_NS, int(thread_id)))
+        except Exception:
+            pass                                      # closing the session below drops the lock regardless
+        _close_quietly(conn)
+
+
 def resume_stalled():
     """Crash-recovery sweep (run from the scheduler). Recovers EVERY durable job a killed worker left
     behind on the 'fleet' gate — not just the clean 'done' ones the original query saw (#10):
@@ -1299,27 +1365,34 @@ def resume_stalled():
                            WHERE phase='RESEARCH' AND research_run_id IS NOT NULL""")
             rrows = cur.fetchall()
         for thread_id, rtid, rid, awaiting in rrows:
-            try:
-                rs = _r.run_state(rtid, rid)
-            except Exception:
-                continue
-            rstatus = rs.get("status")
-            if rstatus == "done":
-                jr = {"run_id": rid, "status": "done", "options": rs.get("options", [])}
-            elif rstatus == "failed" and awaiting == "fleet":
-                # Surface the failure once, from the active dispatch gate; don't re-spam a thread already
-                # parked on a feedback gate (the failure was surfaced when it was first parked there).
-                jr = {"run_id": rid, "status": "failed", "error": "research failed"}
-            else:
-                continue                          # still running, or an already-surfaced failure — leave it
-            with psycopg.connect(DB) as c, c.cursor() as cur:
-                cur.execute("""UPDATE controller_jobs SET status=%s, finished_at=COALESCE(finished_at, now())
-                               WHERE thread_id=%s AND kind='research' AND status IN ('running','pending')""",
-                            (rstatus, thread_id))
-                c.commit()
-            _set(thread_id, awaiting=None)
-            advance(thread_id, job_result=jr)     # done -> OPTIONS; failed -> surfaces failure
-            advanced += 1
+            # Step 2 single-owner: hold the per-thread drive lock across the reconcile+advance so a second
+            # sweeper (or jobd's advance loop) can't also advance this thread. Not owned -> the owner has it.
+            with thread_drive_lock(thread_id) as owned:
+                if not owned:
+                    continue
+                try:
+                    rs = _r.run_state(rtid, rid)
+                except Exception:
+                    continue
+                rstatus = rs.get("status")
+                if rstatus == "done":
+                    jr = {"run_id": rid, "status": "done", "options": rs.get("options", [])}
+                elif rstatus == "failed" and awaiting == "fleet":
+                    # Surface the failure once, from the active dispatch gate; don't re-spam a thread already
+                    # parked on a feedback gate (the failure was surfaced when it was first parked there).
+                    jr = {"run_id": rid, "status": "failed", "error": "research failed"}
+                else:
+                    continue                      # still running, or an already-surfaced failure — leave it
+                with psycopg.connect(DB) as c, c.cursor() as cur:
+                    cur.execute("""UPDATE controller_jobs SET status=%s, finished_at=COALESCE(finished_at, now())
+                                   WHERE thread_id=%s AND kind='research' AND status IN ('running','pending')""",
+                                (rstatus, thread_id))
+                    claimed = cur.rowcount; c.commit()
+                if not claimed:
+                    continue                      # a prior owner already reconciled this run — don't re-advance
+                _set(thread_id, awaiting=None)
+                advance(thread_id, job_result=jr)  # done -> OPTIONS; failed -> surfaces failure
+                advanced += 1
     except Exception:
         pass
     _reap_dead_jobs()                       # overhaul Step 1: reap by heartbeat/ceiling, NEVER by output silence
@@ -1335,12 +1408,20 @@ def resume_stalled():
     for thread_id, result, status in rows:
         if status in ("running", "pending"):
             continue                              # newest job still genuinely in flight — leave it alone
-        res = result if isinstance(result, dict) else {}
-        if status == "failed" and not (res.get("error") or res.get("status") == "failed"):
-            res = {**res, "error": "job failed", "status": "failed"}
-        _set(thread_id, awaiting=None)
-        advance(thread_id, job_result=res)        # done -> advances phase; failed -> surfaces failure
-        advanced += 1
+        # Step 2 single-owner: claim the per-thread drive lock before advancing so concurrent sweepers /
+        # jobd never double-advance. Re-check the newest job UNDER the lock — another owner may have just
+        # advanced it, making our pre-lock read stale.
+        with thread_drive_lock(thread_id) as owned:
+            if not owned:
+                continue
+            if _latest_job_status(thread_id) in ("running", "pending", None):
+                continue                          # owner advanced it (new job dispatched) or nothing to do
+            res = result if isinstance(result, dict) else {}
+            if status == "failed" and not (res.get("error") or res.get("status") == "failed"):
+                res = {**res, "error": "job failed", "status": "failed"}
+            _set(thread_id, awaiting=None)
+            advance(thread_id, job_result=res)    # done -> advances phase; failed -> surfaces failure
+            advanced += 1
     return {"resumed": advanced}
 
 

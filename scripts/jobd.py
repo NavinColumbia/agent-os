@@ -69,17 +69,13 @@ def tick():
         _log(f"resume_stalled error: {e}")
     for tid in runnable_threads():
         try:
-            # advisory lock per thread so two drivers (or a driver + a completion) can't advance the same thread
-            with psycopg.connect(DB) as c, c.cursor() as cur:
-                cur.execute("SELECT pg_try_advisory_lock(841000, %s)", (int(tid),))
-                got = cur.fetchone()[0]
-                if not got:
+            # Single-owner-per-build: the SAME per-thread advisory lock resume_stalled's advances take, so a
+            # sweeper and this loop (or two drivers) can never advance one thread at once. (lc owns the key.)
+            with lc.thread_drive_lock(tid) as owned:
+                if not owned:
                     continue
-                try:
-                    lc.advance(int(tid))
-                    driven += 1
-                finally:
-                    cur.execute("SELECT pg_advisory_unlock(841000, %s)", (int(tid),))
+                lc.advance(int(tid))
+                driven += 1
         except Exception as e:
             _log(f"advance({tid}) error: {e}")
     return {"recovered": recovered, "driven": driven, "reaped": reaped}

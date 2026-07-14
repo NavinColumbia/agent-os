@@ -95,7 +95,15 @@ The single Claude subscription was being over-subscribed and calls hung:
 ## Status
 - [x] **Step 1 — DONE** — output-independent heartbeat + reaper-on-lapse/ceiling (not output-silence) + fencing
   token + a LIBERAL 6h runaway ceiling (Opus builds are slow). Proven by `loopcontroller.py liveness`. Kills F8.
-- [ ] Step 2 — single owner per build
+- [x] **Step 2 (core invariant) — DONE** — SINGLE OWNER PER BUILD at the advance chokepoint. Every path that
+  advances a thread — jobd's runnable loop, a resume-sweep in ANY process, a live worker completion — now takes
+  the same per-thread Postgres advisory lock (`loopcontroller.thread_drive_lock`, namespace `_DRIVE_LOCK_NS`),
+  so two sweepers (or a sweep racing jobd) can never double-advance one build. Sweepers additionally re-check the
+  latest job status UNDER the lock (and research reconciles gate on the claim UPDATE's rowcount) so a stale
+  pre-lock read can't re-advance. Proven by `test_thread_drive_lock_enforces_single_owner` + the jobd selftest.
+  Fail-open on a lock-infra hiccup (never wedges progress). *Remaining for full Step 2:* physically demote
+  jobd/scheduler/resume-sweeper to pure enqueuers (strip their direct build-row writes) — the lock already
+  enforces the single-writer SAFETY property that was the actual bug.
 - [ ] Step 3 — phases as dispatch-and-park activities
 - [ ] Step 4 — consolidate engine
 - [ ] Step 5 — delete hand-rolled durability

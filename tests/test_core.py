@@ -563,3 +563,19 @@ def test_claude_gate_caps_concurrency_and_reclaims_leases():
     finally:
         with psycopg.connect(claude_gate.DB) as c, c.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS {t}"); c.commit()
+
+
+def test_thread_drive_lock_enforces_single_owner():
+    """Step 2 single-owner-per-build: at most one holder of a thread's drive lock at a time, so two
+    sweepers (or a sweeper racing jobd) can never advance the same build concurrently. A different thread
+    is independent, and the lock is reacquirable once released."""
+    import loopcontroller as lc
+    tid = 990000 + int(_rid(), 16) % 1000
+    with lc.thread_drive_lock(tid) as owned1:
+        assert owned1 is True, "first acquire must win"
+        with lc.thread_drive_lock(tid) as owned2:            # separate connection -> separate session
+            assert owned2 is False, "a second concurrent acquire of the SAME thread must be denied"
+        with lc.thread_drive_lock(tid + 1) as owned3:
+            assert owned3 is True, "a DIFFERENT thread's lock is independent"
+    with lc.thread_drive_lock(tid) as owned4:
+        assert owned4 is True, "the lock must be reacquirable after release"

@@ -1363,7 +1363,6 @@ def qa_gate(product) -> dict:
 
 RUNNING_TIMEOUT_MIN = 30   # (legacy constant kept for callers/tests; superseded by heartbeat liveness below)
 RUNNING_FLOOR_MIN = int(os.environ.get("AOS_JOB_FLOOR_MIN", "20"))       # never reap younger than this
-STALL_SILENT_MIN = int(os.environ.get("AOS_JOB_SILENT_MIN", "12"))       # (legacy; retained for callers)
 # ARCHITECTURE-OVERHAUL Step 1 — the CORRECT liveness model (Temporal/Step-Functions shape):
 # the worker beats heartbeat_at every HEARTBEAT_S on a background timer, DECOUPLED from `claude` output. So a job
 # is dead ONLY if its heartbeat lapsed (HEARTBEAT_TIMEOUT_S — the worker process is gone) OR it exceeded the hard

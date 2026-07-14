@@ -664,6 +664,38 @@ def test_dispatch_and_park_worker_finishes_without_advancing():
             c.commit()
 
 
+def test_rebuild_ctx_restores_billing_context_in_a_fresh_process(monkeypatch):
+    """The one thing a DETACHED park worker must get right (the risk I flagged): rebuild factory._ctx — tenant,
+    org, product, and the resolved provider's engine+key — from the thread's persisted state alone, so model
+    spend lands on the TENANT's account exactly as the in-process path. Proven WITHOUT a live build by stubbing
+    provider resolution; this is what de-risks turning dispatch-and-park on."""
+    import psycopg
+    import factory
+    import loopcontroller as lc
+    lc._ensure()
+    tid_thread = 930000 + int(_rid(), 16) % 1000
+    try:
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, product, updated_at)
+                           VALUES (%s,'acme-tenant',7,'IMPLEMENT','acme-app', now())
+                           ON CONFLICT (thread_id) DO UPDATE
+                             SET tenant_id='acme-tenant', org_id=7, product='acme-app'""", (tid_thread,))
+            c.commit()
+        monkeypatch.setattr(lc, "_resolved_provider",
+                            lambda tid: {"engine": "claude", "key": "sk-ant-TENANTKEY", "auth_mode": "api_key"})
+        factory._ctx.tenant = factory._ctx.api_key = factory._ctx.engine = None   # dirty it, prove it's rebuilt
+        lc._rebuild_ctx(tid_thread)
+        assert factory._ctx.tenant == "acme-tenant"
+        assert factory._ctx.org == 7
+        assert factory._ctx.product == "acme-app"
+        assert factory._ctx.api_key == "sk-ant-TENANTKEY", "the tenant's BYO key must be restored (billing lands on THEM)"
+        assert factory._ctx.engine == "claude"
+    finally:
+        factory._ctx.tenant = factory._ctx.api_key = factory._ctx.engine = None
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid_thread,)); c.commit()
+
+
 def test_qa_verdict_ok_is_strict_and_fail_closed():
     """The single ship predicate shared by the QA stage, TESTQA, and the LAUNCH gate: a build reaches a human
     ONLY if passed is exactly True AND blocking_open==0 AND stories>0. Every missing/garbled/loose fact must

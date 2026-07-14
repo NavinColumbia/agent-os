@@ -90,6 +90,8 @@ def _log(msg):
 
 
 def serve(interval=15):
+    import governance
+    governance.assert_control_plane()   # fail LOUD at boot if policy enforcement is missing (not mid-build)
     _log(f"central controller execution daemon up (tick={interval}s, settle={SETTLE_S}s)")
     while True:
         try:

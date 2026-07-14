@@ -27,6 +27,7 @@ CLI:  governance.py selftest
 Run with the agent-os venv python.
 """
 import fnmatch
+import os
 import sys
 from pathlib import Path
 
@@ -41,6 +42,7 @@ if str(_HOOKS) not in sys.path:
     sys.path.insert(0, str(_HOOKS))
 try:
     import manifest_policy
+    CONTROL_PLANE_OK = True
 except ModuleNotFoundError:
     # control-plane is a SEPARATE repo. In production it is always checked out at
     # ~/projects/control-plane so this import succeeds and behavior is unchanged. In CI
@@ -56,6 +58,26 @@ except ModuleNotFoundError:
                 "only in agent-os-only CI, where policy enforcement is not exercised."
             )
     manifest_policy = _MissingManifestPolicy()
+    CONTROL_PLANE_OK = False
+    # Make the degradation VISIBLE the instant this module loads — nothing fails invisibly. A run
+    # that legitimately has no control-plane (CI, the offline selftest) sets AOS_ALLOW_MISSING_CONTROL_PLANE
+    # to silence this; anywhere else, an operator sees it in the very first log line of every process.
+    if not os.environ.get("AOS_ALLOW_MISSING_CONTROL_PLANE"):
+        sys.stderr.write(
+            "[governance] WARNING: control-plane repo not found at ~/projects/control-plane — role-manifest "
+            "policy enforcement is DISABLED and any policy decision will fail closed. Set "
+            "AOS_ALLOW_MISSING_CONTROL_PLANE=1 to acknowledge (CI/selftest only).\n")
+
+
+def assert_control_plane() -> None:
+    """Fail LOUD at boot if the control-plane policy layer is missing. Fleet entrypoints call this so a
+    real production misconfiguration stops the process up front instead of surfacing mid-build as a
+    per-decision RuntimeError. Opt out (CI, offline selftest) with AOS_ALLOW_MISSING_CONTROL_PLANE=1."""
+    if not CONTROL_PLANE_OK and not os.environ.get("AOS_ALLOW_MISSING_CONTROL_PLANE"):
+        raise RuntimeError(
+            "control-plane repo not present (~/projects/control-plane) — refusing to start the fleet without "
+            "role-manifest policy enforcement. Check out control-plane, or set AOS_ALLOW_MISSING_CONTROL_PLANE=1 "
+            "for an explicitly unenforced run (CI/selftest).")
 
 # capability name (as used by may/enforce) -> the manifest flag that grants it.
 _CAP_FLAG = {

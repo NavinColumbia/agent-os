@@ -502,3 +502,64 @@ def test_skills_catalog_is_well_formed():
         assert name not in names, f"duplicate skill {name}"
         names.add(name)
     assert len(names) >= 90
+
+
+# ── reliability invariants (regression guards for the crash-resume / concurrency / safety fixes) ──
+
+def test_aoscfg_resolves_config_portably(monkeypatch):
+    """The shared resolver must locate a real .env.local, expose DATABASE_URL + a venv python, and let a
+    real environment variable override the file — the property that lets CI/dev run outside ~/projects."""
+    import aoscfg
+    assert aoscfg.ENV.exists(), "resolver did not locate a real .env.local"
+    assert aoscfg.DB and "postgres" in aoscfg.DB, "DATABASE_URL not resolved"
+    assert aoscfg.VENV_PY.endswith("python"), f"unexpected venv python: {aoscfg.VENV_PY}"
+    monkeypatch.setenv("AOS_UT_KEY_XYZ", "sentinel")
+    assert aoscfg.get("AOS_UT_KEY_XYZ") == "sentinel", "real env var must win over the file"
+    assert aoscfg.get("AOS_UT_DEFINITELY_MISSING", "dflt") == "dflt"
+
+
+def test_clauded_only_reaps_headless_never_interactive():
+    """The reaper must kill fire-and-forget headless agent calls but NEVER a human's interactive Claude Code
+    session — the single most dangerous mistake it could make. Staleness is a pure ceiling test."""
+    import clauded
+    assert clauded._is_headless_agent(
+        'claude -p "do x" --output-format json --model claude-opus-4-8'), "must match a headless agent call"
+    assert not clauded._is_headless_agent("claude"), "bare interactive REPL must be spared"
+    assert not clauded._is_headless_agent("claude --continue"), "interactive --continue must be spared"
+    assert not clauded._is_headless_agent("claude --resume sess-123"), "interactive --resume must be spared"
+    assert not clauded._is_headless_agent("node /home/x/claude-helper.js"), "unrelated proc must be spared"
+    assert clauded.stale([(1, 100), (2, 2000), (3, 5000)], 900) == [2, 3], "only past-ceiling pids are stale"
+    assert clauded.stale([(1, 100)], 900) == [], "a fresh pid is never stale"
+
+
+def test_governance_fails_loud_without_control_plane(monkeypatch):
+    """A missing control-plane must FAIL LOUD at the boot guard (not silently allow), unless explicitly
+    acknowledged via the env flag (CI/selftest)."""
+    import governance
+    monkeypatch.setattr(governance, "CONTROL_PLANE_OK", False)
+    monkeypatch.delenv("AOS_ALLOW_MISSING_CONTROL_PLANE", raising=False)
+    with pytest.raises(RuntimeError):
+        governance.assert_control_plane()
+    monkeypatch.setenv("AOS_ALLOW_MISSING_CONTROL_PLANE", "1")
+    governance.assert_control_plane()   # acknowledged -> must NOT raise
+
+
+def test_claude_gate_caps_concurrency_and_reclaims_leases():
+    """The cross-process gate must cap total concurrent claude calls (Nth+1 acquire fails-open to None) and
+    reclaim a crashed holder's slot after its lease — so a dead process can't hold a slot forever."""
+    import psycopg
+    import claude_gate
+    t = f"claude_slots_ut_{_rid()}"
+    try:
+        claude_gate._ensure(t, n=2)                                  # a deliberately-sized 2-slot pool
+        s1 = claude_gate.acquire("h1", wait_s=0, table=t)
+        s2 = claude_gate.acquire("h2", wait_s=0, table=t)
+        assert s1 and s2 and s1 != s2, "both slots should be grantable"
+        assert claude_gate.acquire("h3", wait_s=0, table=t) is None, "pool exhausted -> None (fail-open)"
+        claude_gate.release(s1, table=t)
+        assert claude_gate.acquire("h4", wait_s=0, table=t) is not None, "released slot must be reusable"
+        # lease reclaim: with lease_s=0 every held slot is past-lease, so a crashed holder's slot is reclaimable
+        assert claude_gate.acquire("h5", wait_s=0, table=t, lease_s=0) is not None, "expired lease must reclaim"
+    finally:
+        with psycopg.connect(claude_gate.DB) as c, c.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {t}"); c.commit()

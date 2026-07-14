@@ -4,6 +4,10 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    # control-plane is a separate repo not checked out here; acknowledge the unenforced run so governance
+    # neither warns on every import nor blocks (policy enforcement is not exercised by unit tests).
+    env:
+      AOS_ALLOW_MISSING_CONTROL_PLANE: "1"
     services:
       postgres:
         image: pgvector/pgvector:pg16

@@ -337,10 +337,32 @@ def _extract_json(text):
     return {}
 
 
+def _heuristic_estimate(role, task):
+    """Fast, spawn-free timeout/retry budget from role + task size. The estimate ONLY bounds the wall-clock
+    timeout and retry count — it is not a correctness input — and the output-independent heartbeat + 6h hard
+    ceiling (overhaul Step 1) are the real liveness guards, so an approximate budget is entirely safe."""
+    n = len(task or "")
+    r = (role or "").lower()
+    heavy = any(k in r for k in ("research", "build", "dev", "engineer", "implement", "architect",
+                                 "design", "qa", "review", "spec"))
+    if n < 300 and not heavy:
+        mins = 3
+    elif n < 1500:
+        mins = 8 if heavy else 5
+    else:
+        mins = 25 if heavy else 12
+    rets = 3 if any(k in r for k in ("research", "build", "implement", "engineer")) else 2
+    return max(2, min(60, mins)), max(0, min(3, rets))
+
+
 def _estimate_runtime(role, task, env):
-    """Callee-driven handshake: ask the agent itself how long this task will take and how many retries
-    it warrants, BEFORE committing to it. The caller then honors that number (× a safety margin) instead
-    of guessing from prompt length. Sanity-bounded so a bad estimate can't hang forever."""
+    """Timeout/retry budget for a heavy agent call. DEFAULT: a fast heuristic (no extra `claude` spawn) —
+    the LLM handshake below was a SECOND cold subprocess per stage (~30-60s) purely to guess a timeout,
+    doubling per-stage latency on subscription runs. The estimate only bounds the budget (liveness is the
+    heartbeat + hard ceiling), so the heuristic is safe. Opt into the callee-driven LLM handshake with
+    AOS_LLM_ESTIMATE=1 when a precise per-task estimate is worth the extra cheap-model call."""
+    if not os.environ.get("AOS_LLM_ESTIMATE"):
+        return _heuristic_estimate(role, task)
     q = ("You are the " + role + ". You are about to do the TASK below, but FIRST only ESTIMATE it. "
          "Reply with ONLY a JSON object: {\"minutes\": <int realistic wall-clock estimate>, "
          "\"retries\": <int 0-3, how many retries this is worth if it fails>}. Judge by the task's TRUE "

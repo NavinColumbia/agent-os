@@ -92,6 +92,16 @@ The single Claude subscription was being over-subscribed and calls hung:
   is the concurrency half of Step 2 (the "central way to spawn claude" the owner asked for) — done ahead of the
   full single-owner refactor.
 
+## Per-call latency (subscription runs) — estimate handshake removed
+Each heavy stage paid TWO cold `claude` spawns: one for `factory._estimate_runtime` (a callee handshake that
+merely *guessed* a timeout) and one to do the work. On subscription runs (no BYO key, so the warm Messages-API
+fast path doesn't apply) that ~30-60s handshake was pure overhead per stage. The estimate now defaults to a
+**spawn-free heuristic** (role + task size → bounded minutes/retries); the LLM handshake is opt-in via
+`AOS_LLM_ESTIMATE=1`. Safe because the estimate only bounds the timeout budget — liveness is the
+output-independent heartbeat + 6h hard ceiling (Step 1), not this number. Roughly halves per-stage cold spawns.
+(The warm pooled Messages-API path still accelerates BYO-key conversational turns; raw Messages API isn't
+available under subscription/OAuth auth, so subscription tool-work stays on the CLI by necessity.)
+
 ## Status
 - [x] **Step 1 — DONE** — output-independent heartbeat + reaper-on-lapse/ceiling (not output-silence) + fencing
   token + a LIBERAL 6h runaway ceiling (Opus builds are slow). Proven by `loopcontroller.py liveness`. Kills F8.

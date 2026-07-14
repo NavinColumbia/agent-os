@@ -579,3 +579,20 @@ def test_thread_drive_lock_enforces_single_owner():
             assert owned3 is True, "a DIFFERENT thread's lock is independent"
     with lc.thread_drive_lock(tid) as owned4:
         assert owned4 is True, "the lock must be reacquirable after release"
+
+
+def test_estimate_runtime_is_spawn_free_by_default(monkeypatch):
+    """Latency: the default timeout/retry estimate must NOT cold-spawn a second `claude` subprocess (that
+    doubled per-stage latency). It returns sane, bounded budgets from a heuristic; the LLM callee-handshake
+    is opt-in via AOS_LLM_ESTIMATE. Liveness is guarded by the heartbeat + hard ceiling, not this estimate."""
+    import factory
+
+    def _boom(*a, **k):
+        raise AssertionError("the default estimate must not spawn a subprocess")
+
+    monkeypatch.delenv("AOS_LLM_ESTIMATE", raising=False)
+    monkeypatch.setattr(factory.subprocess, "run", _boom)
+    mins, rets = factory._estimate_runtime("builder", "x" * 2000, None)
+    assert 2 <= mins <= 60 and 0 <= rets <= 3, f"budget out of bounds: {mins},{rets}"
+    short_mins, _ = factory._estimate_runtime("controller", "hi", None)
+    assert short_mins <= mins, "a tiny chat task must not budget more time than a big build task"

@@ -119,6 +119,9 @@ def _ensure():
         # lease_token is a fencing token: a reap bumps it so a wrongly-reaped-but-alive worker's writes are rejected.
         cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ")
         cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS lease_token BIGINT DEFAULT 0")
+        # Step 3 dispatch-and-park: the OS pid of the detached worker process (NULL for the in-process daemon
+        # path), so parked work is observable — park_status() can tell "worker alive" from "worker died".
+        cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS worker_pid BIGINT")
         c.commit()
 
 
@@ -482,10 +485,16 @@ def _spawn_parked_worker(thread_id, kind, jid):
     """Launch the phase in a DETACHED worker process (start_new_session so it survives THIS process's death
     and isn't killed by the driver's signals). Returns True if launched, False to fall back to in-process."""
     try:
-        subprocess.Popen(
+        p = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "run_job", str(thread_id), kind, str(jid)],
             start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             cwd=str(Path(__file__).resolve().parent))
+        try:                                             # record the worker pid so parked work is observable
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("UPDATE controller_jobs SET worker_pid=%s WHERE id=%s", (p.pid, jid))
+                c.commit()
+        except Exception:
+            pass
         return True
     except Exception as e:
         try:
@@ -511,6 +520,39 @@ def run_job(thread_id, kind, jid):
         stop.set()
     _finish_job(thread_id, jid, result, status, parked=True)
     return {"thread_id": thread_id, "kind": kind, "jid": jid, "status": status}
+
+
+def _pid_alive(pid):
+    if not pid:
+        return None
+    try:
+        os.kill(int(pid), 0)                             # signal 0 = liveness probe, doesn't touch the process
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                                      # exists but owned by another user
+    except Exception:
+        return None
+
+
+def park_status():
+    """Operator view of in-flight phase work — the observability that makes dispatch-and-park safe to run:
+    every running/pending job with its age, heartbeat freshness, worker pid, and whether that worker process
+    is actually alive. `parked` distinguishes a detached worker (worker_pid set) from the in-process daemon."""
+    _ensure()
+    rows = []
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""SELECT id, thread_id, phase, kind, status, worker_pid,
+                              EXTRACT(EPOCH FROM now()-started_at)::int,
+                              EXTRACT(EPOCH FROM now()-COALESCE(heartbeat_at, started_at))::int
+                       FROM controller_jobs WHERE status IN ('running','pending')
+                       ORDER BY started_at""")
+        for jid, tid, phase, kind, st, pid, age, beat in cur.fetchall():
+            rows.append({"job": jid, "thread": tid, "phase": phase, "kind": kind, "status": st,
+                         "worker_pid": pid, "parked": pid is not None, "worker_alive": _pid_alive(pid),
+                         "age_s": age, "heartbeat_age_s": beat})
+    return {"park_mode": _PARK, "in_flight": rows}
 
 
 def _dispatch(thread_id, kind, fn=None, eta_min=None, kickoff=None, status=None):
@@ -1046,6 +1088,17 @@ def advance(thread_id, job_result=None):
         if crashes <= CRASH_RETRY_MAX:
             audit.append(actor="loopcontroller", action="CrashResume", resource=str(thread_id), decision=phase,
                          payload={"crash_count": crashes})
+            # NOTHING FAILS INVISIBLY: crash-resume is silent to the CEO, but an OPERATOR should see repeated
+            # crashes (a worker that keeps dying = an infra/OOM problem worth attention before it hits the cap).
+            try:
+                import alerts
+                alerts.raise_alert("loopcontroller", "controller",
+                                   f"thread {thread_id} phase {phase}: worker crashed {crashes}× — auto-resuming "
+                                   f"from checkpoint (cap {CRASH_RETRY_MAX})",
+                                   severity="warn" if crashes >= 2 else "info",
+                                   signature=f"crashresume:{thread_id}:{phase}")
+            except Exception:
+                pass
             _set(thread_id, awaiting=None)
             _job_clear(thread_id)
             advance(thread_id)                        # phase unchanged -> re-dispatches; resumes from checkpoint
@@ -2341,6 +2394,8 @@ def _main(a):
         sys.exit(_park_selftest())
     elif a[0] == "parkcrash":
         sys.exit(_park_crash_selftest())
+    elif a[0] == "parkstatus":
+        print(json.dumps(park_status(), indent=2, default=str))
     else:
         sys.exit("usage: loopcontroller.py "
                  "start|say|choose|state|research|live|cancel|resume|run_job|watchdog|liveness|parktest|selftest ...")

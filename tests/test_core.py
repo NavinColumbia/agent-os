@@ -664,6 +664,49 @@ def test_dispatch_and_park_worker_finishes_without_advancing():
             c.commit()
 
 
+def test_worker_crash_is_transparently_resumed_but_persistent_crash_escalates():
+    """Zero bugs reach a human: a worker CRASH (reaped -> job marked crashed=true) is re-run transparently,
+    NOT surfaced to the CEO — UNLESS it keeps crashing (> CRASH_RETRY_MAX), which means a real bug a human
+    should see. Uses a no-op sentinel phase so the transparent re-dispatch does nothing real."""
+    import json
+    import psycopg
+    import loopcontroller as lc
+    lc._ensure()
+    tid = 940000 + int(_rid(), 16) % 1000
+    crashed = {"error": "worker died (heartbeat lapsed or hard ceiling)", "status": "failed", "crashed": True}
+
+    def _mkcrash(n=1):
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            for _ in range(n):
+                cur.execute("""INSERT INTO controller_jobs (thread_id,tenant_id,phase,kind,status,result)
+                               VALUES (%s,1,'__PARKTEST__','build','failed',%s::jsonb)""", (tid, json.dumps(crashed)))
+            cur.execute("UPDATE controller_state SET awaiting=NULL WHERE thread_id=%s", (tid,))
+            c.commit()
+
+    def _awaiting():
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("SELECT awaiting FROM controller_state WHERE thread_id=%s", (tid,))
+            return cur.fetchone()[0]
+    try:
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, awaiting, updated_at)
+                           VALUES (%s,1,1,'__PARKTEST__',NULL, now())
+                           ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting=NULL""", (tid,))
+            c.commit()
+        _mkcrash(1)                                            # a single crash -> transparent resume
+        lc.advance(tid, job_result=crashed)
+        assert _awaiting() != "user_feedback", "a transient crash must NOT escalate to the human"
+
+        _mkcrash(lc.CRASH_RETRY_MAX + 1)                       # now persistently crashing -> escalate
+        lc.advance(tid, job_result=crashed)
+        assert _awaiting() == "user_feedback", "a PERSISTENT crash must escalate to the human"
+    finally:
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid,))
+            cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid,))
+            c.commit()
+
+
 def test_g1_retired_parked_worker_survives_driver_crash():
     """The core dispatch-and-park guarantee: a driver process that hard-CRASHES (SIGKILL) right after
     dispatching a parked phase does NOT take the worker down — the detached worker finishes on its own.

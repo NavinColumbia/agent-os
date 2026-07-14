@@ -1036,6 +1036,22 @@ def advance(thread_id, job_result=None):
         return
     tid, phase = s["tenant_id"], s["phase"]
 
+    # A worker CRASH (its process died -> reaped by heartbeat-lapse/ceiling, marked crashed=true) is NOT a real
+    # job failure — it's transient infra. Transparently RE-RUN the phase (builds resume from their _stage_done
+    # checkpoint; research reconciles against research_runs) instead of escalating to the human — this is
+    # "zero bugs reach a human" for crashes. BOUNDED: after CRASH_RETRY_MAX crashes on the same phase something
+    # is systematically killing the worker (real bug / OOM), so fall through to the user-facing surface below.
+    if job_result and job_result.get("crashed"):
+        crashes = _crash_count(thread_id, phase)
+        if crashes <= CRASH_RETRY_MAX:
+            audit.append(actor="loopcontroller", action="CrashResume", resource=str(thread_id), decision=phase,
+                         payload={"crash_count": crashes})
+            _set(thread_id, awaiting=None)
+            _job_clear(thread_id)
+            advance(thread_id)                        # phase unchanged -> re-dispatches; resumes from checkpoint
+            return
+        # crashes exhausted -> a human should know; fall through to the user-facing failure surface below
+
     # A dispatched job came back BROKEN — the worker raised (_work() -> {'error':...}, status='failed')
     # or the underlying module reported failure/timeout. We must NOT fall through to the phase block:
     # that re-runs the SAME failing job, silently re-dispatching it forever (#9). Surface it to the user
@@ -1307,6 +1323,22 @@ HEARTBEAT_TIMEOUT_S = int(os.environ.get("AOS_JOB_HEARTBEAT_TIMEOUT_S", "180")) 
 # of this ceiling. So this only guards a worker that is ALIVE and beating but stuck looping forever (rare) — keep
 # it big so it never cuts off slow-but-healthy work (per the "backstops must not be conservative" principle).
 HARD_CEILING_MIN = int(os.environ.get("AOS_JOB_CEILING_MIN", "360"))     # 6h runaway backstop (liberal)
+# A worker CRASH (process died -> reaped) is transient infra, not a real job failure: re-run the phase
+# transparently (builds resume from their _stage_done checkpoint) rather than escalate to the human. Bounded —
+# after this many crashes on the SAME phase something is systematically killing the worker, so we surface it.
+CRASH_RETRY_MAX = int(os.environ.get("AOS_CRASH_RETRY_MAX", "3"))
+
+
+def _crash_count(thread_id, phase):
+    """How many times a worker has CRASHED (been reaped) on this thread's current phase — the bound on
+    transparent crash-resume before we stop hiding it and escalate to the human."""
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT count(*) FROM controller_jobs WHERE thread_id=%s AND phase=%s "
+                        "AND status='failed' AND result->>'crashed'='true'", (thread_id, phase))
+            return cur.fetchone()[0]
+    except Exception:
+        return CRASH_RETRY_MAX          # on a counting error, DON'T loop forever — treat as exhausted
 
 
 def _reap_dead_jobs():
@@ -1319,7 +1351,7 @@ def _reap_dead_jobs():
         cur.execute("""
             UPDATE controller_jobs cj SET status='failed', lease_token = cj.lease_token + 1,
                 result = COALESCE(cj.result,'{}'::jsonb)
-                         || '{"error":"worker died (heartbeat lapsed or hard ceiling)","status":"failed"}'::jsonb,
+                         || '{"error":"worker died (heartbeat lapsed or hard ceiling)","status":"failed","crashed":true}'::jsonb,
                 finished_at = now()
             WHERE cj.status='running'
               AND cj.started_at < now() - make_interval(mins => %s)               -- past the generous floor

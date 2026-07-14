@@ -664,6 +664,34 @@ def test_dispatch_and_park_worker_finishes_without_advancing():
             c.commit()
 
 
+def test_qa_verdict_ok_is_strict_and_fail_closed():
+    """The single ship predicate shared by the QA stage, TESTQA, and the LAUNCH gate: a build reaches a human
+    ONLY if passed is exactly True AND blocking_open==0 AND stories>0. Every missing/garbled/loose fact must
+    FAIL closed — this is the contract that keeps a bad or unverified build from shipping. Locking it here
+    stops a future refactor from silently loosening the gate."""
+    import factory
+    # the one shape that ships
+    assert factory.qa_verdict_ok({"passed": True, "blocking_open": 0, "stories": 5}) is True
+    # every failing shape must NOT ship
+    fail_shapes = [
+        {"passed": False, "blocking_open": 0, "stories": 5},      # not passed
+        {"passed": "true", "blocking_open": 0, "stories": 5},     # truthy string, not bool True
+        {"passed": 1, "blocking_open": 0, "stories": 5},          # int 1, not bool True
+        {"passed": True, "blocking_open": 2, "stories": 5},       # open blocking bugs
+        {"passed": True, "blocking_open": 0, "stories": 0},       # zero stories = QA didn't explore
+        {"passed": True, "stories": 5},                           # blocking_open missing
+        {"passed": True, "blocking_open": 0},                     # stories missing
+        {"blocking_open": 0, "stories": 5},                       # passed missing
+        {"passed": True, "blocking_open": None, "stories": 5},    # garbled fact
+        {"passed": True, "blocking_open": 0, "stories": None},    # garbled fact
+        {},                                                       # empty
+        None,                                                     # not even a dict
+        "passed",                                                 # not a dict
+    ]
+    for shape in fail_shapes:
+        assert factory.qa_verdict_ok(shape) is False, f"must FAIL closed on: {shape!r}"
+
+
 def test_worker_crash_is_transparently_resumed_but_persistent_crash_escalates():
     """Zero bugs reach a human: a worker CRASH (reaped -> job marked crashed=true) is re-run transparently,
     NOT surfaced to the CEO — UNLESS it keeps crashing (> CRASH_RETRY_MAX), which means a real bug a human

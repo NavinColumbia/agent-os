@@ -25,6 +25,7 @@ import contextlib
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -326,13 +327,194 @@ def _parse_block(text, tag):
     return m.group(1).strip() if m else None
 
 
-def _dispatch(thread_id, kind, fn, eta_min=None, kickoff=None, status=None):
+# ── dispatch-and-park: phase work rebuildable from persisted state (overhaul Step 3) ─────────────────
+# Each phase's work is reconstructed here from controller_state (product/plan/brief/run-id) instead of being
+# captured in an advance()-local closure, so the SAME callable runs whether executed in-process (daemon path)
+# or in a fresh worker PROCESS after a park. advance() dispatches by `kind`; both _dispatch and run_job rebuild
+# the fn here — one source of truth, no drift between the two execution modes.
+def _phase_fn(thread_id, kind):
+    if kind == "__selftest__":            # trivial, side-effect-free phase used ONLY by _park_selftest
+        return lambda: {"ok": True, "parked_selftest": True}
+    s = _st(thread_id)
+    tid = s["tenant_id"]
+    if kind == "research":
+        q = (s["brief"] or {}).get("question", "build my product")
+
+        def _do_research():
+            import time
+
+            import research as _r
+            eng = "orchestra" if _r.orchestra_on() else "fleet"
+            started = _r.start(tid, s["org_id"], thread_id, q, engine=eng)
+            rid = started.get("run_id")
+            if started.get("error"):
+                return {"run_id": rid, "status": "failed", "error": started["error"], "options": []}
+            _set(thread_id, research_run_id=rid)
+            _job_progress(thread_id, "Researching directions…")
+            deadline = time.time() + RUNNING_TIMEOUT_MIN * 60
+            while time.time() < deadline:
+                st = _r.run_state(tid, rid)
+                if st["status"] in ("done", "failed"):
+                    return {"run_id": rid, "status": st["status"], "options": st.get("options", [])}
+                time.sleep(2)
+            return {"run_id": rid, "status": "pending", "pending": True}
+        return _do_research
+    if kind == "design":
+        plan = s["plan"] or {}
+        product = (s.get("product") or f"{s['org_id'] or 'o'}-{plan.get('name', 'app')}")[:30]
+
+        def _do_proto():
+            import design_fleet
+            return design_fleet.prototype(tid, str(s["org_id"]), product, plan)
+        return _do_proto
+    if kind == "build":
+        plan = s["plan"] or {}
+        product = (s.get("product") or f"{s['org_id'] or 'o'}-{plan.get('name', 'app')}")[:30]
+
+        def _do_build():
+            import frontdoor
+            frontdoor._own(product, tid)
+            charter = plan.get("charter", "build it")
+            try:                                          # embed the agentic feature(s) the CEO described
+                import agentfeatures
+                frag = agentfeatures.charter_for(plan.get("agentic", ""))
+                if frag:
+                    charter += "\n\n" + frag
+            except Exception:
+                pass
+            if plan.get("kind") == "project":
+                import project
+                log = project.build_complex(product, charter)
+                return {"product": product, "result": (log or {}).get("result")}
+            # SCAFFOLD-THEN-IMPROVE: qualityloop only IMPROVES an existing product, so build from the charter
+            # at the registered path first, THEN run the quality loop to raise it to the bar.
+            import pathlib
+
+            import productregistry as _preg
+            repo = pathlib.Path(_preg.path(product))
+            if not repo.exists() or not any(repo.iterdir()):
+                factory.build_product(product, charter, kind=plan.get("kind", "web"))
+            import qualityloop
+            return qualityloop.run(product, bar="high")
+        return _do_build
+    if kind == "qa":
+        product = s.get("product")
+        return lambda: qa_gate(product)
+    raise ValueError(f"unknown phase kind for dispatch-and-park: {kind}")
+
+
+def _rebuild_ctx(thread_id):
+    """Reconstruct factory._ctx from persisted state so a PARKED phase in a fresh worker process bills/gates
+    EXACTLY like the in-process path (tenant, org, product, resolved-provider engine+key). Without this a
+    detached worker would silently lose the tenant's BYO key and consent/billing context."""
+    s = _st(thread_id)
+    factory._ctx.tenant = s["tenant_id"]
+    factory._ctx.org = s.get("org_id")
+    factory._ctx.product = s.get("product")
+    try:
+        prov = _resolved_provider(s["tenant_id"])
+        if prov:
+            _apply_provider_ctx(prov)
+    except Exception:
+        pass
+    return s
+
+
+# DISPATCH-AND-PARK master switch (overhaul Step 3). Default OFF: phase work runs in an in-process daemon
+# thread (the proven path). ON (AOS_DISPATCH_PARK=1): each phase runs in a DETACHED worker process that
+# survives THIS process's death — retiring G1 — while the poller (resume_stalled/jobd) advances on completion.
+_PARK = bool(os.environ.get("AOS_DISPATCH_PARK"))
+
+
+def _start_heartbeat(jid):
+    """Output-independent liveness beat for job `jid` on a background timer (Step 1). Returns a stop Event.
+    Shared by the in-process daemon path and the parked worker so both prove PROCESS liveness identically."""
+    stop = threading.Event()
+
+    def _beat():
+        while not stop.wait(HEARTBEAT_S):
+            try:
+                with psycopg.connect(DB) as c, c.cursor() as cur:
+                    cur.execute("UPDATE controller_jobs SET heartbeat_at=now() WHERE id=%s AND status='running'",
+                                (jid,))
+                    c.commit()
+            except Exception:
+                pass
+    threading.Thread(target=_beat, daemon=True).start()
+    return stop
+
+
+def _finish_job(thread_id, jid, result, status, parked):
+    """Write a phase job's terminal outcome — the single completion path shared by the in-process daemon and
+    the parked worker. A 'pending' sentinel parks the job for resume_stalled to reconcile (research outliving
+    its poll budget). The terminal write is GUARDED on status='running' so a cancel()/reap that already moved
+    the job wins. parked=False advances inline (daemon path); parked=True leaves awaiting='fleet' and lets the
+    poller advance under the drive lock (single-owner) — the worker never advances, so it can't race a driver."""
+    if isinstance(result, dict) and result.get("pending"):
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("UPDATE controller_jobs SET status='pending', result=%s WHERE id=%s AND status='running'",
+                        (json.dumps(result), jid))
+            c.commit()
+        _job_progress(thread_id, "Still working — this one's taking a little longer…")
+        return False
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""UPDATE controller_jobs SET status=%s, result=%s, finished_at=now()
+                       WHERE id=%s AND status='running'""", (status, json.dumps(result), jid))
+        changed = cur.rowcount; c.commit()
+    if not changed:
+        return False
+    if parked:
+        return True                                      # poller (resume_stalled/jobd) advances under the lock
+    _set(thread_id, awaiting=None)
+    _job_clear(thread_id)
+    advance(thread_id, job_result=result)
+    return True
+
+
+def _spawn_parked_worker(thread_id, kind, jid):
+    """Launch the phase in a DETACHED worker process (start_new_session so it survives THIS process's death
+    and isn't killed by the driver's signals). Returns True if launched, False to fall back to in-process."""
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "run_job", str(thread_id), kind, str(jid)],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=str(Path(__file__).resolve().parent))
+        return True
+    except Exception as e:
+        try:
+            _trace("dispatch", kind, f"parked-launch failed for thread {thread_id}", str(e)[:200], -1)
+        except Exception:
+            pass
+        return False
+
+
+def run_job(thread_id, kind, jid):
+    """Parked-worker entrypoint (`loopcontroller.py run_job <thread_id> <kind> <jid>`): run ONE phase job in
+    this dedicated process. Rebuild factory._ctx + the phase fn from persisted state, beat the heartbeat, run
+    the work, then write its terminal result. Does NOT advance — the poller does, under the drive lock."""
+    _ensure()
+    _rebuild_ctx(thread_id)
+    stop = _start_heartbeat(jid)
+    result, status = {}, "done"
+    try:
+        result = _phase_fn(thread_id, kind)() or {}
+    except Exception as e:
+        result, status = {"error": str(e)[:200]}, "failed"
+    finally:
+        stop.set()
+    _finish_job(thread_id, jid, result, status, parked=True)
+    return {"thread_id": thread_id, "kind": kind, "jid": jid, "status": status}
+
+
+def _dispatch(thread_id, kind, fn=None, eta_min=None, kickoff=None, status=None):
     """Durable job + daemon worker that runs a real module then advances. Survives via controller_jobs.
 
     On kickoff it (a) stamps the LIVE-PROGRESS fields (kind/ETA/status) so the console shows a ticking
     bubble, and (b) optionally posts a forward-looking 'working… (~N min)' message so the CEO sees an ETA
     the instant async work starts — never a silent stall."""
     s = _st(thread_id)
+    if fn is None:                                        # dispatch-and-park: rebuild the phase work from state
+        fn = _phase_fn(thread_id, kind)
     if eta_min is None:
         eta_min = _estimate_runtime(s["phase"], s.get("plan"))
     with psycopg.connect(DB) as c, c.cursor() as cur:
@@ -355,21 +537,15 @@ def _dispatch(thread_id, kind, fn, eta_min=None, kickoff=None, status=None):
         _report(s["tenant_id"], thread_id, kickoff + eta_txt,
                 {"kind": "working", "phase": s["phase"], "job": kind, "eta_min": eta_min})
 
-    # OUTPUT-INDEPENDENT HEARTBEAT (overhaul Step 1): a background timer that ticks heartbeat_at every ~45s while
-    # the (possibly long, quiet) phase runs — proving the worker PROCESS is alive regardless of whether `claude`
-    # is producing output. If the process dies, this thread dies with it → heartbeat stops → the reaper correctly
-    # detects a real death. A quiet-but-alive build keeps beating and is NEVER reaped. Kills F8.
-    _beat_stop = threading.Event()
+    # DISPATCH-AND-PARK (Step 3): run the phase in a DETACHED worker PROCESS that survives this process's
+    # death. The worker owns its own heartbeat + terminal write; the poller advances on completion. If the
+    # launch fails we fall through to the in-process path so the phase still runs.
+    if _PARK and _spawn_parked_worker(thread_id, kind, jid):
+        return jid
 
-    def _heartbeat():
-        while not _beat_stop.wait(HEARTBEAT_S):
-            try:
-                with psycopg.connect(DB) as c, c.cursor() as cur:
-                    cur.execute("UPDATE controller_jobs SET heartbeat_at=now() WHERE id=%s AND status='running'", (jid,))
-                    c.commit()
-            except Exception:
-                pass
-    threading.Thread(target=_heartbeat, daemon=True).start()
+    # IN-PROCESS PATH (default): an output-independent heartbeat (Step 1) proves the worker PROCESS is alive
+    # regardless of `claude` output; if the process dies the beat stops and the reaper detects a real death.
+    stop = _start_heartbeat(jid)
 
     def _work():
         result, status = {}, "done"
@@ -378,31 +554,8 @@ def _dispatch(thread_id, kind, fn, eta_min=None, kickoff=None, status=None):
         except Exception as e:
             result, status = {"error": str(e)[:200]}, "failed"
         finally:
-            _beat_stop.set()
-        # A long-but-healthy async run (e.g. a research fleet still going past the in-worker poll budget)
-        # returns a 'pending' sentinel. We must NOT mark it done/failed (that would surface a FALSE timeout
-        # and park the thread on a feedback gate, orphaning the eventual completion) nor advance(). Park the
-        # job as 'pending' (the crash-reaper ignores it — it only reaps 'running') and leave the thread on
-        # its 'fleet' gate so resume_stalled() reconciles it against the REAL run once it terminates.
-        if isinstance(result, dict) and result.get("pending"):
-            with psycopg.connect(DB) as c, c.cursor() as cur:
-                cur.execute("""UPDATE controller_jobs SET status='pending', result=%s
-                               WHERE id=%s AND status='running'""", (json.dumps(result), jid))
-                c.commit()
-            _job_progress(thread_id, "Still working — this one's taking a little longer…")
-            return
-        # Guard the terminal write to status='running': if cancel() (or a reaper) already moved this job to
-        # 'cancelled'/'failed', our UPDATE touches 0 rows and we MUST NOT advance — otherwise a cancelled
-        # job would still surface a result and a halted run would double-report.
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""UPDATE controller_jobs SET status=%s, result=%s, finished_at=now()
-                           WHERE id=%s AND status='running'""", (status, json.dumps(result), jid))
-            changed = cur.rowcount; c.commit()
-        if not changed:
-            return
-        _set(thread_id, awaiting=None)
-        _job_clear(thread_id)
-        advance(thread_id, job_result=result)
+            stop.set()
+        _finish_job(thread_id, jid, result, status, parked=False)
     threading.Thread(target=_work, daemon=True).start()
     return jid
 
@@ -1022,40 +1175,10 @@ def advance(thread_id, job_result=None):
         return
 
     if phase == "RESEARCH":
-        q = (s["brief"] or {}).get("question", "build my product")
-        def _do_research():
-            import research as _r, time
-            # AOS_ORCHESTRA (default ON): dispatch the research as a durable ORCHESTRA org run —
-            # controller actor -> research supervisor -> N child researchers as Postgres rows
-            # (identity/tenure/heartbeats) with events on the persisted bus (REBUILD-PLAN A1:
-            # orchestra IS the engine, this is its production callsite). Flag off -> the legacy
-            # in-process fleet. Same research_runs/report/options contract either way, so the
-            # console UX below is engine-agnostic.
-            eng = "orchestra" if _r.orchestra_on() else "fleet"
-            started = _r.start(tid, s["org_id"], thread_id, q, engine=eng)
-            rid = started.get("run_id")
-            if started.get("error"):
-                # The governed-spend gate (consent/quota) refused the fan-out up front — no thread was
-                # started. Carry the REAL reason into the job result so advance() renders an actionable
-                # message ("accept consent / upgrade plan, then say ready") instead of an opaque 'failed'.
-                return {"run_id": rid, "status": "failed", "error": started["error"], "options": []}
-            # Persist the run id up front so resume_stalled() can reconcile this thread against the REAL
-            # research run even if this worker — or the whole process — dies before the run finishes.
-            _set(thread_id, research_run_id=rid)
-            _job_progress(thread_id, "Researching directions…")
-            # Poll in-worker for the common (fast) case, but bound the wait to the same window the
-            # crash-sweeper uses (RUNNING_TIMEOUT_MIN) instead of a hard 300s cap that falsely declared a
-            # still-healthy fleet 'timeout'. The research fleet runs in its OWN daemon, so if it outlives
-            # this budget we hand off (pending) rather than killing a live run.
-            deadline = time.time() + RUNNING_TIMEOUT_MIN * 60
-            while time.time() < deadline:
-                st = _r.run_state(tid, rid)
-                if st["status"] in ("done", "failed"):
-                    return {"run_id": rid, "status": st["status"], "options": st.get("options", [])}
-                time.sleep(2)
-            # Still running and healthy — hand off to resume_stalled() instead of declaring a false timeout.
-            return {"run_id": rid, "status": "pending", "pending": True}
-        _dispatch(thread_id, "research", _do_research, eta_min=_estimate_runtime("RESEARCH"),
+        # Phase work (start the durable research run, persist its id so resume_stalled can reconcile it, poll
+        # within the crash window, hand off 'pending' if it outlives the budget) lives in _phase_fn("research")
+        # so it runs identically in-process or in a parked worker process.
+        _dispatch(thread_id, "research", eta_min=_estimate_runtime("RESEARCH"),
                   kickoff="On it — I'm researching this now and will bring back a few directions.",
                   status="Researching directions…")
         return
@@ -1085,10 +1208,7 @@ def advance(thread_id, job_result=None):
             _preg.register(product, tenant_id=tid, org_id=s.get("org_id"), plan=plan)
         except Exception:
             pass
-        def _do_proto():
-            import design_fleet
-            return design_fleet.prototype(tid, str(s["org_id"]), product, plan)
-        _dispatch(thread_id, "design", _do_proto, eta_min=_estimate_runtime("PROTOTYPE", plan),
+        _dispatch(thread_id, "design", eta_min=_estimate_runtime("PROTOTYPE", plan),
                   kickoff="Designing your prototype screens (cockpit, team & external).",
                   status="Designing prototype…")
         return
@@ -1102,40 +1222,13 @@ def advance(thread_id, job_result=None):
             _preg.register(product, tenant_id=tid, org_id=s.get("org_id"), plan=plan)
         except Exception:
             pass
-        def _do_build():
-            import frontdoor
-            frontdoor._own(product, tid)
-            charter = plan.get("charter", "build it")
-            try:                                          # embed the agentic feature(s) the CEO described
-                import agentfeatures
-                frag = agentfeatures.charter_for(plan.get("agentic", ""))
-                if frag:
-                    charter += "\n\n" + frag
-            except Exception:
-                pass
-            if plan.get("kind") == "project":
-                import project
-                log = project.build_complex(product, charter)
-                return {"product": product, "result": (log or {}).get("result")}
-            # SCAFFOLD-THEN-IMPROVE (root-cause fix): qualityloop/verify/improve only IMPROVE an EXISTING product
-            # (they return "no such product" otherwise) — so the product must be BUILT first. Nothing did that,
-            # which is why the build errored and QA found nothing. Build it from the charter at the REGISTERED
-            # path, THEN run the quality loop to raise it to the bar.
-            import pathlib
-            import productregistry as _preg
-            repo = pathlib.Path(_preg.path(product))
-            if not repo.exists() or not any(repo.iterdir()):
-                factory.build_product(product, charter, kind=plan.get("kind", "web"))
-            import qualityloop
-            return qualityloop.run(product, bar="high")
-        _dispatch(thread_id, "build", _do_build, eta_min=_estimate_runtime("IMPLEMENT", plan),
+        _dispatch(thread_id, "build", eta_min=_estimate_runtime("IMPLEMENT", plan),
                   kickoff="Building it now — I'll ping you the moment it's ready.",
                   status="Building…")
         return
 
     if phase == "TESTQA":
-        product = s.get("product")
-        _dispatch(thread_id, "qa", lambda: qa_gate(product), eta_min=_estimate_runtime("TESTQA", s.get("plan")),
+        _dispatch(thread_id, "qa", eta_min=_estimate_runtime("TESTQA", s.get("plan")),
                   kickoff="Running QA on the build…", status="Testing…")
         return
 
@@ -2196,13 +2289,84 @@ def _main(a):
         print(json.dumps(cancel(a[1], int(a[2]), a[3] if len(a) > 3 else "stopped by user")))
     elif a[0] == "resume":
         print(json.dumps(resume_stalled()))
+    elif a[0] == "run_job" and len(a) > 3:
+        # dispatch-and-park worker entrypoint: run_job <thread_id> <kind> <jid>
+        print(json.dumps(run_job(int(a[1]), a[2], int(a[3]))))
     elif a[0] == "watchdog":
         print(json.dumps(sla_watchdog()))
     elif a[0] == "liveness":
         sys.exit(liveness_selftest())
+    elif a[0] == "parktest":
+        sys.exit(_park_selftest())
     else:
         sys.exit("usage: loopcontroller.py "
-                 "start|say|choose|state|research|live|cancel|resume|watchdog|liveness|selftest ...")
+                 "start|say|choose|state|research|live|cancel|resume|run_job|watchdog|liveness|parktest|selftest ...")
+
+
+def _park_selftest():
+    """Prove the dispatch-and-park machinery end-to-end WITHOUT a real claude build, using the trivial
+    '__selftest__' phase: (1) run_job in-process writes the terminal result + leaves awaiting='fleet' and does
+    NOT advance (single-owner: the poller advances); (2) a genuinely DETACHED worker process launched by
+    _spawn_parked_worker rebuilds state, runs, and writes 'done' — surviving as its own process. Phase is a
+    no-op sentinel so even a concurrent daemon can't turn this into real work."""
+    import time
+    _ensure()
+    tid_thread = 960000 + int(os.urandom(2).hex(), 16) % 1000
+
+    def _mkjob():
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, awaiting, updated_at)
+                           VALUES (%s,1,1,'__PARKTEST__','fleet', now())
+                           ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting='fleet'""",
+                        (tid_thread,))
+            cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, status, heartbeat_at)
+                           VALUES (%s,1,'__PARKTEST__','__selftest__','running', now()) RETURNING id""", (tid_thread,))
+            jid = cur.fetchone()[0]; c.commit()
+        return jid
+
+    def _status(jid):
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT status, result FROM controller_jobs WHERE id=%s", (jid,))
+            return cur.fetchone()
+
+    def _awaiting():
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT awaiting FROM controller_state WHERE thread_id=%s", (tid_thread,))
+            return cur.fetchone()[0]
+
+    ok = True
+    try:
+        # (1) in-process run_job
+        jid = _mkjob()
+        run_job(tid_thread, "__selftest__", jid)
+        st, res = _status(jid)
+        assert st == "done", f"run_job must finish the job (got {st})"
+        assert isinstance(res, dict) and res.get("parked_selftest"), f"result not written: {res}"
+        assert _awaiting() == "fleet", "parked worker must NOT advance (leaves awaiting='fleet' for the poller)"
+        print("PASS: run_job writes terminal result, leaves awaiting='fleet', does not advance")
+
+        # (2) genuinely detached worker process
+        jid2 = _mkjob()
+        launched = _spawn_parked_worker(tid_thread, "__selftest__", jid2)
+        assert launched, "detached worker must launch"
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            st2, _ = _status(jid2)
+            if st2 == "done":
+                break
+            time.sleep(0.5)
+        assert st2 == "done", f"detached worker must complete the job (got {st2})"
+        print("PASS: detached worker process rebuilt state, ran, and wrote 'done' (survives as its own process)")
+        print("park_selftest: PASS (dispatch-and-park mechanics verified; default OFF via AOS_DISPATCH_PARK)")
+    except AssertionError as e:
+        ok = False
+        print(f"park_selftest: FAIL — {e}")
+    finally:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid_thread,))
+            cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid_thread,))
+            c.commit()
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

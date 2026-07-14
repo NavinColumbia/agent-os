@@ -629,3 +629,36 @@ def test_dispatch_wont_double_run_an_in_flight_thread():
             cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid,))
             cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid,))
             c.commit()
+
+
+def test_dispatch_and_park_worker_finishes_without_advancing():
+    """Step 3 dispatch-and-park: run_job (the parked-worker entrypoint) rebuilds the phase from state, runs
+    it, writes the job's terminal result, and LEAVES awaiting='fleet' WITHOUT advancing — the poller advances
+    under the drive lock (single-owner), so a worker can never race a driver. Uses the trivial '__selftest__'
+    phase (no claude spawn) and a no-op sentinel phase so a concurrent daemon can't turn it into real work."""
+    import psycopg
+    import loopcontroller as lc
+    lc._ensure()
+    tid = 960000 + int(_rid(), 16) % 1000
+    try:
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, awaiting, updated_at)
+                           VALUES (%s,1,1,'__PARKTEST__','fleet', now())
+                           ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting='fleet'""", (tid,))
+            cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, status, heartbeat_at)
+                           VALUES (%s,1,'__PARKTEST__','__selftest__','running', now()) RETURNING id""", (tid,))
+            jid = cur.fetchone()[0]; c.commit()
+        lc.run_job(tid, "__selftest__", jid)
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("SELECT status, result FROM controller_jobs WHERE id=%s", (jid,))
+            st, res = cur.fetchone()
+            cur.execute("SELECT awaiting FROM controller_state WHERE thread_id=%s", (tid,))
+            awaiting = cur.fetchone()[0]
+        assert st == "done", f"parked worker must finish the job (got {st})"
+        assert isinstance(res, dict) and res.get("parked_selftest"), f"terminal result not written: {res}"
+        assert awaiting == "fleet", "parked worker must NOT advance — the poller does, under the drive lock"
+    finally:
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid,))
+            cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid,))
+            c.commit()

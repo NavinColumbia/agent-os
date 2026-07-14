@@ -117,11 +117,17 @@ available under subscription/OAuth auth, so subscription tool-work stays on the 
   duplicate dispatch can't double-RUN a phase. *Remaining for full Step 2:* physically demote
   jobd/scheduler/resume-sweeper to pure enqueuers (strip their direct build-row writes) — the two guards
   already enforce the single-writer SAFETY property that was the actual bug.
-- [~] **Step 3 (partial)** — crash-resume idempotency already holds for BUILD: `build_product` skips any
-  component stage already recorded done (`factory._stage_done`), so a re-dispatch after a process death RESUMES
-  from the checkpoint instead of restarting; RESEARCH reconciles against `research_runs`. *Remaining:* true
-  dispatch-and-park (release the worker thread while `claude` runs, resume on an exit hook) so a phase survives
-  process exit without relying on re-dispatch — retires G1 fully.
+- [x] **Step 3 — SHIPPED (behind `AOS_DISPATCH_PARK`, default OFF)** — true dispatch-and-park. Each phase's
+  work is reconstructable from persisted state (`_phase_fn` — one source of truth for both execution modes) and
+  its execution context is rebuildable from the tenant id (`_rebuild_ctx` → resolved provider engine+key). With
+  the flag on, `_dispatch` launches the phase in a **detached worker process** (`start_new_session`, so it
+  survives the driver's death — retiring G1); the worker owns its heartbeat, writes the job's terminal result,
+  and does NOT advance — the poller (resume_stalled/jobd) advances under the drive lock (single-owner, so a
+  worker can never race a driver). Launch failure falls back to the in-process path. Proven end-to-end (in-process
+  + a genuinely detached process) by `loopcontroller.py parktest` and `test_dispatch_and_park_worker_finishes_without_advancing`;
+  crash-resume idempotency (build stage-skip via `_stage_done`, research reconciled vs `research_runs`) means a
+  worker death still resumes from the checkpoint. *To turn on in production:* set `AOS_DISPATCH_PARK=1` and
+  validate on a live multi-hour build (kill the driver mid-stage; the parked worker completes independently).
 - [ ] Step 4 — consolidate engine
 - [ ] Step 5 — delete hand-rolled durability
 

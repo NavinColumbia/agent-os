@@ -816,6 +816,46 @@ def test_pulse_reap_orphans_finalizes_dead_only():
             c.commit()
 
 
+def test_watchdog_pages_out_of_band_when_db_down():
+    """The DB-outage blind spot: if Postgres itself is down, tick() must NOT throw (which would mute the
+    pager) — it pages out-of-band via notify and returns db_down. The one failure that blinds the whole plane
+    can't also silence the alert. Restores globals so it can't disturb other tests."""
+    import watchdog
+    real_db, real_send, real_mark = watchdog.DB, watchdog.notify.send, watchdog._DB_DOWN_MARK
+    import pathlib, tempfile
+    sent = []
+    watchdog._DB_DOWN_MARK = pathlib.Path(tempfile.gettempdir()) / f"wd-dbdown-{_rid()}.mark"
+    watchdog.DB = "postgresql://nouser@127.0.0.1:5/ nodb"      # unreachable
+    watchdog.notify.send = lambda *a, **k: sent.append(k.get("priority"))
+    try:
+        assert watchdog._db_reachable() is False
+        r = watchdog.tick()                                    # must return, not raise
+        assert r.get("db_down") is True and "urgent" in sent
+    finally:
+        watchdog.DB, watchdog.notify.send = real_db, real_send
+        try:
+            watchdog._DB_DOWN_MARK.unlink()
+        except Exception:
+            pass
+        watchdog._DB_DOWN_MARK = real_mark
+
+
+def test_qa_auditor_gate_fails_closed_when_audit_unavailable():
+    """The skeptical auditor is the anti-rubber-stamp control. If it was supposed to run but CRASHED, a run
+    that the coverage tally thought passed must be downgraded to not-passed (an unverifiable run does not
+    ship) — but a run that already failed stays failed, and the passing case is only ever downgraded, never
+    upgraded. Locks the fail-CLOSED contract (previously the exception path left 'passed' untouched)."""
+    sys.path.insert(0, str(ROOT / "scripts" / "qa"))
+    import qa_run
+    would_pass = {"passed": True, "verdict": "ALL STORIES PASSED"}
+    assert qa_run._audit_unavailable(would_pass, RuntimeError("auditor boom")) is True
+    assert would_pass["passed"] is False and "AUDIT UNAVAILABLE" in would_pass["verdict"]
+    assert would_pass["audit_error"] == "auditor boom"
+    already_failed = {"passed": False, "verdict": "2 blocking bugs open"}
+    assert qa_run._audit_unavailable(already_failed, RuntimeError("boom")) is False
+    assert already_failed["passed"] is False and already_failed["verdict"] == "2 blocking bugs open"
+
+
 def test_reap_dead_parked_worker_by_pid_before_floor():
     """A parked worker whose process is provably gone must be reaped IMMEDIATELY via its pid — not left
     pinning the build on 'fleet' for up to the 20-min floor. A young, freshly-BEATING job with a LIVE pid

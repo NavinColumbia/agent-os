@@ -376,6 +376,20 @@ def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_c
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
 # the top-level autonomous loop.
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
+def _audit_unavailable(report, err):
+    """FAIL-CLOSED auditor rule: the skeptical work-execution audit was supposed to run and could NOT (it
+    raised). An unverifiable run must not claim a clean pass — zero bugs reach a human — so a would-be pass
+    is downgraded to not-passed (it then can't clear the LAUNCH gate). A run that already failed the coverage
+    tally stays failed. Returns True iff it actually downgraded a pass (so the caller can emit the event)."""
+    report["audit_error"] = str(err)
+    if report.get("passed"):
+        report["passed"] = False
+        report["verdict"] = ("AUDIT UNAVAILABLE → not a pass — the skeptical work-execution audit could not "
+                             f"complete ({str(err)[:140]}); re-run QA before shipping")
+        return True
+    return False
+
+
 def qa_run(target_url, vision, token, org, product_summary, *,
            product="app", repo=None, restart_cmd=None, health_url=None,
            stories=None, max_rounds=MAX_ROUNDS, max_steps=MAX_STEPS,
@@ -456,10 +470,24 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     # not become a 0-story round + NO VERDICT. Still fail-closed after the attempts — an unverifiable
     # build does not ship, but only after the enumeration genuinely could not be obtained.
     if stories is None:
+        # BREADTH-SATURATED enumeration (default): generate -> an INDEPENDENT coverage judge (a DIFFERENT
+        # role than the enumerator, never the same homework-grader) -> expand on the judge's named gaps,
+        # bounded rounds, corpus-persisted with regression pins. This is the fix for the "I did 50 actions,
+        # no errors, I'm out" failure when the surface actually needed far more: the story SET itself is
+        # adversarially saturated, not one un-judged enumeration. AOS_QA_SATURATE=0 falls back to the single
+        # call; a saturation error also falls back (never lose the ability to enumerate -> fail-closed later).
+        saturate = os.environ.get("AOS_QA_SATURATE", "1").lower() not in ("0", "false", "no")
         for attempt in range(1, max(1, STORY_GEN_ATTEMPTS) + 1):
-            # pass the product repo so story_gen can RECOVER stories the agent WROTE to a file (F13) instead of
-            # a bare prose reply — otherwise a flaky JSON reply forces expensive Opus re-generation.
-            stories = story_gen.generate_stories(vision, product_summary, repo=repo)
+            try:
+                # pass the product repo so story_gen can RECOVER stories the agent WROTE to a file (F13)
+                # instead of a bare prose reply — otherwise a flaky JSON reply forces expensive re-generation.
+                if saturate:
+                    stories = story_gen.saturate_stories(vision, product_summary, product=product, repo=repo)
+                else:
+                    stories = story_gen.generate_stories(vision, product_summary, repo=repo)
+            except Exception as e:
+                print(f"[qa_run] saturation failed ({e}) — falling back to single enumeration", flush=True)
+                stories = story_gen.generate_stories(vision, product_summary, repo=repo)
             if stories:
                 break
             print(f"[qa_run] story enumeration returned nothing (attempt {attempt}/{STORY_GEN_ATTEMPTS})"
@@ -655,7 +683,8 @@ def qa_run(target_url, vision, token, org, product_summary, *,
                                         "skipped_flows": len(av.get("skipped_flows") or []),
                                         "unbacked_claims": len(av.get("unbacked_claims") or [])})
         except Exception as e:
-            report["audit_error"] = str(e)
+            if _audit_unavailable(report, e):        # FAIL-CLOSED (see helper): a would-be pass can't ship
+                emit("audit_unavailable", {"error": str(e)[:200]})   # if its skeptical audit couldn't run
     # DURABLE HISTORY (REBUILD-PLAN C1): every run is a qa_runs row in Postgres — the evidence chain
     # survives reboots. A persistence failure is surfaced on the report, never swallowed silently.
     try:
@@ -773,14 +802,18 @@ def _selftest():
     events = []
     on_event = lambda k, d: events.append((k, d))
 
-    # 1) story_gen -> two canned stories (skip real AI enumeration).
-    real_gen = story_gen.generate_stories
-    story_gen.generate_stories = lambda vision, summary, **k: [
+    # 1) story_gen -> two canned stories (skip real AI enumeration). Stub BOTH the single enumerator and the
+    # saturating enumerator (the ship path now calls saturate_stories by default) so the loop test stays
+    # fully offline while still exercising the real qa_run story-enumeration branch.
+    real_gen, real_sat = story_gen.generate_stories, story_gen.saturate_stories
+    _canned = lambda vision, summary, **k: [
         {"id": "US-1", "title": "Sign in", "expected_outcome": "user reaches the dashboard",
          "steps": ["open app", "click sign in"]},
         {"id": "US-2", "title": "Open Assistant", "expected_outcome": "assistant panel opens",
          "steps": ["click Assistant"]},
     ]
+    story_gen.generate_stories = _canned
+    story_gen.saturate_stories = _canned
 
     # 2) a fake Explorer: round 1 -> US-1 hits a BLOCKING bug (loop must fix+reset+re-run); round 2 -> clean.
     state = {"round": 0}
@@ -974,6 +1007,7 @@ def _selftest():
         print(f"qa_run selftest: FAIL — {e}")
     finally:
         story_gen.generate_stories = real_gen
+        story_gen.saturate_stories = real_sat
         qa_explorer.Explorer = real_explorer
         dev_loop.fix_bug, dev_loop.restart_target = real_fix, real_restart
         factory.agent = real_agent

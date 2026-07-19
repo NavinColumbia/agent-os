@@ -1061,15 +1061,16 @@ const VIEWS={
    <div class=card><div class="row composer"><textarea id=msg class=chatbox rows=1 aria-label="Describe your app idea" placeholder="e.g. I want an app to track my gym members…" oninput="grow(this)" onkeydown="taKey(event,chatSend)"></textarea><button class=pri id=chatsend onclick=chatSend()>Send</button></div><div id=chatnote class=muted style=margin-top:6px></div></div>`;
   await chatRender();
  },
- cockpit:async()=>{const d=await get('/api/cockpit?org='+ORG);const s=d.summary||{},b=d.budget||{};d.products=d.products||[];d.communications=d.communications||[];d.queue=d.queue||{};
-  let fc=null;try{fc=await get('/api/forecast')}catch(e){}
-  let ql={};try{const q=await get('/api/quality');(q.products||[]).forEach(p=>ql[p.product]=p)}catch(e){}
-  let ob=null;try{ob=await get('/api/onboarding')}catch(e){}
-  let co=null;try{co=await get('/api/company?org='+ORG)}catch(e){}
-  let hl=null;try{hl=await get('/api/health?org='+ORG)}catch(e){}
-  let ls={};try{const l=await get('/api/livestatus');(l.products||[]).forEach(p=>ls[p.product]=p)}catch(e){}
+ cockpit:async()=>{const P=u=>get(u).catch(()=>null);   // fetch the whole cockpit CONCURRENTLY (was 8 sequential
+  // round-trips → a multi-second phone spinner). Each is fault-tolerant; the brief stays async (below).
+  const [d0,fc,q,ob,co,hl,l,pf]=await Promise.all([P('/api/cockpit?org='+ORG),P('/api/forecast'),
+    P('/api/quality'),P('/api/onboarding'),P('/api/company?org='+ORG),P('/api/health?org='+ORG),
+    P('/api/livestatus'),P('/api/portfolio')]);
+  const d=d0||{};const s=d.summary||{},b=d.budget||{};d.products=d.products||[];d.communications=d.communications||[];d.queue=d.queue||{};
+  const ql={};((q&&q.products)||[]).forEach(p=>ql[p.product]=p);
+  const ls={};((l&&l.products)||[]).forEach(p=>ls[p.product]=p);
   let h='<h1>Cockpit</h1><p class=sub>Your whole company at a glance.</p>';
-  try{const pf=await get('/api/portfolio');if(pf&&pf.totals){const t=pf.totals;const sr=t.products?Math.round(100*(t.live||0)/t.products):0;h+=kpis([['Products',t.products||0],['Live',t.live||0],['In progress',t.building||0],['Ship rate',sr+'%'],['AI spend','$'+(t.spend_usd||0)]]);}}catch(_e){}
+  if(pf&&pf.totals){const t=pf.totals;const sr=t.products?Math.round(100*(t.live||0)/t.products):0;h+=kpis([['Products',t.products||0],['Live',t.live||0],['In progress',t.building||0],['Ship rate',sr+'%'],['AI spend','$'+(t.spend_usd||0)]]);}
   // BRIEF is a MODEL call (~seconds) — load it ASYNC into a placeholder so it NEVER blocks the cockpit
   // render (a blocking await here hung the whole main screen ~8s). Fire-and-forget; injects when it lands.
   h+='<div id=cockpit_brief></div>';

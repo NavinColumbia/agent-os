@@ -61,6 +61,39 @@ def beat(component, meta=None):
         c.commit()
 
 
+# THE DB-OUTAGE BLIND SPOT: every detector, the dedup table, and self-heal all live in Postgres. If Postgres
+# itself is down (container died / OS shutdown — exactly the North-Star failure list), a normal tick() throws
+# before it can page — the ONE failure that blinds the whole plane would also MUTE the pager. So tick() probes
+# the DB first (DB-free) and, if it's gone, pages out-of-band via ntfy (which needs no DB), file-deduped
+# because our watchdog_alerts dedup lives in the very DB that's unreachable.
+_DB_DOWN_MARK = Path("/tmp/agentos-watchdog-dbdown.mark")
+
+
+def _db_reachable():
+    try:
+        with psycopg.connect(DB, connect_timeout=3) as c, c.cursor() as cur:
+            cur.execute("SELECT 1"); cur.fetchone()
+        return True
+    except Exception:
+        return False
+
+
+def _page_db_down():
+    """One urgent page per COOLDOWN_S while Postgres is unreachable (file-deduped)."""
+    try:
+        fresh = (not _DB_DOWN_MARK.exists()) or (time.time() - _DB_DOWN_MARK.stat().st_mtime > COOLDOWN_S)
+    except Exception:
+        fresh = True
+    if fresh:
+        notify.send("■ Postgres is UNREACHABLE — the whole control plane (builds, QA, pulse, watchdog dedup) "
+                    "is blind until it is back. Check the postgres container.",
+                    title="agent-os watchdog", priority="urgent", tags="rotating_light")
+        try:
+            _DB_DOWN_MARK.touch()
+        except Exception:
+            pass
+
+
 def _pgrep(pat):
     return int(subprocess.run(["pgrep", "-fc", pat], capture_output=True, text=True).stdout.strip() or "0")
 
@@ -132,6 +165,15 @@ def check():
 def tick(auto_heal=True):
     """Detect → try a bounded auto-fix (responder) → page only what can't be auto-fixed or needs
     judgement. Recoveries announced for things a human was paged about."""
+    if not _db_reachable():                # DB-OUTAGE GUARD: page out-of-band before any DB touch (see above),
+        _page_db_down()                    # so the failure that blinds the plane can't also mute the pager
+        return {"issues": 1, "healed": [], "paged": ["postgres unreachable"], "recovered": 0, "db_down": True}
+    if _DB_DOWN_MARK.exists():             # Postgres just came back — announce recovery and clear the marker
+        try:
+            notify.send("✓ recovered: Postgres reachable again", title="agent-os watchdog", tags="white_check_mark")
+            _DB_DOWN_MARK.unlink()
+        except Exception:
+            pass
     _ensure()
     beat("watchdog")   # the act of ticking IS our liveness proof — beat FIRST so a slow tick (e.g. a 180s
                        # snapshot remediation) or a fresh post-boot tick never flags OUR OWN heartbeat as stale

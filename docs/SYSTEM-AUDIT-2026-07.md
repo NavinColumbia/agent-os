@@ -52,9 +52,9 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
    present where it actually runs.
 
 ## B. Observability — the "silence is a signal" bar
-6. **DB-down blinds the watchdog AND mutes the pager** (watchdog.py:135) — `tick()` touches Postgres before
-   paging, so the one failure that blinds pulse/heartbeats/sentinel also silences alerts. Only `monitor.py`
-   can report it (and it also pages through the same ntfy). Biggest silent-failure hole.
+6. ✅ **FIXED — watchdog survives a DB outage** — `tick()` now probes Postgres first (DB-free) and, if it's
+   down, pages out-of-band via ntfy (file-deduped, since the dedup table is in the dead DB) and returns
+   instead of throwing. Announces recovery when the DB returns. New `test_watchdog_pages_out_of_band_when_db_down`.
 7. **The pager itself can die silently** — `notify.send` is fail-open; a down ntfy drops every page with no
    out-of-band fallback, and nothing detects a dead ntfy except a module that pages through ntfy.
 8. **In-stage build hangs invisible ~30min** — the controller beats once per stage at cadence 600; factory
@@ -69,13 +69,16 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
     tenant outage can't bill the platform has no asserting selftest branch.
 
 ## D. QA integrity — the "zero bugs reach a human" bar
-12. **The auditor gate is optional + fail-open** (qa_run.py:640/657) — `AOS_QA_AUDIT_GATE=0`, or ANY
-    exception in `review.review`, leaves `passed` untouched → a run ships with no skeptical review.
+12. ✅ **FIXED (fail-open half) — auditor gate now fails CLOSED** (`_audit_unavailable`) — an exception in
+    `review.review` downgrades a would-be pass to not-passed (an unverifiable run can't ship). New
+    `test_qa_auditor_gate_fails_closed_when_audit_unavailable`. (The deliberate `AOS_QA_AUDIT_GATE=0`
+    operator/offline-test override remains.)
 13. **Finding re-verification skips the auditor** (findings.py:145) — a fixer's re-run resolves a finding on
-    a run the jury never saw (judged more leniently than the original).
-14. **The story SET on the ship path is a single un-judged enumeration** — `saturate_stories` + the
-    independent coverage judge + regression pins exist but have **zero callers**; an entire persona/surface
-    can be silently absent and the verdict still says "ALL STORIES PASSED."
+    a run the jury never saw (judged more leniently than the original). *(still open)*
+14. ✅ **FIXED — ship path now saturates the story SET** — `qa_run` calls `story_gen.saturate_stories`
+    (generate → INDEPENDENT coverage judge in a different role → expand on named gaps, bounded, corpus-
+    persisted with regression pins) instead of one un-judged `generate_stories`. `AOS_QA_SATURATE=0` +
+    safe fallback preserved. This is the direct fix for the "50 actions, I'm out / needed 5,000" gap.
 
 ## E. Security / due-diligence — the "sellable for hundreds of millions" bar
 15. **No Postgres RLS** — tenant isolation rests on every hand-written query remembering its predicate;
@@ -93,8 +96,9 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
 20. **`appregistry.publish` can push secrets** — `git add -A` after a `.gitignore` that omits `.env`/`keys/`.
 
 ## F. Product UX — the "astonish a skeptic" bar
-21. **Cockpit first-paint latency** (console.py:1064) — ~7 sequential `await get()` calls before render; a
-    multi-second spinner on the CEO's phone home screen. The single most likely "one frustration."
+21. ✅ **FIXED — cockpit first paint is now concurrent** — the 8 sequential `await get()` calls are one
+    `Promise.all` (fault-tolerant, brief still async); no more multi-second phone spinner. Client JS
+    node-syntax-checked; console selftest green.
 22. **No proactive push** — the whole "briefed on the calls that matter" promise is poll-only (5–15s while a
     tab is open); a CEO who closes the tab hears nothing.
 23. **Human-pattern comms are shallow** — options are neutral cards; no disagreement surfacing, no escalation

@@ -47,9 +47,11 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
 4. **At-least-once re-run duplicates side effects** — *largely subsumed by #1* (no more emitted-but-not-
    completed window on the decide loop). Residual: cross-PROCESS duplicate tool dispatch (jobrunner `_JOBS`
    is process-local) — lower priority, single-process is the current assumption. No idempotency key on emits.
-5. **Research (the ONE live orchestra caller) bypasses `run_org`** (research_org.py:133) — hand-rolls a
-   synchronous single-shot over store.py, so the crash-resume the engine is documented to have is **not**
-   present where it actually runs.
+5. 🟡 **ADDRESSED (offline, flagged) — research now has a crash-resumable `run_org` path** — new
+   `research_org.run_research_via_org` + `research_subq` tool + `research-coordinator` branch, behind
+   `AOS_RESEARCH_RUNORG` (default OFF). Offline-proven (contract preserved, crash-resume lossless, billing
+   correct: `_selftest_via_org` + 2 unit tests). Remaining: the owner-gated live run, then flip default +
+   delete the synchronous path. Plan: `docs/RESEARCH-RUNORG-REWIRE.md`.
 
 ## B. Observability — the "silence is a signal" bar
 6. ✅ **FIXED — watchdog survives a DB outage** — `tick()` now probes Postgres first (DB-free) and, if it's

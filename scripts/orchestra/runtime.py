@@ -457,6 +457,20 @@ def _coordinator_specs(ctx, a, task, role):
                     "target_url": c.get("target_url"), "stories": c.get("stories"),
                     "restart_cmd": c.get("restart_cmd"), "health_url": c.get("health_url"),
                     "token": c.get("token"), "org": c.get("org")}}]
+    if role == "research-coordinator":
+        # RESEARCH as a durable org: the coordinator DECOMPOSES the question (research_fleet's proven splitter)
+        # and spawns one research_subq tool-worker per sub-question. Each is dispatch-and-parked (crash-
+        # reclaimable) and writes the CONTRACT finding (findings/NN.md); run_research_via_org synthesizes
+        # REPORT.md after the org completes. Mirrors the qa-coordinator's deterministic tool-team spawn.
+        import research_fleet
+        repo = c.get("repo") or ctx.repo
+        question = c.get("question") or task
+        subqs = research_fleet.decompose(Path(repo), question) or [question]   # >=1 -> honest empty never fabricated
+        return [{"name": f"{a['name']}.r{i}", "role": "research-growth", "kind": "worker", "task": sq,
+                 "tool": "research_subq",
+                 "tool_args": {"idx": i, "subq": sq, "repo": str(repo),
+                               "tenant": c.get("tenant"), "org": c.get("org")}}
+                for i, sq in enumerate(subqs)]
     # COMPANY / CEO coordinator: context.functions = [{role, tool, items, worker_role, task}] -> spawn one
     # SUPERVISOR (a FUNCTION coordinator) per function, each carrying its own tool-team context. This is the
     # top of a full CEO-directed org: CEO-coordinator -> function coordinators -> tool-workers -> reports up.

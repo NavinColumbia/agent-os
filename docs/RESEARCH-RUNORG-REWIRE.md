@@ -66,16 +66,18 @@ subq (mirrors the qa-coordinator branch). No new AI-decompose prompt; reuse rese
 - tenant BYO-key run → `research_subq` rebuilds the TENANT's provider; spend attributed to the tenant.
 
 ## Done-checklist (each mapped to a named proof)
-- [ ] `research_subq` writes a contract finding → extend `tools.py` selftest.
-- [ ] `_coordinator_specs` research branch returns one spec/subq → `runtime` selftest assertion.
-- [ ] full org run: controller → coordinator → N researchers → synthesize → REPORT.md where research.py
-      expects it → a NEW `research_org` selftest path (mirrors the existing one, engine=run_org).
-- [ ] CRASH-RESUME: kill mid-run, re-enter, lossless, no double-run → assertion in that selftest (mirror the
-      `runtime` crash-resume proof).
-- [ ] BILLING: a tenant run resolves the tenant provider (not platform) → assertion.
-- [ ] `AOS_RESEARCH_RUNORG=1` live run on one real question matches the legacy report shape → the live-run
-      step (spends; owner-gated).
-- [ ] flip default to on; delete the synchronous path + `ThreadPoolExecutor` import.
+- [x] `research_subq` tool (tools.py) writes the contract finding via `research_fleet.research_one`; registered.
+- [x] `_coordinator_specs` research-coordinator branch decomposes → one `research_subq` spec/subq (runtime.py).
+- [x] full org run: coordinator → N researchers → synthesize → REPORT.md where research.py expects it →
+      `research_org._selftest_via_org()` part A (subquestions=3, answered=2, run done).
+- [x] CRASH-RESUME: a worker parked mid-job (finding deleted, in-proc handle gone) is re-dispatched by
+      `reconcile_parked` and re-writes its finding losslessly → `_selftest_via_org()` part B.
+- [x] BILLING: `tools._apply_tenant_ctx` resolves the tenant provider (platform→host, claude→their key,
+      codex→engine codex) → `test_research_subq_ctx_rebuild_bills_the_tenant`.
+- [x] wired behind `AOS_RESEARCH_RUNORG` (default OFF); legacy path + runtime + tools selftests still green.
+- [ ] **NEXT (owner-gated, spends):** `AOS_RESEARCH_RUNORG=1` live run on one real question; compare report +
+      billing to legacy.
+- [ ] flip default to on; delete the synchronous path + `ThreadPoolExecutor`.
 
 ## Rollout
 1. Land the additive code + offline proofs (flag OFF). 2. One live research with the flag ON, compare report

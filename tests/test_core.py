@@ -816,6 +816,40 @@ def test_pulse_reap_orphans_finalizes_dead_only():
             c.commit()
 
 
+def test_research_subq_ctx_rebuild_bills_the_tenant():
+    """BILLING correctness for the run_org research path: research_subq runs in a jobrunner thread that does
+    NOT inherit factory._ctx, so it must rebuild the provider from the tenant id (never a persisted key) so
+    spend lands on THEIR account. Platform -> host subscription (no key); a claude tenant -> their key; a codex
+    tenant -> engine codex. This is the single most important invariant of the rewire."""
+    sys.path.insert(0, str(ROOT / "scripts" / "orchestra"))
+    import tools, factory, tenantproviders
+    real = tenantproviders.resolve
+    try:
+        assert tools._apply_tenant_ctx("platform", None) is None          # platform -> host subscription
+        assert factory._ctx.tenant is None and factory._ctx.api_key is None
+        tenantproviders.resolve = lambda t: {"engine": "claude", "key": "sk-tenant-abc"}
+        k = tools._apply_tenant_ctx("acme", "3")                          # BYO claude key -> billed to them
+        assert k == "sk-tenant-abc" and factory._ctx.api_key == "sk-tenant-abc"
+        assert factory._ctx.engine == "claude" and factory._ctx.tenant == "acme" and factory._ctx.org == "3"
+        tenantproviders.resolve = lambda t: {"engine": "codex", "key": "cdx-xyz"}
+        k2 = tools._apply_tenant_ctx("beta", None)                        # codex -> engine codex, no claude key
+        assert k2 is None and factory._ctx.engine == "codex" and factory._ctx.codex_key == "cdx-xyz"
+        assert factory._ctx.api_key is None
+    finally:
+        tenantproviders.resolve = real
+        factory._ctx.tenant = factory._ctx.api_key = factory._ctx.codex_key = None
+        factory._ctx.engine = "claude"
+
+
+def test_research_via_org_durable_and_crash_resumable():
+    """Band-2 rewire: research runs as a crash-resumable run_org org (research-coordinator -> dispatch-and-
+    parked research_subq workers), preserves the REPORT.md output contract, and reconcile re-dispatches a
+    worker whose job died — losslessly. Delegates to the module's offline proof (stubbed agent, real DB)."""
+    sys.path.insert(0, str(ROOT / "scripts" / "orchestra"))
+    import research_org
+    assert research_org._selftest_via_org() == 0
+
+
 def test_watchdog_pages_out_of_band_when_db_down():
     """The DB-outage blind spot: if Postgres itself is down, tick() must NOT throw (which would mute the
     pager) — it pages out-of-band via notify and returns db_down. The one failure that blinds the whole plane

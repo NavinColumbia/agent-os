@@ -142,6 +142,48 @@ def research(args: dict) -> dict:
     return r
 
 
+def _apply_tenant_ctx(tenant, org):
+    """BILLING CORRECTNESS for a tool running in a jobrunner background thread — which does NOT inherit the
+    caller's thread-local factory._ctx. Resolve THIS tenant's connected provider and wire engine/keys into
+    _ctx so model spend lands on THEIR account, never the platform default. Returns the resolved CLAUDE
+    api_key (or None for codex/subscription/platform) to hand to research_one. tenant None/'platform' -> the
+    host subscription CLI (no key). Mirrors loopcontroller._apply_provider_ctx so both engines agree."""
+    import factory
+    tid = tenant if tenant not in (None, "", "platform") else None
+    factory._ctx.tenant, factory._ctx.org = tid, org
+    factory._ctx.engine, factory._ctx.api_key, factory._ctx.codex_key = "claude", None, None
+    if not tid:
+        return None
+    try:
+        import tenantproviders
+        r = tenantproviders.resolve(tid) or {}
+    except Exception:
+        r = {}
+    if r.get("engine") == "codex":
+        factory._ctx.engine, factory._ctx.codex_key = "codex", r.get("key")
+        return None
+    factory._ctx.api_key = r.get("key")
+    return r.get("key")
+
+
+def research_subq(args: dict) -> dict:
+    """One researcher's real work IN THE run_org ENGINE: answer ONE sub-question via
+    research_fleet.research_one so it writes the CONTRACT finding (findings/NN.md) that
+    research_fleet.synthesize later reads — this is what lets research run as a crash-resumable durable org
+    (each subq is a dispatch-and-parked, lease-reclaimable tool job) WITHOUT changing the console output.
+    Rebuilds factory._ctx from the tenant id in args (never a persisted api_key) so spend is billed to the
+    right account. args: {idx, subq|task, repo, tenant?, org?}."""
+    import research_fleet
+    idx = int(args.get("idx") or 0)
+    subq = args.get("subq") or args.get("task") or ""
+    repo = args.get("repo")
+    if not (subq and repo):
+        return {"status": "failed", "findings": [], "result": {"error": "research_subq needs {subq, repo}"}}
+    key = _apply_tenant_ctx(args.get("tenant"), args.get("org"))
+    res = research_fleet.research_one(Path(repo), idx, subq, api_key=key)
+    return {"status": "done" if res.get("ok") else "failed", "findings": [], "result": res}
+
+
 def finance_report(args: dict) -> dict:
     """A finance function's real work: assemble a CEO-facing financial report from the data provided (or the
     platform's own metrics/billing if present) — spend, revenue, burn, runway, unit economics — honestly."""
@@ -294,7 +336,7 @@ def knowledge_work(args: dict) -> dict:
     return _agent_tool(role, prompt, args)
 
 
-_TOOLS = {"qa_explore": qa_explore, "dev_fix": dev_fix, "research": research,
+_TOOLS = {"qa_explore": qa_explore, "dev_fix": dev_fix, "research": research, "research_subq": research_subq,
           "finance_report": finance_report, "knowledge_work": knowledge_work, "data_query": data_query,
           "legal_scan": legal_scan, "connector_ingest": connector_ingest,
           "produce_artifact": produce_artifact, "design_asset": design_asset}

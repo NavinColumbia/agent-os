@@ -78,6 +78,10 @@ def run_research(question, out_rel="REPORT.md", api_key=None, research_run_id=No
     """Execute one research question as a durable org run. Same return contract as
     research_fleet.research: {"report": <path>, "subquestions": N, "answered": N} (+ the
     orchestra run id). Raises on a refused/failed run so research._run marks it failed."""
+    if os.environ.get("AOS_RESEARCH_RUNORG", "0").lower() not in ("0", "false", "no", ""):
+        # CRASH-RESUMABLE engine (docs/RESEARCH-RUNORG-REWIRE.md): route through runtime.run_org. Flagged OFF
+        # by default until the offline crash-resume proof AND one live run pass; then this becomes the default.
+        return run_research_via_org(question, out_rel, api_key, research_run_id, tenant_id, org_id)
     rid = research_run_id if research_run_id is not None else uuid.uuid4().hex[:12]
     tenant = tenant_id or "platform"
     org_num = int(org_id) if org_id is not None and str(org_id).isdigit() else None
@@ -184,6 +188,71 @@ def run_research(question, out_rel="REPORT.md", api_key=None, research_run_id=No
         stop.set()                                         # stop the heartbeat ticker
 
 
+def run_research_via_org(question, out_rel="REPORT.md", api_key=None, research_run_id=None,
+                         tenant_id=None, org_id=None):
+    """CRASH-RESUMABLE research: run it as a durable runtime.run_org org instead of the synchronous
+    ThreadPoolExecutor. A research-coordinator DECOMPOSES the question and spawns one dispatch-and-parked
+    `research_subq` tool-worker per sub-question — each is lease-reclaimable, so a process death mid-run is
+    resumed (reconcile_parked re-dispatches only the unfinished ones) rather than lost. Then we synthesize
+    REPORT.md deterministically (kept OUT of the org: a mid-synthesize crash just re-runs a single cheap call).
+    Same return contract as run_research. See docs/RESEARCH-RUNORG-REWIRE.md."""
+    import time as _t
+    import runtime as rt
+    rid = research_run_id if research_run_id is not None else uuid.uuid4().hex[:12]
+    tenant = tenant_id or "platform"
+    org_num = int(org_id) if org_id is not None and str(org_id).isdigit() else None
+    repo = factory.PRODUCTS / f"research-{rid}-{research_fleet._slug(question)}"
+    (repo / "findings").mkdir(parents=True, exist_ok=True)
+
+    run = _guard(store.start_run(tenant, question, org_id=org_num), "start_run")
+    orc = run["run_id"]
+    coord = _guard(store.spawn_actor(orc, tenant, "research-coordinator", "research-coordinator",
+                                     kind="supervisor", org_id=org_num, assignment=question,
+                                     memory={"context": {"repo": str(repo), "question": question,
+                                                         "tenant": tenant, "org": org_id},
+                                             "research_run_id": rid}), "spawn coordinator")
+    _guard(store.emit(orc, tenant, None, coord["actor_id"], "task", {"task": question}), "emit task")
+
+    try:
+        # DRIVE to completion — tool jobs are async, so re-enter run_org until terminal or fully idle (the
+        # proven company.run_company_org loop). run_org's reconcile_parked at startup gives crash-resume.
+        budget_s = int(os.environ.get("AOS_RESEARCH_DRIVE_S", "3600"))
+        started = _t.time()
+        while _t.time() - started < budget_s:
+            rt.run_org(orc, tenant, repo=str(repo), workers=WORKERS)
+            if (store.run(orc, tenant) or {}).get("status") in ("done", "failed", "halted"):
+                break
+            try:
+                import jobrunner
+                active = any(j["state"] == "running" for j in jobrunner._JOBS.values())
+            except Exception:
+                active = False
+            if not active and not sum(store.pending_count(a["actor_id"], tenant)
+                                      for a in store.actors(orc, tenant)):
+                break
+            _t.sleep(0.2)
+
+        # SYNTHESIZE the contract report where research.py expects it (deterministic post-step).
+        report = research_fleet.synthesize(repo, question, out_rel)
+        workers = [a for a in store.actors(orc, tenant) if a.get("kind") == "worker"]
+        answered = sum(1 for w in workers if ((w.get("result") or {}).get("result") or {}).get("ok"))
+        summary = {"report": str(report), "subquestions": len(workers), "answered": answered,
+                   "research_run_id": rid}
+        if (store.run(orc, tenant) or {}).get("status") != "done":
+            store.finish_run(orc, "done", summary, tenant_id=tenant)
+        audit.append(actor="orchestra:research", action="OrgRunDone", resource=str(orc),
+                     decision="executed", payload={**summary, "engine": "run_org"})
+        return {**summary, "orchestra_run_id": orc}
+    except Exception as e:
+        try:
+            store.finish_run(orc, "failed", {"error": str(e)[:300]}, tenant_id=tenant)
+            audit.append(actor="orchestra:research", action="OrgRunFailed", resource=str(orc),
+                         decision="failed", payload={"error": str(e)[:300], "engine": "run_org"})
+        except Exception:
+            pass
+        raise
+
+
 # ==============================================================================================
 # OFFLINE SELFTEST — factory.agent stubbed (no LLM, no web, no spend); REAL local Postgres.
 # Proves the full org run: hire tree -> task events -> parallel children (one BLOCKS) ->
@@ -284,10 +353,100 @@ def _selftest():
     sys.exit(0 if ok else 1)
 
 
-__all__ = ["run_research", "CONTROLLER_ROLE", "RESEARCHER_ROLE"]
+def _selftest_via_org():
+    """OFFLINE proof of the run_org engine path (AOS_RESEARCH_RUNORG): (A) happy path — controller-less
+    research-coordinator decomposes → 3 dispatch-and-parked research_subq workers (one fails) → REPORT.md lands
+    where research.py expects, answered=2/3; (B) CRASH-RESUME — a worker left parked mid-job (its finding
+    deleted, in-process job handle gone) is re-dispatched by run_org's reconcile_parked and re-writes its
+    finding losslessly. factory.agent stubbed (no LLM/web/spend); REAL local Postgres. Returns 0/1."""
+    import shutil
+    import tempfile
+    import time as _t
+    import psycopg
+    import jobrunner
+    import runtime as rt
+
+    tid = f"research-viaorg-selftest-{uuid.uuid4().hex[:8]}"
+    tmp = Path(tempfile.mkdtemp())
+    real_agent, real_products = factory.agent, factory.PRODUCTS
+    factory.PRODUCTS = tmp
+
+    def fake_agent(role, repo, task, **k):
+        repo = Path(repo)
+        if "Split this research question" in task:
+            return {"rc": 0, "out": "Q: q1 alpha?\nQ: q2 beta?\nQ: q3 gamma?"}
+        if "Write your findings" in task:
+            if "q2" in task:
+                return {"rc": -1, "failed": True, "out": "", "blocker": "no web access"}
+            f = task.split("Write your findings to ")[1].split(" ")[0]
+            (repo / f).parent.mkdir(parents=True, exist_ok=True)
+            (repo / f).write_text("finding\nSources: x")
+            return {"rc": 0, "out": "ok"}
+        if "SYNTHESIZER" in task:
+            (repo / "REPORT.md").write_text("# report")
+            return {"rc": 0, "out": "ok"}
+        return {"rc": 0, "out": "ok"}
+
+    factory.agent = fake_agent
+    ok = False
+    try:
+        # (A) happy path through the durable engine
+        res = run_research_via_org("how should we grow the platform", tenant_id=tid,
+                                   org_id="7", research_run_id=555)
+        orc = res["orchestra_run_id"]
+        acts = store.actors(orc, tid)
+        workers = [a for a in acts if a["kind"] == "worker"]
+        happy = (Path(res["report"]).exists() and str(res["report"]).endswith("REPORT.md")
+                 and res["subquestions"] == 3 and res["answered"] == 2
+                 and any(a["role"] == "research-coordinator" for a in acts)
+                 and len(workers) == 3
+                 and (store.run(orc, tid) or {}).get("status") == "done")
+
+        # (B) crash-resume: take one DONE worker, wipe its finding + park it as if its job crashed mid-flight,
+        # drop the in-process job handle, then let run_org's reconcile_parked re-dispatch it -> re-writes it.
+        repo = Path(res["report"]).parent
+        victim = next(w for w in workers if (w.get("result") or {}).get("result", {}).get("ok"))
+        vidx = victim["result"]["result"]["idx"]
+        (repo / f"findings/{int(vidx):02d}.md").unlink(missing_ok=True)
+        store.update_actor(victim["actor_id"], tid, status="blocked",
+                           memory={"context": {"tool": "research_subq", "tool_dispatched": True,
+                                               "tool_args": {"idx": vidx, "subq": victim["assignment"],
+                                                             "repo": str(repo), "tenant": tid}}})
+        with jobrunner._LOCK:
+            jobrunner._JOBS.clear()                               # simulate a fresh process (crash)
+        with psycopg.connect(store.DB) as c, c.cursor() as cur:   # a crashed run is 'running', not 'done'
+            cur.execute("UPDATE orchestra_runs SET status='running' WHERE run_id=%s AND tenant_id=%s", (orc, tid))
+            c.commit()
+        deadline = _t.time() + 30
+        while _t.time() < deadline:                              # run_org startup reconciles the parked worker
+            rt.run_org(orc, tid, repo=str(repo), workers=2, stall_s=2.0)
+            if store.actor(victim["actor_id"], tid)["status"] == "done":
+                break
+            _t.sleep(0.2)
+        resumed = (store.actor(victim["actor_id"], tid)["status"] == "done"
+                   and (repo / f"findings/{int(vidx):02d}.md").exists())    # finding re-written -> lossless
+
+        ok = happy and resumed
+        print(f"via_org: happy_path(contract+answered)={happy} crash_resume(reconcile re-dispatch)={resumed}")
+        print("PASS: research via run_org — durable coordinator→parked research_subq workers, contract "
+              "REPORT.md preserved, crash-resumed losslessly ✅" if ok else "FAIL")
+        return 0 if ok else 1
+    finally:
+        factory.agent, factory.PRODUCTS = real_agent, real_products
+        shutil.rmtree(tmp, ignore_errors=True)
+        with psycopg.connect(store.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM orchestra_events WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM orchestra_actors WHERE tenant_id=%s", (tid,))
+            cur.execute("DELETE FROM orchestra_runs WHERE tenant_id=%s", (tid,))
+            c.commit()
+
+
+__all__ = ["run_research", "run_research_via_org", "CONTROLLER_ROLE", "RESEARCHER_ROLE"]
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] != "selftest":
-        sys.exit("usage: research_org.py selftest")
+    if len(sys.argv) > 1 and sys.argv[1] not in ("selftest", "selftest-via-org"):
+        sys.exit("usage: research_org.py selftest|selftest-via-org")
+    if len(sys.argv) > 1 and sys.argv[1] == "selftest-via-org":
+        sys.exit(_selftest_via_org())
     _selftest()

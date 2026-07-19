@@ -117,7 +117,7 @@ available under subscription/OAuth auth, so subscription tool-work stays on the 
   duplicate dispatch can't double-RUN a phase. *Remaining for full Step 2:* physically demote
   jobd/scheduler/resume-sweeper to pure enqueuers (strip their direct build-row writes) — the two guards
   already enforce the single-writer SAFETY property that was the actual bug.
-- [x] **Step 3 — SHIPPED (behind `AOS_DISPATCH_PARK`, default OFF)** — true dispatch-and-park. Each phase's
+- [x] **Step 3 — SHIPPED (behind `AOS_DISPATCH_PARK`, default ON)** — true dispatch-and-park. Each phase's
   work is reconstructable from persisted state (`_phase_fn` — one source of truth for both execution modes) and
   its execution context is rebuildable from the tenant id (`_rebuild_ctx` → resolved provider engine+key). With
   the flag on, `_dispatch` launches the phase in a **detached worker process** (`start_new_session`, so it

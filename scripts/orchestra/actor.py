@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""actor.py — the autonomous Actor (an IC) of the event-driven agent-org.
+"""actor.py — ⚠️ DEPRECATED / SUPERSEDED. This is the ORIGINAL in-memory prototype; the LIVE durable engine
+is scripts/orchestra/runtime.py (`_worker_step`). Kept for reference + its selftest only — it has NO
+production callers. Do not build on it. See docs/AGENTIC-QA-ORG.md.
+
+actor.py — the autonomous Actor (an IC) of the event-driven agent-org.
 
 Spec: docs/blueprint/AGENTIC-ORCHESTRATION.md § "Execution model: event-driven actors +
 hierarchical escalation (NOT barriers)".

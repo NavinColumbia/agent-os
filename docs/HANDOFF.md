@@ -11,7 +11,9 @@ invisibly*. When in doubt, re-read it.
 **How to verify you haven't broken anything (run before AND after any change):**
 ```bash
 cd ~/projects/agent-os
-bash scripts/selftest.sh                 # full suite — MUST stay "137 passed, 0 failed"
+bash scripts/selftest.sh                 # full suite of module selftests — MUST stay "0 failed" (the pass
+                                         # COUNT grows as modules are added; never gate on a fixed number)
+.venv/bin/python -m pytest tests/ -q     # the offline pytest suite (one of selftest.sh's checks) — 0 failed
 bash scripts/recover.sh                  # bring all services up (idempotent)
 ```
 Individual module selftests (fast, offline, no API/browser — run the one you touched):
@@ -253,4 +255,30 @@ python scripts/review.py <that-evidence-dir>              # the skeptical audit 
 Evidence (video `qa-session.mp4`, `COVERAGE.md`, `AUDIT.md`, screenshots) lands in a Windows-visible folder
 under `/mnt/c/Users/<you>/Documents/agent-os-qa-evidence/` when running under WSL.
 
-*Last updated at handoff. Session commits: `fbb51bf` … `de7d9f7`. Working tree clean; suite 137/0 green.*
+---
+
+## Part 6 — MOST RECENT WORK (2026-07, newest thrust — read this first to continue)
+
+The single source of truth for the current state is now **[`SYSTEM-AUDIT-2026-07.md`](SYSTEM-AUDIT-2026-07.md)**
+(a ground-up audit of all code + docs, with every finding severity-ranked and ✅-marked as fixed). Highlights
+landed after the sections above were written:
+
+- **Durability overhaul (Steps 1–3), dispatch-and-park is now the DEFAULT** (`AOS_DISPATCH_PARK=1`). Single-
+  owner drive lock, atomic orchestra decide-step, pid-reap of dead workers, crash-transparent resume. See
+  [`ARCHITECTURE-OVERHAUL.md`](ARCHITECTURE-OVERHAUL.md) / [`PARK-VALIDATION.md`](PARK-VALIDATION.md).
+- **The CEO's requirements agent** (`visionkeeper.py`) — holds the standing vision, self-refines requirements
+  incl. the up-front "what I need from you", maintains [`SYSTEM-REQUIREMENTS.md`](SYSTEM-REQUIREMENTS.md), and
+  feeds the controller so a vague prompt is enough. Auto-refines daily; surfaced in the console "Requirements".
+- **Proactive comms** (`proactivecomms.py`) — pushes the calls that matter to the CEO before they wonder.
+- **The living company org** (`orchestra/company.py`) — billing-correct, reliably completes, invocable via
+  `company.py run "<directive>"`; research runs on the crash-resumable `run_org` engine
+  ([`RESEARCH-RUNORG-REWIRE.md`](RESEARCH-RUNORG-REWIRE.md), flagged). Remaining: owner-gated LIVE run.
+- **Security/compliance hardening**: provider-aware consent, Codex spend counted, auth code brute-force cap +
+  non-enumerating login, published-repo secret-leak guard, watchdog survives a DB outage, auditor gate fails
+  closed + covers re-verification. All in the audit ledger.
+
+**The one true remaining critical path** is a LIVE end-to-end run (dispatch-and-park multi-hour crash test;
+agentic-QA parity; the company-org live run) — everything else is offline-green. That run spends real credits
+and is owner-gated.
+
+*Session commits through `master`. Verify with `bash scripts/selftest.sh` (0 failed) + `pytest tests/` (0 failed).*

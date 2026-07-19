@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""orchestra.py — the CONTROLLER (top actor) that wires the event-driven agent-org together.
+"""orchestra.py — ⚠️ DEPRECATED / SUPERSEDED. Original in-memory prototype controller; the LIVE durable engine
+is scripts/orchestra/runtime.py (`run_org` + controller logic). No production callers (selftest/demo only).
+Do not build on it.
+
+orchestra.py — the CONTROLLER (top actor) that wires the event-driven agent-org together.
 
 Spec: docs/blueprint/AGENTIC-ORCHESTRATION.md.
 

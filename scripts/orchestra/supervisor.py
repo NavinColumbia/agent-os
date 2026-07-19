@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""supervisor.py — the interrupt-driven Supervisor: a LEAD in the event-driven agent-org.
+"""supervisor.py — ⚠️ DEPRECATED / SUPERSEDED. Original in-memory prototype; the LIVE durable engine is
+scripts/orchestra/runtime.py (`_supervisor_step`). No production callers (only orchestra.py, also deprecated,
+and its selftest). Do not build on it.
+
+supervisor.py — the interrupt-driven Supervisor: a LEAD in the event-driven agent-org.
 
 Spec: docs/blueprint/AGENTIC-ORCHESTRATION.md § "Execution model: event-driven actors + hierarchical
 escalation (NOT barriers)" and § "Recursive, elastic org scaling".

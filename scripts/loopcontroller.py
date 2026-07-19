@@ -2578,7 +2578,7 @@ def _park_selftest():
             time.sleep(0.5)
         assert st2 == "done", f"detached worker must complete the job (got {st2})"
         print("PASS: detached worker process rebuilt state, ran, and wrote 'done' (survives as its own process)")
-        print("park_selftest: PASS (dispatch-and-park mechanics verified; default OFF via AOS_DISPATCH_PARK)")
+        print("park_selftest: PASS (dispatch-and-park mechanics verified; default ON via AOS_DISPATCH_PARK)")
     except AssertionError as e:
         ok = False
         print(f"park_selftest: FAIL — {e}")

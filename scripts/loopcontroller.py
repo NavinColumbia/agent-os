@@ -961,7 +961,8 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
                 "End with EXACTLY:\n[[PLAN]]\nname: <slug>\nkind: lib|web|service|project\n"
                 "plan: <bullets incl. the impact map, invariants/edge cases, parallelization, and done checks; one per line '- '>\n"
                 "agentic: <free-text: the agentic feature(s) the CEO wants + how each is invoked (button/event-async/"
-                "schedule), or 'none'>\ncharter: <2-4 sentences incl. the team/external surfaces to build in>\n[[/PLAN]]")
+                "schedule), or 'none'>\ncharter: <2-4 sentences incl. the team/external surfaces to build in>\n[[/PLAN]]"
+                + _ceo_context(tid, s.get("org_id")))   # ground the plan in the CEO's standing vision + reqs
         reply = _llm(tid, thread_id, sysp, s, on_delta=on_delta)
         pb = _parse_block(reply, "PLAN")
         clean = re.sub(r"\[\[PLAN\]\].*?\[\[/PLAN\]\]", "", reply, flags=re.S | re.I).strip()

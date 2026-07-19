@@ -53,6 +53,7 @@ import orgview           # noqa: E402
 import projbudget        # noqa: E402
 import projectsview      # noqa: E402
 import qualityview       # noqa: E402
+import visionkeeper       # noqa: E402  — the CEO's self-refining requirements (incl. up-front prerequisites)
 import settingsview      # noqa: E402
 import statuspage        # noqa: E402
 import templatesview     # noqa: E402
@@ -404,6 +405,7 @@ GETS = {
     "/api/onboarding": lambda tid, q: onboarding.state(tid),
     "/api/quality": lambda tid, q: {"products": qualityview.summary(tid)},
     "/api/quality/product": lambda tid, q: qualityview.verdict(tid, q.get("product", [""])[0]),
+    "/api/requirements": lambda tid, q: visionkeeper.get(tid, "meta"),   # standing vision + refined requirements
     "/api/estimate": lambda tid, q: estimate.estimate(q.get("kind", ["lib"])[0]),
     "/api/budgets": lambda tid, q: {"budgets": projbudget.list_budgets(tid)},
     "/api/versions": lambda tid, q: {"versions": versions.versions(tid, q.get("product", [""])[0])},
@@ -709,12 +711,12 @@ button:disabled{opacity:.6;cursor:not-allowed;pointer-events:none}
 </div>
 <script>
 const NAV=[
- ['Workspace',[['controller','Assistant','🧭'],['cockpit','Cockpit','◧'],['projects','Projects','▤'],['design','Design','🎨'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
+ ['Workspace',[['controller','Assistant','🧭'],['cockpit','Cockpit','◧'],['requirements','Requirements','📋'],['projects','Projects','▤'],['design','Design','🎨'],['approvals','Approvals','✓'],['activity','Activity','◴']]],
  ['Build',[['agents','Agents','🤖'],['agentic','Agentic features','⚡'],['templates','Templates','▦']]],
  ['Portfolio',[['orgs','My companies','🏢'],['portfolio','Portfolio','◎']]],
  ['Account',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
 ];
-const LABEL={controller:'Assistant',assistant:'Assistant',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My companies',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
+const LABEL={controller:'Assistant',assistant:'Assistant',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',requirements:'Requirements',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My companies',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
 const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
 let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];let PROVIDER_OK=true;let PEND_EMAIL='';
 async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];
@@ -965,6 +967,17 @@ function startTick(){if(window.CTLTICK)return;window.CTLTICK=setInterval(()=>{
   const el=$('#progelapsed');if(el)el.textContent=fmtElapsed((Date.now()-PROG._anchor)/1000);},1000);}
 function stopTick(){if(window.CTLTICK){clearInterval(window.CTLTICK);window.CTLTICK=null}}
 const VIEWS={
+ requirements:async()=>{
+  const d=await get('/api/requirements').catch(()=>null)||{};const r=d.requirements||{};
+  let h='<h1>Requirements</h1><p class=sub>What your agents will do — and what they need from you. Auto-refined from your vision; you never have to write a spec.</p>';
+  if(r.refined_vision)h+=`<section class=card style="border-color:var(--accent)"><b>Vision</b><div class=muted style=margin-top:6px>${esc(r.refined_vision)}</div></section>`;
+  const pre=r.prerequisites||[];const ic={credential:'🔑',account:'👤',budget:'💳',legal:'⚖️',approval:'✅',email:'✉️',other:'•'};
+  if(pre.length)h+='<section class=card><h2>What I need from you (up front)</h2>'+pre.map(p=>`<div class=item><span aria-hidden=true>${ic[p.kind]||'•'}</span> <b>${esc(p.item)}</b> ${pill(esc((p.when||'as needed').replace(/_/g,' ')),p.when==='before_start'?'warn':'ok')}<div class=muted style=margin-top:2px>${esc(p.why||'')}</div></div>`).join('')+'</section>';
+  const list=(t,xs)=>(xs&&xs.length)?`<section class=card><h2>${t}</h2>`+xs.map(x=>`<div class=item>${esc(x)}</div>`).join('')+'</section>':'';
+  h+=list('Goals',r.goals)+list('Quality bar',r.quality_bar)+list('Next up',r.next_capabilities)+list('Questions for you',r.open_questions);
+  if(!r.goals)h+='<div class=card>'+emptyB('📋','Refining your requirements…','Your requirements agent composes this from your vision — it refreshes daily, or the moment you start a build.')+'</div>';
+  $('#view').innerHTML=h;
+ },
  controller:async()=>{
   if(!ORGS.length){try{await loadOrgs()}catch(e){}}
   try{await loadProviders()}catch(e){}                                  // keep setup steps current after a provider is added

@@ -57,6 +57,10 @@ DEFAULT_SCHEDULES = [
     # CEO chief-of-staff brief (REBUILD-PLAN B1): DAILY per-tenant briefing composed from each company's
     # real state, delivered into their console notifications — the "your executive team briefs you" moment.
     ("chiefofstaff-daily", f"{VENV_PY} {SCRIPTS / 'chiefofstaff.py'} push-daily", 86400),
+    # CEO requirements keeper: DAILY re-refine of the standing requirements from the vision + live system
+    # state, so the spec (goals, quality bar, the UP-FRONT prerequisites) keeps self-sharpening without the
+    # CEO ever restating it. One model call; fail-soft (a bad refine never wipes a prior good spec).
+    ("vision-refine",     f"{VENV_PY} {SCRIPTS / 'visionkeeper.py'} refine meta", 86400),
 ]
 
 

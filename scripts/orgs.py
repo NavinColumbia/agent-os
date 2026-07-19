@@ -130,6 +130,11 @@ def set_vision(tenant_id, org_id, vision):
         if not _owned(cur, tenant_id, org_id):
             return {"error": "not your org"}
         cur.execute("UPDATE orgs SET vision=%s, updated_at=now() WHERE id=%s", (vision, org_id)); c.commit()
+    try:                                  # mirror into the requirements keeper (org scope) so this company's
+        import visionkeeper               # vague idea becomes build-ready requirements without the CEO restating
+        visionkeeper.set_vision(tenant_id, vision, scope=f"org:{org_id}")   # it. Best-effort; no spend here.
+    except Exception:
+        pass
     return {"org_id": org_id, "vision": vision}
 
 

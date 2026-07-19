@@ -1554,8 +1554,17 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/health":
             return self._json(200, {"service": "agent-os-console", "ok": True})
         if p.startswith("/download/"):
+            # A tenant may download ONLY a product it owns. This route is hit BEFORE the general auth block
+            # below, so it must do its own auth + ownership + path-traversal defense (mirrors the hardened
+            # frontdoor.py:252). Every failure returns 404 so a stranger can't even probe which products exist.
             product = p[len("/download/"):]
-            if not (frontdoor.PRODUCTS / product).exists():
+            tid = _tenant(self.headers.get("X-Tenant-Token"))
+            if tid is _TENANT_ERROR:                              # transient backend blip — keep the session
+                return self._json(503, {"error": "backend temporarily unavailable — reconnecting"})
+            slug_ok = bool(product) and set(product) <= set("abcdefghijklmnopqrstuvwxyz0123456789-")
+            inside = (frontdoor.PRODUCTS / product).resolve().is_relative_to(frontdoor.PRODUCTS.resolve())
+            if not (tid and slug_ok and inside and tenancy.owns(tid, product)
+                    and (frontdoor.PRODUCTS / product).exists()):
                 return self._json(404, {"error": "not found"})
             data = frontdoor._zip(product)
             self.send_response(200); self.send_header("Content-Type", "application/zip")

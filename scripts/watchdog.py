@@ -117,7 +117,8 @@ def check():
     # the live view agrees; each becomes an incident (deduped by watchdog_alerts like everything else).
     try:
         import pulse
-        pulse.sweep()
+        pulse.reap_orphans()   # first reconcile dead-process ghosts to terminal (reboot/crash) so we don't
+        pulse.sweep()          # page forever on work that no longer exists; then flag the genuinely-silent live ones
         for w in pulse.stalled():
             issues.append({"sig": f"pulse:{w['work_id']}", "level": "warn",
                            "msg": f"{w['kind']} '{w.get('label') or w['work_id']}' silent "
@@ -132,6 +133,8 @@ def tick(auto_heal=True):
     """Detect → try a bounded auto-fix (responder) → page only what can't be auto-fixed or needs
     judgement. Recoveries announced for things a human was paged about."""
     _ensure()
+    beat("watchdog")   # the act of ticking IS our liveness proof — beat FIRST so a slow tick (e.g. a 180s
+                       # snapshot remediation) or a fresh post-boot tick never flags OUR OWN heartbeat as stale
     issues = check()
     now_sigs = {i["sig"] for i in issues}
     paged, healed = [], []
@@ -197,6 +200,13 @@ def _main(a):
         beat("selftest-probe")
         iss = check()
         ok = isinstance(iss, list)
+        # clean up the probe row — a lingering 'selftest-probe' heartbeat would itself become a permanent
+        # stale-heartbeat false alarm (exactly what we just had to reconcile by hand).
+        try:
+            with psycopg.connect(DB) as c, c.cursor() as cur:
+                cur.execute("DELETE FROM heartbeats WHERE component='selftest-probe'"); c.commit()
+        except Exception:
+            pass
         print(f"watchdog check returned {len(iss)} issue(s); heartbeat write ok")
         print("PASS: watchdog detect + heartbeat ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)

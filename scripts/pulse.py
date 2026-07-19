@@ -212,6 +212,41 @@ def sweep():
     return len(hits)
 
 
+# A pulse silent past cadence*REAP_MULT (with an absolute REAP_MIN_S floor) is not "slow" — its process is
+# gone (a WSL/host restart killed it, or it crashed without a terminal write). `stalled` is the right LIVE
+# signal, but a stalled row must not linger forever: after a reboot the in-flight view would show week-old
+# ghosts and the watchdog would page on work that no longer exists. reap_orphans() reconciles those to a
+# terminal 'reaped' state — honest ("it did NOT finish; its process died"), and it clears the plane so
+# `live()`/`stalled()`/the watchdog reflect reality. Deliberately conservative so a slow-but-alive beater is
+# never reaped; call it from a slow control loop (the watchdog), never the hot beat path.
+REAP_MULT = int(os.environ.get("AOS_PULSE_REAP_MULT", "20"))
+REAP_MIN_S = int(os.environ.get("AOS_PULSE_REAP_MIN_S", "900"))     # 15 min floor — no live beater is this quiet
+
+
+def reap_orphans():
+    """Finalize non-terminal pulses gone silent past max(cadence*REAP_MULT, REAP_MIN_S) → status='reaped'.
+    Their process is provably gone (dead heartbeat). Returns the count reaped. Fail-open."""
+    if not DB:
+        return 0
+    try:
+        _ensure()
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""UPDATE agent_pulse
+                             SET status='reaped', finished_at=now(),
+                                 result=COALESCE(result,'{}'::jsonb)
+                                        || jsonb_build_object('reaped_reason','heartbeat dead (process gone) — reconciled',
+                                                              'last_beat_age_s', EXTRACT(EPOCH FROM now()-last_beat)::INT)
+                           WHERE status IN ('active','stalled')
+                             AND EXTRACT(EPOCH FROM now()-last_beat)
+                                 > GREATEST(expected_cadence_s * %s, %s)
+                           RETURNING work_id""", (REAP_MULT, REAP_MIN_S))
+            n = len(cur.fetchall())
+            c.commit()
+        return n
+    except Exception:
+        return 0
+
+
 def _fmt_age(s):
     s = int(s or 0)
     return f"{s}s" if s < 90 else f"{s // 60}m{s % 60:02d}s"

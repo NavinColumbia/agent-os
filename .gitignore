@@ -39,3 +39,4 @@ assets/voices/
 
 # Runtime-generated incident RCAs
 docs/incidents/
+logs/

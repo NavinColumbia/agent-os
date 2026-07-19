@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import psycopg
@@ -903,7 +904,7 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         if rq:
             _set(thread_id, brief={"question": rq})
             _report(tid, thread_id, clean or "Got it.")   # the research kickoff (with its ETA) is posted by _dispatch
-            _to(thread_id, "RESEARCH"); _set(thread_id, awaiting=None); advance(thread_id)
+            _to(thread_id, "RESEARCH"); _set(thread_id, awaiting=None); _advance_owned(thread_id)
         else:
             _report(tid, thread_id, reply)
         return {"phase": _st(thread_id)["phase"]}
@@ -913,7 +914,7 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
     if phase == "DEEP_DESIGN":
         if s["plan"] and _classify_intent(tid, thread_id, msg, phase, "user_feedback",
                                            api_key=api_key)["verdict"] in ("approve", "proceed"):
-            _set(thread_id, awaiting=None); _to(thread_id, "PLAN_APPROVAL"); advance(thread_id)
+            _set(thread_id, awaiting=None); _to(thread_id, "PLAN_APPROVAL"); _advance_owned(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
         sysp = ("Turn the chosen direction into a concrete, RIGOROUS plan that accounts for EVERYTHING before "
                 "any code is written — un-propagated signature changes and un-analyzed enforcement edits are the "
@@ -986,7 +987,7 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         intent = _classify_intent(tid, thread_id, msg, phase, s["awaiting"], api_key=api_key)
         if intent["verdict"] in ("approve", "proceed"):
             _resume_halts(thread_id)   # a 'retry' after a cancel() must lift the halt before re-dispatching
-            _set(thread_id, awaiting=None); advance(thread_id)
+            _set(thread_id, awaiting=None); _advance_owned(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
         if intent["verdict"] == "cancel":
             cancel(tid, thread_id, reason="stopped by user")
@@ -999,7 +1000,7 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
     if s["awaiting"] == "credentials":
         if _classify_intent(tid, thread_id, msg, phase, "credentials", api_key=api_key)["verdict"] in ("approve", "proceed"):
             _resume_halts(thread_id)
-            _set(thread_id, awaiting=None); advance(thread_id)
+            _set(thread_id, awaiting=None); _advance_owned(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
         _report(tid, thread_id, "When your provider is connected in Settings → Providers, say \"ready\".")
         return {"phase": phase}
@@ -1399,8 +1400,26 @@ def _reap_dead_jobs():
     """Reap ONLY jobs whose worker is genuinely dead — its heartbeat lapsed (process gone) OR it blew the hard
     ceiling (runaway) — and NEVER on output silence (overhaul Step 1; the correct Temporal/Step-Functions liveness
     model). A long, quiet-but-alive build keeps beating heartbeat_at on its background timer, so it is never
-    falsely reaped (F8). Bumps lease_token to fence a wrongly-reaped-but-alive worker. Returns rows reaped."""
+    falsely reaped (F8). Bumps lease_token to fence a wrongly-reaped-but-alive worker. Returns rows reaped.
+
+    FAST PATH: a PARKED worker whose recorded pid is provably gone is dead RIGHT NOW — we don't wait out the
+    20-min floor or the heartbeat timeout for it. Single-box: the worker runs in our PID namespace. Safe in
+    only one direction — PID reuse can make a dead worker LOOK alive (_pid_alive True), which merely DELAYS
+    its reap to the heartbeat/floor path below; it can never falsely reap a LIVE worker, because _pid_alive
+    returns False only on ProcessLookupError (the pid truly doesn't exist). Reaped jobs carry crashed:true so
+    advance() transparently re-runs the phase (crash-resume)."""
     _ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("SELECT id, worker_pid FROM controller_jobs WHERE status='running' AND worker_pid IS NOT NULL")
+        dead_pids = [jid for jid, pid in cur.fetchall() if _pid_alive(pid) is False]
+        if dead_pids:
+            cur.execute("""
+                UPDATE controller_jobs cj SET status='failed', lease_token = cj.lease_token + 1,
+                    result = COALESCE(cj.result,'{}'::jsonb)
+                             || '{"error":"parked worker process gone (pid dead)","status":"failed","crashed":true}'::jsonb,
+                    finished_at = now()
+                WHERE cj.id = ANY(%s) AND cj.status='running'""", (dead_pids,))
+            c.commit()
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""
             UPDATE controller_jobs cj SET status='failed', lease_token = cj.lease_token + 1,
@@ -1415,7 +1434,7 @@ def _reap_dead_jobs():
               )
         """, (RUNNING_FLOOR_MIN, HEARTBEAT_TIMEOUT_S, HARD_CEILING_MIN))
         n = cur.rowcount; c.commit()
-        return n
+        return n + len(dead_pids)
 
 
 def liveness_selftest():
@@ -1520,6 +1539,18 @@ def thread_drive_lock(thread_id):
         except Exception:
             pass                                      # closing the session below drops the lock regardless
         _close_quietly(conn)
+
+
+def _advance_owned(thread_id, job_result=None):
+    """Advance the INTERACTIVE (say()-initiated) path under the single-owner drive lock — exactly as jobd
+    and resume_stalled do. Without this a CEO chat turn could advance a thread at the very instant a sweep or
+    a jobd tick advances the same thread (the double-driver race). If another driver currently owns the
+    thread we skip: the transition the caller already persisted (awaiting cleared, phase set) is carried
+    forward by that owner's in-flight advance or the next jobd tick within seconds, so no progress is lost —
+    and _dispatch's single-writer guard remains the final backstop. Fail-open like the lock itself."""
+    with thread_drive_lock(thread_id) as owned:
+        if owned:
+            advance(thread_id, job_result=job_result)
 
 
 def resume_stalled():

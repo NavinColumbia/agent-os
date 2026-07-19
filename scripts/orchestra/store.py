@@ -409,6 +409,61 @@ def complete_event(event_id, tenant_id=None):
     return {"id": event_id, "processed": done, "already_processed": not done}
 
 
+def persist_step(run_id, tenant_id, actor_id, status=None, assignment=None,
+                 memory=None, result=None, emits=(), complete_ids=()):
+    """ATOMIC durable decide-step: apply an actor's status/assignment/memory/result change, all its
+    outbound emits, and completion of the events it just handled — in ONE transaction. Either the whole
+    step lands or none of it does.
+
+    Why this exists: doing these as separate `update_actor`/`emit`/`complete_event` calls left a fatal
+    window — a crash after an actor committed status='done' but before its 'done' emit reached its
+    supervisor stranded the parent FOREVER (it never reached its all-terminal aggregate). It also created
+    an 'emitted but not completed' gap that re-delivered and double-spawned on replay. One transaction
+    removes both: a crash before commit persists NOTHING (the claimed events simply reappear after their
+    lease and the step re-runs cleanly); a commit persists EVERYTHING at once.
+
+    None means 'leave unchanged' for status/assignment/result; memory is a shallow JSONB MERGE (skipped
+    when falsy). Preserves the emit kill-switch gate (a halted org emits no NEW work but still completes
+    the in-flight events it already claimed) and status validation. Returns a summary dict."""
+    ensure()
+    if status is not None and status not in ACTOR_STATUSES:
+        return {"error": f"status must be one of {ACTOR_STATUSES}"}
+    bad = [k for (_f, _t, k, _p, _c) in emits if k not in KINDS]
+    if bad:
+        return {"error": f"unknown kind(s) {sorted(set(bad))}; must be in {sorted(KINDS)}"}
+    halted = _halted()
+    sets, args = ["last_active=now()"], []
+    if status is not None:
+        sets.append("status=%s"); args.append(status)
+    if assignment is not None:
+        sets.append("assignment=%s"); args.append(assignment)
+    if memory:
+        sets.append("memory = COALESCE(memory,'{}'::jsonb) || %s::jsonb"); args.append(json.dumps(memory))
+    if result is not None:
+        sets.append("result=%s"); args.append(json.dumps(result))
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute(f"""UPDATE orchestra_actors SET {', '.join(sets)}
+                        WHERE actor_id=%s AND (%s::text IS NULL OR tenant_id=%s)
+                        RETURNING {_ACTOR_COLS}""", (*args, actor_id, tenant_id, tenant_id))
+        arow = cur.fetchone()
+        emitted = 0
+        if not halted:                                   # a halted org accepts no NEW work...
+            for frm, to, kind, payload, corr in emits:
+                cur.execute("""INSERT INTO orchestra_events (run_id, tenant_id, frm, to_actor, kind, payload, corr_id)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                            (run_id, tenant_id, frm, to, kind, json.dumps(payload or {}), corr))
+                emitted += 1
+        completed = 0
+        for eid in complete_ids:                         # ...but still drains events it already claimed
+            cur.execute("""UPDATE orchestra_events SET processed_at=now()
+                           WHERE id=%s AND processed_at IS NULL AND (%s::text IS NULL OR tenant_id=%s)""",
+                        (eid, tenant_id, tenant_id))
+            completed += cur.rowcount
+        c.commit()
+    return {"ok": True, "actor": _actor_dict(arow) if arow else {"error": "no such actor"},
+            "emitted": emitted, "completed": completed, "halted": bool(halted)}
+
+
 def events(run_id, tenant_id=None, corr_id=None):
     """Audit read-back: a run's full event stream (optionally one corr_id conversation)."""
     ensure()

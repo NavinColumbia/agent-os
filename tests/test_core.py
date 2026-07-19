@@ -788,6 +788,117 @@ def test_worker_crash_is_transparently_resumed_but_persistent_crash_escalates():
             c.commit()
 
 
+def test_pulse_reap_orphans_finalizes_dead_only():
+    """After a host/WSL restart a pulse whose process is gone must not linger as 'stalled' forever (it
+    pollutes the in-flight view and pages the owner on work that no longer exists). reap_orphans() finalizes
+    a pulse silent past the reap floor to terminal 'reaped', while leaving a freshly-beating pulse ALONE."""
+    import psycopg
+    import pulse
+    if not pulse.DB:
+        pytest.skip("no DB")
+    dead, live = f"reap-dead-{_rid()}", f"reap-live-{_rid()}"
+    try:
+        pulse.start(dead, "test", "orphan"); pulse.start(live, "test", "alive")
+        # backdate the orphan's heartbeat past the reap floor; the live one keeps a fresh beat
+        with psycopg.connect(pulse.DB) as c, c.cursor() as cur:
+            cur.execute("UPDATE agent_pulse SET last_beat = now() - interval '2 hours' WHERE work_id=%s", (dead,))
+            c.commit()
+        n = pulse.reap_orphans()
+        assert n >= 1
+        with psycopg.connect(pulse.DB) as c, c.cursor() as cur:
+            cur.execute("SELECT status FROM agent_pulse WHERE work_id=%s", (dead,))
+            assert cur.fetchone()[0] == "reaped", "a dead-heartbeat pulse must be reconciled to terminal"
+            cur.execute("SELECT status FROM agent_pulse WHERE work_id=%s", (live,))
+            assert cur.fetchone()[0] != "reaped", "a freshly-beating pulse must NOT be reaped"
+    finally:
+        with psycopg.connect(pulse.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM agent_pulse WHERE work_id = ANY(%s)", ([dead, live],))
+            c.commit()
+
+
+def test_reap_dead_parked_worker_by_pid_before_floor():
+    """A parked worker whose process is provably gone must be reaped IMMEDIATELY via its pid — not left
+    pinning the build on 'fleet' for up to the 20-min floor. A young, freshly-BEATING job with a LIVE pid
+    must NOT be reaped (that's a healthy build). Closes the early-worker-death invisible-strand gap."""
+    import os, subprocess, psycopg
+    import loopcontroller as lc
+    lc._ensure()
+    dead = subprocess.Popen(["true"]); dead.wait()            # a pid that is now definitively gone
+    assert lc._pid_alive(dead.pid) is False
+    ins = []
+    try:
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            for pid, tag in ((dead.pid, "dead"), (os.getpid(), "live")):
+                cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, status,
+                                 started_at, heartbeat_at, worker_pid)
+                               VALUES (0,'pidreap-selftest','IMPLEMENT','build','running',
+                                       now(), now(), %s) RETURNING id""", (pid,))   # young + beating NOW
+                ins.append((cur.fetchone()[0], tag))
+            c.commit()
+        lc._reap_dead_jobs()
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            got = {}
+            for jid, tag in ins:
+                cur.execute("SELECT status, result FROM controller_jobs WHERE id=%s", (jid,))
+                got[tag] = cur.fetchone()
+        assert got["dead"][0] == "failed" and got["dead"][1].get("crashed") is True, "dead-pid worker must reap now"
+        assert got["live"][0] == "running", "a live, freshly-beating worker must NOT be reaped"
+    finally:
+        with psycopg.connect(lc.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM controller_jobs WHERE tenant_id='pidreap-selftest'"); c.commit()
+
+
+def test_orchestra_persist_step_is_atomic_and_validating():
+    """One decide-step's actor-update + emits + event-completion must land together (store.persist_step),
+    so a crash can't strand a parent with a committed 'done' status whose 'done' emit never fired. Proves:
+    the happy path applies all three; a bad event kind is rejected as a unit (nothing partially written);
+    and a halted org still drains claimed events but emits no new work."""
+    import psycopg
+    sys.path.insert(0, str(ROOT / "scripts" / "orchestra"))
+    import store, killswitch
+    if not store.DB:
+        pytest.skip("no DB")
+    r = store.start_run("t-atomic", f"atomic-{_rid()}")
+    run_id = r["run_id"]
+    try:
+        a = store.spawn_actor(run_id, "t-atomic", "worker-a", "engineer")
+        sup = store.spawn_actor(run_id, "t-atomic", "sup", "supervisor")
+        aid, sid = a["actor_id"], sup["actor_id"]
+        # give the worker an event to complete in the same step
+        ev = store.emit(run_id, "t-atomic", sid, aid, "task", {"task": "x"})
+        claimed = store.claim_events(aid, "t-atomic")
+        # happy path: mark done + emit 'done' up + complete the task event, all at once
+        res = store.persist_step(run_id, "t-atomic", aid, status="done",
+                                 emits=[(aid, sid, "done", {"result": "ok"}, None)],
+                                 complete_ids=[e["id"] for e in claimed])
+        assert res["ok"] and res["emitted"] == 1 and res["completed"] == 1
+        assert store.actor(aid, "t-atomic")["status"] == "done"
+        assert store.pending_count(aid, "t-atomic") == 0                 # task event consumed
+        assert any(e["kind"] == "done" for e in store.events(run_id, "t-atomic"))  # 'done' reached the bus
+        # validation: an unknown kind rejects the WHOLE step (no partial write)
+        bad = store.persist_step(run_id, "t-atomic", sid, status="working",
+                                 emits=[(sid, aid, "not_a_real_kind", {}, None)])
+        assert "error" in bad
+        assert store.actor(sid, "t-atomic")["status"] != "working"       # status change did NOT apply
+        # halt: claimed events still drain, but no NEW emit is accepted
+        ev2 = store.emit(run_id, "t-atomic", sid, aid, "task", {"task": "y"})
+        claimed2 = store.claim_events(aid, "t-atomic")
+        killswitch.halt(reason="test-atomic")             # scope defaults to 'global' (store checks 'orchestra')
+        try:
+            res2 = store.persist_step(run_id, "t-atomic", aid,
+                                      emits=[(aid, sid, "finding", {"bug": "z"}, None)],
+                                      complete_ids=[e["id"] for e in claimed2])
+        finally:
+            killswitch.resume()
+        assert res2["emitted"] == 0 and res2["completed"] == 1 and res2["halted"]
+    finally:
+        with psycopg.connect(store.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM orchestra_events WHERE run_id=%s", (run_id,))
+            cur.execute("DELETE FROM orchestra_actors WHERE run_id=%s", (run_id,))
+            cur.execute("DELETE FROM orchestra_runs WHERE run_id=%s", (run_id,))
+            c.commit()
+
+
 def test_g1_retired_parked_worker_survives_driver_crash():
     """The core dispatch-and-park guarantee: a driver process that hard-CRASHES (SIGKILL) right after
     dispatching a parked phase does NOT take the worker down — the detached worker finishes on its own.

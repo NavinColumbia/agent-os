@@ -197,22 +197,18 @@ class _Step:
 
 
 def _persist(ctx, a, step, evs):
-    kw = {"memory": step.memory}
-    if step.status:
-        kw["status"] = step.status
-    if step.result is not None:
-        kw["result"] = step.result
-    if step.assignment is not None:
-        kw["assignment"] = step.assignment
-    store.update_actor(a["actor_id"], ctx.tenant, **kw)
-    for frm, to, kind, payload, corr in step.emits:
-        store.emit(ctx.run_id, ctx.tenant, frm, to, kind, payload, corr_id=corr)
-    for ev in evs:
-        store.complete_event(ev["id"], ctx.tenant)
-    store.heartbeat(a["actor_id"], ctx.tenant)
+    # ATOMIC: the actor update, every emit, and the completion of the events we just handled land in ONE
+    # transaction (store.persist_step). This is load-bearing for crash-safety: a partial persist here (e.g.
+    # actor='done' committed but its 'done' emit not) would strand the supervisor forever. One transaction
+    # means a crash before commit persists nothing — the claimed events reappear after their lease and the
+    # step re-runs cleanly, with no double-delivery. last_active is bumped inside that same UPDATE.
+    store.persist_step(ctx.run_id, ctx.tenant, a["actor_id"],
+                       status=step.status, assignment=step.assignment,
+                       memory=step.memory, result=step.result,
+                       emits=step.emits, complete_ids=[ev["id"] for ev in evs])
     # NOTE: the fleet is surfaced in the unified pulse view by READING orchestra_actors.last_active
     # (pulse.live() aggregates it) — NOT by a write here. A synchronous pulse write on this hot per-step
-    # path added latency that perturbed the timing-sensitive supervisor/sibling race. Heartbeat already exists.
+    # path added latency that perturbed the timing-sensitive supervisor/sibling race.
 
 
 def _task_contract(spec):

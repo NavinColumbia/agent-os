@@ -49,6 +49,8 @@ import audit    # noqa: E402
 import billing  # noqa: E402
 
 from aoscfg import ENV, DB
+
+MAX_CODE_ATTEMPTS = int(os.environ.get("AOS_MAX_CODE_ATTEMPTS", "6"))   # wrong-code tries before a code locks
 _ROUNDS = 200_000
 
 
@@ -69,6 +71,8 @@ def _ensure():
         cur.execute("ALTER TABLE email_codes ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'verify'")
         cur.execute("ALTER TABLE email_codes DROP CONSTRAINT IF EXISTS email_codes_pkey")
         cur.execute("ALTER TABLE email_codes ADD CONSTRAINT email_codes_pkey PRIMARY KEY (email, purpose)")
+        # brute-force guard: a 6-digit code (1M space) with no attempt cap is guessable in the 15-min window.
+        cur.execute("ALTER TABLE email_codes ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0")
         c.commit()
 
 
@@ -223,7 +227,8 @@ def _issue_code(email, purpose="verify"):
         cur.execute("""INSERT INTO email_codes (email, code_hash, purpose, expires_at)
                        VALUES (%s, %s, %s, now() + interval '15 minutes')
                        ON CONFLICT (email, purpose) DO UPDATE
-                         SET code_hash=EXCLUDED.code_hash, expires_at=EXCLUDED.expires_at, created_at=now()""",
+                         SET code_hash=EXCLUDED.code_hash, expires_at=EXCLUDED.expires_at,
+                             created_at=now(), attempts=0""",   # a fresh/resent code gets a fresh attempt budget
                     (email, _code_hash(code, purpose), purpose))
         c.commit()
     _send_code(email, code, purpose)                # best-effort deliver over every wired channel (email + ntfy ping)
@@ -284,10 +289,17 @@ def verify_email(email, code):
     email = _norm(email)
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT code_hash FROM email_codes WHERE email=%s AND purpose='verify' AND expires_at > now()",
+        cur.execute("SELECT code_hash, attempts FROM email_codes WHERE email=%s AND purpose='verify' AND expires_at > now()",
                     (email,))
         row = cur.fetchone()
-        if not row or not hmac.compare_digest(row[0], _code_hash(code, "verify")):
+        if not row:
+            return {"error": "that code is wrong or expired — resend a new one"}
+        if row[1] >= MAX_CODE_ATTEMPTS:                  # BRUTE-FORCE GUARD: burn the code, force a resend
+            cur.execute("DELETE FROM email_codes WHERE email=%s AND purpose='verify'", (email,)); c.commit()
+            return {"error": "too many attempts — resend a new code"}
+        if not hmac.compare_digest(row[0], _code_hash(code, "verify")):
+            cur.execute("UPDATE email_codes SET attempts=attempts+1 WHERE email=%s AND purpose='verify'", (email,))
+            c.commit()
             return {"error": "that code is wrong or expired — resend a new one"}
         cur.execute("UPDATE accounts SET verified=true WHERE email=%s", (email,))
         cur.execute("DELETE FROM email_codes WHERE email=%s AND purpose='verify'", (email,))     # single-use
@@ -342,10 +354,17 @@ def verify_reset(email, code, new_password):
         return {"error": "password must be at least 8 characters"}
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT code_hash FROM email_codes WHERE email=%s AND purpose='reset' AND expires_at > now()",
+        cur.execute("SELECT code_hash, attempts FROM email_codes WHERE email=%s AND purpose='reset' AND expires_at > now()",
                     (email,))
         row = cur.fetchone()
-        if not row or not hmac.compare_digest(row[0], _code_hash(code, "reset")):
+        if not row:
+            return {"error": "that code is wrong or expired — resend a new one"}
+        if row[1] >= MAX_CODE_ATTEMPTS:                  # BRUTE-FORCE GUARD (reset codes reset the password!)
+            cur.execute("DELETE FROM email_codes WHERE email=%s AND purpose='reset'", (email,)); c.commit()
+            return {"error": "too many attempts — resend a new code"}
+        if not hmac.compare_digest(row[0], _code_hash(code, "reset")):
+            cur.execute("UPDATE email_codes SET attempts=attempts+1 WHERE email=%s AND purpose='reset'", (email,))
+            c.commit()
             return {"error": "that code is wrong or expired — resend a new one"}
         salt = os.urandom(16).hex()
         cur.execute("UPDATE accounts SET pw_salt=%s, pw_hash=%s, verified=true WHERE email=%s",

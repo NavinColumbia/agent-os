@@ -89,8 +89,10 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
 16. **Audit HMAC key co-located with the DB + captured in every snapshot** (snapshot.py:131) — an insider (or
     anyone who restores a `.aosnap`) can forge/rewrite the "tamper-evident" chain undetectably. Needs KMS/HSM
     or external notarization.
-17. **Auth is brute-forceable / enumerable** (auth.py:281/336/373) — 6-digit verify/reset codes with no
-    attempt cap; distinct login/signup responses leak account existence; PBKDF2-200k is below the Argon2 bar.
+17. 🟡 **PARTLY FIXED — verify/reset codes now cap attempts** — `MAX_CODE_ATTEMPTS` (default 6) burns a code
+    after too many wrong guesses (forcing a resend), bounding brute-force of the 6-digit code; a resend
+    restores a fresh budget. New `test_auth_verify_code_locks_after_max_attempts`. *Still open:* login/signup
+    response enumeration + PBKDF2→Argon2id.
 18. ✅ **FIXED — consent is provider-aware** — `consent.for_tenant` resolves the tenant's ACTUAL provider
     (engine → OpenAI/Anthropic) and the gate/disclosure auto-use it; an OpenAI consent no longer satisfies an
     Anthropic gate. Every existing caller (passes no provider) became correct automatically. New

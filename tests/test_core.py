@@ -816,6 +816,30 @@ def test_pulse_reap_orphans_finalizes_dead_only():
             c.commit()
 
 
+def test_auth_verify_code_locks_after_max_attempts():
+    """A 6-digit code (1M space) with no cap is brute-forceable in the 15-min window. After MAX_CODE_ATTEMPTS
+    wrong guesses the code is BURNED (even a correct guess then fails) and a resend is required — which
+    restores a fresh attempt budget. Bounds an attacker to a handful of tries per issued code."""
+    import psycopg
+    import auth
+    email = f"bf-{_rid()}@example.com"
+    try:
+        assert not auth.signup(email, "password123").get("error")
+        code = auth.resend_code(email).get("dev_code")
+        assert code
+        wrong = "000000" if code != "000000" else "111111"
+        for _ in range(auth.MAX_CODE_ATTEMPTS):
+            assert "wrong" in (auth.verify_email(email, wrong).get("error") or "")
+        locked = auth.verify_email(email, code)                    # right code, but budget spent -> burned
+        assert "too many attempts" in (locked.get("error") or "")
+        fresh = auth.resend_code(email).get("dev_code")            # resend -> fresh code + fresh budget
+        assert auth.verify_email(email, fresh).get("api_token")    # now it works
+    finally:
+        with psycopg.connect(auth.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM email_codes WHERE email=%s", (email,))
+            cur.execute("DELETE FROM accounts WHERE email=%s", (email,)); c.commit()
+
+
 def test_codex_spend_is_counted_not_zero():
     """Codex reports tokens, not USD — but it must not record $0 (a platform failover would burn uncounted
     money and never trip the budget cap). _codex_cost converts tokens to USD so the spend is real."""

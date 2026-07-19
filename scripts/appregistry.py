@@ -202,7 +202,19 @@ def set_url(name, which, url):
 
 
 # ── publish: each app -> its own PRIVATE GitHub repo, deps + README tracked ──────
-_GITIGNORE = "*.db\n*.sqlite*\n__pycache__/\n*.pyc\n.pytest_cache/\nnode_modules/\n.DS_Store\n*.log\n"
+_GITIGNORE = ("*.db\n*.sqlite*\n__pycache__/\n*.pyc\n.pytest_cache/\nnode_modules/\n.DS_Store\n*.log\n"
+              # SECRETS — a published product repo must NEVER carry credentials.
+              ".env\n.env.*\n*.pem\n*.key\nkeys/\nsecrets/\n*credentials*\nid_rsa*\n.aws/\n.ssh/\n")
+
+
+def _is_secret_path(p):
+    """A path that must never be committed into a published product repo (credentials/keys). Used as a
+    fail-closed backstop even beyond .gitignore, since a force-add or a pre-tracked file bypasses ignore."""
+    pl = "/" + p.strip().lower().lstrip("/")
+    base = pl.rsplit("/", 1)[-1]
+    return (base == ".env" or base.startswith(".env.") or base.endswith(".pem") or base.endswith(".key")
+            or "credentials" in base or base.startswith("id_rsa")
+            or "/keys/" in pl or "/secrets/" in pl or pl.startswith("/.aws/") or pl.startswith("/.ssh/"))
 
 
 def _ensure_repo_hygiene(repo: Path, kind: str):
@@ -244,6 +256,18 @@ def publish(name, private=True, role="controller", approval_id=None):
         git("init", "-q")
         git("symbolic-ref", "HEAD", "refs/heads/main", check=False)
     git("add", "-A")
+    # FAIL-CLOSED secret guard: even with .gitignore, never publish a credential — unstage any secret-shaped
+    # file that slipped into the index (force-add / pre-tracked from an earlier commit) before it's committed.
+    staged = (git("diff", "--cached", "--name-only", check=False).stdout or "").splitlines()
+    leaks = [f for f in staged if _is_secret_path(f)]
+    for f in leaks:
+        git("rm", "--cached", "-q", "--", f, check=False)
+    if leaks:
+        try:
+            audit.append(actor="appregistry", action="PublishSecretsStripped", resource=name,
+                         decision="stripped", payload={"files": leaks[:20]})
+        except Exception:
+            pass
     git("commit", "-q", "-m", f"{name} {detect_version(repo, kind)} — built by agent-os factory\n\n"
         f"Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>", check=False)
     has_remote = git("remote", "get-url", "origin", check=False).returncode == 0

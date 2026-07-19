@@ -816,6 +816,18 @@ def test_pulse_reap_orphans_finalizes_dead_only():
             c.commit()
 
 
+def test_appregistry_never_publishes_secret_paths():
+    """A published product repo must never carry credentials. _is_secret_path flags .env/keys/pem/secrets so
+    publish's fail-closed guard unstages them; ordinary source is untouched."""
+    import appregistry as ar
+    for p in [".env", ".env.local", "server/.env", "keys/id.key", "config/secrets/db", "id_rsa", "cert.pem",
+              "my_credentials.json"]:
+        assert ar._is_secret_path(p), p
+    for p in ["src/app.py", "README.md", "notes.txt", "package.json", "docs/keys-guide.md"]:
+        assert not ar._is_secret_path(p), p
+    assert ".env" in ar._GITIGNORE and "keys/" in ar._GITIGNORE and "secrets/" in ar._GITIGNORE
+
+
 def test_auth_verify_code_locks_after_max_attempts():
     """A 6-digit code (1M space) with no cap is brute-forceable in the 15-min window. After MAX_CODE_ATTEMPTS
     wrong guesses the code is BURNED (even a correct guess then fails) and a resend is required — which

@@ -99,7 +99,9 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
     `test_consent_names_the_tenants_actual_provider`. Closes the EU AI Act Art.50 / Apple 5.1.2(i) blocker.
 19. **Ungoverned spawn path** — `providers.py`→`agent_worker.run_agent` runs `claude -p --permission-mode
     acceptEdits` with NO consent/budget/killswitch gate and NO cost capture. Any caller escapes every gate.
-20. **`appregistry.publish` can push secrets** — `git add -A` after a `.gitignore` that omits `.env`/`keys/`.
+20. ✅ **FIXED — publish can't leak secrets** — `_GITIGNORE` now covers `.env*`/`keys/`/`secrets/`/`*.pem`/
+    `*.key`/credentials, and publish unstages any secret-shaped file (`_is_secret_path`) before commit
+    (fail-closed, even against a force-add/pre-tracked file). New `test_appregistry_never_publishes_secret_paths`.
 
 ## F. Product UX — the "astonish a skeptic" bar
 21. ✅ **FIXED — cockpit first paint is now concurrent** — the 8 sequential `await get()` calls are one

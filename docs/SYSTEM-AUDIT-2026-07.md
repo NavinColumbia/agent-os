@@ -63,8 +63,9 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
    direct builds beat no pulse at all.
 
 ## C. Billing / cost — the "commercial" bar
-9. **Codex spend recorded as $0.0** (factory.py:541) — every Codex path (incl. **platform** failover) does
-   `_add_spend(0.0)`, so real platform money is spent and counted as zero against the budget cap.
+9. ✅ **FIXED — Codex spend is now counted** — `_codex_cost` converts Codex's token counts to estimated USD
+   (`CODEX_PRICE`, env-overridable) so `_run_once_codex` reports real spend instead of `0.0`; a platform
+   failover now counts against the budget cap. New `test_codex_spend_is_counted_not_zero`.
 10. **Default budget is unlimited** — `BUDGET_USD=0=unlimited` when the env is unset (the default). No global
     dollar stop on a default fleet run.
 11. **The `byo-key-no-platform-failover` billing invariant is untested** — the load-bearing rule that a

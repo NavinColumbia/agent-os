@@ -238,6 +238,16 @@ _MODEL_EXHAUSTED = ("reached your", "usage-credits", "usage limit", "switch mode
 # disable. CODEX_MODEL is just the label recorded in the trace (Codex uses its own configured model).
 FALLBACK_ENGINE = os.environ.get("AOS_FALLBACK_ENGINE", "codex").lower()
 CODEX_MODEL = os.environ.get("AOS_CODEX_MODEL", "codex")
+# Codex reports TOKENS, not USD, so its spend used to be recorded as $0 — meaning a PLATFORM failover to
+# Codex burned real OpenAI money that never counted against the budget cap (cost-runaway risk). Convert
+# tokens -> USD with an estimate (USD per 1M tokens, input/output); override via env if the real rate differs.
+CODEX_PRICE = (float(os.environ.get("AOS_CODEX_PRICE_IN", "2.5")),
+               float(os.environ.get("AOS_CODEX_PRICE_OUT", "10.0")))
+
+
+def _codex_cost(tin, tout):
+    """Estimated USD for a Codex turn from its token counts, so Codex spend is counted, not recorded as $0."""
+    return (int(tin or 0) * CODEX_PRICE[0] + int(tout or 0) * CODEX_PRICE[1]) / 1_000_000
 # Per-factory BUDGET control (a tenant tunes these to their wallet). AOS_BUDGET_USD is a soft cap on total
 # spend for this process: once reached, agent() refuses to spawn new work and escalates instead of running
 # away. 0 = unlimited. (Agent COUNT is AOS_MAX_AGENTS; recursion depth is AOS_MAX_DEPTH.)
@@ -517,8 +527,9 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
 def _run_once_codex(role, repo, prompt, timeout, env):
     """Fallback engine: run the SAME task via OpenAI Codex (`codex exec`) when Claude is unavailable.
     Returns the SAME tuple shape as _run_once. Codex reports tokens (not USD) in its `turn.completed`
-    JSONL events, so cost=0.0 and `used` records the Codex engine label — the trace then shows which
-    engine actually produced the stage. Uses the platform's Codex auth (workspace-write sandbox = it may
+    JSONL events, so we convert them to an estimated USD (_codex_cost) — otherwise the spend records as $0
+    and a platform failover burns uncounted money. `used` records the Codex engine label so the trace shows
+    which engine produced the stage. Uses the platform's Codex auth (workspace-write sandbox = it may
     edit files in the repo, like the Claude path). Honest note: a BYO-key tenant is NOT failed over here
     (the caller gates that) so we never silently spend platform OpenAI on a tenant's behalf."""
     tmp = Path(tempfile.mkdtemp(prefix="codexrun-"))
@@ -538,7 +549,7 @@ def _run_once_codex(role, repo, prompt, timeout, env):
             except Exception:
                 pass
         out_text = out_file.read_text().strip() if out_file.exists() else (p.stdout or "")
-        return p.returncode, out_text, 0.0, tin, tout, CODEX_MODEL
+        return p.returncode, out_text, _codex_cost(tin, tout), tin, tout, CODEX_MODEL   # real spend, not $0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -816,6 +816,16 @@ def test_pulse_reap_orphans_finalizes_dead_only():
             c.commit()
 
 
+def test_codex_spend_is_counted_not_zero():
+    """Codex reports tokens, not USD — but it must not record $0 (a platform failover would burn uncounted
+    money and never trip the budget cap). _codex_cost converts tokens to USD so the spend is real."""
+    import factory
+    assert factory._codex_cost(0, 0) == 0.0
+    c = factory._codex_cost(1_000_000, 1_000_000)
+    assert c == factory.CODEX_PRICE[0] + factory.CODEX_PRICE[1] and c > 0
+    assert factory._codex_cost(500_000, 250_000) > 0        # any real usage costs > $0
+
+
 def test_consent_names_the_tenants_actual_provider():
     """Compliance (Apple 5.1.2(i) / EU AI Act Art.50): a tenant whose data goes to OpenAI must consent to
     OpenAI, not Anthropic. consent now auto-resolves the tenant's ACTUAL provider, so the gate + the named

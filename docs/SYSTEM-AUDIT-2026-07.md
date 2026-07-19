@@ -90,9 +90,10 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
     or external notarization.
 17. **Auth is brute-forceable / enumerable** (auth.py:281/336/373) — 6-digit verify/reset codes with no
     attempt cap; distinct login/signup responses leak account existence; PBKDF2-200k is below the Argon2 bar.
-18. **Consent names the wrong provider** (consent.py:48, hardcoded "Anthropic Claude") — a Codex/OpenAI-routed
-    tenant has only ever consented to Anthropic. Direct EU AI Act Art. 50 / Apple 5.1.2(i) violation → app-
-    store-shippable blocker.
+18. ✅ **FIXED — consent is provider-aware** — `consent.for_tenant` resolves the tenant's ACTUAL provider
+    (engine → OpenAI/Anthropic) and the gate/disclosure auto-use it; an OpenAI consent no longer satisfies an
+    Anthropic gate. Every existing caller (passes no provider) became correct automatically. New
+    `test_consent_names_the_tenants_actual_provider`. Closes the EU AI Act Art.50 / Apple 5.1.2(i) blocker.
 19. **Ungoverned spawn path** — `providers.py`→`agent_worker.run_agent` runs `claude -p --permission-mode
     acceptEdits` with NO consent/budget/killswitch gate and NO cost capture. Any caller escapes every gate.
 20. **`appregistry.publish` can push secrets** — `git add -A` after a `.gitignore` that omits `.env`/`keys/`.

@@ -816,6 +816,32 @@ def test_pulse_reap_orphans_finalizes_dead_only():
             c.commit()
 
 
+def test_consent_names_the_tenants_actual_provider():
+    """Compliance (Apple 5.1.2(i) / EU AI Act Art.50): a tenant whose data goes to OpenAI must consent to
+    OpenAI, not Anthropic. consent now auto-resolves the tenant's ACTUAL provider, so the gate + the named
+    disclosure name the right one, and an OpenAI consent does NOT satisfy an Anthropic gate."""
+    import psycopg
+    import consent
+    import tenantproviders
+    real = tenantproviders.resolve
+    tid = f"consent-{_rid()}"
+    try:
+        tenantproviders.resolve = lambda t: {"engine": "codex", "key": "x"}
+        assert consent.for_tenant(tid) == "OpenAI"
+        st = consent.state(tid)
+        assert st["provider"] == "OpenAI" and "OpenAI" in st["disclosure"] and "Anthropic" not in st["disclosure"]
+        assert consent.require_consent(tid) is False              # not yet consented
+        consent.record(tid)                                       # records for the RESOLVED provider (OpenAI)
+        assert consent.require_consent(tid) is True
+        tenantproviders.resolve = lambda t: {"engine": "claude", "key": "y"}
+        assert consent.require_consent(tid) is False              # OpenAI consent must NOT satisfy Anthropic
+        assert consent.state(tid)["provider"] == "Anthropic Claude"
+    finally:
+        tenantproviders.resolve = real
+        with psycopg.connect(consent.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,)); c.commit()
+
+
 def test_visionkeeper_seeds_refines_and_feeds_controller():
     """The requirements-provider agent: it SEEDS the CEO's standing vision (no restating needed), REFINES it
     into a spec that names UPFRONT human prerequisites, and the controller seam returns a build-ready spec from

@@ -26,14 +26,54 @@ import audit   # noqa: E402
 
 from aoscfg import ENV, DB
 
-PROVIDER = "Anthropic Claude"           # the named third-party model provider data is sent to
+PROVIDER = "Anthropic Claude"           # the DEFAULT named provider (platform subscription / Anthropic key)
 DISCLOSURE_VERSION = "2026-06-v1"       # bump when the disclosure text below materially changes
-DISCLOSURE = (
-    f"To build your product, agent-os sends the text you provide (your product description and the code "
-    f"generated for you) to {PROVIDER}, a third-party AI provider, for processing. Your prompts are not "
-    f"used to train their models on enterprise/API traffic. You can revoke this consent at any time in "
-    f"Settings; revoking disables AI builds. By accepting you consent to this processing."
-)
+
+# The disclosure must NAME the provider the tenant's data is ACTUALLY sent to (Apple 5.1.2(i) / Play AI /
+# EU AI Act Art. 50 — a generic or WRONG provider name fails the requirement). A Codex/OpenAI-routed tenant
+# must consent to OpenAI, not Anthropic. Map the resolved engine/provider to its legal display name here.
+PROVIDER_NAMES = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude", "opus": "Anthropic Claude",
+                  "codex": "OpenAI", "openai": "OpenAI", "gpt": "OpenAI"}
+
+
+def provider_name(engine_or_name):
+    """Resolve an engine id / provider string to the NAMED legal provider for the disclosure. Unknown ->
+    the default (Anthropic Claude), so a resolution gap fails safe to the platform default rather than a
+    blank name."""
+    if not engine_or_name:
+        return PROVIDER
+    key = str(engine_or_name).strip().lower()
+    return PROVIDER_NAMES.get(key) or (engine_or_name if engine_or_name in PROVIDER_NAMES.values() else PROVIDER)
+
+
+def disclosure_for(provider=PROVIDER):
+    """The named-provider disclosure text for the SPECIFIC provider the tenant's data goes to."""
+    return (
+        f"To build your product, agent-os sends the text you provide (your product description and the code "
+        f"generated for you) to {provider}, a third-party AI provider, for processing. Your prompts are not "
+        f"used to train their models on enterprise/API traffic. You can revoke this consent at any time in "
+        f"Settings; revoking disables AI builds. By accepting you consent to this processing.")
+
+
+DISCLOSURE = disclosure_for(PROVIDER)   # back-compat: the default-provider text
+
+
+def for_tenant(tenant_id):
+    """The named provider a tenant's data will ACTUALLY go to — resolved from their connected provider
+    (engine), defaulting to the platform default when none is connected yet. This is what makes consent
+    correct per-tenant: a Codex tenant consents to OpenAI, an Anthropic tenant to Anthropic."""
+    try:
+        import tenantproviders
+        r = tenantproviders.resolve(tenant_id) or {}
+        return provider_name(r.get("engine"))
+    except Exception:
+        return PROVIDER
+
+
+def _resolve(tenant_id, provider):
+    """provider=None -> resolve the tenant's actual provider; else normalize the given one. So every gate
+    caller that passes nothing automatically checks/records consent for the RIGHT provider."""
+    return provider_name(provider) if provider is not None else for_tenant(tenant_id)
 
 
 def _ensure():
@@ -45,9 +85,10 @@ def _ensure():
         c.commit()
 
 
-def require_consent(tenant_id, provider=PROVIDER):
+def require_consent(tenant_id, provider=None):
     """True iff valid (accepted, not revoked) consent for the CURRENT disclosure version is on file.
     A gate calls this and refuses the AI action when it returns False."""
+    provider = _resolve(tenant_id, provider)
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""SELECT accepted_at, revoked_at FROM ai_consent
@@ -57,7 +98,8 @@ def require_consent(tenant_id, provider=PROVIDER):
     return bool(row and row[0] and not row[1])
 
 
-def record(tenant_id, provider=PROVIDER):
+def record(tenant_id, provider=None):
+    provider = _resolve(tenant_id, provider)
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO ai_consent (tenant_id, provider, disclosure_version, accepted_at)
@@ -71,7 +113,8 @@ def record(tenant_id, provider=PROVIDER):
     return True
 
 
-def revoke(tenant_id, provider=PROVIDER):
+def revoke(tenant_id, provider=None):
+    provider = _resolve(tenant_id, provider)
     _ensure()
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""UPDATE ai_consent SET revoked_at=now()
@@ -83,10 +126,12 @@ def revoke(tenant_id, provider=PROVIDER):
     return True
 
 
-def state(tenant_id, provider=PROVIDER):
-    """What a consent screen needs to render: whether it's required + the named disclosure."""
-    return {"required": not require_consent(tenant_id, provider), "accepted": require_consent(tenant_id, provider),
-            "provider": provider, "version": DISCLOSURE_VERSION, "disclosure": DISCLOSURE}
+def state(tenant_id, provider=None):
+    """What a consent screen needs to render: whether it's required + the named disclosure FOR THAT provider."""
+    provider = _resolve(tenant_id, provider)
+    accepted = require_consent(tenant_id, provider)
+    return {"required": not accepted, "accepted": accepted,
+            "provider": provider, "version": DISCLOSURE_VERSION, "disclosure": disclosure_for(provider)}
 
 
 def _selftest():

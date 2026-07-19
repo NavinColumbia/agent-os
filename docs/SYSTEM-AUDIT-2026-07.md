@@ -120,9 +120,13 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
 ## G. Architecture hygiene
 26. **~1700 lines of superseded orchestra prototypes** (actor.py, supervisor.py, orchestra.py, bus.py's
     MessageBus) read as live but have no non-test callers — dilute "this is THE engine."
-27. **`company.run_directive` (full CEO org) is unwired**; `qa_agentic` is opt-in and unused. Nothing has run
-    a real multi-hour autonomous company on the resumable engine — the gap is activation + the atomicity fix
-    (#1), not the happy-path logic.
+27. 🟡 **PROGRESSED — the living company org is now billing-correct + reliably completes offline** — every
+    knowledge-work tool rebuilds the tenant's provider (`_agent_tool`→`_apply_tenant_ctx`, tenant injected by
+    jobrunner) so a company run bills the tenant, not the platform; `run_company_org` now **finalizes the run**
+    (the root CEO-coordinator has no controller above it, so a completed run used to linger `running` forever);
+    and a Band-2 regression (the `research-coordinator` branch hijacking the generic role) is fixed. Company
+    selftest now passes 3/3. Remaining: a live console trigger + the owner-gated live run. `qa_agentic` still
+    opt-in.
 28. **Two copies of the factory gate chain** (agent() inline vs `_chat_gates`) — a new gate can silently miss
     one path. Hardcoded paths bypass the `aoscfg` chokepoint in several modules.
 

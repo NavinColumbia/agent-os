@@ -125,6 +125,9 @@ def _agent_tool(role: str, prompt: str, args: dict) -> dict:
     research/intel/finance agents reach live data) and return its report as the result. The tool-worker
     dispatch-and-parks it, so a long web-research or analysis call never blocks a decide-step."""
     import factory
+    _apply_tenant_ctx(args.get("tenant"), args.get("org"))    # BILLING: rebuild the tenant's provider — this
+    #        runs in a jobrunner thread with no inherited factory._ctx, so without this the whole company org's
+    #        knowledge work (research/finance/legal/data/artifact/design) would spend on the PLATFORM default.
     res = factory.agent(role, args.get("repo") or str(getattr(factory, "PRODUCTS", "/tmp")), prompt)
     out = (res.get("out_full") or res.get("out") or "") if isinstance(res, dict) else str(res)
     ok = isinstance(res, dict) and res.get("rc", 0) == 0 and bool(out.strip())
@@ -147,11 +150,15 @@ def _apply_tenant_ctx(tenant, org):
     caller's thread-local factory._ctx. Resolve THIS tenant's connected provider and wire engine/keys into
     _ctx so model spend lands on THEIR account, never the platform default. Returns the resolved CLAUDE
     api_key (or None for codex/subscription/platform) to hand to research_one. tenant None/'platform' -> the
-    host subscription CLI (no key). Mirrors loopcontroller._apply_provider_ctx so both engines agree."""
+    host subscription CLI (no key). Mirrors loopcontroller._apply_provider_ctx so both engines agree.
+    FAIL-OPEN: a ctx-rebuild hiccup (or a stubbed factory with no _ctx) must never break the tool."""
     import factory
+    ctx = getattr(factory, "_ctx", None)
+    if ctx is None:
+        return None
     tid = tenant if tenant not in (None, "", "platform") else None
-    factory._ctx.tenant, factory._ctx.org = tid, org
-    factory._ctx.engine, factory._ctx.api_key, factory._ctx.codex_key = "claude", None, None
+    ctx.tenant, ctx.org = tid, org
+    ctx.engine, ctx.api_key, ctx.codex_key = "claude", None, None
     if not tid:
         return None
     try:
@@ -160,9 +167,9 @@ def _apply_tenant_ctx(tenant, org):
     except Exception:
         r = {}
     if r.get("engine") == "codex":
-        factory._ctx.engine, factory._ctx.codex_key = "codex", r.get("key")
+        ctx.engine, ctx.codex_key = "codex", r.get("key")
         return None
-    factory._ctx.api_key = r.get("key")
+    ctx.api_key = r.get("key")
     return r.get("key")
 
 

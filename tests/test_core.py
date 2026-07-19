@@ -948,6 +948,27 @@ def test_visionkeeper_seeds_refines_and_feeds_controller():
             cur.execute("DELETE FROM ceo_vision WHERE tenant_id=%s", (tid,)); c.commit()
 
 
+def test_company_tools_bill_the_tenant_via_agent_tool():
+    """Every knowledge-work tool the living company org runs (research/finance/legal/data/artifact/design)
+    goes through _agent_tool in a jobrunner thread with no inherited factory._ctx — so it must rebuild the
+    tenant's provider from the tenant id jobrunner injects, or the whole org would bill the platform."""
+    sys.path.insert(0, str(ROOT / "scripts" / "orchestra"))
+    import tools, factory, tenantproviders
+    real = tenantproviders.resolve, factory.agent
+    seen = {}
+    try:
+        tenantproviders.resolve = lambda t: {"engine": "claude", "key": "sk-tenant-9"}
+        factory.agent = lambda role, repo, prompt, **k: (
+            seen.update(tenant=factory._ctx.tenant, key=factory._ctx.api_key) or
+            {"rc": 0, "out": "r", "out_full": "r"})
+        out = tools._agent_tool("researcher", "do research", {"tenant": "acme", "org": "2", "repo": "/tmp"})
+        assert out["status"] == "done"
+        assert seen["tenant"] == "acme" and seen["key"] == "sk-tenant-9"   # billed to the tenant, not platform
+    finally:
+        tenantproviders.resolve, factory.agent = real
+        factory._ctx.tenant = factory._ctx.api_key = None
+
+
 def test_research_subq_ctx_rebuild_bills_the_tenant():
     """BILLING correctness for the run_org research path: research_subq runs in a jobrunner thread that does
     NOT inherit factory._ctx, so it must rebuild the provider from the tenant id (never a persisted key) so

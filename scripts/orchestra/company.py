@@ -38,22 +38,34 @@ def run_company_org(vision, functions, *, tenant="company", workers=2, drive_bud
                             memory={"context": {"functions": functions}, "repo": "."})
     store.emit(rid, tenant, None, ceo["actor_id"], "task", {"task": vision})
 
+    ceo_id = ceo["actor_id"]
     started = time.time()
     while time.time() - started < drive_budget_s:
         rt.run_org(rid, tenant, repo=".", workers=workers, stall_s=stall_s)
         if (store.run(rid, tenant) or {}).get("status") in ("done", "failed", "halted"):
             break
+        acts = store.actors(rid, tenant)
+        ceo_actor = next((a for a in acts if a["actor_id"] == ceo_id), None)
+        if ceo_actor and ceo_actor.get("status") in ("done", "failed", "dead"):
+            break                                    # the CEO aggregated every function -> finalize below
         try:
             import jobrunner
             active = any(j["state"] == "running" for j in jobrunner._JOBS.values())
         except Exception:
             active = False
-        if not active and not sum(store.pending_count(a["actor_id"], tenant) for a in store.actors(rid, tenant)):
+        if not active and not sum(store.pending_count(a["actor_id"], tenant) for a in acts):
             break
         time.sleep(0.2)
 
     acts = store.actors(rid, tenant)
-    ceo_id = ceo["actor_id"]
+    # FINALIZE: the CEO-coordinator is the ROOT — there is no controller above it to finish the run, so a
+    # completed company run would otherwise linger 'running' forever. Once the CEO is terminal (it aggregated
+    # every function's report) we mark the run done; if it settled without the CEO cleanly finishing, fail honestly.
+    if (store.run(rid, tenant) or {}).get("status") == "running":
+        _ceo = next((a for a in acts if a["actor_id"] == ceo_id), None)
+        _done = bool(_ceo and _ceo.get("status") == "done")
+        store.finish_run(rid, "done" if _done else "failed",
+                         {"ceo": (_ceo or {}).get("result")}, tenant_id=tenant)
     func_reports = []
     for a in acts:
         if a.get("kind") == "supervisor" and a["actor_id"] != ceo_id:

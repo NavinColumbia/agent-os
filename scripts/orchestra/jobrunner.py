@@ -74,7 +74,10 @@ def _run(jid, job, store, run_tool):
                label=f"{job.get('tool')} · {job.get('actor_name') or job.get('actor_id')}",
                stage="running", progress=f"running {job.get('tool')}", expected_cadence_s=300)
     try:
-        out = run_tool(job["tool"], job.get("args") or {})
+        args = dict(job.get("args") or {})
+        args.setdefault("tenant", job.get("tenant"))     # authoritative tenant on the job -> the tool rebuilds
+        args.setdefault("org", job.get("org"))           # factory._ctx from it (billing correct in this thread)
+        out = run_tool(job["tool"], args)
     except Exception as e:                                # a tool must never take the org down
         out = {"status": "failed", "findings": [], "result": {"error": f"{type(e).__name__}: {e}"}}
     ok = _complete(jid, job, out, store)

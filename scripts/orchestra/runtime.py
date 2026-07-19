@@ -457,7 +457,10 @@ def _coordinator_specs(ctx, a, task, role):
                     "target_url": c.get("target_url"), "stories": c.get("stories"),
                     "restart_cmd": c.get("restart_cmd"), "health_url": c.get("health_url"),
                     "token": c.get("token"), "org": c.get("org")}}]
-    if role == "research-coordinator":
+    if role == "research-coordinator" and c.get("question") and not c.get("items"):
+        # RESEARCH-as-a-durable-org path ONLY (context carries a `question`, no pre-set `items`). A generic
+        # tool-team coordinator that happens to be named "research-coordinator" (context {tool, items}) must
+        # fall through to the generic branch below — don't hijack it into research decomposition.
         # RESEARCH as a durable org: the coordinator DECOMPOSES the question (research_fleet's proven splitter)
         # and spawns one research_subq tool-worker per sub-question. Each is dispatch-and-parked (crash-
         # reclaimable) and writes the CONTRACT finding (findings/NN.md); run_research_via_org synthesizes

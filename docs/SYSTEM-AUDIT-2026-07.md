@@ -68,7 +68,7 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
    failover now counts against the budget cap. New `test_codex_spend_is_counted_not_zero`.
 10. **Default budget is unlimited** — `BUDGET_USD=0=unlimited` when the env is unset (the default). No global
     dollar stop on a default fleet run.
-11. **The `byo-key-no-platform-failover` billing invariant is untested** — the load-bearing rule that a
+11. ✅ **FIXED — the `byo-key-no-platform-failover` invariant is now tested** — the load-bearing rule that a
     tenant outage can't bill the platform has no asserting selftest branch.
 
 ## D. QA integrity — the "zero bugs reach a human" bar
@@ -76,8 +76,9 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
     `review.review` downgrades a would-be pass to not-passed (an unverifiable run can't ship). New
     `test_qa_auditor_gate_fails_closed_when_audit_unavailable`. (The deliberate `AOS_QA_AUDIT_GATE=0`
     operator/offline-test override remains.)
-13. **Finding re-verification skips the auditor** (findings.py:145) — a fixer's re-run resolves a finding on
-    a run the jury never saw (judged more leniently than the original). *(still open)*
+13. ✅ **FIXED — finding re-verification faces the auditor** — qa_run gained an `audit_gate` param decoupled
+    from finding-filing; `findings.verify` passes `audit_gate=True`, so a fixer's re-run clears the skeptical
+    jury the original had to.
 14. ✅ **FIXED — ship path now saturates the story SET** — `qa_run` calls `story_gen.saturate_stories`
     (generate → INDEPENDENT coverage judge in a different role → expand on named gaps, bounded, corpus-
     persisted with regression pins) instead of one un-judged `generate_stories`. `AOS_QA_SATURATE=0` +

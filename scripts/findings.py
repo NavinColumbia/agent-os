@@ -142,7 +142,7 @@ def verify(fid):
                              org=str(check.get("org", "0")), product_summary=check.get("summary", ""),
                              product=check.get("product", "app"), stories=[check["story"]],
                              max_rounds=1, max_steps=int(check.get("max_steps", 15)),
-                             file_findings=False)
+                             file_findings=False, audit_gate=True)   # re-verify still faces the skeptical auditor
             passed = bool(rep.get("passed"))
             evidence = {"report_md": rep.get("md"), "report_json": rep.get("json"),
                         "verdict": rep.get("verdict"), "qa_run_id": rep.get("qa_run_id")}

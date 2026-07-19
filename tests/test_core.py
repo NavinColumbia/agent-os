@@ -948,6 +948,30 @@ def test_visionkeeper_seeds_refines_and_feeds_controller():
             cur.execute("DELETE FROM ceo_vision WHERE tenant_id=%s", (tid,)); c.commit()
 
 
+def test_byo_key_never_fails_over_to_platform_codex():
+    """The load-bearing billing rule: a tenant paying with their OWN Anthropic key (api_key on _ctx, no full
+    tenant record, no codex key) must NEVER fall over to platform-funded Codex — that would silently bill the
+    platform for their outage. Only a platform run (no api_key) uses the host Codex. Previously unasserted."""
+    import factory
+    real_which, real_fb = factory.shutil.which, factory.FALLBACK_ENGINE
+    save = (getattr(factory._ctx, "api_key", None), getattr(factory._ctx, "tenant", None),
+            getattr(factory._ctx, "codex_key", None))
+    try:
+        factory.shutil.which = lambda n: "/usr/bin/codex"          # pretend the Codex CLI is present
+        factory.FALLBACK_ENGINE = "codex"
+        factory._ctx.codex_key = None
+        factory._ctx.tenant = None
+        factory._ctx.api_key = "sk-tenant-own"                     # BYO key, no tenant, no codex
+        env, src = factory._codex_fallback_env()
+        assert env is None and src == "byo-key-no-platform-failover", (env is None, src)
+        factory._ctx.api_key = None                                # platform run -> host Codex is allowed
+        env2, src2 = factory._codex_fallback_env()
+        assert env2 is not None and src2 == "platform-codex", src2
+    finally:
+        factory.shutil.which, factory.FALLBACK_ENGINE = real_which, real_fb
+        factory._ctx.api_key, factory._ctx.tenant, factory._ctx.codex_key = save
+
+
 def test_company_tools_bill_the_tenant_via_agent_tool():
     """Every knowledge-work tool the living company org runs (research/finance/legal/data/artifact/design)
     goes through _agent_tool in a jobrunner thread with no inherited factory._ctx — so it must rebuild the

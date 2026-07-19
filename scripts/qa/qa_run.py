@@ -393,7 +393,7 @@ def _audit_unavailable(report, err):
 def qa_run(target_url, vision, token, org, product_summary, *,
            product="app", repo=None, restart_cmd=None, health_url=None,
            stories=None, max_rounds=MAX_ROUNDS, max_steps=MAX_STEPS,
-           on_event=None, out_dir=None, file_findings=True, agentic=False):
+           on_event=None, out_dir=None, file_findings=True, agentic=False, audit_gate=None):
     """Autonomously QA a product from its VISION until it is bug-free (or a round cap trips), then report.
 
     agentic=True routes to the AGENTIC ORG path (scripts/qa/qa_agentic.run_agentic_qa): a qa-coordinator
@@ -665,7 +665,11 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     # before hand-off. Runs BEFORE _persist_run/write_verdict so the downgrade flows into the gate artifact.
     # Fail-open: an auditor error never blocks the pipeline (degrades to the coverage-grounded verdict).
     report["audit"] = None
-    if file_findings and os.environ.get("AOS_QA_AUDIT_GATE", "1").lower() not in ("0", "false", "no"):
+    # The skeptical auditor gate is decoupled from finding-FILING: a re-verification run (findings.verify) has
+    # file_findings=False but must STILL face the auditor, or a fixer's rerun could resolve a finding the jury
+    # never saw. audit_gate defaults to file_findings (unchanged for the normal path) but callers can force it.
+    _audit_on = file_findings if audit_gate is None else audit_gate
+    if _audit_on and os.environ.get("AOS_QA_AUDIT_GATE", "1").lower() not in ("0", "false", "no"):
         pulse.beat(pulse_work_id, stage="audit", progress="skeptical work-execution audit")
         try:
             import review

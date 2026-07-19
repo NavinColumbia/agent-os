@@ -170,8 +170,10 @@ def stage_step(product: str, stage: str) -> str:
     # 3) do the work. With AGENT_WORKERS=1 a real governed agent does the BUILD stage
     # (proven in agent_worker.py); otherwise stages produce their (non-gate) artifacts directly.
     if stage == "BUILD" and os.environ.get("AGENT_WORKERS") == "1":
-        import agent_worker
-        agent_worker.run_agent(str(repo), "Implement the spec in src/. Edit/create files under src/ only.")
+        # Route through the GOVERNED factory (consent/provider/budget/killswitch gates + cost capture + trace),
+        # never the ungoverned agent_worker primitive — no live spawn path may escape the factory chokepoint.
+        import factory
+        factory.agent("builder", str(repo), "Implement the spec in src/. Edit/create files under src/ only.")
     for rel in STAGE_PLAN[stage]["artifacts"]:
         # The Controller must NOT author its own gate evidence (findings #37/#45/#46): if the actor
         # the gate checks is the same one fabricating SPEC.md/ADR/QA-VERDICT.json/src, the gate proves

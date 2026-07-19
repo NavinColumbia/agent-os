@@ -51,6 +51,7 @@ import billing  # noqa: E402
 from aoscfg import ENV, DB
 
 MAX_CODE_ATTEMPTS = int(os.environ.get("AOS_MAX_CODE_ATTEMPTS", "6"))   # wrong-code tries before a code locks
+_BAD_LOGIN = "that email or password is incorrect"   # non-enumerating: same for no-account and wrong-password
 _ROUNDS = 200_000
 
 
@@ -389,10 +390,11 @@ def login(email, password):
         cur.execute("SELECT tenant_id, pw_salt, pw_hash, verified FROM accounts WHERE email=%s", (email,))
         row = cur.fetchone()
     if not row:
-        return {"error": "no account with that email — sign up first"}
+        _hash(password or "", "00" * 16)   # equalize timing with the wrong-password branch (valid hex salt)
+        return {"error": _BAD_LOGIN}                          # do NOT reveal whether the account exists
     tid, salt, want, verified = row
     if not hmac.compare_digest(_hash(password or "", salt), want):
-        return {"error": "wrong password"}
+        return {"error": _BAD_LOGIN}
     if not verified:                                                 # never issue a token to an unverified account
         return {"error": "please verify your email first — check for the code"}
     # fetch the tenant's current api token
@@ -478,25 +480,25 @@ def _selftest():
                   and badcode.get("error") and not badcode.get("api_token")
                   and ver.get("api_token") and ver.get("tenant_id")
                   and good.get("tenant_id") == ver["tenant_id"] and good.get("api_token")
-                  and wrong.get("error") == "wrong password" and nouser.get("error")
+                  and wrong.get("error") == _BAD_LOGIN and nouser.get("error")
                   and no_prov is False and no_tenant is True
                   and rst.get("ok") and not ghost_rst.get("dev_code")
                   and rbad.get("error") and rshort.get("error")
                   and old_still.get("api_token")
                   and rok.get("api_token") and rok.get("tenant_id") == ver["tenant_id"]
-                  and new_login.get("api_token") and old_login.get("error") == "wrong password"
+                  and new_login.get("api_token") and old_login.get("error") == _BAD_LOGIN
                   and ("configured" in nstat and "hint" in nstat))
         print(f"reject-short={bool(bad.get('error'))} signup-pending={pend.get('pending_verification') is True} "
               f"no-token-yet={not pend.get('api_token')} nudge-field={'notify_configured' in pend} "
               f"dup-blocked={bool(dup.get('error'))} "
               f"unverified-login-blocked={'verify' in (blocked.get('error') or '')} "
               f"wrong-code-rejected={bool(badcode.get('error'))} verify-token={bool(ver.get('api_token'))} "
-              f"verified-login-token={bool(good.get('api_token'))} wrong-pw={wrong.get('error')=='wrong password'} "
+              f"verified-login-token={bool(good.get('api_token'))} wrong-pw={wrong.get('error')==_BAD_LOGIN} "
               f"provider-gate(none={no_prov},no-tenant={no_tenant}) "
               f"reset-issued={bool(rst.get('ok'))} no-leak={not ghost_rst.get('dev_code')} "
               f"reset-badcode={bool(rbad.get('error'))} reset-shortpw={bool(rshort.get('error'))} "
               f"reset-token={bool(rok.get('api_token'))} newpw-works={bool(new_login.get('api_token'))} "
-              f"oldpw-dead={old_login.get('error')=='wrong password'} notify-cfg={nstat.get('configured')}")
+              f"oldpw-dead={old_login.get('error')==_BAD_LOGIN} notify-cfg={nstat.get('configured')}")
         print("PASS: email-verified accounts + password reset (signup→verify→login→reset→relogin) ✅"
               if passed else "FAIL")
     finally:

@@ -186,5 +186,27 @@ def _selftest():
             _cleanup(out["run_id"], "company-selftest")
 
 
+def _main(argv):
+    import json
+    if not argv or argv[0] == "selftest":
+        sys.exit(_selftest())
+    if argv[0] == "run":
+        # LIVE entrypoint (spends): AI-plan the functions for a CEO directive, then run the full company org.
+        args = [a for a in argv[1:] if not a.startswith("--")]
+        tenant = "ceo"
+        if "--tenant" in argv:
+            tenant = argv[argv.index("--tenant") + 1]
+        directive = " ".join(args).strip()
+        if not directive:
+            sys.exit('usage: company.py run "<CEO directive>" [--tenant <id>]')
+        res = run_directive(directive, tenant=tenant)
+        print(json.dumps({"run_id": res.get("run_id"), "status": res.get("status"),
+                          "functions": [f.get("role") for f in res.get("functions", [])],
+                          "actors": res.get("actors"), "ceo_report": res.get("ceo_report")},
+                         indent=2, default=str))
+        sys.exit(0 if res.get("status") == "done" else 1)
+    sys.exit('usage: company.py selftest | run "<CEO directive>" [--tenant <id>]')
+
+
 if __name__ == "__main__":
-    sys.exit(_selftest())
+    _main(sys.argv[1:])

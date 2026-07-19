@@ -688,6 +688,29 @@ def _resolved_provider(tid):
     return r if (r.get("key") or r.get("auth_mode") == "subscription") else None
 
 
+def _ceo_context(tid, org_id=None):
+    """The CEO's STANDING vision + refined requirements (visionkeeper), folded into scoping so the controller
+    works from the CEO's intent instead of pestering for requirements — and is reminded to surface human
+    prerequisites UP FRONT. Fail-open and NO spend (allow_refine=False): a missing keeper yields ''."""
+    try:
+        import visionkeeper
+        v = visionkeeper.requirements_for_controller(tid, org_id=org_id, allow_refine=False)
+    except Exception:
+        return ""
+    sv = (v.get("standing_vision") or "").strip()
+    if not sv:
+        return ""
+    reqs = v.get("requirements") or {}
+    out = f"\n\nCEO STANDING VISION (factor this — do NOT re-ask what it already answers): {sv}"
+    goals = "; ".join((reqs.get("goals") or [])[:5])
+    pre = "; ".join(p.get("item", "") for p in (reqs.get("prerequisites") or [])[:6])
+    if goals:
+        out += f"\nKnown goals: {goals}"
+    if pre:
+        out += f"\nHuman prerequisites to surface up front (don't discover them mid-build): {pre}"
+    return out
+
+
 def _apply_provider_ctx(r):
     """Wire the tenant's resolved provider into factory._ctx so model spend lands on THEIR account
     (engine + key), not the platform default — mirrors factory.build_product's engine routing. This
@@ -897,7 +920,8 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
                 "— immediately emit the research block. Ask AT MOST ONE short clarifying question, and only when "
                 "you genuinely cannot form a research question without it. Do NOT draft plans, option lists, or "
                 "tech-stack choices here — that happens in later phases. The MOMENT you can name what to research, "
-                "end your reply with EXACTLY:\n[[RESEARCH]]\n<the research question to investigate>\n[[/RESEARCH]]")
+                "end your reply with EXACTLY:\n[[RESEARCH]]\n<the research question to investigate>\n[[/RESEARCH]]"
+                + _ceo_context(tid, s.get("org_id")))
         reply = _llm(tid, thread_id, sysp, s, on_delta=on_delta)
         rq = _parse_block(reply, "RESEARCH")
         clean = re.sub(r"\[\[RESEARCH\]\].*?\[\[/RESEARCH\]\]", "", reply, flags=re.S | re.I).strip()

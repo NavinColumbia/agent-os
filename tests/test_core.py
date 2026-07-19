@@ -816,6 +816,42 @@ def test_pulse_reap_orphans_finalizes_dead_only():
             c.commit()
 
 
+def test_visionkeeper_seeds_refines_and_feeds_controller():
+    """The requirements-provider agent: it SEEDS the CEO's standing vision (no restating needed), REFINES it
+    into a spec that names UPFRONT human prerequisites, and the controller seam returns a build-ready spec from
+    a vague prompt — so the CEO isn't pestered for requirements. factory.agent stubbed (offline)."""
+    import json as _j
+    import uuid
+    import psycopg
+    import visionkeeper
+    import factory
+    if not visionkeeper.DB:
+        pytest.skip("no DB")
+    tid = f"vk-test-{uuid.uuid4().hex[:8]}"
+    real = factory.agent
+    factory.agent = lambda role, repo, task, **k: {"rc": 0, "out": _j.dumps({
+        "refined_vision": "multi-company AI operator", "goals": ["one-prompt company creation"],
+        "non_goals": [], "quality_bar": ["zero bugs reach a human"],
+        "prerequisites": [{"item": "connect a model provider", "kind": "credential", "why": "agents need a model",
+                           "when": "before_start"}],
+        "next_capabilities": ["wire the living org"], "open_questions": []})}
+    try:
+        seed = visionkeeper.get(tid, "meta")                      # seeded from the standing directive
+        assert "CEO" in seed["vision"] and seed["requirements"] is None
+        req = visionkeeper.refine(tid, "meta")                    # refine -> names an up-front prerequisite
+        assert req["goals"] and any(p["when"] == "before_start" for p in req["prerequisites"])
+        seam = visionkeeper.requirements_for_controller(tid, org_id=5, hint="build a TikTok competitor")
+        assert seam["standing_vision"] and seam["requirements"] and seam["scope"] == "org:5"
+        # the controller-context helper folds it in without spending (allow_refine=False), fail-open
+        import loopcontroller as lc
+        ctx = lc._ceo_context(tid, 5)
+        assert "CEO STANDING VISION" in ctx and "prerequisites" in ctx.lower()
+    finally:
+        factory.agent = real
+        with psycopg.connect(visionkeeper.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM ceo_vision WHERE tenant_id=%s", (tid,)); c.commit()
+
+
 def test_research_subq_ctx_rebuild_bills_the_tenant():
     """BILLING correctness for the run_org research path: research_subq runs in a jobrunner thread that does
     NOT inherit factory._ctx, so it must rebuild the provider from the tenant id (never a persisted key) so

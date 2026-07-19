@@ -61,6 +61,9 @@ DEFAULT_SCHEDULES = [
     # state, so the spec (goals, quality bar, the UP-FRONT prerequisites) keeps self-sharpening without the
     # CEO ever restating it. One model call; fail-soft (a bad refine never wipes a prior good spec).
     ("vision-refine",     f"{VENV_PY} {SCRIPTS / 'visionkeeper.py'} refine meta", 86400),
+    # Proactive briefing: PUSH each tenant's actionable items (blockers, decisions, AI questions) to their
+    # phone/feed so the CEO is briefed BEFORE they wonder — deduped so a standing item reminds, never spams.
+    ("proactive-comms",   f"{VENV_PY} {SCRIPTS / 'proactivecomms.py'} sweep-all", 300),
 ]
 
 

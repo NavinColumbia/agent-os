@@ -816,6 +816,30 @@ def test_pulse_reap_orphans_finalizes_dead_only():
             c.commit()
 
 
+def test_proactive_comms_pushes_matters_dedups_and_rerouts_by_severity():
+    """Proactive comms: the CEO is briefed on the calls that matter without opening the app — new actionable
+    items push once (high→urgent/phone, medium→standard/feed), a standing item is deduped, and it re-reminds
+    when overdue. Injected seams keep it offline."""
+    import psycopg
+    import proactivecomms as pc
+    tid = f"pc-{_rid()}"
+    sent = []
+    notify = lambda t, cat, title, body="", level="standard", url="": sent.append((level, title))
+    items = [{"id": "blocked_build:x", "title": "Build blocked", "detail": "needs a key", "severity": "high"},
+             {"id": "q:1", "title": "Agent question", "detail": "which region?", "severity": "medium"}]
+    sig = lambda t, o: items
+    try:
+        first = pc.sweep(tid, notify=notify, signals=sig)
+        assert len(first) == 2                                    # both new -> pushed
+        assert pc.sweep(tid, notify=notify, signals=sig) == []    # same items -> deduped
+        assert len(pc.sweep(tid, cooldown_s=0, notify=notify, signals=sig)) == 2   # overdue -> re-remind
+        levels = {title: lvl for (lvl, title) in sent}
+        assert levels["Build blocked"] == "urgent" and levels["Agent question"] == "standard"
+    finally:
+        with psycopg.connect(pc.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM proactive_sent WHERE tenant_id=%s", (tid,)); c.commit()
+
+
 def test_appregistry_never_publishes_secret_paths():
     """A published product repo must never carry credentials. _is_secret_path flags .env/keys/pem/secrets so
     publish's fail-closed guard unstages them; ordinary source is untouched."""

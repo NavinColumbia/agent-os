@@ -1099,6 +1099,36 @@ def test_reap_dead_parked_worker_by_pid_before_floor():
             cur.execute("DELETE FROM controller_jobs WHERE tenant_id='pidreap-selftest'"); c.commit()
 
 
+def test_release_stale_claims_frees_abandoned_events():
+    """A live company-org run exposed this: run_org's pool claims an event then abandons it when the pool
+    stalls out, and the 900s claim lease meant the org hung ~15 min. run_org fully joins its pool before
+    returning, so at the next re-entry any claimed-but-unprocessed event is orphaned — release_stale_claims
+    frees it (guarded by an age threshold), so the org self-heals in seconds instead of waiting out the lease."""
+    import psycopg
+    sys.path.insert(0, str(ROOT / "scripts" / "orchestra"))
+    import store
+    if not store.DB:
+        pytest.skip("no DB")
+    r = store.start_run("t-stale", f"stale-{_rid()}")
+    run_id = r["run_id"]
+    try:
+        a = store.spawn_actor(run_id, "t-stale", "w", "engineer")
+        store.emit(run_id, "t-stale", None, a["actor_id"], "task", {"task": "x"})
+        claimed = store.claim_events(a["actor_id"], "t-stale")     # simulate a pool claiming it
+        assert claimed
+        assert store.release_stale_claims(run_id, "t-stale", older_than_s=100) == 0   # too fresh -> kept
+        freed = store.release_stale_claims(run_id, "t-stale", older_than_s=0)          # orphaned -> freed
+        assert freed == 1
+        again = store.claim_events(a["actor_id"], "t-stale")       # now re-claimable immediately
+        assert again and again[0]["kind"] == "task"
+    finally:
+        with psycopg.connect(store.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM orchestra_events WHERE run_id=%s", (run_id,))
+            cur.execute("DELETE FROM orchestra_actors WHERE run_id=%s", (run_id,))
+            cur.execute("DELETE FROM orchestra_runs WHERE run_id=%s", (run_id,))
+            c.commit()
+
+
 def test_orchestra_persist_step_is_atomic_and_validating():
     """One decide-step's actor-update + emits + event-completion must land together (store.persist_step),
     so a crash can't strand a parent with a committed 'done' status whose 'done' emit never fired. Proves:

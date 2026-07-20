@@ -966,6 +966,13 @@ def run_org(run_id, tenant_id, repo=".", workers=2, human_hook=None, max_steps=N
         jobrunner.reconcile_parked(store, run_id, tenant_id)
     except Exception:
         pass
+    # Free any event a prior (now-joined) pool claimed but never processed, so a multi-level org doesn't stall
+    # ~15 min waiting out the 900s claim lease. Safe: run_org joins its whole pool before returning, so on this
+    # re-entry no claimer is live. Threshold guards a hypothetical concurrent process.
+    try:
+        store.release_stale_claims(run_id, tenant_id, older_than_s=max(3, int(stall_s)))
+    except Exception:
+        pass
     ctx = _Ctx(run_id, tenant_id, repo, human_hook, lease_s, max_steps)
     threads = [threading.Thread(target=_pool_loop, args=(ctx, f"orgw-{i}", poll_s, stall_s),
                                 daemon=True, name=f"orgw-{i}")

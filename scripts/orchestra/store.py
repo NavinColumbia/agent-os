@@ -395,6 +395,23 @@ def claim_events(actor_id, tenant_id=None, limit=16, claimed_by=None, lease_s=CL
     return sorted((_event_dict(r) for r in rows), key=lambda e: e["id"])
 
 
+def release_stale_claims(run_id, tenant_id=None, older_than_s=5):
+    """Re-open events that were CLAIMED but never processed and whose claim is older than `older_than_s` —
+    an event a pool thread claimed then abandoned when its run_org pool stalled out. run_org fully joins its
+    pool before returning, so on the next re-entry no claimer is live and such events are provably orphaned;
+    without this they'd wait out the full 900s claim lease, stalling a multi-level org for ~15 min. Called at
+    run_org startup. Returns how many were freed. (older_than_s guards a hypothetical concurrent claimer.)"""
+    ensure()
+    with psycopg.connect(DB) as c, c.cursor() as cur:
+        cur.execute("""UPDATE orchestra_events SET claimed_at=NULL, claimed_by=NULL
+                       WHERE run_id=%s AND processed_at IS NULL AND claimed_at IS NOT NULL
+                         AND claimed_at < now() - make_interval(secs => %s)
+                         AND (%s::text IS NULL OR tenant_id=%s)""",
+                    (run_id, older_than_s, tenant_id, tenant_id))
+        n = cur.rowcount; c.commit()
+    return n
+
+
 def complete_event(event_id, tenant_id=None):
     """Mark one claimed event handled (processed_at=now()). Idempotent — completing twice is a
     no-op that reports already_processed."""

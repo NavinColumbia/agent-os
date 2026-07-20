@@ -44,6 +44,7 @@ never run live"; (3) **product UX + proactive comms** are thinner than the "asto
 3. ✅ **FIXED — dead parked worker reaped by pid immediately** (`_reap_dead_jobs` fast path) — a running job
    whose `worker_pid` is provably gone is reaped now (crash-resume kicks in) instead of pinning 'fleet' up to
    the 20-min floor. New `test_reap_dead_parked_worker_by_pid_before_floor`.
+4b. ✅ **FIXED (found by the LIVE company-org run) — run_org self-heals abandoned claims** — a pool thread that claims an event then abandons it on stall left the org hung ~15 min waiting out the 900s claim lease. `store.release_stale_claims` (called at run_org startup; safe because run_org joins its pool before returning) frees orphaned claims in seconds. New `test_release_stale_claims_frees_abandoned_events`.
 4. **At-least-once re-run duplicates side effects** — *largely subsumed by #1* (no more emitted-but-not-
    completed window on the decide loop). Residual: cross-PROCESS duplicate tool dispatch (jobrunner `_JOBS`
    is process-local) — lower priority, single-process is the current assumption. No idempotency key on emits.

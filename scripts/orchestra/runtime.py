@@ -422,9 +422,13 @@ _DECIDE_PROMPT = (
     "EVENT: kind={kind} from={frm} payload={payload}")
 
 _AGGREGATE_PROMPT = (
-    "You are the LEAD. Synthesize your children's results into ONE coherent result. "
-    'Reply ONLY JSON: {{"result":"...", "ok":true}}. '
-    "RESULTS: {results} ESCALATIONS(unresolved): {escalations}")
+    "You are the LEAD reporting UP to your boss (ultimately the CEO). Your team's results are below. Write a "
+    "SUBSTANTIVE executive synthesis a CEO can act on — NOT a status line. Lead with the bottom line / "
+    "recommendation, then the 3-6 key findings that support it, then any risks or unresolved items. Be "
+    "concrete: pull the actual numbers, names, and conclusions from your team's work; never reply with an "
+    "empty or vague result. 4-10 sentences.\n"
+    'Reply ONLY JSON: {{"result":"<the executive synthesis>", "ok":true}}. '
+    "TEAM RESULTS: {results}\nUNRESOLVED ESCALATIONS: {escalations}")
 
 _CONTROLLER_PROMPT = (
     "You are the CONTROLLER — the TOP escalation tier of a recursive agent-org. A supervisor "
@@ -836,7 +840,7 @@ def _supervisor_step(ctx, a, evs):
             _audit(a["name"], "QaVerdict", "executed", agg)
         else:
             d = _ai_json(a["role"], ctx.repo, _AGGREGATE_PROMPT.format(
-                results=json.dumps(results)[:2000], escalations=json.dumps(escalations)[:800]),
+                results=json.dumps(results)[:8000], escalations=json.dumps(escalations)[:800]),
                 spawner=a["role"])
             agg = {"result": d.get("result", ""), "ok": bool(d.get("ok", True)),
                    "children": len(children), "escalations": len(escalations)}
@@ -1023,7 +1027,7 @@ def make_offline_agent():
         if t.startswith("You are the CONTROLLER"):
             return {"rc": 0, "out_full": json.dumps(
                 {"action": "resolve", "grant": GRANT, "message": "serviceX creds provisioned"})}
-        if t.startswith("You are the LEAD. Synthesize"):
+        if t.startswith("You are the LEAD reporting UP"):
             return {"rc": 0, "out_full": json.dumps(
                 {"result": "charge + refunds endpoints integrated", "ok": True})}
         if "autonomous AI employee" in t:

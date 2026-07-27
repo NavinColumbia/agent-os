@@ -169,11 +169,20 @@ def _agent_config_dir():
         (d / "settings.json").write_text(json.dumps(_AGENT_SETTINGS, indent=2))
         creds = Path.home() / ".claude" / ".credentials.json"          # host login (subscription mode)
         link = d / ".credentials.json"
-        if creds.exists() and not link.exists():
-            try:
-                link.symlink_to(creds)                                 # share auth, isolate settings
-            except Exception:
-                pass
+        # Keep the agents' creds in SYNC with the host's. A one-time symlink is NOT durable: claude refreshes
+        # the OAuth token by atomic-rename, which replaces the symlink with a regular file that then goes STALE
+        # while the host token keeps refreshing — every spawned agent then fails "OAuth session expired". So
+        # COPY the host creds whenever they're newer than (or absent from) the isolated dir. (Found by a live
+        # company-org run whose whole fleet failed auth on a week-old copy.)
+        try:
+            if creds.exists() and ((not link.exists()) or creds.stat().st_mtime > link.stat().st_mtime + 1):
+                import shutil
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                shutil.copy2(creds, link)
+                link.chmod(0o600)
+        except Exception:
+            pass
         return str(d)
     except Exception:
         return None

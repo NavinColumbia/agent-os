@@ -1633,13 +1633,21 @@ def resume_stalled():
                     jr = {"run_id": rid, "status": "failed", "error": "research failed"}
                 else:
                     continue                      # still running, or an already-surfaced failure — leave it
+                # Mark the research job terminal for bookkeeping. NOTE: in PARK mode the detached worker already
+                # marks the job 'done' itself (without advancing the phase — advancement is left to this poller),
+                # so this UPDATE legitimately claims 0 rows. The anti-double-advance guard must therefore be the
+                # PHASE state under the drive lock, NOT this rowcount — otherwise a park-completed research run
+                # is stranded at RESEARCH/fleet forever (the job is 'done' so nothing ever re-advances it).
                 with psycopg.connect(DB) as c, c.cursor() as cur:
                     cur.execute("""UPDATE controller_jobs SET status=%s, finished_at=COALESCE(finished_at, now())
                                    WHERE thread_id=%s AND kind='research' AND status IN ('running','pending')""",
                                 (rstatus, thread_id))
-                    claimed = cur.rowcount; c.commit()
-                if not claimed:
-                    continue                      # a prior owner already reconciled this run — don't re-advance
+                    c.commit()
+                    # re-read the live phase/awaiting UNDER the lock: only advance if still parked at RESEARCH
+                    cur.execute("SELECT phase, awaiting FROM controller_state WHERE thread_id=%s", (thread_id,))
+                    pr = cur.fetchone()
+                if not pr or pr[0] != "RESEARCH" or pr[1] is None:
+                    continue                      # already advanced by a prior owner -> don't double-advance
                 _set(thread_id, awaiting=None)
                 advance(thread_id, job_result=jr)  # done -> OPTIONS; failed -> surfaces failure
                 advanced += 1

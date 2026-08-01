@@ -37,7 +37,8 @@ EXPECTED = {"ticker": "ticker.sh", "dashboard": "dashboard.py serve",
             "console": "console.py serve",   # the CEO-facing app — supervise it like the others (#resilience)
             "frontdoor": "frontdoor.py serve",   # self-serve signup/build front door (crashed unsupervised once)
             "cockpit-api": "realapi/server.py",   # CEO Cockpit real-data backend — supervised so it stays up
-            "cockpit-web": "http.server 8871"}    # CEO Cockpit frontend static server
+            "cockpit-web": "http.server 8871",    # CEO Cockpit frontend static server
+            "replybridge": "replybridge.py serve"}   # phone->controller loop (CEO answers decisions from phone)
 STALL_MIN = 8          # a running factory build with no audit activity for this long = stalled
 COOLDOWN_S = 1800      # re-ping an unresolved issue at most every 30 min
 PRIO = {"crit": "urgent", "warn": "high"}

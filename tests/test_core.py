@@ -955,18 +955,27 @@ def test_browser_gate_bounds_global_concurrency():
     import browser_gate
     if not browser_gate.claude_gate.DB:
         pytest.skip("no DB")
+    # Drain whatever is free RIGHT NOW (a live QA run may legitimately hold some slots — that's the gate
+    # working). The invariant under test: you can never hold MORE than GLOBAL_MAX at once, and a released slot
+    # is reclaimable. Acquire until the pool is exhausted, then assert one more is refused, then a release frees one.
     n = browser_gate.GLOBAL_MAX
-    got = [browser_gate.acquire(f"t-{_rid()}-{i}", wait_s=2) for i in range(n)]
+    got = []
+    for i in range(n + 2):                          # try to over-acquire past the cap
+        s = browser_gate.acquire(f"t-{_rid()}-{i}", wait_s=1)
+        if s is None:
+            break
+        got.append(s)
     try:
-        assert all(s is not None for s in got), "should grant GLOBAL_MAX slots"
-        assert browser_gate.acquire(f"t-{_rid()}-over", wait_s=1) is None, "pool full -> fail-open None, not over-grant"
+        assert 0 < len(got) <= n, f"held {len(got)} slots but cap is {n} (never exceed the global cap)"
+        assert browser_gate.acquire(f"t-{_rid()}-over", wait_s=1) is None, "pool exhausted -> refuse, never over-grant"
+        one = got.pop()
+        browser_gate.release(one)                   # free exactly one
+        reclaimed = browser_gate.acquire(f"t-{_rid()}-reuse", wait_s=2)
+        assert reclaimed is not None, "a released slot must be reclaimable"
+        got.append(reclaimed)
     finally:
         for s in got:
-            if s is not None:
-                browser_gate.release(s)
-    after = browser_gate.acquire(f"t-{_rid()}-reuse", wait_s=2)   # slot reclaimed after release
-    assert after is not None
-    browser_gate.release(after)
+            browser_gate.release(s)
 
 
 def test_dogfood_yields_to_active_qa():
@@ -1222,3 +1231,13 @@ def test_g1_retired_parked_worker_survives_driver_crash():
     claude); generous deadlines keep it non-flaky in CI."""
     import loopcontroller as lc
     assert lc._park_crash_selftest() == 0, "parked worker must survive a driver crash (see printed reason)"
+
+
+def test_ceo_run_and_replybridge_close_the_e2e_loop():
+    """The real e2e loop: ceo_run.submit starts a durable thread + says the prompt (jobd drives, not this
+    process); replybridge routes a phone reply for ceo-<id> into loopcontroller.say. Delegates to the modules'
+    own offline selftests (stubbed say/state/notify)."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import ceo_run, replybridge
+    assert ceo_run._selftest() == 0
+    assert replybridge._selftest() == 0

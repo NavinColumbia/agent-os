@@ -437,9 +437,27 @@ def run_all(base: str = BASE) -> list:
     return [run_once(p, base=base) for p in _ORDER]
 
 
+def _qa_active() -> bool:
+    """Is a real build's browser QA (or a QA fleet) actively running right now? Scheduled acceptance-QA must
+    YIELD to real work — two browser-QA passes competing for the box thrash each other (observed live: the
+    dogfood pass stalled an active build's QA). Best-effort via the pulse plane; fail-open (treat as idle)."""
+    try:
+        import pulse
+        for r in (pulse.live() or []):
+            if r.get("kind") in ("qa-run", "tool-job") and not r.get("stalled"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def cron() -> dict:
     """The scheduler entry point. scheduler.tick() kills any job at JOB_TIMEOUT (120s); a real browser
-    pass takes far longer — so detach the actual run into its own session and return immediately."""
+    pass takes far longer — so detach the actual run into its own session and return immediately.
+    YIELDS to active real work: if a build's QA is already running, skip this pass rather than thrash the box."""
+    if _qa_active():
+        print("dogfood: skipping — a real build's QA is active (yielding the box to real work)")
+        return {"skipped": "qa-active", "reason": "yielded to an active QA run to avoid browser contention"}
     with open(LOG, "ab") as lf:
         p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run"],
                              cwd=str(SCRIPTS.parent), stdout=lf, stderr=lf,

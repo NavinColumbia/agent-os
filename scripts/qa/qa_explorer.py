@@ -134,8 +134,17 @@ class BrowserBridge:
         self._id = 0
         self.proc = None
         self.video_path = None            # webm path the bridge reports on close() (for mp4 transcode)
+        self._gate_slot = None            # global browser-concurrency slot (released in close())
         if not autostart:
             return
+        # GLOBAL BROWSER CAP: hold a slot for this session's lifetime so total concurrent Chromium+video
+        # sessions across the whole box stay bounded (1000s of agents must not thrash). Fail-open (None) so a
+        # DB hiccup never blocks QA — better brief over-subscription than a stalled fleet.
+        try:
+            import browser_gate
+            self._gate_slot = browser_gate.acquire(f"qa:{shot_dir or target_url}")
+        except Exception:
+            self._gate_slot = None
         env = {**os.environ, "NODE_PATH": NODE_PATH}
         if shot_dir:
             env["AOS_QA_SHOT_DIR"] = str(shot_dir)
@@ -269,6 +278,14 @@ class BrowserBridge:
                 self.proc.kill()
             except Exception:
                 pass
+        finally:
+            if self._gate_slot is not None:                 # release the global browser slot for the next session
+                try:
+                    import browser_gate
+                    browser_gate.release(self._gate_slot)
+                except Exception:
+                    pass
+                self._gate_slot = None
 
 
 # ----------------------------------------------------------------------------------------------------

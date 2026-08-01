@@ -948,6 +948,41 @@ def test_visionkeeper_seeds_refines_and_feeds_controller():
             cur.execute("DELETE FROM ceo_vision WHERE tenant_id=%s", (tid,)); c.commit()
 
 
+def test_browser_gate_bounds_global_concurrency():
+    """Production reliability: at scale (1000s of agents) concurrent browser QA must not thrash the box.
+    browser_gate caps TOTAL concurrent browser sessions across all processes; a slot is released on close and
+    reclaimable. Without this cap, competing QA runs stalled each other (observed live)."""
+    import browser_gate
+    if not browser_gate.claude_gate.DB:
+        pytest.skip("no DB")
+    n = browser_gate.GLOBAL_MAX
+    got = [browser_gate.acquire(f"t-{_rid()}-{i}", wait_s=2) for i in range(n)]
+    try:
+        assert all(s is not None for s in got), "should grant GLOBAL_MAX slots"
+        assert browser_gate.acquire(f"t-{_rid()}-over", wait_s=1) is None, "pool full -> fail-open None, not over-grant"
+    finally:
+        for s in got:
+            if s is not None:
+                browser_gate.release(s)
+    after = browser_gate.acquire(f"t-{_rid()}-reuse", wait_s=2)   # slot reclaimed after release
+    assert after is not None
+    browser_gate.release(after)
+
+
+def test_dogfood_yields_to_active_qa():
+    """Scheduled acceptance-QA must yield the box to a real build's QA (the collision that stalled a live run).
+    dogfood.cron() skips when _qa_active() is True instead of thrashing browsers against the active run."""
+    sys.path.insert(0, str(ROOT / "scripts" / "qa"))
+    import dogfood
+    real = dogfood._qa_active
+    try:
+        dogfood._qa_active = lambda: True
+        r = dogfood.cron()
+        assert r.get("skipped") == "qa-active" and not r.get("detached"), r
+    finally:
+        dogfood._qa_active = real
+
+
 def test_byo_key_never_fails_over_to_platform_codex():
     """The load-bearing billing rule: a tenant paying with their OWN Anthropic key (api_key on _ctx, no full
     tenant record, no codex key) must NEVER fall over to platform-funded Codex — that would silently bill the

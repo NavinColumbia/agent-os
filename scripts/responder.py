@@ -23,6 +23,7 @@ import sys
 import time
 from pathlib import Path
 
+HOME = str(Path.home())
 ROOT = Path.home() / "projects" / "agent-os"
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -37,6 +38,10 @@ DAEMONS = {
     "frontdoor": (f"cd {ROOT} && exec {VENV} scripts/frontdoor.py serve 8093", "frontdoor.py serve"),
     "ticker":    (f"exec bash {ROOT}/scripts/ticker.sh", "ticker.sh"),
     "listener":  (f"bash {ROOT}/scripts/bridge.sh start", "reply_listener.py"),
+    # CEO Cockpit — served as supervised services so they stay up like every other daemon (the watchdog
+    # restarts them if they die). realapi = the real agent-os data backend; cockpit-web = the frontend.
+    "cockpit-api": (f"exec {VENV} {HOME}/projects/products/1-ceo-cockpit/realapi/server.py 8766", "realapi/server.py"),
+    "cockpit-web": (f"cd {HOME}/projects/products/1-ceo-cockpit && exec python3 -m http.server 8871 --bind 127.0.0.1", "http.server 8871"),
 }
 CONTAINERS = {"postgres", "ntfy", "cerbos"}
 

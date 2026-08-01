@@ -30,7 +30,9 @@ class LiveController:
         self.lc = lc
 
     def start(self, tid, org):
-        return self.lc.start(tid, org)
+        r = self.lc.start(tid, org)
+        # lc.start returns {"thread_id":..,"phase":..}; the driver needs the thread_id itself.
+        return r["thread_id"] if isinstance(r, dict) else r
 
     def say(self, tid, th, msg):
         return self.lc.say(tid, th, msg)

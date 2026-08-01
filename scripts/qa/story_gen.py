@@ -50,6 +50,11 @@ import factory   # noqa: E402  — the LLM call (retries 529/overload, fails ove
 STORY_ROLE = os.environ.get("AOS_STORY_ROLE", "qa-security")
 JUDGE_ROLE = os.environ.get("AOS_STORY_JUDGE_ROLE", "product-manager")
 MAX_ROUNDS = int(os.environ.get("AOS_STORY_MAX_ROUNDS", "4"))   # bounded saturation rounds
+# HIGH safety backstop on corpus SIZE (not a quality terminator). Coverage stays AI-driven within the rounds,
+# but a tiny surface must not saturate to 100+ stories (observed: 113 for a Pomodoro timer -> hours of browser
+# QA). Once the corpus passes this bound we stop generating MORE and let the judge close out — logged honestly,
+# overridable, 0 = unlimited. This is a backstop the way the North Star allows: high, reported, never silent.
+SATURATE_MAX = int(os.environ.get("AOS_STORY_SATURATE_MAX", "40"))
 
 # The coverage matrix every critique/judge call reasons over: per SURFACE × PERSONA × CATEGORY.
 CATEGORIES = ("happy", "edge", "empty", "error", "denied", "abuse", "latency", "a11y")
@@ -553,6 +558,11 @@ def saturate_stories(vision: str, product_summary: str, *, product: str = None, 
         verdict = judge_saturation(vision, product_summary, stories, role=judge_role, repo=repo)
         if verdict.get("saturated"):
             saturated = True
+            break
+        if SATURATE_MAX and len(stories) >= SATURATE_MAX:    # HIGH backstop: enough breadth; stop growing
+            print(f"[story_gen] saturation backstop hit ({len(stories)} >= AOS_STORY_SATURATE_MAX="
+                  f"{SATURATE_MAX}) — stopping generation; testing the {len(stories)} enumerated stories "
+                  f"(coverage within each still AI-driven). Raise/zero the env to go deeper.", flush=True)
             break
         gaps = critique_gaps(vision, product_summary, stories, role=role, repo=repo)
         gaps += [m for m in verdict.get("missing", []) if m not in gaps]

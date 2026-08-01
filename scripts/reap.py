@@ -66,8 +66,12 @@ def _reap_browser_decision(ppid, etimes, max_s=BROWSER_STALE_S):
 
 
 def _browser_procs():
-    """(pid, ppid, etimes) for playwright chrome-headless-shell ROOT browsers (not renderer children).
-    QA/explorer runs spawn these; a crashed run can orphan them (we saw one 1 DAY old)."""
+    """(pid, ppid, etimes) for QA-leaked PROCESSES: playwright browser ROOTS (chrome-headless-shell AND the
+    full 'chromium'/'chrome' channels — a leaked run left 42 of the latter that the old headless-only match
+    missed) plus the per-session FFMPEG video recorders (each QA session = a Chromium + an ffmpeg; nothing
+    reaped ffmpeg, so they leaked forever -> slow OOM). Renderer/gpu children (--type=) are skipped: they die
+    with their root. Only ROOTS + recorders are returned; the ORPHANED/very-OLD safety in the caller ensures a
+    live QA run is never touched."""
     out = subprocess.run(["ps", "-eo", "pid,ppid,etimes,args"], capture_output=True, text=True).stdout
     procs = []
     for line in out.splitlines()[1:]:
@@ -75,8 +79,14 @@ def _browser_procs():
         if len(parts) < 4:
             continue
         pid, ppid, etimes, args = parts
-        # the browser ROOT has no --type=; renderer/gpu children do (and die with the root anyway)
-        if "chrome-headless-shell" in args and "--type=" not in args:
+        low = args.lower()
+        is_browser_root = (("chrome-headless-shell" in low or "/chromium" in low or "/chrome " in low
+                            or low.endswith("/chrome") or "headless_shell" in low)
+                           and "--type=" not in args)
+        # playwright records video via an ffmpeg child; a leaked session leaves the recorder writing forever
+        is_ffmpeg_recorder = ("ffmpeg" in low and ("agent-os-qa-evidence" in low or "image2pipe" in low
+                              or ".webm" in low))
+        if is_browser_root or is_ffmpeg_recorder:
             try:
                 procs.append((int(pid), int(ppid), int(etimes)))
             except ValueError:

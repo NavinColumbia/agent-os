@@ -1662,6 +1662,37 @@ def resume_stalled():
     except Exception:
         pass
     _reap_dead_jobs()                       # overhaul Step 1: reap by heartbeat/ceiling, NEVER by output silence
+    # 1.5) RESEARCH-CRASH STRAND: a research worker that died BEFORE persisting research_run_id (crash between
+    # dispatch and _set(research_run_id=...), or research.start() returning run_id=None) leaves the thread at
+    # RESEARCH/fleet with research_run_id IS NULL — invisible to block 0 (needs NOT NULL) AND block 2 (excludes
+    # RESEARCH). Nobody would ever advance it => permanent freeze. Here: if such a thread's newest research job
+    # is terminal (crashed/failed, i.e. the reaper gave up on it), surface the failure so the CEO can retry,
+    # instead of stranding forever. (A still-running job is left alone; a healthy run always persists its id.)
+    try:
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT cs.thread_id, cj.status, cj.result
+                           FROM controller_state cs
+                           JOIN LATERAL (SELECT status, result FROM controller_jobs
+                                         WHERE thread_id=cs.thread_id AND kind='research'
+                                         ORDER BY id DESC LIMIT 1) cj ON true
+                           WHERE cs.phase='RESEARCH' AND cs.awaiting='fleet'
+                             AND cs.research_run_id IS NULL""")
+            strays = cur.fetchall()
+        for thread_id, jstatus, jresult in strays:
+            if jstatus in ("running", "pending"):
+                continue                     # a fresh dispatch that just hasn't persisted its id yet — wait
+            with thread_drive_lock(thread_id) as owned:
+                if not owned:
+                    continue
+                cur_pr = _st(thread_id) or {}
+                if cur_pr.get("phase") != "RESEARCH" or cur_pr.get("awaiting") is None or cur_pr.get("research_run_id"):
+                    continue                 # advanced / recovered by another owner in the meantime
+                _set(thread_id, awaiting=None)
+                advance(thread_id, job_result={"status": "failed",
+                        "error": "research did not start (worker died before it began); say \"retry\" to run it again"})
+                advanced += 1
+    except Exception:
+        pass
     with psycopg.connect(DB) as c, c.cursor() as cur:
         # 2) For every NON-research thread parked on 'fleet', take its most recent job (any status).
         #    RESEARCH is reconciled above against its real run, so exclude it here.

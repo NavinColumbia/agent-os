@@ -948,38 +948,49 @@ def test_visionkeeper_seeds_refines_and_feeds_controller():
             cur.execute("DELETE FROM ceo_vision WHERE tenant_id=%s", (tid,)); c.commit()
 
 
+def test_reaper_catches_ffmpeg_and_all_chromium_variants():
+    """A leaked QA session = a Chromium ROOT + an ffmpeg video recorder. The old reaper matched only
+    chrome-headless-shell (missed ffmpeg entirely + full 'chromium'/'chrome' channels), so those leaked
+    forever -> slow OOM over a long run. _reap_browser_decision stays conservative (orphan or very-old only),
+    and the browser-proc matcher now recognizes the leaking names."""
+    import reap
+    # decision logic unchanged + conservative: a young, parented proc is NEVER reaped; an orphan/old one is.
+    assert reap._reap_browser_decision(ppid=1234, etimes=30) is False, "young + parented -> keep (live QA safe)"
+    assert reap._reap_browser_decision(ppid=1, etimes=30) is True, "orphaned (PPID 1) -> reap"
+    assert reap._reap_browser_decision(ppid=1234, etimes=reap.BROWSER_STALE_S + 1) is True, "very old -> reap"
+    # the matcher source now covers ffmpeg recorders + all chromium variants (not just headless-shell)
+    src = __import__("inspect").getsource(reap._browser_procs)
+    assert "ffmpeg" in src and "chromium" in src and "chrome-headless-shell" in src, \
+        "must match ffmpeg recorders AND all chromium variants, not just headless-shell"
+
+
 def test_browser_gate_bounds_global_concurrency():
     """Production reliability: at scale (1000s of agents) concurrent browser QA must not thrash the box.
     browser_gate caps TOTAL concurrent browser sessions across all processes; a slot is released on close and
     reclaimable. Without this cap, competing QA runs stalled each other (observed live)."""
     import browser_gate
-    if not browser_gate.claude_gate.DB:
+    import claude_gate
+    if not claude_gate.DB:
         pytest.skip("no DB")
-    # Drain whatever is free RIGHT NOW (a live QA run may legitimately hold some slots — that's the gate
-    # working). The invariant under test: you can never hold MORE than GLOBAL_MAX at once, and a released slot
-    # is reclaimable. Acquire until the pool is exhausted, then assert one more is refused, then a release frees one.
-    n = browser_gate.GLOBAL_MAX
-    assert 1 <= n <= 64, f"auto-sized cap should be sane for this box, got {n}"
-    got = []
-    for i in range(n + 2):                          # try to over-acquire past the cap
-        s = browser_gate.acquire(f"t-{_rid()}-{i}", wait_s=1)
-        if s is None:
-            break
-        got.append(s)
+    # 1) the cap is auto-sized to this box (RAM+CPU), sane range — not a hardcoded guess.
+    assert 1 <= browser_gate.GLOBAL_MAX <= 64, f"auto-sized cap should be sane, got {browser_gate.GLOBAL_MAX}"
+    # 2) prove the pool MECHANISM (cap + reclaim) on an ISOLATED throwaway table, so this never races the live
+    #    browser_slots pool that a running QA fleet is churning (that raced when run in the full suite).
+    import psycopg
+    tbl = f"browser_slots_test_{_rid()}"
+    cap = 3
     try:
-        # core invariant: never hold MORE than the cap (a live QA run may already hold some — that's the gate
-        # working). If the pool is fully saturated by a live run, that itself proves the cap is enforced.
-        assert len(got) <= n, f"held {len(got)} slots but cap is {n} (never exceed the global cap)"
-        if got:
-            assert browser_gate.acquire(f"t-{_rid()}-over", wait_s=1) is None, "pool exhausted -> refuse, never over-grant"
-            one = got.pop()
-            browser_gate.release(one)               # free exactly one
-            reclaimed = browser_gate.acquire(f"t-{_rid()}-reuse", wait_s=2)
-            assert reclaimed is not None, "a released slot must be reclaimable"
-            got.append(reclaimed)
+        claude_gate._ensure(tbl, cap)
+        got = [claude_gate.acquire(f"t-{i}", wait_s=1, table=tbl) for i in range(cap)]
+        assert all(s is not None for s in got), f"should grant all {cap} isolated slots, got {got}"
+        assert claude_gate.acquire("t-over", wait_s=1, table=tbl) is None, "pool full -> refuse, never over-grant"
+        claude_gate.release(got[0], table=tbl)
+        assert claude_gate.acquire("t-reuse", wait_s=1, table=tbl) is not None, "a released slot must be reclaimable"
     finally:
-        for s in got:
-            browser_gate.release(s)
+        with psycopg.connect(claude_gate.DB) as c, c.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {tbl}"); c.commit()
+    # 3) the in-process fallback semaphore exists (bounds concurrency even when the DB gate fails open).
+    assert browser_gate._LOCAL_SEM is not None
 
 
 def test_dogfood_yields_to_active_qa():

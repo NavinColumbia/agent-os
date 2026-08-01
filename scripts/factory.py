@@ -259,8 +259,12 @@ def _codex_cost(tin, tout):
     return (int(tin or 0) * CODEX_PRICE[0] + int(tout or 0) * CODEX_PRICE[1]) / 1_000_000
 # Per-factory BUDGET control (a tenant tunes these to their wallet). AOS_BUDGET_USD is a soft cap on total
 # spend for this process: once reached, agent() refuses to spawn new work and escalates instead of running
-# away. 0 = unlimited. (Agent COUNT is AOS_MAX_AGENTS; recursion depth is AOS_MAX_DEPTH.)
-BUDGET_USD = float(os.environ.get("AOS_BUDGET_USD", "0") or 0)
+# away. DEFAULT is a HIGH RUNAWAY BACKSTOP ($200), not unlimited — an UNATTENDED run must not burn forever if
+# a loop gets stuck (the owner's "cost is not a concern, go deep" is still honored: this is deliberately high,
+# scale.apply raises it further with the wallet, and AOS_BUDGET_USD=0 opts into truly unlimited). Hitting it is
+# logged LOUDLY + escalated, never silent — a safety net in the North-Star sense (high backstop, never a
+# quality terminator).
+BUDGET_USD = float(os.environ.get("AOS_BUDGET_USD", "200") or 0)
 _SPENT = [0.0]
 _SPENT_LOCK = threading.Lock()
 

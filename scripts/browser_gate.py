@@ -67,15 +67,41 @@ def _auto_cap():
 
 GLOBAL_MAX = _auto_cap()      # sized to THIS box at import; AOS_BROWSER_GLOBAL_MAX overrides
 
+# IN-PROCESS FALLBACK: the DB slot pool FAILS OPEN on a Postgres hiccup (returns None = proceed ungated) —
+# which would remove the browser cap exactly under heavy load when Postgres is most stressed. This local
+# semaphore is the backstop: when the DB gate can't grant a slot, we still bound concurrency WITHIN this
+# process to GLOBAL_MAX. It can't enforce a box-wide cap across separate processes without shared state (that
+# needs the DB), but it fully bounds the common case (one big run) and caps each process otherwise — so the
+# box degrades to (n_processes x GLOBAL_MAX) instead of unbounded when the DB is down.
+import threading  # noqa: E402
+_LOCAL_SEM = threading.BoundedSemaphore(GLOBAL_MAX)
+_LOCAL_TAG = "local-fallback"
+
 
 def acquire(holder, wait_s=WAIT_S):
-    """Claim a global browser slot (or a lease-expired one). Returns slot_id, or None on fail-open. The pool is
-    sized to what THIS machine can actually run (see _auto_cap) — queue past that rather than thrash the box."""
-    claude_gate._ensure(TABLE, GLOBAL_MAX)
-    return claude_gate.acquire(holder, wait_s=wait_s, table=TABLE, lease_s=LEASE_S)
+    """Claim a browser slot sized to what THIS machine can run. Prefer the cross-process DB pool; if it
+    fails-open (DB hiccup), fall back to an in-process semaphore so concurrency is STILL bounded. Returns a
+    slot id (int) or the sentinel _LOCAL_TAG (fallback held) or None (both unavailable -> proceed ungated)."""
+    try:
+        claude_gate._ensure(TABLE, GLOBAL_MAX)
+        sid = claude_gate.acquire(holder, wait_s=wait_s, table=TABLE, lease_s=LEASE_S)
+    except Exception:
+        sid = None
+    if sid is not None:
+        return sid
+    # DB gate unavailable -> bound this process locally instead of going fully ungated
+    if _LOCAL_SEM.acquire(timeout=max(1, min(wait_s, 60))):
+        return _LOCAL_TAG
+    return None                                   # even the local cap is full -> last-resort fail-open
 
 
 def release(sid):
+    if sid == _LOCAL_TAG:
+        try:
+            _LOCAL_SEM.release()
+        except (ValueError, RuntimeError):
+            pass                                  # never over-release the bounded semaphore
+        return
     claude_gate.release(sid, table=TABLE)
 
 

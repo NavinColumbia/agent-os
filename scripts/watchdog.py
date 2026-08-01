@@ -36,6 +36,7 @@ EXPECTED = {"ticker": "ticker.sh", "dashboard": "dashboard.py serve",
             "api": "api.py serve", "listener": "reply_listener.py",
             "console": "console.py serve",   # the CEO-facing app — supervise it like the others (#resilience)
             "frontdoor": "frontdoor.py serve",   # self-serve signup/build front door (crashed unsupervised once)
+            "jobd": "jobd.py serve",   # the central execution daemon — drives EVERY build; a silent SPOF if unsupervised
             "cockpit-api": "realapi/server.py",   # CEO Cockpit real-data backend — supervised so it stays up
             "cockpit-web": "http.server 8871",    # CEO Cockpit frontend static server
             "replybridge": "replybridge.py serve"}   # phone->controller loop (CEO answers decisions from phone)

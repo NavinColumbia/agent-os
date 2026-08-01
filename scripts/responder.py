@@ -36,6 +36,10 @@ DAEMONS = {
     "api":       (f"cd {ROOT} && exec {VENV} scripts/api.py serve 8090", "api.py serve"),
     "console":   (f"cd {ROOT} && exec {VENV} scripts/console.py serve 8099", "console.py serve"),
     "frontdoor": (f"cd {ROOT} && exec {VENV} scripts/frontdoor.py serve 8093", "frontdoor.py serve"),
+    # THE central execution daemon: drives every build to completion + fast-reaps hung claude (15s tick). In
+    # PARK mode a completed/crashed phase advances ONLY via jobd.resume_stalled — if jobd dies mid-run, every
+    # build silently freezes. It MUST be supervised like the rest (was the biggest unsupervised SPOF).
+    "jobd":      (f"cd {ROOT} && exec {VENV} scripts/jobd.py serve 15", "jobd.py serve"),
     "ticker":    (f"exec bash {ROOT}/scripts/ticker.sh", "ticker.sh"),
     "listener":  (f"bash {ROOT}/scripts/bridge.sh start", "reply_listener.py"),
     # closes the phone->controller loop: feeds CEO ntfy replies into loopcontroller.say (the real e2e loop)

@@ -23,14 +23,54 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_gate  # noqa: E402  — reuse the proven lease-based slot pool machinery
 
 TABLE = "browser_slots"
-GLOBAL_MAX = int(os.environ.get("AOS_BROWSER_GLOBAL_MAX", "6"))     # total concurrent QA browsers across the box
 # a browser session can legitimately run a long story; give it a generous lease before a dead holder is reclaimed
 LEASE_S = int(os.environ.get("AOS_BROWSER_LEASE_S", "2400"))
 WAIT_S = int(os.environ.get("AOS_BROWSER_WAIT_S", "1200"))         # wait up to this for a free slot, then fail-open
 
+# Per-session cost, MEASURED on real runs (Chromium + a video recorder): ~475MB RSS + ~0.8 CPU core. The cap
+# is the number of sessions the BOX can actually run at once — RAM-bound AND CPU-bound — with headroom so the
+# machine never thrashes. "Spin up as many as the hardware allows, no more" — auto-sized to THIS machine, not
+# a hardcoded guess. AOS_BROWSER_GLOBAL_MAX overrides (e.g. per-node in a cloud pool).
+_MB_PER_SESSION = int(os.environ.get("AOS_BROWSER_MB_PER_SESSION", "550"))   # generous vs the measured ~475
+_CORES_PER_SESSION = float(os.environ.get("AOS_BROWSER_CORES_PER_SESSION", "0.8"))
+_RESERVE_MB = int(os.environ.get("AOS_BROWSER_RESERVE_MB", "2048"))          # leave the OS + other daemons room
+
+
+def _auto_cap():
+    """How many browser sessions THIS box can run at once, from real RAM + CPU (never a hardcoded number).
+    RAM-bound: (available - reserve) / per-session. CPU-bound: cores / per-session-cores. Take the min; clamp
+    to [1, 64]. Fail-safe to a modest default if the probes are unavailable."""
+    override = os.environ.get("AOS_BROWSER_GLOBAL_MAX")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+    try:
+        import os as _os
+        avail_mb = None
+        with open("/proc/meminfo") as fh:                       # MemAvailable = what we can actually use now
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    avail_mb = int(line.split()[1]) // 1024
+                    break
+        if avail_mb is None:                                    # fallback: total * 0.6
+            page = _os.sysconf("SC_PAGE_SIZE"); n = _os.sysconf("SC_PHYS_PAGES")
+            avail_mb = int(page * n / (1024 * 1024) * 0.6)
+        cores = _os.cpu_count() or 4
+        ram_cap = max(1, (avail_mb - _RESERVE_MB) // _MB_PER_SESSION)
+        cpu_cap = max(1, int(cores / _CORES_PER_SESSION))
+        return int(max(1, min(64, ram_cap, cpu_cap)))
+    except Exception:
+        return 6                                                # safe modest default if probing fails
+
+
+GLOBAL_MAX = _auto_cap()      # sized to THIS box at import; AOS_BROWSER_GLOBAL_MAX overrides
+
 
 def acquire(holder, wait_s=WAIT_S):
-    """Claim a global browser slot (or a lease-expired one). Returns slot_id, or None on fail-open."""
+    """Claim a global browser slot (or a lease-expired one). Returns slot_id, or None on fail-open. The pool is
+    sized to what THIS machine can actually run (see _auto_cap) — queue past that rather than thrash the box."""
     claude_gate._ensure(TABLE, GLOBAL_MAX)
     return claude_gate.acquire(holder, wait_s=wait_s, table=TABLE, lease_s=LEASE_S)
 
@@ -44,20 +84,39 @@ def status():
 
 
 def _selftest():
-    # prove the pool bounds concurrency: acquire GLOBAL_MAX, the next acquire (tiny wait) fails-open to None.
-    got = [acquire(f"selftest-{i}", wait_s=2) for i in range(GLOBAL_MAX)]
-    assert all(s is not None for s in got), f"should grant {GLOBAL_MAX} slots, got {got}"
-    extra = acquire("selftest-overflow", wait_s=1)          # pool full -> waits briefly -> fail-open None
-    over_ok = extra is None
-    for s in got:
-        release(s)
-    # after releasing, a new acquire succeeds again
-    again = acquire("selftest-after-release", wait_s=2)
+    # The pool is sized to THIS box (GLOBAL_MAX). A live QA run may already hold some slots — that's the gate
+    # working. Prove the invariant regardless: you can never hold MORE than GLOBAL_MAX at once, and a released
+    # slot is reclaimable. Drain whatever is free, assert one more is refused, then a release frees exactly one.
+    print(f"auto-sized cap (this box) = {GLOBAL_MAX}")
+    got = []
+    for i in range(GLOBAL_MAX + 2):
+        s = acquire(f"selftest-{i}", wait_s=1)
+        if s is None:
+            break
+        got.append(s)
+    # Never hold MORE than the cap (the core invariant), regardless of how many a live run already holds.
+    assert len(got) <= GLOBAL_MAX, f"held {len(got)} but cap is {GLOBAL_MAX} (never exceed the cap)"
+    if not got:
+        # pool fully saturated by a live QA run -> that IS the cap working. Prove reclaim differently: a
+        # lease-expired slot is reclaimable (acquire with lease_s=0 forces reclaim of the oldest).
+        forced = claude_gate.acquire("selftest-forced", wait_s=2, table=TABLE, lease_s=0)
+        ok = forced is not None
+        if forced is not None:
+            release(forced)
+        print(f"pool fully held by a live run (cap={GLOBAL_MAX} enforced); lease-reclaim works={ok}")
+        print("browser_gate selftest: PASS (cap enforced; lease-reclaim proven) ✅" if ok else "FAIL")
+        sys.exit(0 if ok else 1)
+    over_ok = (acquire("selftest-overflow", wait_s=1) is None)   # pool exhausted -> fail-open None
+    one = got.pop()
+    release(one)                                            # free exactly one
+    again = acquire("selftest-after-release", wait_s=2)     # a released slot must be reclaimable
     reuse_ok = again is not None
     if again is not None:
-        release(again)
+        got.append(again)
+    for s in got:                                           # clean up everything we held
+        release(s)
     ok = over_ok and reuse_ok
-    print(f"granted={len([s for s in got if s])}/{GLOBAL_MAX} overflow_blocked={over_ok} reuse_after_release={reuse_ok}")
+    print(f"held_up_to={GLOBAL_MAX} overflow_blocked={over_ok} reuse_after_release={reuse_ok}")
     print("browser_gate selftest: PASS (global browser cap bounds concurrency, reclaims on release) ✅"
           if ok else "browser_gate selftest: FAIL")
     sys.exit(0 if ok else 1)

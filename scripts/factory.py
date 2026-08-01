@@ -169,18 +169,22 @@ def _agent_config_dir():
         (d / "settings.json").write_text(json.dumps(_AGENT_SETTINGS, indent=2))
         creds = Path.home() / ".claude" / ".credentials.json"          # host login (subscription mode)
         link = d / ".credentials.json"
-        # Keep the agents' creds in SYNC with the host's. A one-time symlink is NOT durable: claude refreshes
-        # the OAuth token by atomic-rename, which replaces the symlink with a regular file that then goes STALE
-        # while the host token keeps refreshing — every spawned agent then fails "OAuth session expired". So
-        # COPY the host creds whenever they're newer than (or absent from) the isolated dir. (Found by a live
-        # company-org run whose whole fleet failed auth on a week-old copy.)
+        # Keep the agents' creds in SYNC with the host's, by CONTENT (not mtime). A one-time symlink isn't
+        # durable (claude refreshes the OAuth token via atomic-rename, replacing the symlink with a file that
+        # then goes stale). An mtime check ALSO isn't enough: an "not logged in" claude run in the isolated dir
+        # writes an EMPTY 2-byte creds file whose mtime can match the host's within a second, so the stale/empty
+        # copy is kept and EVERY spawned agent fails "Not logged in" (observed live, twice). So: copy whenever
+        # the isolated creds are MISSING or their bytes DIFFER from the host's. Cheap (creds are ~500 bytes).
         try:
-            if creds.exists() and ((not link.exists()) or creds.stat().st_mtime > link.stat().st_mtime + 1):
-                import shutil
-                if link.is_symlink() or link.exists():
-                    link.unlink()
-                shutil.copy2(creds, link)
-                link.chmod(0o600)
+            if creds.exists():
+                host_b = creds.read_bytes()
+                cur_b = link.read_bytes() if link.exists() and not link.is_symlink() else b""
+                if host_b and host_b != cur_b:
+                    import shutil
+                    if link.is_symlink() or link.exists():
+                        link.unlink()
+                    shutil.copy2(creds, link)
+                    link.chmod(0o600)
         except Exception:
             pass
         return str(d)
@@ -259,12 +263,13 @@ def _codex_cost(tin, tout):
     return (int(tin or 0) * CODEX_PRICE[0] + int(tout or 0) * CODEX_PRICE[1]) / 1_000_000
 # Per-factory BUDGET control (a tenant tunes these to their wallet). AOS_BUDGET_USD is a soft cap on total
 # spend for this process: once reached, agent() refuses to spawn new work and escalates instead of running
-# away. DEFAULT is a HIGH RUNAWAY BACKSTOP ($200), not unlimited — an UNATTENDED run must not burn forever if
+# away. DEFAULT is a HIGH RUNAWAY BACKSTOP ($1000 ~= ~2250 heavy agent calls), not unlimited — an UNATTENDED
+# run must not burn forever if
 # a loop gets stuck (the owner's "cost is not a concern, go deep" is still honored: this is deliberately high,
 # scale.apply raises it further with the wallet, and AOS_BUDGET_USD=0 opts into truly unlimited). Hitting it is
 # logged LOUDLY + escalated, never silent — a safety net in the North-Star sense (high backstop, never a
 # quality terminator).
-BUDGET_USD = float(os.environ.get("AOS_BUDGET_USD", "200") or 0)
+BUDGET_USD = float(os.environ.get("AOS_BUDGET_USD", "1000") or 0)
 _SPENT = [0.0]
 _SPENT_LOCK = threading.Lock()
 
@@ -290,7 +295,7 @@ def _apply_scale():
             import scale
             prof = scale.profile(BUDGET_USD)
             applied = scale.apply(prof)                 # sets AOS_MAX_AGENTS/RIGOR/MAX_DEPTH/EXPLORATION/...
-            BUDGET_USD = float(os.environ.get("AOS_BUDGET_USD", "0") or 0)
+            BUDGET_USD = float(os.environ.get("AOS_BUDGET_USD", "1000") or 0)
             _AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8")))
             audit.append(actor="factory:controller", action="ScaleProfile", resource="factory",
                          decision="applied", payload={"profile": prof, "env": applied})

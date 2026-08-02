@@ -1922,12 +1922,32 @@ def _llm(tid, thread_id, sysp, s, on_delta=None):
     return (r.get("out_full") or r.get("out") or "").strip() or "Tell me a bit more."
 
 
+_PLAN_FIELDS = "name|kind|plan|agentic|charter"
+
+
 def _parse_plan(body):
     def f(name, d=""):
-        m = re.search(rf"{name}\s*:\s*(.+?)(?:\n[a-z]+\s*:|\Z)", body, re.S | re.I)
-        return m.group(1).strip() if m else d
-    kind = f("kind", "service").lower()
-    return {"name": (f("name", "app").split()[0][:24] or "app"),
+        # A field runs until the NEXT known field label — which the model routinely bolds (**kind:**). The old
+        # terminator (\n[a-z]+:) missed a bolded label, so every field then greedily ate the rest of the block
+        # (observed live: kind captured "web\nplan\n..." -> squashed to garbage -> wrong builder). Match the
+        # label optionally wrapped in markdown, and terminate ONLY on a real next field (never an incidental
+        # "invariants:" inside the plan bullets).
+        m = re.search(rf"{name}\s*[*_`]*\s*:\s*(.+?)"
+                      rf"(?:\n\s*[*_`>#-]*\s*(?:{_PLAN_FIELDS})\s*[*_`]*\s*:|\Z)", body, re.S | re.I)
+        if not m:
+            return d
+        v = m.group(1).strip()
+        # Models routinely wrap field VALUES in markdown emphasis (**bold**, `code`) or bold the LABEL
+        # ("**name:** finance-tracker" -> capture "** finance-tracker"). Strip surrounding *,_,` and stray
+        # leading emphasis so scalar fields don't come back as "**". The multi-line `plan` bullets keep their
+        # internal "- "/"**" — we only trim the head/tail of the whole captured value.
+        v = re.sub(r"^[\s*_`>#]+", "", v)
+        v = re.sub(r"[\s*_`]+$", "", v)
+        return v.strip() or d
+    # name -> a clean slug token (drop any residual markdown/punctuation the model added)
+    name = re.sub(r"[^A-Za-z0-9._-]", "", (f("name", "app").split() or ["app"])[0])[:24] or "app"
+    kind = re.sub(r"[^a-z]", "", f("kind", "service").lower())          # "service." / "**web**" -> "web"
+    return {"name": name,
             "kind": kind if kind in ("lib", "web", "service", "project") else "service",
             "plan": f("plan"), "agentic": f("agentic", "").strip(),   # free-text: feature(s) + invocation
             "charter": f("charter", "Build a small, well-tested product.")}

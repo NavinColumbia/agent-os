@@ -685,6 +685,33 @@ def test_dispatch_and_park_defaults_on():
     assert lc._PARK is True, "dispatch-and-park should default ON"
 
 
+def test_plan_parser_survives_markdown_wrapped_fields():
+    """Observed on a LIVE build: the model bolds the [[PLAN]] field labels/values (**name:** x, kind: **web**),
+    and the old parser captured the markdown -> name='**' (a broken build slug) and a mis-read kind (wrong
+    builder path). The parser must strip emphasis from the scalar fields while leaving the multi-line plan
+    bullets (which legitimately contain '- ' and '**') intact, and never mangle clean input."""
+    import loopcontroller as lc
+    p = lc._parse_plan("name: **finance-tracker**\nkind: **web**\n"
+                       "plan:\n- **Foundation:** src/db.ts\n- import/export\n"
+                       "agentic: ** none\ncharter: **A local-first tracker.**")
+    assert p["name"] == "finance-tracker", f"markdown must not leak into the slug: {p['name']!r}"
+    assert p["kind"] == "web", f"kind must parse past emphasis: {p['kind']!r}"
+    assert not p["charter"].startswith("*") and p["charter"].endswith("."), p["charter"]
+    assert p["plan"].splitlines()[0] == "- **Foundation:** src/db.ts", "plan bullets must be preserved verbatim"
+    # THE actual live failure: EVERY label bolded -> the terminator missed the next label and each field ate the
+    # rest of the block (kind captured "web\nplan\n..." and squashed to garbage -> wrong builder path).
+    q = lc._parse_plan("**name:** local-first-finance-tracker\n**kind:** web\n**plan:**\n"
+                       "- **Foundation:** src/db.ts\n- import/export handles edge cases\n"
+                       "**agentic:** none\n**charter:** A local-first tracker.")
+    assert q["kind"] == "web", f"bolded label must not collapse field boundaries: {q['kind']!r}"
+    assert "import/export" in q["plan"], "every plan bullet must survive, not just the first"
+    assert q["charter"] == "A local-first tracker.", q["charter"]
+    # an unknown/garbled kind still falls back safely; clean input is untouched
+    assert lc._parse_plan("name: x\nkind: nonsense")["kind"] == "service"
+    clean = lc._parse_plan("name: myapp\nkind: project\nplan:\n- do x\ncharter: Build it.")
+    assert clean["name"] == "myapp" and clean["kind"] == "project"
+
+
 def test_rebuild_ctx_restores_billing_context_in_a_fresh_process(monkeypatch):
     """The one thing a DETACHED park worker must get right (the risk I flagged): rebuild factory._ctx — tenant,
     org, product, and the resolved provider's engine+key — from the thread's persisted state alone, so model

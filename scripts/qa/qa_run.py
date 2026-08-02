@@ -615,6 +615,10 @@ def qa_run(target_url, vision, token, org, product_summary, *,
         "bugs": all_bugs,
         "rounds": rounds_ran,
         "clean": clean,
+        # This IS the real-browser interface path. Declaring it lets qa_report enforce the "never pass a UI
+        # no one drove" invariant: interface_exercised is then proven by the per-step screenshots below, so a
+        # browser run that loaded nothing (0 screenshots) cannot be graded as passed.
+        "requires_interface": True,
     }
     try:
         (evidence_dir / "run-final.json").write_text(json.dumps(run, indent=2, default=str))

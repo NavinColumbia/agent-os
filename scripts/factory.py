@@ -1330,17 +1330,21 @@ def _npm_install_safe(repo: str) -> None:
             continue
 
 
-def _run_node_tests(repo: str) -> tuple[bool, str]:
+def _run_node_tests(repo: str, target: str = "") -> tuple[bool, str]:
     """Grade a Node/JS/TS product with ITS OWN declared test command (package.json 'test' script → `npm test`),
     falling back to the framework-free node test files. Deps are installed with lifecycle scripts DISABLED
     (_npm_install_safe — no install-time RCE), and the tests THEMSELVES run inside the srt sandbox (network
     denied, writes limited to the repo) via _exec_tests — so untrusted node code can never escape the jail,
-    exactly like the pytest path."""
+    exactly like the pytest path. `target` scopes the framework-free runner to a subdir (per-component builds)."""
     r = Path(repo)
     try:
         pkg = json.loads((r / "package.json").read_text())
     except Exception:
         pkg = {}
+    # a per-component target: run the framework-free node files under that subdir (npm test grades the whole repo,
+    # which a single not-yet-integrated component can't satisfy).
+    if target:
+        return run_js_tests(repo, subdir=target)
     if not (pkg.get("scripts") or {}).get("test"):
         return run_js_tests(repo)                        # no declared script → the framework-free node runner (sandboxed)
     import shlex
@@ -1351,16 +1355,21 @@ def _run_node_tests(repo: str) -> tuple[bool, str]:
                        action="RunTests-node")
 
 
-def run_tests(repo: str, sandboxed: bool = True, target: str = "", python: str = "") -> tuple[bool, str]:
-    """Run the product's test suite with the runner that MATCHES ITS STACK (F10 fix). A Node/JS/TS app is graded
-    by its own `npm test`; a Python app by pytest (below). Untrusted generated code runs inside the srt sandbox
-    (write-limited to the repo, network denied). Falls back to direct exec ONLY if the sandbox infra itself is
-    unavailable (never to mask a real test failure). `target` scopes pytest to a subpath — empty means the whole
-    repo. `python` overrides the interpreter — defaults to the platform venv."""
-    # STACK DISPATCH: a targeted adversarial subpath (tests/adversarial) is a Python-specific tier, so only
-    # dispatch by stack for a whole-repo baseline run.
-    if not target and detect_stack(repo) == "node":
-        return _run_node_tests(repo)
+def run_tests(repo: str, sandboxed: bool = True, target: str = "", python: str = "",
+              stack: str = "") -> tuple[bool, str]:
+    """Run the product's test suite with the runner that MATCHES ITS STACK (F10 fix). A Node/JS/TS/web app is
+    graded by its own `npm test` (or the framework-free node runner); a Python app by pytest (below). Untrusted
+    generated code runs inside the srt sandbox (write-limited to the repo, network denied). Falls back to direct
+    exec ONLY if the sandbox infra itself is unavailable (never to mask a real test failure). `target` scopes to
+    a subpath — empty means the whole repo. `python` overrides the interpreter. `stack` (from the hierarchical
+    builder) FORCES the runner — 'web'/'node'/'js'/'ts' → the node runner even for a per-component `target`,
+    so a web component's tests aren't mis-run through pytest."""
+    st = (stack or "").strip().lower()
+    node_forced = st in ("web", "node", "js", "ts", "javascript", "typescript")
+    # STACK DISPATCH: force node for a web/node stack (any target); otherwise auto-detect only for a whole-repo run
+    # (a targeted adversarial subpath, tests/adversarial, is a Python-specific tier).
+    if node_forced or (not target and detect_stack(repo) == "node"):
+        return _run_node_tests(repo, target=target)
     py = python or VENV_PY
     pytest_cmd = f"cd {repo} && {py} -m pytest -q {target}".rstrip()
     return _exec_tests(repo, pytest_cmd, sandboxed)
@@ -1409,16 +1418,19 @@ def _exec_tests(repo: str, test_cmd: str, sandboxed: bool = True, action: str = 
     return p.returncode == 0, out[-2500:]
 
 
-def run_js_tests(repo: str) -> tuple[bool, str]:
+def run_js_tests(repo: str, subdir: str = "") -> tuple[bool, str]:
     """Run the builder's framework-free Node test files (tests/**/*.test.js|.cjs) — the FUNCTIONAL path
     coverage for web/extension products (conversions, error paths, edge cases). Each file must exit 0.
     ABSENCE of any test file is a FAIL: a QA stage that smoke-loads a page but never runs behaviour tests
-    is theatre (this is the gap that let a web app 'pass' while its 22 real tests were never executed)."""
+    is theatre (this is the gap that let a web app 'pass' while its 22 real tests were never executed).
+    `subdir` scopes the glob to a component's folder (per-component hierarchical builds)."""
     root = Path(repo)
-    files = [p for p in sorted(root.rglob("*.test.js")) + sorted(root.rglob("*.test.cjs"))
-             if "node_modules" not in p.parts]
+    scan = (root / subdir) if subdir else root
+    files = [p for p in sorted(scan.rglob("*.test.js")) + sorted(scan.rglob("*.test.cjs"))
+             if "node_modules" not in p.parts] if scan.exists() else []
     if not files:
-        return False, "NO functional tests found — expected tests/*.test.js exercising every operation, "\
+        where = f" under {subdir}" if subdir else ""
+        return False, f"NO functional tests found{where} — expected *.test.js exercising every operation, "\
                       "error path, and edge case (a smoke-load is not QA)."
     # These test files are UNTRUSTED generated node code — run them INSIDE the srt sandbox (network denied,
     # writes limited to the repo) via _exec_tests, exactly like pytest, so they can't touch the factory host.
@@ -1641,6 +1653,16 @@ def _qa_stack_path():
         sys.path.insert(0, qa_dir)
 
 
+# Target kinds whose product IS an interactive interface a real user drives — these can only be verified by
+# actually driving that interface (a browser session), never by a code-only grader. Keep in sync with the
+# build-side platform vocabulary; anything browser-runnable belongs here.
+_UI_KINDS = {"web", "spa", "webapp", "pwa", "game-web", "browser-game", "static-web", "desktop-web", "mobile-web"}
+
+
+def _is_ui_target(kind: str) -> bool:
+    return (kind or "").strip().lower() in _UI_KINDS
+
+
 def qa_verdict_ok(v: dict) -> bool:
     """The ship condition, verbatim what gate_check._v_qa_verdict enforces on the LAUNCH artifact:
     passed==true AND blocking_open==0 AND stories>0. Fail-closed on any missing/garbled fact."""
@@ -1767,6 +1789,10 @@ def run_independent_qa(repo: str, product: str, vision: str, kind: str = "lib") 
             "severity": b.get("severity", "medium"),
         } for i, b in enumerate(bugs)],
         "not_covered": (data or {}).get("not_covered"),
+        # SAFETY NET: this is the code-only grader (no browser). If a UI product was MISROUTED here (kind
+        # mis-detected, or devserve couldn't bring up a URL), declaring it a UI target makes qa_report refuse
+        # to pass it — a browser app graded without a browser must escalate, never ship green.
+        "requires_interface": _is_ui_target(kind),
     }
     report = qa_report_mod.build_report(run)
     vpath = qa_run_mod.write_verdict(str(repo), report, product=product, producer="independent-qa")
@@ -1781,17 +1807,52 @@ def run_independent_qa(repo: str, product: str, vision: str, kind: str = "lib") 
     return out
 
 
+# Native targets with no toolchain / simulator / device on this box. We can BUILD them but cannot honestly
+# certify their interactive behaviour here — so QA returns an explicit "not verified on this box" verdict
+# (never a fake pass), which fails the ship gate and escalates to a human/device-farm.
+_UNTESTABLE_HERE = {"mobile-ios", "mobile-android", "mobile-cross", "desktop", "pc-game", "ios", "android"}
+
+
+def _honest_untestable_verdict(repo: Path, product: str, platform: str) -> dict:
+    """Write a real (non-pass) verdict artifact for a target we can't exercise here, so gate_check has a
+    machine verdict to read and DELIVER stays blocked pending real-device/simulator QA."""
+    import qa_run as qa_run_mod
+    import qa_report as qa_report_mod
+    run = {"product": product, "vision": f"{product} ({platform})", "started_at": time.time(),
+           "finished_at": time.time(), "requires_interface": True, "interface_exercised": False,
+           "stories": [{"id": "US-1", "title": f"{platform} app runs on a real device",
+                        "expected": "interactive verification on a real device/simulator",
+                        "status": "blocked",
+                        "steps": [{"action": f"attempt {platform} QA on this box",
+                                   "expected": "a device/simulator harness", "actual": "none available here",
+                                   "verdict": "blocked"}]}],
+           "bugs": [{"id": "BUG-1", "title": f"{platform} target not verifiable on this box",
+                     "detail": f"the build exists but {platform} needs a real device/simulator/store toolchain "
+                               "not installed here; interactive QA cannot run — escalate to a device farm",
+                     "blocking": True, "fixed": False, "severity": "high"}]}
+    report = qa_report_mod.build_report(run)
+    vpath = qa_run_mod.write_verdict(str(repo), report, product=product, producer=f"untestable-{platform}")
+    return {"passed": False, "stories": int(report.get("total_stories") or 0),
+            "blocking_open": int(report.get("blocking_open") or 1), "verdict": report.get("verdict"),
+            "verdict_json": vpath, "detail": report.get("md"), "untestable_here": platform}
+
+
 def run_grounded_qa(product: str, kind: str = None, vision: str = None, summary: str = None,
-                    target_url: str = None) -> dict:
+                    target_url: str = None, platform: str = None) -> dict:
     """ONE entry point for the grounded ship-gate verdict — used by build_product's QA stage and by
-    loopcontroller's TESTQA. Web/UI builds (or anything already RUNNING at target_url) go through the
-    agentic browser stack; everything else gets the independent qa-security verification. Both write
-    docs/QA-VERDICT.json — the machine-readable LAUNCH artifact gate_check consumes — so a product
+    loopcontroller's TESTQA. `platform` (from the plan) decides routing: a UI target (web/game-web) MUST be
+    driven in a real browser (never code-graded); a native target with no harness here gets an honest
+    'not verified on this box' verdict; everything else gets the independent qa-security verification. All
+    write docs/QA-VERDICT.json — the machine-readable LAUNCH artifact gate_check consumes — so a product
     without a verdict fails the gate honestly, and one with a verdict ships only on its JSON facts."""
     repo = PRODUCTS / product
     if not repo.exists():
         return {"passed": False, "stories": 0, "blocking_open": 0, "verdict_json": None,
                 "verdict": f"no such product repo: {repo}"}
+    plat = (platform or "").strip().lower()
+    # HONESTY GATE: a target we cannot exercise here must not be code-graded into a fake pass.
+    if plat in _UNTESTABLE_HERE:
+        return _honest_untestable_verdict(repo, product, plat)
     kind = kind or _detect_kind(repo)
     if vision is None:
         ch = repo / "docs" / "CHARTER.md"
@@ -1799,7 +1860,10 @@ def run_grounded_qa(product: str, kind: str = None, vision: str = None, summary:
     if summary is None:
         sp = repo / "docs" / "SPEC.md"
         summary = sp.read_text()[:4000] if sp.exists() else vision[:2000]
-    if kind == "web" or target_url:
+    # A UI target (declared platform OR detected kind) is verified ONLY in a real browser — even if devserve
+    # couldn't produce a URL, run_agentic_web_qa fail-closes ("no index.html to serve") rather than silently
+    # code-grading a UI no one drove.
+    if _is_ui_target(plat) or kind == "web" or target_url:
         return run_agentic_web_qa(str(repo), product, vision, summary, target_url=target_url)
     return run_independent_qa(str(repo), product, vision, kind)
 
@@ -2248,18 +2312,37 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
 
 
 def _detect_kind(repo: Path) -> str:
-    """Recover a product's build kind for resume: from the CHARTER.md header `(kind)`, else disk shape."""
+    """Recover a product's build kind for resume/QA-routing: from the CHARTER.md header `(kind)`, else disk
+    shape. The disk sniff must catch a WEB app even when it has no built root index.html (an SPA/bundler
+    whose entry is under src/ + a package.json with a frontend framework) — otherwise a browser app is
+    mislabelled 'lib' and QA grades it without ever opening a browser (the false-pass this whole change
+    closes)."""
     ch = repo / "docs" / "CHARTER.md"
     if ch.exists():
         first = (ch.read_text().splitlines() or [""])[0]
         if first.endswith(")") and "(" in first:
-            k = first.rsplit("(", 1)[-1].rstrip(")").strip()
-            if k in ("lib", "web", "service", "extension"):
+            k = first.rsplit("(", 1)[-1].rstrip(")").strip().lower()
+            if k in ("lib", "web", "service", "extension") or _is_ui_target(k):
                 return k
     if (repo / "manifest.json").exists():
         return "extension"
-    if (repo / "index.html").exists():
+    # any HTML entry anywhere (root, public/, dist/, src/) ⇒ a browser app
+    if (repo / "index.html").exists() or (repo / "public" / "index.html").exists() \
+            or any(repo.glob("src/**/index.html")) or any(repo.glob("*.html")):
         return "web"
+    # a JS/TS package that pulls in a frontend framework or defines a dev/build script ⇒ a web app
+    pkg = repo / "package.json"
+    if pkg.exists():
+        try:
+            j = json.loads(pkg.read_text())
+            deps = {**(j.get("dependencies") or {}), **(j.get("devDependencies") or {})}
+            scripts = j.get("scripts") or {}
+            frontend = ("react", "vue", "svelte", "next", "vite", "@angular/core", "solid-js", "preact",
+                        "phaser", "three", "pixi.js")
+            if any(f in deps for f in frontend) or any(s in scripts for s in ("dev", "build", "start")):
+                return "web"
+        except Exception:
+            pass
     return "lib"
 
 

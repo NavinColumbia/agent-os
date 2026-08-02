@@ -106,14 +106,31 @@ def _tally(run: dict) -> dict:
     blocking_open = [b for b in open_bugs if _truthy(b, "blocking", "blocker")]
     all_passed = (bool(stories) and per["failed"] == 0 and per["blocked"] == 0
                   and per["unknown"] == 0 and per["incomplete"] == 0)
-    # A run passes only if every story passed AND nothing blocking is still open. A non-blocking open bug
-    # is noted but does not veto the verdict (ship-with-known-issues is a real, honest outcome).
-    passed = all_passed and not blocking_open
+
+    # ── THE "never lie about a UI" invariant ──────────────────────────────────────────────────────────
+    # A UI/interactive target (web app, browser game, …) can ONLY pass if its REAL interface was actually
+    # driven — a browser launched and at least one story step really executed (evidenced by a screenshot).
+    # Without this, a code-only grader (run_independent_qa: no browser, target_url=null, 0 screenshots)
+    # could declare "ALL N STORIES PASSED" for a product no human could even open — the exact false-pass
+    # that shipped a Python lib as a "finance tracker". `requires_interface` is set by the QA entry from the
+    # target type; `interface_exercised` is proven by real browser evidence, never asserted.
+    requires_interface = bool(run.get("requires_interface"))
+    exercised = bool(run.get("interface_exercised")) or any(
+        (step.get("screenshot") or step.get("shot"))
+        for st in stories for step in (st.get("steps") or [])
+    )
+    interface_ok = (not requires_interface) or exercised
+
+    # A run passes only if every story passed, nothing blocking is still open, AND (for a UI target) the real
+    # interface was exercised. A non-blocking open bug is noted but does not veto (ship-with-known-issues).
+    passed = all_passed and not blocking_open and interface_ok
     return {
         "total_stories": len(stories), "per_status": per,
         "total_bugs": len(bugs), "open_bugs": len(open_bugs),
         "blocking_open": len(blocking_open), "fixed_bugs": len(bugs) - len(open_bugs),
         "passed": passed, "_open_bug_objs": open_bugs, "_blocking_open_objs": blocking_open,
+        "requires_interface": requires_interface, "interface_exercised": exercised,
+        "interface_ok": interface_ok,
     }
 
 
@@ -121,6 +138,9 @@ def _verdict_line(t: dict) -> str:
     """The grounded one-liner (no model). This is the fallback AND the ground truth the AI must not contradict."""
     if t["total_stories"] == 0:
         return "NO VERDICT — no user stories were exercised in this run"
+    if t.get("requires_interface") and not t.get("interface_exercised"):
+        return ("NOT VERIFIED — this is an interactive product but its real interface was never exercised "
+                "(no browser session / screenshots); refusing to pass a UI no one actually drove")
     if t["passed"]:
         extra = f" ({t['open_bugs']} non-blocking issue(s) noted)" if t["open_bugs"] else ""
         return f"ALL {t['total_stories']} STORIES PASSED{extra}"
@@ -292,6 +312,8 @@ def build_report(run: dict, out_dir=None) -> dict:
         "summary": summary,
         "verdict": verdict,
         "passed": t["passed"],
+        "requires_interface": t.get("requires_interface", False),
+        "interface_exercised": t.get("interface_exercised", False),
         "coverage": {"total_stories": t["total_stories"], "per_status": t["per_status"]},
         "bugs": {
             "total": t["total_bugs"], "open": t["open_bugs"],
@@ -313,6 +335,8 @@ def build_report(run: dict, out_dir=None) -> dict:
         "summary": summary, "verdict": verdict, "passed": t["passed"],
         "total_stories": t["total_stories"], "total_bugs": t["total_bugs"],
         "open_bugs": t["open_bugs"], "blocking_open": t["blocking_open"],
+        "requires_interface": t.get("requires_interface", False),
+        "interface_exercised": t.get("interface_exercised", False),
     }
 
 

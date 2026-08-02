@@ -171,13 +171,13 @@ def test_project_build_complex_orchestration(monkeypatch):
     monkeypatch.setattr(project, "plan", lambda *a, **k: plan_obj)
     seen = {}
 
-    def fake_build(product, comp, dep_ifaces, api_key=None, ns=""):
+    def fake_build(product, comp, dep_ifaces, api_key=None, ns="", stack=None):
         seen[comp["id"]] = set(dep_ifaces)
         return {"id": comp["id"], "passed": True, "fix_attempts": 0}
     monkeypatch.setattr(project, "build_component", fake_build)
     integrated = {"called": False}
     monkeypatch.setattr(project, "integrate",
-                        lambda product, p, ns="", facade=None: (integrated.__setitem__("called", True), {"passed": True})[1])
+                        lambda product, p, ns="", facade=None, stack=None: (integrated.__setitem__("called", True), {"passed": True})[1])
     prod = f"ut-complex-{_rid()}"
     try:
         log = project.build_complex(prod, "goal")
@@ -199,11 +199,11 @@ def test_project_blocks_integration_when_a_component_fails(monkeypatch):
                 "integration_tests": "x"}
     monkeypatch.setattr(project, "plan", lambda *a, **k: plan_obj)
     monkeypatch.setattr(project, "build_component",
-                        lambda product, comp, dep_ifaces, api_key=None, ns="": {"id": comp["id"],
+                        lambda product, comp, dep_ifaces, api_key=None, ns="", stack=None: {"id": comp["id"],
                         "passed": comp["id"] != "b", "blocker": None if comp["id"] != "b" else "b failed"})
     integrated = {"called": False}
     monkeypatch.setattr(project, "integrate",
-                        lambda product, p, ns="", facade=None: (integrated.__setitem__("called", True), {"passed": True})[1])
+                        lambda product, p, ns="", facade=None, stack=None: (integrated.__setitem__("called", True), {"passed": True})[1])
     prod = f"ut-complex-{_rid()}"
     try:
         log = project.build_complex(prod, "goal")
@@ -222,7 +222,7 @@ def test_project_explore_plan_picks_best(monkeypatch, tmp_path):
     (tmp_path / "prodx" / "docs").mkdir(parents=True)
     calls = {"n": 0}
 
-    def fake_arch(product, goal, model, ns, depth, variant, out_name):
+    def fake_arch(product, goal, model, ns, depth, variant, out_name, stack=None):
         calls["n"] += 1
         return {"components": [{"id": f"c{calls['n']}", "name": "x", "description": "d", "deps": [], "interface": "i()"}],
                 "integration_tests": "t"}
@@ -265,13 +265,13 @@ def test_project_recursive_decomposition(monkeypatch):
     ], "integration_tests": "engine parts"}
     plans_for = []
     monkeypatch.setattr(project, "plan",
-                        lambda product, goal, model=None, ns="", depth=0: (plans_for.append(ns), root if ns == "" else sub)[1])
+                        lambda product, goal, model=None, ns="", depth=0, stack=None: (plans_for.append(ns), root if ns == "" else sub)[1])
     leaves = []
     monkeypatch.setattr(project, "build_component",
-                        lambda product, comp, dep_ifaces, api_key=None, ns="": (leaves.append(ns + comp["id"]), {"id": comp["id"], "passed": True})[1])
+                        lambda product, comp, dep_ifaces, api_key=None, ns="", stack=None: (leaves.append(ns + comp["id"]), {"id": comp["id"], "passed": True})[1])
     integ_ns = []
     monkeypatch.setattr(project, "integrate",
-                        lambda product, p, ns="", facade=None: (integ_ns.append(ns), {"passed": True})[1])
+                        lambda product, p, ns="", facade=None, stack=None: (integ_ns.append(ns), {"passed": True})[1])
     prod = f"ut-recur-{_rid()}"
     try:
         log = project.build_complex(prod, "goal")
@@ -1345,3 +1345,108 @@ def test_ceo_run_and_replybridge_close_the_e2e_loop():
     import ceo_run, replybridge
     assert ceo_run._selftest() == 0
     assert replybridge._selftest() == 0
+
+
+def test_qa_never_passes_a_ui_target_without_a_real_interface():
+    """THE false-pass this whole change closes: a browser/UI product graded by a code-only path (no browser,
+    no screenshots) must NOT be reported passed — even if every AI-declared story says 'passed'. The invariant
+    lives in qa_report._tally so EVERY QA path (browser or independent) is bound by it. Non-UI targets (lib)
+    are unaffected: code-graded verification is legitimate for them."""
+    sys.path.insert(0, str(ROOT / "scripts" / "qa"))
+    import qa_report as qr
+    ui_no_browser = {"product": "x", "requires_interface": True, "bugs": [], "stories": [
+        {"id": "US-1", "status": "passed", "steps": [{"verdict": "match"}]},
+        {"id": "US-2", "status": "passed", "steps": [{"verdict": "match"}]}]}
+    t = qr._tally(ui_no_browser)
+    assert t["passed"] is False, "a UI graded without a browser must never pass"
+    assert "NOT VERIFIED" in qr._verdict_line(t)
+    # same stories, but WITH real browser evidence (a screenshot on an executed step) -> may pass
+    ui_browser = {"product": "x", "requires_interface": True, "bugs": [], "stories": [
+        {"id": "US-1", "status": "passed", "steps": [{"verdict": "match", "screenshot": "/e/US-1.png"}]}]}
+    assert qr._tally(ui_browser)["passed"] is True
+    # a plain library (no interface required) is unaffected — code QA is a real pass for it
+    lib = {"product": "x", "bugs": [], "stories": [{"id": "US-1", "status": "passed",
+                                                    "steps": [{"verdict": "match"}]}]}
+    assert qr._tally(lib)["passed"] is True
+
+
+def test_independent_qa_flags_a_misrouted_ui_product():
+    """factory.run_independent_qa is the code-only grader. If a UI product is MISROUTED to it (kind mis-detected
+    / no servable URL), it must declare requires_interface so qa_report refuses the pass. _is_ui_target is the
+    seam; assert it classifies the browser kinds and not the code kinds."""
+    import factory
+    for k in ("web", "spa", "game-web", "pwa", "browser-game"):
+        assert factory._is_ui_target(k), k
+    for k in ("lib", "service", "api", "cli", "python", ""):
+        assert not factory._is_ui_target(k), k
+
+
+def test_detect_kind_recognizes_a_web_app_without_root_index_html():
+    """_detect_kind mislabelling a bundler/SPA as 'lib' was what routed a web app to the browserless grader.
+    A package.json with a frontend framework (or a build/dev script) is a web app, even with no root
+    index.html; a plain python project stays 'lib'."""
+    import json as _json
+    import factory
+    web = ROOT / "scripts"  # dummy; use a temp dir instead
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        r = Path(d)
+        (r / "package.json").write_text(_json.dumps({"dependencies": {"react": "^18"}}))
+        assert factory._detect_kind(r) == "web"
+    with tempfile.TemporaryDirectory() as d:
+        r = Path(d)
+        (r / "src").mkdir()
+        (r / "src" / "app.py").write_text("x = 1\n")
+        assert factory._detect_kind(r) == "lib"
+
+
+def test_project_builder_targets_the_right_stack():
+    """The hierarchical builder must build in the RIGHT language for the target, not always Python. stack_for
+    maps a web platform to the web (ES-module + node-test) descriptor and everything else to Python; the
+    descriptors' prompt fragments format cleanly (no leaked Python for web)."""
+    import project as pj
+    assert pj.stack_for("web")["id"] == "web"
+    assert pj.stack_for("game-web")["id"] == "web"
+    assert pj.stack_for("cli")["id"] == "python"
+    assert pj.stack_for(None)["id"] == "python"          # unknown/absent -> safe Python default
+    web = pj.stack_for("web")
+    comp = web["component"].format(pkg="ledger")
+    assert "index.js" in comp and "python" not in comp.lower()
+    assert "node --test" in web["fix_cmd"].format(pkg="ledger")
+    # python stack is byte-for-byte the old behaviour
+    py = pj.stack_for("python")
+    assert "python -m pytest" in py["fix_cmd"].format(pkg="ledger")
+    assert "__init__.py" in py["component"].format(pkg="ledger")
+
+
+def test_run_tests_routes_web_stack_to_node_runner():
+    """factory.run_tests(stack='web') must grade with the node runner even for a per-component target, so a
+    web component's *.test.js aren't force-run through pytest (which would error / falsely fail)."""
+    import factory
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        r = Path(d)
+        (r / "tests").mkdir()
+        # a web target with NO test files -> the node runner reports the honest 'NO functional tests' fail,
+        # proving it routed to node (pytest would instead say 'no tests ran'/collected 0).
+        ok, out = factory.run_tests(str(r), target="tests/ledger", stack="web")
+        assert ok is False
+        assert "functional tests" in out.lower() or "test.js" in out.lower(), out[:200]
+
+
+def test_untestable_native_target_is_honestly_blocked_not_faked():
+    """A native target with no harness on this box (ios/android/desktop/pc-game) must yield an HONEST
+    non-pass verdict (escalate to a device farm) — never a code-graded fake pass. run_grounded_qa routes
+    _UNTESTABLE_HERE platforms to _honest_untestable_verdict."""
+    import factory
+    for p in ("mobile-ios", "mobile-android", "mobile-cross", "desktop", "pc-game"):
+        assert p in factory._UNTESTABLE_HERE, p
+    # the honest verdict is a real non-pass with a blocking bug + written artifact
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        (repo / "docs").mkdir()
+        v = factory._honest_untestable_verdict(repo, "some-app", "mobile-ios")
+        assert v["passed"] is False and int(v["blocking_open"]) >= 1
+        assert v.get("untestable_here") == "mobile-ios"
+        assert not factory.qa_verdict_ok(v), "an untestable target must fail the ship gate"

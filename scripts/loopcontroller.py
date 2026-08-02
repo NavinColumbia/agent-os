@@ -393,9 +393,12 @@ def _phase_fn(thread_id, kind):
                     charter += "\n\n" + frag
             except Exception:
                 pass
+            platform = plan.get("platform") or ("web" if plan.get("kind") == "web" else "lib")
             if plan.get("kind") == "project":
                 import project
-                log = project.build_complex(product, charter)
+                # target the RIGHT stack (web app, python, …) — not always Python. platform drives the
+                # architect/builder/integrator language + test runner.
+                log = project.build_complex(product, charter, stack=platform)
                 return {"product": product, "result": (log or {}).get("result")}
             # SCAFFOLD-THEN-IMPROVE: qualityloop only IMPROVES an existing product, so build from the charter
             # at the registered path first, THEN run the quality loop to raise it to the bar.
@@ -404,13 +407,16 @@ def _phase_fn(thread_id, kind):
             import productregistry as _preg
             repo = pathlib.Path(_preg.path(product))
             if not repo.exists() or not any(repo.iterdir()):
-                factory.build_product(product, charter, kind=plan.get("kind", "web"))
+                # a UI platform (web/game-web) builds the real servable artifact via kind=web
+                build_kind = "web" if platform in ("web", "game-web") else plan.get("kind", "web")
+                factory.build_product(product, charter, kind=build_kind)
             import qualityloop
             return qualityloop.run(product, bar="high")
         return _do_build
     if kind == "qa":
         product = s.get("product")
-        return lambda: qa_gate(product)
+        platform = (s.get("plan") or {}).get("platform")
+        return lambda: qa_gate(product, platform=platform)
     raise ValueError(f"unknown phase kind for dispatch-and-park: {kind}")
 
 
@@ -958,15 +964,22 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
                 "empty/error/loading/edge cases each surface must handle; "
                 "(3) a PARALLELIZATION note — which work items are INDEPENDENT (can build concurrently) vs. "
                 "ordered; (4) a DONE checklist mapping each item to the check that proves it.\n"
-                "CHOOSE 'kind' HONESTLY by complexity — this decides whether a SINGLE builder or a HIERARCHICAL "
-                "team of engineers builds it: use 'project' when the product has MULTIPLE distinct, "
-                "interdependent components/features that a real team would split across separate engineers "
-                "(e.g. a multi-view app: library + search + planner + list + data-layer) — 'project' triggers "
-                "an architect who decomposes it into a component DAG built by MULTIPLE dev agents recursively "
-                "with per-component tests + an integration pass. Use 'web' ONLY for a genuinely single-artifact "
-                "static page, 'lib' for a library, 'service' for a single API. When in doubt between web and "
-                "project for a real multi-feature app, choose 'project'.\n"
-                "End with EXACTLY:\n[[PLAN]]\nname: <slug>\nkind: lib|web|service|project\n"
+                "Decide TWO INDEPENDENT axes:\n"
+                "• 'platform' = WHAT KIND OF PRODUCT the user actually wants a real person to use. Pick the "
+                "HONEST one from: web (a browser app — most SaaS/dashboards/trackers/tools), game-web (a "
+                "browser game), mobile-ios, mobile-android, mobile-cross (one codebase for both phones), "
+                "desktop (a downloadable desktop app), pc-game, cli (a command-line tool), api (a backend "
+                "service), lib (a code library). If the user says 'app' with no platform and it's clearly "
+                "something they'd open in a browser, that's 'web' — NEVER silently deliver a code library when "
+                "a person expected an app they can open.\n"
+                "• 'kind' = build STRATEGY by complexity: 'project' when the product has MULTIPLE distinct, "
+                "interdependent components a real team would split across engineers (a multi-view app: "
+                "data-layer + views + import/export + dashboard) — it triggers an architect who decomposes it "
+                "into a component DAG built by MULTIPLE dev agents recursively with per-component tests + an "
+                "integration pass. 'web'/'lib'/'service' = a single-builder artifact. When in doubt for a real "
+                "multi-feature app, choose 'project' (the platform still decides the actual tech stack).\n"
+                "End with EXACTLY:\n[[PLAN]]\nname: <slug>\nplatform: web|game-web|mobile-ios|mobile-android|"
+                "mobile-cross|desktop|pc-game|cli|api|lib\nkind: lib|web|service|project\n"
                 "plan: <bullets incl. the impact map, invariants/edge cases, parallelization, and done checks; one per line '- '>\n"
                 "agentic: <free-text: the agentic feature(s) the CEO wants + how each is invoked (button/event-async/"
                 "schedule), or 'none'>\ncharter: <2-4 sentences incl. the team/external surfaces to build in>\n[[/PLAN]]"
@@ -1369,13 +1382,15 @@ def advance(thread_id, job_result=None):
         return
 
 
-def qa_gate(product) -> dict:
+def qa_gate(product, platform=None) -> dict:
     """TESTQA's verification body (REBUILD-PLAN C1): run the AGENTIC QA stack against the RUNNING build
     and consume the SAME machine verdict the LAUNCH gate reads (docs/QA-VERDICT.json: passed==true,
     blocking_open==0, stories>0). The build is brought up via devserve (web/service get a stable dev
     URL; non-servable kinds fall through to factory's independent qa-security verification inside
-    run_grounded_qa). The builder never grades its own homework, and verify.verify's static tiers are
-    no longer the ship gate. FAIL-CLOSED: an unverifiable build is a QA failure — DELIVER stays blocked."""
+    run_grounded_qa). `platform` (from the plan) tells QA whether a real interface is REQUIRED (a web/game
+    UI can't pass without a browser session) and whether the target is even testable on this box. The
+    builder never grades its own homework. FAIL-CLOSED: an unverifiable build is a QA failure — DELIVER
+    stays blocked."""
     try:
         target = None
         try:
@@ -1384,7 +1399,7 @@ def qa_gate(product) -> dict:
             target = up.get("url")
         except Exception:
             target = None                             # not servable / didn't come up -> independent path
-        v = factory.run_grounded_qa(product, target_url=target)
+        v = factory.run_grounded_qa(product, target_url=target, platform=platform)
         # ONE ship condition, shared with the factory QA stage and gate_check's LAUNCH validator:
         # passed==true AND blocking_open==0 AND stories>0 (fail-closed on missing/garbled facts).
         qa_ok = factory.qa_verdict_ok(v)
@@ -1922,7 +1937,13 @@ def _llm(tid, thread_id, sysp, s, on_delta=None):
     return (r.get("out_full") or r.get("out") or "").strip() or "Tell me a bit more."
 
 
-_PLAN_FIELDS = "name|kind|plan|agentic|charter"
+_PLAN_FIELDS = "name|platform|kind|plan|agentic|charter"
+
+# The target platforms the CEO pipeline understands. Each maps (in factory/project) to a real build stack +
+# the QA harness that can actually exercise it — or, for targets with no toolchain on this box, an HONEST
+# "built, device-QA needs a real device/simulator" verdict instead of a faked pass.
+_PLATFORMS = ("web", "game-web", "mobile-ios", "mobile-android", "mobile-cross",
+              "desktop", "pc-game", "cli", "api", "lib")
 
 
 def _parse_plan(body):
@@ -1947,8 +1968,12 @@ def _parse_plan(body):
     # name -> a clean slug token (drop any residual markdown/punctuation the model added)
     name = re.sub(r"[^A-Za-z0-9._-]", "", (f("name", "app").split() or ["app"])[0])[:24] or "app"
     kind = re.sub(r"[^a-z]", "", f("kind", "service").lower())          # "service." / "**web**" -> "web"
+    platform = re.sub(r"[^a-z-]", "", f("platform", "").lower())        # "**web**" -> "web"; "" if absent
     return {"name": name,
             "kind": kind if kind in ("lib", "web", "service", "project") else "service",
+            # target platform: honour it if recognized; else infer a sane default from kind (a 'web' build kind
+            # is a web platform; anything else with no platform declared falls back to 'lib' — a plain library).
+            "platform": platform if platform in _PLATFORMS else ("web" if kind == "web" else "lib"),
             "plan": f("plan"), "agentic": f("agentic", "").strip(),   # free-text: feature(s) + invocation
             "charter": f("charter", "Build a small, well-tested product.")}
 

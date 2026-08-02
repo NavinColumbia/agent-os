@@ -46,6 +46,71 @@ MAX_INTEGRATION_FIX = int(os.environ.get("AOS_MAX_INTEGRATION_FIX", "3"))
 MAX_DEPTH = int(os.environ.get("AOS_MAX_DEPTH", "2"))
 
 
+# ── STACK DESCRIPTORS ─────────────────────────────────────────────────────────────────────────────────
+# The hierarchical builder used to hardcode Python everywhere (architect: "ONE Python codebase"; builders:
+# `src/<pkg>/__init__.py` + `python -m pytest`), so a browser web app got built as a Python library with a
+# simulated DOM and QA had no URL to drive. A stack descriptor makes every builder/integrator/test-runner
+# prompt speak the RIGHT language for the requested target. `python` reproduces the old behaviour exactly
+# (default, zero regression); `web` builds a real, servable, no-build-step browser app that browser-QA can
+# actually exercise. New stacks slot in here.
+_STACK_PY = {
+    "id": "python", "lang": "Python",
+    "codebase": "ONE Python codebase",
+    "component": "a Python package under src/{pkg}/ (create src/{pkg}/__init__.py; use `from src.{pkg}...` imports)",
+    "deps_line": "import and call these — do NOT reimplement them",
+    "tests": "Also write tests under tests/{pkg}/ covering this component. Touch ONLY src/{pkg}/** and "
+             "tests/{pkg}/**. Make `python -m pytest -q tests/{pkg}` pass.",
+    "fix_cmd": "`python -m pytest -q tests/{pkg}`",
+    "integ_sub": "Build the FACADE package src/{base}/ (src/{base}/__init__.py) that composes those parts THROUGH "
+                 "their interfaces (do NOT rewrite them) and exposes EXACTLY this public interface:\n{iface}\n"
+                 "Write tests under {target}/ proving the facade. Use `from src...` imports. "
+                 "Make `python -m pytest -q {target}` pass.",
+    "integ_root": "Wire them into one coherent product: add the top-level entrypoint/orchestration under src/ that "
+                  "composes the components THROUGH their public interfaces (do not rewrite internals), and write "
+                  "END-TO-END INTEGRATION TESTS under tests/integration/ that exercise: {itests}. "
+                  "Use `from src...` imports. Make `python -m pytest -q` (the WHOLE suite) pass.",
+    "roles_pref": "",
+}
+_STACK_WEB = {
+    "id": "web", "lang": "web (HTML/CSS/vanilla JS, runs in a browser)",
+    "codebase": "ONE browser web app (HTML/CSS/vanilla JavaScript) — NO build step, NO bundler, NO external CDNs; "
+                "it must run by opening index.html",
+    "component": "an ES module folder src/{pkg}/ with an index.js that EXPORTS its public interface (plus any "
+                 ".js/.css it owns); import a dependency via a RELATIVE path like `import {{...}} from "
+                 "'../{pkg}/index.js'` — never a bundler alias",
+    "deps_line": "import and call these via relative ES-module paths — do NOT reimplement them",
+    "tests": "Also write tests under tests/{pkg}/ as framework-free `*.test.js` files (use node's built-in "
+             "`node:assert` + `node:test`), importing the component's ES modules. Touch ONLY src/{pkg}/** and "
+             "tests/{pkg}/**. Every test file must pass under `node --test tests/{pkg}`.",
+    "fix_cmd": "`node --test tests/{pkg}`",
+    "integ_sub": "Build the FACADE module src/{base}/index.js that composes those parts THROUGH their interfaces "
+                 "(do NOT rewrite them) and exports EXACTLY this public interface:\n{iface}\n"
+                 "Write `*.test.js` under {target}/ proving the facade. Every file must pass under "
+                 "`node --test {target}`.",
+    "integ_root": "Wire them into one coherent browser app: create index.html at the repo ROOT that loads the app "
+                  "as an ES module (`<script type=\"module\">`) composing the components through their public "
+                  "interfaces (do not rewrite internals) — NO build step, NO external CDNs, so it runs by opening "
+                  "the file. Write END-TO-END `*.test.js` under tests/integration/ that exercise: {itests}. "
+                  "Every test file must pass under `node --test`.",
+    "roles_pref": " PREFER frontend-engineer / fullstack-engineer for UI components.",
+}
+# Target platforms → the stack that actually builds+tests them on this box. Native mobile/desktop/game-engine
+# targets have no toolchain/simulator here; they map to the closest buildable stack and are honestly flagged by
+# QA rather than faked (see factory qa routing).
+_PLATFORM_STACK = {
+    "web": _STACK_WEB, "spa": _STACK_WEB, "webapp": _STACK_WEB, "pwa": _STACK_WEB,
+    "game-web": _STACK_WEB, "browser-game": _STACK_WEB, "static-web": _STACK_WEB, "desktop-web": _STACK_WEB,
+    "python": _STACK_PY, "service": _STACK_PY, "api": _STACK_PY, "cli": _STACK_PY, "lib": _STACK_PY,
+}
+
+
+def stack_for(platform):
+    """Resolve a target platform (or stack id) to its build descriptor. Unknown/None → Python (safe default)."""
+    if isinstance(platform, dict):
+        return platform
+    return _PLATFORM_STACK.get((platform or "").strip().lower(), _STACK_PY)
+
+
 def _pkg(ns, cid):
     return ns + cid.replace("-", "_")
 
@@ -124,9 +189,11 @@ _ROLES = ("builder | backend-engineer | frontend-engineer | fullstack-engineer |
           "mobile-engineer | staff-engineer")
 
 
-def _architect(product, goal, model, ns, depth, variant, out_name):
+def _architect(product, goal, model, ns, depth, variant, out_name, stack=None):
     """One architect pass -> a validated plan written to docs/<out_name>. Supports recursion (decompose),
-    role assignment per component, OSS reuse (when AOS_ALLOW_DEPS), and an optional design `variant`."""
+    role assignment per component, OSS reuse (when AOS_ALLOW_DEPS), an optional design `variant`, and the
+    target STACK (Python vs web vs …) so the decomposition targets the right kind of codebase."""
+    stack = stack or _STACK_PY
     repo = factory.PRODUCTS / product
     (repo / "docs").mkdir(parents=True, exist_ok=True)
     factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"PLAN:{ns or 'root'}"
@@ -139,8 +206,8 @@ def _architect(product, goal, model, ns, depth, variant, out_name):
              if os.environ.get("AOS_ALLOW_DEPS") else ' Do NOT set "reuse" — standard library only.')
     var = f' DESIGN PHILOSOPHY for this plan: prioritise {variant}.' if variant else ""
     task = (
-        f"You are the system ARCHITECT. Decompose this goal into 4-8 INTERDEPENDENT components of ONE Python "
-        f"codebase. GOAL:\n{goal}\n\n"
+        f"You are the system ARCHITECT. Decompose this goal into 4-8 INTERDEPENDENT components of {stack['codebase']}. "
+        f"GOAL:\n{goal}\n\n"
         f"Write {out_name} (under docs/) containing ONLY this JSON (no prose, no fences):\n"
         f'{{"components":[{{"id":"kebab-id","name":"short name","description":"what it does",'
         f'"deps":["other-id"],"interface":"the EXACT public functions/classes other components call — a '
@@ -149,7 +216,7 @@ def _architect(product, goal, model, ns, depth, variant, out_name):
         f"Rules: 'deps' acyclic, referencing other component ids; ids kebab-case + UNIQUE; 'interface' "
         f"precise. Assign each component the best-fit 'role' from: {_ROLES}. A component that must talk to a "
         f"THIRD-PARTY system (e.g. Stripe, Twilio, Samsara) sets \"integrates\":[\"System name\"] — its docs "
-        f"get researched before building.{decomp}{reuse}{var}")
+        f"get researched before building.{stack.get('roles_pref','')}{decomp}{reuse}{var}")
     r = factory.agent("staff-engineer", str(repo), task, model=model)
     if r.get("failed"):
         raise RuntimeError(f"architect failed to plan: {r.get('out','')[:200]}")
@@ -161,7 +228,7 @@ def _architect(product, goal, model, ns, depth, variant, out_name):
     return p
 
 
-def plan(product, goal, model=None, ns="", depth=0):
+def plan(product, goal, model=None, ns="", depth=0, stack=None):
     """Single-architect plan with RESUME (reuse an existing per-namespace plan file)."""
     repo = factory.PRODUCTS / product
     pj = repo / "docs" / (f"PLAN_{ns.rstrip('_')}.json" if ns else "PLAN.json")
@@ -172,7 +239,7 @@ def plan(product, goal, model=None, ns="", depth=0):
             return p
         except Exception:
             pass
-    p = _architect(product, goal, model, ns, depth, None, pj.name)
+    p = _architect(product, goal, model, ns, depth, None, pj.name, stack=stack)
     audit.append(actor="project:architect", action="Plan", resource=product, decision="executed",
                  payload={"ns": ns or "root", "depth": depth, "components": [c["id"] for c in p["components"]]})
     return p
@@ -196,20 +263,20 @@ def _judge_plans(product, goal, cands):
     return cands.get(best, cands[min(cands)])
 
 
-def explore_plan(product, goal, model=None, ns="", depth=0, n=1):
+def explore_plan(product, goal, model=None, ns="", depth=0, n=1, stack=None):
     """PARALLEL DESIGN EXPLORATION: generate n candidate architectures (different design philosophies) at
     once, judge, and build the best. 'More budget -> better, not just more.' n<=1 (or resume) = single plan."""
     repo = factory.PRODUCTS / product
     pj = repo / "docs" / (f"PLAN_{ns.rstrip('_')}.json" if ns else "PLAN.json")
     if pj.exists() or n <= 1:
-        return plan(product, goal, model, ns, depth)
+        return plan(product, goal, model, ns, depth, stack=stack)
     variants = ["simplicity and the fewest moving parts", "clean modular boundaries and testability",
                 "robustness, validation and explicit error handling", "performance and scalability"]
     base = ns.rstrip("_") or "root"
     cands, workers = {}, int(os.environ.get("AOS_FLEET_WORKERS", "5"))
     with ThreadPoolExecutor(max_workers=min(n, workers)) as ex:
         futs = {ex.submit(_architect, product, goal, model, ns, depth, variants[i % len(variants)],
-                          f"cand_{base}_{i}.json"): i for i in range(n)}
+                          f"cand_{base}_{i}.json", stack): i for i in range(n)}
         for f in as_completed(futs):
             i = futs[f]
             try:
@@ -217,7 +284,7 @@ def explore_plan(product, goal, model=None, ns="", depth=0, n=1):
             except Exception:
                 pass
     if not cands:
-        return plan(product, goal, model, ns, depth)
+        return plan(product, goal, model, ns, depth, stack=stack)
     chosen = list(cands.values())[0] if len(cands) == 1 else _judge_plans(product, goal, cands)
     (repo / "docs" / pj.name).write_text(json.dumps(chosen, indent=2))
     audit.append(actor="project:architect", action="Plan", resource=product, decision="explored",
@@ -225,11 +292,13 @@ def explore_plan(product, goal, model=None, ns="", depth=0, n=1):
     return chosen
 
 
-def build_component(product, comp, dep_interfaces, api_key=None, ns=""):
+def build_component(product, comp, dep_interfaces, api_key=None, ns="", stack=None):
     """Build ONE LEAF component as src/<ns><pkg>/ with its own tests, coding against its interface contract
     and its dependencies' interfaces. Runs in a worker thread, so it sets its OWN thread-local _ctx. Bounded
     per-component test loop. Disjoint namespaced paths make same-layer builds (and whole sub-trees)
-    collision-free. On failure returns a `blocker` reason that propagates up the tree for aggregation."""
+    collision-free. On failure returns a `blocker` reason that propagates up the tree for aggregation.
+    `stack` selects the language/layout/test-runner (Python default; web = ES modules + node tests)."""
+    stack = stack or _STACK_PY
     repo = factory.PRODUCTS / product
     cid = comp["id"]; pkg = _pkg(ns, cid)
     role = comp.get("role") or "builder"              # ROLE SPECIALIZATION (infra/data/ml/staff/builder)
@@ -238,7 +307,7 @@ def build_component(product, comp, dep_interfaces, api_key=None, ns=""):
     factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"BUILD:{pkg}"
     # RESUME: if this component was already built green in a prior (interrupted) run, skip it.
     if (repo / "src" / pkg).exists():
-        pre_ok, _ = factory.run_tests(str(repo), target=f"tests/{pkg}", python=pybin)
+        pre_ok, _ = factory.run_tests(str(repo), target=f"tests/{pkg}", python=pybin, stack=stack["id"])
         if pre_ok:
             print(f"[project] component {cid}: already green — skipping (resume)", flush=True)
             return {"id": cid, "passed": True, "resumed": True, "fix_attempts": 0}
@@ -266,23 +335,21 @@ def build_component(product, comp, dep_interfaces, api_key=None, ns=""):
                        f"researched API notes in docs/integration-{pkg}.md (summary below). Use a config/env for "
                        f"any credentials (never hardcode); real credential use is approval-gated.\n{notes}")
     task = (
-        f"Implement component '{cid}' of a LARGER system as a Python package under src/{pkg}/ "
-        f"(create src/{pkg}/__init__.py; use `from src.{pkg}...` imports).\n"
+        f"Implement component '{cid}' of a LARGER system as {stack['component'].format(pkg=pkg)}.\n"
         f"COMPONENT: {comp['name']} — {comp['description']}\n"
         f"THE PUBLIC INTERFACE YOU MUST EXPOSE (your dependents rely on this EXACT contract):\n{comp['interface']}\n"
-        f"INTERFACES OF YOUR DEPENDENCIES (import and call these — do NOT reimplement them):\n{deps_block}{reuse_block}{integ_block}\n"
-        f"Also write tests under tests/{pkg}/ covering this component. Touch ONLY src/{pkg}/** and "
-        f"tests/{pkg}/**. Make `python -m pytest -q tests/{pkg}` pass.")
+        f"INTERFACES OF YOUR DEPENDENCIES ({stack['deps_line']}):\n{deps_block}{reuse_block}{integ_block}\n"
+        + stack["tests"].format(pkg=pkg))
     factory.agent(role, str(repo), task)
-    ok, out = factory.run_tests(str(repo), target=f"tests/{pkg}", python=pybin)
+    ok, out = factory.run_tests(str(repo), target=f"tests/{pkg}", python=pybin, stack=stack["id"])
     attempts = 0
     while not ok and attempts < MAX_COMPONENT_FIX:
         attempts += 1
         print(f"[project] component {cid}: test red — fix {attempts}/{MAX_COMPONENT_FIX}", flush=True)
         factory.agent(role, str(repo),
                       f"Component '{cid}' tests FAILING:\n\n{out[-1500:]}\n\nFix src/{pkg}/** (or a genuinely "
-                      f"wrong test) so `python -m pytest -q tests/{pkg}` passes. Keep the public interface intact.")
-        ok, out = factory.run_tests(str(repo), target=f"tests/{pkg}", python=pybin)
+                      f"wrong test) so {stack['fix_cmd'].format(pkg=pkg)} passes. Keep the public interface intact.")
+        ok, out = factory.run_tests(str(repo), target=f"tests/{pkg}", python=pybin, stack=stack["id"])
     try:
         import directory
         directory.release(aid)
@@ -292,12 +359,13 @@ def build_component(product, comp, dep_interfaces, api_key=None, ns=""):
             "blocker": None if ok else f"leaf '{pkg}' tests still red after {attempts} fixes: {out[-240:]}"}
 
 
-def integrate(product, p, ns="", facade=None):
+def integrate(product, p, ns="", facade=None, stack=None):
     """INTEGRATOR wires this level's built components into a coherent whole. At the ROOT (ns="") it builds
     the product entrypoint + end-to-end tests and gates on the WHOLE suite. At a SUB level (ns set) it builds
     a FACADE package src/<base> that composes the sub-components (src/<ns>*) and exposes the parent
     component's exact interface — so a decomposed component looks identical to a leaf to its dependents.
-    Bounded integration-fix loop."""
+    Bounded integration-fix loop. `stack` selects the language/entrypoint/test-runner."""
+    stack = stack or _STACK_PY
     repo = factory.PRODUCTS / product
     factory._ctx.product = product; factory._ctx.run = f"proj-{product}"; factory._ctx.stage = f"INTEGRATE:{ns or 'root'}"
     comp_list = ", ".join(_pkg(ns, c["id"]) for c in p["components"])
@@ -306,51 +374,50 @@ def integrate(product, p, ns="", facade=None):
         target = f"tests/{base}"
         task = (
             f"You are the INTEGRATOR for subsystem '{facade.get('name', base) if facade else base}'. Its parts "
-            f"are built as packages ({comp_list}) under src/. Build the FACADE package src/{base}/ "
-            f"(src/{base}/__init__.py) that composes those parts THROUGH their interfaces (do NOT rewrite them) "
-            f"and exposes EXACTLY this public interface (your dependents rely on it):\n{facade.get('interface','') if facade else ''}\n"
-            f"Write tests under {target}/ proving the facade exposes that interface and the parts work together. "
-            f"Use `from src...` imports. Make `python -m pytest -q {target}` pass.")
+            f"are built as packages ({comp_list}) under src/. "
+            + stack["integ_sub"].format(base=base, target=target,
+                                         iface=facade.get('interface', '') if facade else ''))
     else:
         target = ""
         task = (
-            f"You are the INTEGRATOR. The components ({comp_list}) are built as packages under src/. Wire them "
-            f"into one coherent product: add the top-level entrypoint/orchestration under src/ that composes the "
-            f"components THROUGH their public interfaces (do not rewrite internals), and write END-TO-END "
-            f"INTEGRATION TESTS under tests/integration/ that exercise: "
-            f"{p.get('integration_tests', 'the components working together')}. Use `from src...` imports. "
-            f"Make `python -m pytest -q` (the WHOLE suite) pass.")
+            f"You are the INTEGRATOR. The components ({comp_list}) are built as packages under src/. "
+            + stack["integ_root"].format(
+                itests=p.get('integration_tests', 'the components working together')))
     factory.agent("staff-engineer", str(repo), task)
-    ok, out = factory.run_tests(str(repo), target=target)
+    ok, out = factory.run_tests(str(repo), target=target, stack=stack["id"])
     attempts = 0
     while not ok and attempts < MAX_INTEGRATION_FIX:
         attempts += 1
         print(f"[project] integrate({ns or 'root'}) red — fix {attempts}/{MAX_INTEGRATION_FIX}", flush=True)
         factory.agent("staff-engineer", str(repo),
                       f"Integration/tests FAILING:\n\n{out[-1800:]}\n\nFix the wiring or a genuinely wrong "
-                      f"integration test (do NOT weaken component tests). Make `python -m pytest -q {target}` pass.")
-        ok, out = factory.run_tests(str(repo), target=target)
+                      f"integration test (do NOT weaken component tests). Make the integration tests pass.")
+        ok, out = factory.run_tests(str(repo), target=target, stack=stack["id"])
     return {"passed": ok, "fix_attempts": attempts, "tail": out[-400:],
             "blocker": None if ok else f"integration({ns or 'root'}) red after {attempts} fixes: {out[-240:]}"}
 
 
-def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None):
+def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stack=None):
     """Drive ONE complex product end-to-end as a RECURSIVE tree: PLAN -> dependency-ordered parallel builds
     (each component either a LEAF builder OR, if the architect marked it 'decompose', a recursive sub-build
     with its own architect/builders/integrator) -> INTEGRATE this level. Blockers from any leaf or sub-tree
     propagate UP and aggregate; results aggregate UP through each integrator. Total live agents across the
-    whole tree stay bounded by factory._AGENT_SEM regardless of depth/width. depth 0 = the root product."""
+    whole tree stay bounded by factory._AGENT_SEM regardless of depth/width. depth 0 = the root product.
+    `stack` is the target platform/descriptor (e.g. 'web', 'python') — it decides the language, file layout
+    and test runner every architect/builder/integrator prompt uses; None → Python (backward compatible)."""
+    stack = stack_for(stack)
     repo = factory.PRODUCTS / product
     (repo / "src").mkdir(parents=True, exist_ok=True)
     (repo / "tests").mkdir(parents=True, exist_ok=True)
     top = depth == 0
     indent = "  " * depth
-    log = {"product": product, "ns": ns or "root", "depth": depth, "phases": []}
+    log = {"product": product, "ns": ns or "root", "depth": depth, "phases": [], "stack": stack["id"]}
     if top:
-        audit.append(actor="project:controller", action="ProjectStart", resource=product, decision="executed")
+        audit.append(actor="project:controller", action="ProjectStart", resource=product, decision="executed",
+                     payload={"stack": stack["id"]})
 
     p = explore_plan(product, goal, model=os.environ.get("AOS_ARCHITECT_MODEL"), ns=ns, depth=depth,
-                     n=int(os.environ.get("AOS_EXPLORATION", "1")))
+                     n=int(os.environ.get("AOS_EXPLORATION", "1")), stack=stack)
     by_id = {c["id"]: c for c in p["components"]}
     layers = topo_layers(p["components"])
     log["plan"] = {"components": list(by_id), "layers": layers}
@@ -362,11 +429,11 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None):
         cid = comp["id"]
         if comp.get("decompose") and depth < MAX_DEPTH:       # RECURSE: this component is its own subsystem
             sub = build_complex(product, comp.get("subgoal") or comp["description"], api_key,
-                                depth + 1, ns=f"{_pkg(ns, cid)}_", facade=comp)
+                                depth + 1, ns=f"{_pkg(ns, cid)}_", facade=comp, stack=stack)
             return {"id": cid, "pkg": _pkg(ns, cid), "passed": sub["passed"],
                     "blocker": sub.get("blocker"), "sub": {"result": sub["result"], "layers": sub.get("plan", {}).get("layers")}}
         dep_ifaces = {d: by_id[d]["interface"] for d in comp.get("deps", [])}
-        return build_component(product, comp, dep_ifaces, api_key, ns)
+        return build_component(product, comp, dep_ifaces, api_key, ns, stack=stack)
 
     built, workers = {}, int(os.environ.get("AOS_FLEET_WORKERS", "5"))
     for li, layer in enumerate(layers):               # BARRIER between layers (layer N needs N-1's interfaces)
@@ -382,7 +449,7 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None):
 
     blockers = [b["blocker"] for b in built.values() if not b.get("passed") and b.get("blocker")]
     if all(b.get("passed") for b in built.values()):
-        integ = integrate(product, p, ns=ns, facade=facade)
+        integ = integrate(product, p, ns=ns, facade=facade, stack=stack)
         log["integration"] = integ
         if integ["passed"]:
             log["result"], log["passed"], log["blocker"] = "INTEGRATED", True, None

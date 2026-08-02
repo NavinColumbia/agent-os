@@ -294,10 +294,44 @@ def _bug_report(bug: dict, story: dict, n: int, fixed: bool = False) -> dict:
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
 # one round — explore EVERY story fresh, returning (story_reports, bug_reports, first_blocking_bug).
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
-# How many stories to explore CONCURRENTLY. QA is otherwise sequential — one story, one ~2-min claude
-# decide-call at a time — so a real sweep took hours. Each story gets its OWN browser; the global claude_gate
-# still bounds total concurrent claude calls, so this can't over-subscribe. Wall-time drops ~N×.
-_QA_PARALLEL = int(os.environ.get("AOS_QA_PARALLEL", "4"))
+# HOW MANY STORIES TO EXPLORE CONCURRENTLY — sized to the WORK, not a hardcoded number.
+# QA is otherwise sequential (one story = a few browser steps + ~2-min claude decide-calls), so a real sweep
+# crawled for hours. Each story is independent and gets its OWN browser. The principle (owner's): at any point
+# spin up ENOUGH workers that each one's SLICE of the queue finishes in ~a target window (~20 min) — so the
+# whole round completes in roughly that window regardless of how many stories there are — then BOUND that by
+# what the box can actually run (browser_gate cap, itself sized to box RAM+CPU; and claude_gate bounds total
+# model calls). Few stories → few workers (don't over-spin); hundreds → fan out to the hardware ceiling. On a
+# bigger box / cloud pool the ceiling is higher and the same formula uses it. No magic 4 or 15 anywhere.
+QA_TARGET_WINDOW_MIN = float(os.environ.get("AOS_QA_TARGET_MIN", "20"))   # aim: a worker's slice done in ~this
+QA_PER_STORY_MIN = float(os.environ.get("AOS_QA_PER_STORY_MIN", "4"))     # rough cost of exploring one story
+
+
+def _hardware_cap():
+    """Max concurrent browser sessions this box can actually run (RAM+CPU-sized by browser_gate)."""
+    try:
+        import browser_gate
+        return max(1, int(browser_gate.GLOBAL_MAX))
+    except Exception:
+        return 4
+
+
+def plan_workers(n_stories, target_min=None, per_story_min=None, hardware_cap=None):
+    """Work-driven fan-out: enough workers that each handles ~target_min of stories, capped by hardware and by
+    the story count. An explicit AOS_QA_PARALLEL env pins the number (ops override); otherwise it's derived."""
+    pin = os.environ.get("AOS_QA_PARALLEL")
+    if pin:
+        try:
+            return max(1, min(int(pin), max(1, n_stories)))
+        except ValueError:
+            pass
+    if n_stories <= 0:
+        return 1
+    tw = target_min or QA_TARGET_WINDOW_MIN
+    ps = per_story_min or QA_PER_STORY_MIN
+    cap = hardware_cap if hardware_cap is not None else _hardware_cap()
+    import math
+    need = math.ceil((n_stories * ps) / max(1.0, tw))     # workers to finish the whole set in ~tw minutes
+    return max(1, min(need, cap, n_stories))
 
 
 def _explore_one(story, target_url, vision, token, org, *, max_steps, explorer_cls, artifact_dir, pulse_work_id):
@@ -335,11 +369,15 @@ def _explore_one(story, target_url, vision, token, org, *, max_steps, explorer_c
 
 def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_cls,
                bug_seq, on_event=None, artifact_dir=None, pulse_work_id=None):
-    """Drive all stories once against the live app — CONCURRENTLY (up to _QA_PARALLEL browsers). Sequential
-    exploration made a real sweep take hours; each story is independent, so we fan them out. Results are merged
-    in the original story order; the first BLOCKING bug (by that order) drives the fix+reset+re-run."""
+    """Drive all stories once against the live app — CONCURRENTLY, with the worker count SIZED TO THE WORK
+    (plan_workers: enough that the round finishes in ~a target window, bounded by the box's browser capacity).
+    Sequential exploration made a real sweep take hours; each story is independent, so we fan them out. Results
+    are merged in the original story order; the first BLOCKING bug (by that order) drives the fix+reset+re-run."""
     from concurrent.futures import ThreadPoolExecutor
-    n = max(1, min(_QA_PARALLEL, len(stories)))
+    n = plan_workers(len(stories))
+    if on_event:
+        on_event("fanout", {"stories": len(stories), "workers": n, "hardware_cap": _hardware_cap(),
+                            "target_window_min": QA_TARGET_WINDOW_MIN})
     results = [None] * len(stories)
 
     def _task(i, story):
@@ -837,7 +875,9 @@ def _selftest():
             assert max_steps == 5, max_steps                      # the caller's cap is honored
             # emit ONE real step-record so the report gets expected-vs-actual rows
             rec = {"step": 0, "action": {"cmd": "click", "idx": 0}, "expected": "panel opens",
-                   "actual": {"url": "http://app/x", "console_errors": []},
+                   # a real browser step captures a screenshot — include one so this represents an ACTUALLY
+                   # exercised interface (the interface_exercised invariant refuses to pass a UI otherwise).
+                   "actual": {"url": "http://app/x", "console_errors": [], "screenshot": "/tmp/step0.png"},
                    "verdict": {"matches_expected": True, "bug": None, "severity": "none", "blocking": False}}
             if state["round"] == 0 and story["id"] == "US-1":
                 bug = {"step": 0, "story": "Sign in", "url": "http://app/login",

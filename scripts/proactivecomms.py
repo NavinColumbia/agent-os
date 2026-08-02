@@ -56,15 +56,64 @@ def _mark(tid, sig):
         c.commit()
 
 
-def _signals(tid, org):
-    """The actionable list for this tenant — reuses approvals.inbox (the canonical 'awaiting a human' set:
-    paused apps, consent gate, blocked builds, hire requests, AI→CEO questions, dead-letters). Fail-open to []
-    so a bad source never silences the whole sweep."""
+def _controller_gates(tid):
+    """CONTROLLER-PIPELINE decision gates — the calls that matter that approvals.inbox did NOT surface (a
+    build parked mid-pipeline waiting for the CEO to pick an option / approve a plan / answer a clarification /
+    connect a provider). Without this, a CEO had NO WAY to know a build was sitting idle on a decision — the
+    exact gap that made the owner poll. Reads controller_state directly. Fail-open to []."""
     try:
-        import approvals
-        return list(approvals.inbox(tid) or [])
+        import psycopg
+        from aoscfg import DB
+        rows = []
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            # Only GENUINELY-waiting builds: parked on a human gate, NOT delivered, NOT cancelled (cancel()
+            # marks the latest job 'cancelled' but leaves awaiting='user_feedback' for retry — exclude those),
+            # and touched recently (a stale thread from a past session shouldn't re-ping forever).
+            cur.execute("""SELECT cs.thread_id, cs.phase, cs.awaiting, cs.product
+                           FROM controller_state cs
+                           WHERE cs.tenant_id=%s
+                             AND cs.awaiting IN ('user_feedback','user_approval','credentials')
+                             AND cs.phase <> 'DELIVER'
+                             AND cs.updated_at > now() - interval '12 hours'
+                             AND NOT EXISTS (
+                                   SELECT 1 FROM controller_jobs cj
+                                   WHERE cj.thread_id=cs.thread_id AND cj.status='cancelled'
+                                     AND cj.id = (SELECT max(id) FROM controller_jobs WHERE thread_id=cs.thread_id))
+                        """, (tid,))
+            candidates = cur.fetchall()
+        # exclude CANCELLED builds: cancel() trips killswitch.halt("thread-<id>") and leaves awaiting set for
+        # retry, so a stopped build otherwise looks like a pending gate. A halted thread is not "waiting on you".
+        try:
+            import killswitch
+            candidates = [r for r in candidates if not killswitch.is_halted(f"thread-{r[0]}").get("halted")]
+        except Exception:
+            pass
+        for thread_id, phase, awaiting, product in candidates:
+            what = {"user_approval": "pick a direction / approve the plan",
+                    "user_feedback": "review & respond",
+                    "credentials": "connect a model provider"}.get(awaiting, "your input")
+            rows.append({
+                "id": f"ceo_gate:{thread_id}", "kind": "ceo_decision", "ref": str(thread_id),
+                "title": f"Your build is waiting on you ({phase})",
+                "detail": f"It needs you to {what}. Reply to task 'ceo-{thread_id}' from your phone, "
+                          f"or open the console.",
+                "severity": "high", "action_label": "Answer in console"})
+        return rows
     except Exception:
         return []
+
+
+def _signals(tid, org):
+    """The actionable list for this tenant: controller-pipeline decision gates (a build parked waiting on the
+    CEO) PLUS approvals.inbox (paused apps, consent, blocked builds, hire requests, AI→CEO questions,
+    dead-letters). Fail-open per-source so one bad source never silences the whole sweep."""
+    out = _controller_gates(tid)
+    try:
+        import approvals
+        out += list(approvals.inbox(tid) or [])
+    except Exception:
+        pass
+    return out
 
 
 def sweep(tid, org=0, cooldown_s=RE_REMIND_S, notify=None, signals=None):
@@ -77,6 +126,8 @@ def sweep(tid, org=0, cooldown_s=RE_REMIND_S, notify=None, signals=None):
     items = (signals or _signals)(tid, org)
     pushed = []
     for it in items:
+        if not isinstance(it, dict):
+            continue                                 # a source may yield a non-dict; skip defensively
         sig = str(it.get("id") or f"{it.get('kind')}:{it.get('ref')}")
         if not _due(tid, sig, cooldown_s):
             continue
@@ -85,6 +136,16 @@ def sweep(tid, org=0, cooldown_s=RE_REMIND_S, notify=None, signals=None):
         body = (it.get("detail") or "")[:280] + (f"\n\n→ {it['action_label']}" if it.get("action_label") else "")
         try:
             notify(tid, "approvals", title, body, level=level, url="/#approvals")
+            # A CEO DECISION GATE must reach the phone, not just the in-app feed — this is the whole point
+            # ("never stall without me knowing why"). Ping the founder pager DIRECTLY too, so it doesn't
+            # depend on the tenant's notification prefs being wired. Best-effort.
+            if it.get("kind") == "ceo_decision":
+                try:
+                    import notify as _pager
+                    _pager.send(f"{title} — {body[:180]}", title="agent-os · your build needs you",
+                                priority="high", tags="speech_balloon")
+                except Exception:
+                    pass
             _mark(tid, sig)
             pushed.append(sig)
         except Exception:

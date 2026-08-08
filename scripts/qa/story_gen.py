@@ -97,10 +97,24 @@ def _ensure(cur):
     cur.execute("CREATE INDEX IF NOT EXISTS story_corpus_product_idx ON story_corpus (product)")
 
 
-def save_stories(product: str, stories: list, source: str = "generated") -> int:
+def _cap_corpus(stories: list, cap: int) -> list:
+    """Bound the persisted corpus so repeat runs of an UNCHANGED app can't inflate it forever. Regression
+    pins (source='regression' — tied to a REAL bug found) are ALWAYS kept, no matter how many. The remaining
+    'generated' stories are kept as a STABLE core up to `cap` (insertion order — the earliest, most-settled
+    ones win; newer novelty is dropped). cap<=0 disables capping (keep everything)."""
+    if not cap or cap <= 0:
+        return stories
+    pins = [s for s in stories if (s.get("source") == "regression")]
+    gen = [s for s in stories if (s.get("source") != "regression")]
+    return pins + gen[:cap]
+
+
+def save_stories(product: str, stories: list, source: str = "generated", replace: bool = False) -> int:
     """UPSERT stories into the per-product corpus. Returns rows written (0 on no-DB/failure — LOUD).
     Regression pins are permanent: ON CONFLICT the row's source stays 'regression' once set, the original
-    story_id/bug_ref are kept, and content fields refresh to the newest wording."""
+    story_id/bug_ref are kept, and content fields refresh to the newest wording. `replace=True` first DELETEs
+    the product's existing generated rows (keeping regression pins) so a capped set truly SHRINKS the stored
+    corpus instead of only upserting — this is how the balloon actually deflates."""
     dsn = _dsn()
     if not dsn or not product or not stories:
         if not dsn:
@@ -109,6 +123,12 @@ def save_stories(product: str, stories: list, source: str = "generated") -> int:
     try:
         with psycopg.connect(dsn) as c, c.cursor() as cur:
             _ensure(cur)
+            if replace:
+                # drop stored GENERATED rows not in the set we're about to write (pins are never deleted),
+                # so the persisted corpus converges to the capped set instead of growing every run.
+                keep = [(s.get("title") or "").strip() for s in stories]
+                cur.execute("DELETE FROM story_corpus WHERE product=%s AND source<>'regression' "
+                            "AND NOT (title = ANY(%s))", (product, keep))
             for s in stories:
                 cur.execute(
                     """INSERT INTO story_corpus
@@ -546,6 +566,20 @@ def saturate_stories(vision: str, product_summary: str, *, product: str = None, 
               f"(grows across releases)", flush=True)
     gaps = []
     saturated, verdict = False, {}
+    # BALLOON GUARD: generation EXCLUDES existing titles, so every run is forced to mint brand-new
+    # micro-scenarios — left unchecked the persisted corpus grows ~a batch per run FOREVER (observed:
+    # 228→289→…→1078 for an UNCHANGED app). If the loaded corpus already meets the breadth backstop, DON'T
+    # generate more novelty: test the (capped) set we already have. Coverage WITHIN each story stays AI-driven;
+    # this only stops infinite breadth-inflation across repeat runs of the same app. A real new release adds
+    # regression pins (which always ride along) + can raise/zero AOS_STORY_SATURATE_MAX to intentionally go
+    # deeper.
+    if SATURATE_MAX and len(stories) >= SATURATE_MAX:
+        print(f"[story_gen] corpus already at {len(stories)} >= AOS_STORY_SATURATE_MAX={SATURATE_MAX} — "
+              f"skipping generation; testing the existing capped set (raise/zero the env to expand)", flush=True)
+        stories = _cap_corpus(stories, SATURATE_MAX)
+        if persist and product:
+            save_stories(product, stories, replace=True)   # collapse any prior bloat to the capped set
+        return stories
     for rnd in range(1, max_rounds + 1):
         new = generate_stories(vision, product_summary, role=role,
                                existing=[s["title"] for s in stories], repo=repo, gaps=gaps)
@@ -567,7 +601,8 @@ def saturate_stories(vision: str, product_summary: str, *, product: str = None, 
         gaps = critique_gaps(vision, product_summary, stories, role=role, repo=repo)
         gaps += [m for m in verdict.get("missing", []) if m not in gaps]
     if persist and product and stories:
-        wrote = save_stories(product, stories)
+        stories = _cap_corpus(stories, SATURATE_MAX)        # keep regression pins + a bounded generated core
+        wrote = save_stories(product, stories, replace=True)
         print(f"[story_gen] persisted {wrote}/{len(stories)} stories to story_corpus for {product!r}",
               flush=True)
     print(f"[story_gen] saturation {'REACHED' if saturated else 'NOT reached (round bound hit)'} — "

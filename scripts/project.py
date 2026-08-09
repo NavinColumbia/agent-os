@@ -91,7 +91,14 @@ _STACK_WEB = {
                   "as an ES module (`<script type=\"module\">`) composing the components through their public "
                   "interfaces (do not rewrite internals) — NO build step, NO external CDNs, so it runs by opening "
                   "the file. Write END-TO-END `*.test.js` under tests/integration/ that exercise: {itests}. "
-                  "Every test file must pass under `node --test`.",
+                  "Every test file must pass under `node --test`.\n"
+                  "DEPLOYABLE, CONNECTED, END-TO-END (non-negotiable — this is the DEFINITION OF DONE): the "
+                  "product must RUN as one unit a real person can visit. Create an executable run.sh at the repo "
+                  "root that starts a server binding $PORT (default 8000) on 127.0.0.1 which serves BOTH the static "
+                  "frontend AND the backend/API this app calls — at the SAME ORIGIN, so visiting the URL shows the "
+                  "working app with live data (a same-origin SPA whose /api/* 404s is a FAILED deliverable). If the "
+                  "app talks to an external/pre-existing backend, run.sh must start a server that PROXIES /api/* to "
+                  "it. QA will run `bash run.sh` and drive the URL exactly as a user would — build for that.",
     "roles_pref": " PREFER frontend-engineer / fullstack-engineer for UI components.",
 }
 # Target platforms → the stack that actually builds+tests them on this box. Native mobile/desktop/game-engine
@@ -397,6 +404,38 @@ def integrate(product, p, ns="", facade=None, stack=None):
             "blocker": None if ok else f"integration({ns or 'root'}) red after {attempts} fixes: {out[-240:]}"}
 
 
+def _git_init(repo):
+    """git-init a freshly built product so the DEV-FIX loop can DIFF to verify its own fixes. Without this the
+    fix-verifier reported 'no change evidence — not a git checkout' and flip-flopped fixed:False/True, so the
+    loop couldn't converge. Best-effort, idempotent."""
+    repo = Path(repo)
+    try:
+        if (repo / ".git").exists():
+            return
+        subprocess.run(["git", "init", "-q"], cwd=str(repo), timeout=30, check=False)
+        (repo / ".gitignore").write_text("node_modules/\n.venv/\n__pycache__/\n*.db\n*.log\n")
+        subprocess.run(["git", "add", "-A"], cwd=str(repo), timeout=60, check=False)
+        subprocess.run(["git", "-c", "user.email=fleet@agent-os", "-c", "user.name=agent-os",
+                        "commit", "-q", "-m", "initial build"], cwd=str(repo), timeout=60, check=False)
+    except Exception:
+        pass
+
+
+def _finalize_deployable(repo, stack, log):
+    """Ensure a top-level build is a RUNNABLE, CONNECTED unit + git-tracked. Sets log['deployable'].
+    For a UI stack a run.sh (serves frontend + backend at one origin) is the required handoff QA runs; its
+    ABSENCE is a real deliverable gap we record honestly rather than paper over."""
+    repo = Path(repo)
+    _git_init(repo)
+    runsh = repo / "run.sh"
+    is_ui = (stack or _STACK_PY).get("id") == "web"
+    log["deployable"] = bool(runsh.exists()) if is_ui else True
+    if is_ui and not runsh.exists():
+        log["deploy_gap"] = ("no run.sh — the integrator did not produce a connected run-target; QA cannot "
+                             "bring up a same-origin app (static-serving would 404 every /api/*)")
+        print(f"[project] DEPLOY GAP: {log['deploy_gap']}", flush=True)
+
+
 def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stack=None):
     """Drive ONE complex product end-to-end as a RECURSIVE tree: PLAN -> dependency-ordered parallel builds
     (each component either a LEAF builder OR, if the architect marked it 'decompose', a recursive sub-build
@@ -473,10 +512,16 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stac
             except Exception as e:                    # fail CLOSED: an unverifiable build is NOT INTEGRATED
                 log["verification"] = {"error": str(e)[:160]}
                 log["result"], log["passed"] = "BLOCKED_AT_VERIFY", False
+    if top and log["result"] == "INTEGRATED":
+        # DEPLOYABILITY GATE (grand-scheme / end-to-end): a build is only DONE if it can RUN as one connected
+        # unit a person can visit. For a UI stack, a run.sh serving the app+backend at one origin is required;
+        # if the integrator didn't emit one, that's a real gap — flag it (QA will then correctly fail to bring
+        # up a connected app rather than silently static-serving a backend-less shell).
+        _finalize_deployable(repo, stack, log)
     if top:
         audit.append(actor="project:controller", action="ProjectComplete", resource=product,
                      decision=log["result"], payload={"components": len(by_id), "layers": len(layers),
-                                                       "max_depth_reached": depth})
+                                                       "max_depth_reached": depth, "deployable": log.get("deployable")})
         try:
             import appregistry
             appregistry.register(product, repo)

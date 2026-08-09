@@ -28,7 +28,29 @@ import psycopg  # noqa: E402
 import trace as _trace  # noqa: E402
 
 DB = _trace.DB
-GLOBAL_MAX = int(os.environ.get("AOS_CLAUDE_GLOBAL_MAX", "6"))     # total concurrent claude calls across the box
+
+
+def _auto_global_max():
+    """Total concurrent `claude -p` calls allowed across the box. Env override wins; else AUTO-SIZE — a
+    hardcoded 6 throttled the whole fleet (QA fanned out 15 browsers but their per-step model calls queued
+    6-wide, so deep QA crawled). A `claude -p` process is an API CLIENT — the heavy compute is server-side, so
+    it's cheap locally (a little RAM); the real ceiling is the provider's concurrency, not this box. Size to
+    the box generously (cores*3) with a floor of 12 and a sane cap, and let AOS_CLAUDE_GLOBAL_MAX pin it for
+    ops (raise for throughput, lower if a plan hits provider rate limits)."""
+    env = os.environ.get("AOS_CLAUDE_GLOBAL_MAX")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    try:
+        cores = os.cpu_count() or 4
+    except Exception:
+        cores = 4
+    return max(12, min(32, cores * 3))
+
+
+GLOBAL_MAX = _auto_global_max()                                    # total concurrent claude calls across the box
 LEASE_S = int(os.environ.get("AOS_CLAUDE_LEASE_S", "1200"))        # a slot held longer than this = crashed holder
 WAIT_S = int(os.environ.get("AOS_CLAUDE_WAIT_S", "900"))           # how long to wait for a free slot before fail-open
 

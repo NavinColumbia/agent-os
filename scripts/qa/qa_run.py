@@ -303,7 +303,9 @@ def _bug_report(bug: dict, story: dict, n: int, fixed: bool = False) -> dict:
 # model calls). Few stories → few workers (don't over-spin); hundreds → fan out to the hardware ceiling. On a
 # bigger box / cloud pool the ceiling is higher and the same formula uses it. No magic 4 or 15 anywhere.
 QA_TARGET_WINDOW_MIN = float(os.environ.get("AOS_QA_TARGET_MIN", "20"))   # aim: a worker's slice done in ~this
-QA_PER_STORY_MIN = float(os.environ.get("AOS_QA_PER_STORY_MIN", "4"))     # rough cost of exploring one story
+# Measured cost of ONE deep story: 10-15 browser steps × a ~1-2min model decide-call each ≈ ~12min. The old 4
+# under-counted 3-4×, so plan_workers under-fanned (chose 8 for 40 stories when it should saturate the box).
+QA_PER_STORY_MIN = float(os.environ.get("AOS_QA_PER_STORY_MIN", "12"))    # rough wall-cost of exploring one story
 
 
 def _hardware_cap():

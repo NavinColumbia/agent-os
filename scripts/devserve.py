@@ -93,16 +93,37 @@ def up(name):
     if not repo.exists():
         return {"name": name, "error": "no such product"}
     kind = ar.detect_kind(repo)
-    if kind not in ("web", "service"):
+    # A run.sh IS a declared deployable run-target (serves the connected app at one origin) — it's browser-
+    # reachable regardless of the registry 'kind' (a hierarchical web app is kind='project' but still a real,
+    # runnable, connected app). Honor it. Only genuinely non-servable kinds with no run-target are skipped.
+    has_runsh = (repo / "run.sh").exists()
+    if kind not in ("web", "service") and not has_runsh:
         return {"name": name, "skipped": f"{kind} is not browser-reachable"}
     pid = _running(name)
-    port = _assign_port(name, kind)
+    port = _assign_port(name, kind if kind in ("web", "service") else "web")
     url = f"http://127.0.0.1:{port}"
     if pid and _port_listening(port):
         ar.set_url(name, "dev", url)
         return {"name": name, "already_up": True, "url": url, "pid": pid}
     log = open(f"/tmp/devserve-{name}.log", "a")
     import os
+    # GRAND-SCHEME / END-TO-END (the deployable-unit rule): a web product that needs a backend must ship a
+    # RUN-TARGET (run.sh) that serves the app CONNECTED to its backend at ONE origin — so visiting the URL
+    # shows the working app exactly as a user would see it deployed. QA must run THAT, not raw static files
+    # (static-serving a same-origin SPA 404s every /api/* call → the app can't load data → every story blocks).
+    # Prefer run.sh over everything else; it is the honest "as-deployed" surface.
+    runsh = repo / "run.sh"
+    if runsh.exists():
+        env = {**os.environ, "PORT": str(port), "HOST": "127.0.0.1"}
+        proc = subprocess.Popen(["bash", str(runsh)], cwd=str(repo), env=env, stdout=log,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+        _pidfile(name).write_text(str(proc.pid))
+        import time
+        ok = any(_port_listening(port) or time.sleep(0.5) for _ in range(60))
+        if ok:
+            ar.set_url(name, "dev", url)
+        return {"name": name, "kind": "run.sh", "url": url if ok else None, "pid": proc.pid,
+                "up": ok, **({} if ok else {"error": "run.sh did not bind PORT — see /tmp/devserve-%s.log" % name})}
     # NODE/JS app with its OWN server (F11): a package.json `start` script means the app runs a real backend
     # (API + SPA), so RUN it — a Python static file server would 404 every /api/* call. This is the serving
     # counterpart to the stack-aware VERIFIER (F10): the QA harness must bring an app up in its own language.

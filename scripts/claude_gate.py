@@ -43,11 +43,16 @@ def _auto_global_max():
             return max(1, int(env))
         except ValueError:
             pass
+    # Empirical: a burst of ~10 concurrent calls is fine, but SUSTAINED heavy calls (QA's long browser-
+    # exploration prompts, 15 workers for hours) at high concurrency hit the SUBSCRIPTION's rate limit →
+    # transient overloads → mass Codex failover → degraded QA. A subscription sustains roughly ~8 heavy
+    # concurrent calls. Keep the default conservative (8) so runs stay on Claude and don't thrash into
+    # failover; raise AOS_CLAUDE_GLOBAL_MAX only with an API key / higher-tier plan that tolerates more.
     try:
         cores = os.cpu_count() or 4
     except Exception:
         cores = 4
-    return max(12, min(32, cores * 3))
+    return max(6, min(8, cores))
 
 
 GLOBAL_MAX = _auto_global_max()                                    # total concurrent claude calls across the box

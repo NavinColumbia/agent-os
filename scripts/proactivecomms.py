@@ -110,10 +110,16 @@ def _signals(tid, org):
     out = _controller_gates(tid)
     try:
         import approvals
-        out += list(approvals.inbox(tid) or [])
+        inbox = approvals.inbox(tid) or []
+        # approvals.inbox() returns {"items": [...], "count": N}. `list(dict)` yields its KEYS, so this
+        # appended the strings 'items' and 'count' instead of the actual approvals — and sweep()'s
+        # defensive `if not isinstance(it, dict): continue` then skipped them without a sound. Net effect:
+        # the proactive engine ran every 5 minutes and pushed ZERO approvals, ever, while looking healthy.
+        # Accept either shape so a future change to either side cannot silently re-break it.
+        out += list(inbox.get("items") or []) if isinstance(inbox, dict) else list(inbox)
     except Exception:
         pass
-    return out
+    return [i for i in out if isinstance(i, dict)]
 
 
 def sweep(tid, org=0, cooldown_s=RE_REMIND_S, notify=None, signals=None):

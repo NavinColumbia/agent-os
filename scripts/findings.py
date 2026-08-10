@@ -203,10 +203,26 @@ def resolve(fid, by="agent", verification_id=None):
                 "reason": "verification did not pass — the originating check still fails"}
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("""UPDATE findings SET status='resolved', resolved_at=now(), resolved_by=%s,
-                       verification_id=%s WHERE id=%s""", (by, v["verification_id"], fid))
+                       verification_id=%s WHERE id=%s RETURNING board_id""",
+                    (by, v["verification_id"], fid))
+        row = cur.fetchone()
+        # CLOSE THE CEO-VISIBLE MIRROR. task_board is where the CEO actually looks; resolving the finding
+        # without closing its card left the board asserting the bug was still open. Measured 2026-08-10:
+        # 16 findings resolved-with-evidence (some back on 2026-07-03) still showed as open work, so the
+        # board reported a 23-item backlog when only 7 were real — and several of the loudest "HIGH,
+        # 37 days overdue" rows had been fixed weeks earlier. A one-way mirror is worse than no mirror.
+        if row and row[0]:
+            cur.execute("""UPDATE task_board
+                              SET status='done', updated_at=now(),
+                                  notes = coalesce(notes,'') ||
+                                          %s
+                            WHERE id=%s AND status <> 'done'""",
+                        (f"\n[done] finding {fid} resolved with verification "
+                         f"{v['verification_id']} (by {by})", row[0]))
         c.commit()
     audit.append(actor="findings", action="FindingResolved", resource=str(fid), decision="resolved",
-                 payload={"by": by, "verification_id": v["verification_id"]})
+                 payload={"by": by, "verification_id": v["verification_id"],
+                          "board_id": (row[0] if row else None)})
     return {"finding_id": fid, "status": "resolved", "resolved": True,
             "verification_id": v["verification_id"]}
 

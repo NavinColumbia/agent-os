@@ -57,8 +57,17 @@ def compose():
         f"Build cost: ${t['total_build_cost']} · Platform MRR: ${t['platform_mrr']} · Product revenue: ${t['product_revenue']}",
         f"Money guard: {npaused} app(s) auto-paused for losses" if npaused else "Money guard: all apps within budget",
         "",
-        "Next steps (prioritized):",
     ]
+    # Open findings, worst first. The board was write-only — dogfood/QA filed bugs nobody ever read back
+    # out (27 open, none triaged, 3 critical). Surfacing it in the digest is what makes the loop close.
+    try:
+        import findings_sweep
+        fs = findings_sweep.summary()
+        if fs:
+            lines += [fs, ""]
+    except Exception:
+        pass
+    lines.append("Next steps (prioritized):")
     for i, (title, why) in enumerate(recommendations(s), 1):
         lines.append(f"{i}. {title} — {why}")
     return "\n".join(lines)

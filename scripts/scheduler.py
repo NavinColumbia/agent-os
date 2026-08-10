@@ -46,6 +46,16 @@ DEFAULT_SCHEDULES = [
     ("resume-sweep",      f"{VENV_PY} {SCRIPTS / 'factory.py'} resume-sweep", 600),
     ("tasksweep",         f"{VENV_PY} {SCRIPTS / 'tasksweep.py'} run", 600),
     ("reap-orphans",      f"{VENV_PY} {SCRIPTS / 'reap.py'} run", 600),
+    # Close the loop on the findings board. Dogfood/QA write findings into task_board; before this nothing
+    # ever read them back out — 27 open, ZERO triaged after being raised, avg age 35 days, 3 of them
+    # CRITICAL. This escalates an overdue critical/high to the CEO (cooldown-guarded, once per item) and
+    # feeds the founder digest. It NEVER auto-closes: a finding closes only on evidence the bug no longer
+    # reproduces, because closing on a heuristic would manufacture the false-green the board exists to catch.
+    # NOT "findings-sweep" — that name is taken by findings.py's own governed sweep (owner re-routing +
+    # evidence-gated resolution). This is the CEO-facing triage view over the board mirror: rank by
+    # severity, escalate anything overdue, feed the digest. It never auto-closes; closing is findings.py's
+    # job and requires a passing verification record.
+    ("findings-triage",   f"{VENV_PY} {SCRIPTS / 'findings_sweep.py'} sweep", 21600),
     # F12: kill hung/orphaned `claude` agent calls (a dead parent orphans its claude child, which then holds
     # subscription capacity forever → new calls throttle+hang). Tight cadence; jobd also reaps every tick, this
     # is the always-on backstop for when jobd itself is down.

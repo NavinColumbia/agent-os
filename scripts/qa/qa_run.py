@@ -409,11 +409,22 @@ def _explore_one(story, target_url, vision, token, org, *, max_steps, explorer_c
 
 
 def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_cls,
-               bug_seq, on_event=None, artifact_dir=None, pulse_work_id=None):
+               bug_seq, on_event=None, artifact_dir=None, pulse_work_id=None, allow_early_stop=False):
     """Drive all stories once against the live app — CONCURRENTLY, with the worker count SIZED TO THE WORK
     (plan_workers: enough that the round finishes in ~a target window, bounded by the box's browser capacity).
     Sequential exploration made a real sweep take hours; each story is independent, so we fan them out. Results
-    are merged in the original story order; the first BLOCKING bug (by that order) drives the fix+reset+re-run."""
+    are merged in the original story order; the first BLOCKING bug (by that order) drives the fix+reset+re-run.
+
+    EARLY STOP (allow_early_stop): futures are consumed IN SUBMISSION ORDER, so the moment story i reports a
+    blocking bug, no story after i can supply an earlier one — first_blocking is already decided. The caller
+    then throws this round's reports away wholesale (report_by_key/acc_bugs are reset before the re-run,
+    because a fix can regress anything), so exploring the remaining stories cannot affect ANY output. We
+    therefore cancel the still-queued ones. This is behaviour-preserving, not a heuristic: the returned
+    first_blocking is bit-identical to a full round. Measured cost of not doing it: a 40-story round spent
+    ~76 min to act on a bug found at story 4, then discarded 36 stories' work and re-ran all 40.
+
+    The caller passes allow_early_stop=False on the FINAL allowed round — there the reports are NOT discarded
+    (cap-reached breaks out and reports what it has), so full coverage still matters."""
     from concurrent.futures import ThreadPoolExecutor
     n = plan_workers(len(stories))
     if on_event:
@@ -426,7 +437,8 @@ def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_c
                                explorer_cls=explorer_cls, artifact_dir=artifact_dir, pulse_work_id=pulse_work_id)
 
     with ThreadPoolExecutor(max_workers=n) as pool:
-        for fut in [pool.submit(_task, i, s) for i, s in enumerate(stories)]:
+        futs = [pool.submit(_task, i, s) for i, s in enumerate(stories)]
+        for pos, fut in enumerate(futs):
             try:
                 i, (sr, collected) = fut.result()
             except Exception as e:                        # a task itself dying is a blocking bug on that story
@@ -435,6 +447,15 @@ def _run_round(target_url, vision, token, org, stories, *, max_steps, explorer_c
             if on_event:
                 on_event("story_done", {"story": stories[i].get("id"), "status": sr["status"],
                                         "bugs": len(collected)})
+            if allow_early_stop and any(b.get("blocking") for b in collected):
+                # first_blocking is settled; the rest of this round is provably dead work. Cancel what has not
+                # started (in-flight tasks still drain on pool exit — bounded by the worker count).
+                skipped = sum(1 for later in futs[pos + 1:] if later.cancel())
+                if on_event:                              # never silently truncate — record what was skipped
+                    on_event("early_stop", {"after_story": stories[i].get("id"), "skipped": skipped,
+                                            "remaining": len(futs) - pos - 1,
+                                            "reason": "blocking bug settled; round is discarded before re-run"})
+                break
 
     # merge in story order (deterministic bug ids + first_blocking), skipping any task that produced nothing.
     story_reports, bug_reports, first_blocking = [], [], None
@@ -605,7 +626,10 @@ def qa_run(target_url, vision, token, org, product_summary, *,
         story_reports, bug_reports, blocking = _run_round(
             target_url, vision, token, org, active,
             max_steps=max_steps, explorer_cls=explorer_cls, bug_seq=bug_seq, on_event=emit,
-            artifact_dir=evidence_dir, pulse_work_id=pulse_work_id)
+            artifact_dir=evidence_dir, pulse_work_id=pulse_work_id,
+            # Only safe when a fix+re-run will FOLLOW (which discards this round's reports anyway). On the
+            # final allowed round the cap-reached path reports whatever this round produced, so we need it all.
+            allow_early_stop=(rounds_ran < max_rounds))
         for sr in story_reports:                          # accumulate the latest report per story across rounds
             report_by_key[_skey(sr)] = sr
         acc_bugs.extend(bug_reports)                       # keep bugs from complete stories across gap-fill rounds

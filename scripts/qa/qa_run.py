@@ -246,14 +246,27 @@ def _story_report(story: dict, records: list, story_bugs: list) -> dict:
             "covers": r.get("covers", []),                       # which ledger aspects this step CLAIMED to exercise
             "screenshot": (r.get("actual") or {}).get("screenshot"),
         })
-    blocking = any(b.get("blocking") for b in story_bugs)
-    status = "blocked" if blocking else ("failed" if story_bugs else "passed")
+    # Separate INFRA (provider/browser hiccup) from real APP bugs. Infra never blocks and never fails the story
+    # — it makes the story INCONCLUSIVE ('unknown'), which the loop treats as incomplete → retried next round,
+    # so a rate-limit failover can't contaminate the verdict as a product defect.
+    app_bugs = [b for b in story_bugs if not b.get("infra")]
+    infra_bugs = [b for b in story_bugs if b.get("infra")]
+    blocking = any(b.get("blocking") for b in app_bugs)
+    if blocking:
+        status = "blocked"
+    elif app_bugs:
+        status = "failed"
+    elif infra_bugs:
+        status = "unknown"                                # inconclusive — provider/infra hiccup, retry it
+    else:
+        status = "passed"
     return {
         "id": story.get("id", ""),
         "title": story.get("title", story.get("name", "(untitled)")),
         "expected": story.get("expected_outcome", story.get("expected", "")),
         "status": status,
         "steps": steps,
+        "inconclusive": bool(infra_bugs and not app_bugs),
     }
 
 
@@ -336,9 +349,29 @@ def plan_workers(n_stories, target_min=None, per_story_min=None, hardware_cap=No
     return max(1, min(need, cap, n_stories))
 
 
+# Signs that a story crashed because the TEST INFRASTRUCTURE (model provider / browser bridge / network)
+# faltered — NOT because the app is broken. On a subscription plan a long QA sweep rate-limits the model into
+# overload/failover storms; those manifest as timeouts, exhausted providers, and dead browser bridges. Blaming
+# the APP for a provider hiccup put phantom "blocking" bugs in the verdict (observed: 31 stories flip
+# blocked↔passed across rounds purely from failover noise). An infra failure is INCONCLUSIVE → retry, never a
+# blocking app defect.
+_INFRA_SIGNS = ("timeout", "timed out", "overloaded", "rate limit", "rate_limit", "429", "529", "503",
+                "econnreset", "connection reset", "connection refused", "connection aborted", "broken pipe",
+                "bridge", "failover", "codex", "exhausted", "target closed", "browser has been closed",
+                "navigation timeout", "net::err", "temporarily unavailable", "service unavailable",
+                "provider", "model call failed", "no output", "empty reply")
+
+
+def _is_infra_error(text) -> bool:
+    t = str(text or "").lower()
+    return any(s in t for s in _INFRA_SIGNS)
+
+
 def _explore_one(story, target_url, vision, token, org, *, max_steps, explorer_cls, artifact_dir, pulse_work_id):
-    """Explore ONE story end-to-end in its own browser. Returns (story_report, collected_bugs). Never raises —
-    a browser/bridge failure or a mid-story crash becomes a blocking bug on the report (safe to run in a pool)."""
+    """Explore ONE story end-to-end in its own browser. Returns (story_report, collected_bugs). Never raises.
+    A crash caused by the TEST INFRASTRUCTURE (provider rate-limit/failover, dead browser bridge, network) is
+    recorded as an INCONCLUSIVE infra note (non-blocking, story → 'unknown' so it's retried), NOT a blocking
+    app bug — a provider hiccup must never masquerade as a product defect in the verdict."""
     collected, ex, records = [], None, []
     try:
         try:
@@ -347,15 +380,21 @@ def _explore_one(story, target_url, vision, token, org, *, max_steps, explorer_c
             ex = explorer_cls(target_url, vision, token=token, org=org)
         if ex is not None and pulse_work_id:
             setattr(ex, "pulse_work_id", pulse_work_id)
-    except Exception as e:                                # a browser/bridge failure is itself a blocking bug
+    except Exception as e:                                # browser/bridge failure = INFRA, not an app defect
         collected = [{"bug": f"could not launch the explorer/browser: {e}", "expected": "app is reachable",
-                      "blocking": True, "severity": "critical", "url": target_url, "action": {"cmd": "goto"}}]
+                      "infra": True, "blocking": False, "severity": "none", "url": target_url,
+                      "action": {"cmd": "goto"}}]
     else:
         try:
             records = ex.explore(story, max_steps=max_steps, on_bug=collected.append)
         except Exception as e:
+            # a mid-story crash on an infra sign is INCONCLUSIVE (retry); a genuinely unexpected crash still
+            # blocks (a real hang/loop in the app can crash the explorer and must not be swept under the rug).
+            infra = _is_infra_error(e)
             collected.append({"bug": f"explorer crashed mid-story: {e}", "expected": "story completes",
-                              "blocking": True, "severity": "critical", "url": target_url, "action": {"cmd": "noop"}})
+                              "infra": infra, "blocking": not infra,
+                              "severity": "none" if infra else "critical",
+                              "url": target_url, "action": {"cmd": "noop"}})
         finally:
             try:
                 ex.close()

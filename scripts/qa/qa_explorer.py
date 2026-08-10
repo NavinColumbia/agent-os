@@ -715,11 +715,16 @@ class Explorer:
         prompt = _evaluate_prompt(self.vision, story, expected, targeting, before_state, after_state,
                                   untested=untested)
         res = _call_agent(ROLE, self.repo, prompt)
-        j = _extract_json(res.get("out_full") or res.get("out") or "")
+        raw_out = res.get("out_full") or res.get("out") or ""
+        j = _extract_json(raw_out)
+        # A model call that itself FAILED (provider exhausted/failover, empty output) must not be read as a
+        # PASS — that hides real defects behind a provider hiccup. Surface it as INCONCLUSIVE so the step is
+        # retried, never counted as a clean pass on no evidence.
+        call_failed = bool((isinstance(res, dict) and res.get("failed")) or not str(raw_out).strip() or not j)
         bug = j.get("bug") if j.get("bug") not in (None, "", "null") else None
         verdict = (j.get("verdict") or "").strip().lower()
         if not verdict:                       # tolerate an older-style reply that omits `verdict`
-            verdict = "bug" if bug else "pass"
+            verdict = "inconclusive" if call_failed else ("bug" if bug else "pass")
         # THE BLAME CONTRACT: a bug is only real when the verdict is explicitly 'bug'. Any other verdict
         # (control-not-found / retry / inconclusive / pass) is NOT the app's fault — drop the bug text so a
         # mis-targeted or missed click can never be recorded as an app defect.

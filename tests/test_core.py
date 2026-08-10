@@ -1450,3 +1450,22 @@ def test_untestable_native_target_is_honestly_blocked_not_faked():
         assert v["passed"] is False and int(v["blocking_open"]) >= 1
         assert v.get("untestable_here") == "mobile-ios"
         assert not factory.qa_verdict_ok(v), "an untestable target must fail the ship gate"
+
+
+def test_qa_infra_failover_is_inconclusive_not_a_blocking_app_bug():
+    """A provider rate-limit/failover or dead browser bridge must NOT masquerade as a product defect in the
+    verdict (observed: 31 stories flip blocked<->passed purely from failover noise, poisoning a real 40/40
+    pass into a 'FAILED'). An infra crash → story 'unknown' (inconclusive, retried); a genuine app crash still
+    blocks. _is_infra_error classifies; _story_report routes."""
+    sys.path.insert(0, str(ROOT / "scripts" / "qa"))
+    import qa_run as q
+    assert q._is_infra_error("Navigation timeout of 30000ms exceeded")
+    assert q._is_infra_error("Claude exhausted on transient errors — failing over to Codex")
+    assert q._is_infra_error("target closed / browser has been closed")
+    assert not q._is_infra_error("expected the submit button to be enabled, but it was missing")
+    infra = [{"bug": "explorer crashed mid-story: timeout", "infra": True, "blocking": False}]
+    appbug = [{"bug": "clicking Save does nothing", "infra": False, "blocking": True, "severity": "high"}]
+    assert q._story_report({"id": "US-1"}, [], infra)["status"] == "unknown", "infra hiccup must be inconclusive"
+    assert q._story_report({"id": "US-1"}, [], infra)["inconclusive"] is True
+    assert q._story_report({"id": "US-2"}, [], appbug)["status"] == "blocked", "a real app bug still blocks"
+    assert q._story_report({"id": "US-3"}, [], [])["status"] == "passed"

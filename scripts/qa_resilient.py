@@ -111,9 +111,79 @@ def _verdict_is_contaminated(verdict_json_path):
     return contaminated, real
 
 
+# Sustained-concurrency ceiling for QA on a SUBSCRIPTION plan. The real cause of the failover storm (39
+# failovers in ~30 stories) is too many heavy model calls sustained for the ~hour a round takes — the
+# subscription rate-limits, calls fail over to Codex, and coverage degrades. The cure is to keep sustained
+# concurrency LOW so the plan is never hammered. Slow but CLEAN (owner: "don't care how long"). We start
+# conservative and DE-ESCALATE further if an attempt still shows a failover storm.
+_CONC_LADDER = [4, 3, 2, 1]
+
+
+def _apply_throttle(level_idx):
+    """Pin model + browser concurrency for this attempt (env — read by claude_gate/qa_run at import time in
+    the child call path). Lower index = more concurrency; we step down the ladder as needed."""
+    n = _CONC_LADDER[min(level_idx, len(_CONC_LADDER) - 1)]
+    os.environ["AOS_CLAUDE_GLOBAL_MAX"] = str(n)        # total concurrent claude calls box-wide
+    os.environ["AOS_QA_PARALLEL"] = str(n)              # QA browser workers (match — no queueing past the gate)
+    return n
+
+
+def _reset_claude_slots(n):
+    """Resize the cross-process claude concurrency pool to n by clearing it so claude_gate._ensure reseeds at
+    the new size. Best-effort — the gate fails open if the table is unavailable."""
+    try:
+        import aoscfg
+        import psycopg
+        with psycopg.connect(aoscfg.DB) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM claude_slots")
+            cur.execute("INSERT INTO claude_slots (slot_id) SELECT g FROM generate_series(1,%s) g "
+                        "ON CONFLICT (slot_id) DO NOTHING", (n,))
+            c.commit()
+    except Exception:
+        pass
+
+
+def _run_qa_subprocess(product, timeout_s=None):
+    """Run one qa_gate in a fresh subprocess (throttle env already set). Returns the verdict dict or None on a
+    crash. The child prints one JSON line prefixed VERDICT_JSON: which we parse; it also writes the durable
+    docs/QA-VERDICT.json regardless."""
+    code = (
+        "import sys,os,json;sys.path.insert(0,%r);sys.path.insert(0,%r);"
+        "import loopcontroller as lc;"
+        "v=lc.qa_gate(%r, platform='web');"
+        "print('VERDICT_JSON:'+json.dumps(v, default=str))"
+        % (str(SCRIPTS), str(SCRIPTS / "qa"), product)
+    )
+    try:
+        p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                           timeout=timeout_s, env=os.environ.copy())
+    except subprocess.TimeoutExpired:
+        return None
+    except Exception:
+        return None
+    for line in (p.stdout or "").splitlines():
+        if line.startswith("VERDICT_JSON:"):
+            try:
+                return json.loads(line[len("VERDICT_JSON:"):])
+            except Exception:
+                return None
+    return None
+
+
+def _attempt_stormed(verdict_json_path):
+    """Did this attempt still get rate-limited into a failover storm? True when the verdict has many
+    inconclusive/unknown stories — the signal to throttle harder next attempt."""
+    try:
+        d = json.loads(Path(verdict_json_path).read_text())
+        return int((d.get("coverage") or {}).get("per_status", {}).get("unknown", 0)) >= 5
+    except Exception:
+        return False
+
+
 def run(product, tenant="demo", max_attempts=30):
     _status(product=product, phase="starting", attempt=0, max_attempts=max_attempts)
     os.environ["AOS_COCKPIT_DEMO"] = "1"               # QA-mode: real-but-cheap directive dispatch
+    storm_level = 0                                     # index into _CONC_LADDER; rises when a storm recurs
 
     for attempt in range(1, max_attempts + 1):
         # 1) DB must be up (wait for self-heal after a reboot)
@@ -131,20 +201,26 @@ def run(product, tenant="demo", max_attempts=30):
             print("QA_RESILIENT need_login", flush=True)
             return 3
 
-        # 3) bring up the CONNECTED app + run the real coverage-driven QA gate
-        _status(phase="qa_running", attempt=attempt)
-        print(f"QA_RESILIENT attempt {attempt}/{max_attempts} — running qa_gate({product})", flush=True)
-        try:
-            import loopcontroller as lc
-            v = lc.qa_gate(product, platform="web")
-        except Exception as e:
-            _status(phase="qa_crashed", attempt=attempt, error=str(e)[:200])
-            # a crash mid-attempt (often a DB/creds drop) — loop retries after re-checking DB/auth
+        # 3) bring up the CONNECTED app + run the real coverage-driven QA gate — in a SUBPROCESS with a LOW
+        #    sustained-concurrency throttle so the subscription isn't rate-limited into a failover storm. Fresh
+        #    import picks up the throttle; the slot pool is reset so the new gate size actually applies. A
+        #    subprocess also crash-isolates the attempt (a segfault can't kill this durable runner).
+        conc = _apply_throttle(storm_level)
+        _reset_claude_slots(conc)
+        _status(phase="qa_running", attempt=attempt, concurrency=conc)
+        print(f"QA_RESILIENT attempt {attempt}/{max_attempts} — qa_gate({product}) @ concurrency={conc}", flush=True)
+        v = _run_qa_subprocess(product)
+        if v is None:
+            _status(phase="qa_crashed", attempt=attempt)
             time.sleep(5)
             continue
 
         qa_ok = bool(v.get("qa_ok"))
         vj = v.get("verdict_json")
+        # if this attempt STILL stormed (many failovers), step the throttle down for the next try
+        if _attempt_stormed(vj):
+            storm_level += 1
+            print(f"QA_RESILIENT storm persisted → de-escalating concurrency (level {storm_level})", flush=True)
         contaminated, real_bugs = _verdict_is_contaminated(vj) if vj else (True, [])
         _status(phase="attempt_done", attempt=attempt, qa_ok=qa_ok, verdict=v.get("verdict"),
                 verdict_json=vj, real_bugs=real_bugs, contaminated=contaminated)

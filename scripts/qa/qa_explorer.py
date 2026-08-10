@@ -721,10 +721,19 @@ class Explorer:
         # PASS — that hides real defects behind a provider hiccup. Surface it as INCONCLUSIVE so the step is
         # retried, never counted as a clean pass on no evidence.
         call_failed = bool((isinstance(res, dict) and res.get("failed")) or not str(raw_out).strip() or not j)
+        # DEGRADED-ENGINE guard: this evaluation was produced by the CODEX FAILOVER engine only because Claude
+        # (the trusted primary verifier) was rate-limited. A "bug" verdict from the degraded fallback during a
+        # failover storm is LOW-CONFIDENCE — on a healthy app it manufactured phantom blocks (26/31 stories
+        # "blocked" while every endpoint returned 200). Treat it as INCONCLUSIVE → the story is retried once
+        # Claude recovers; a REAL bug reproduces on the trusted engine, Codex noise does not.
+        engine = str((res or {}).get("model") or "").lower()
+        degraded = ("codex" in engine) or ("gpt" in engine)
         bug = j.get("bug") if j.get("bug") not in (None, "", "null") else None
         verdict = (j.get("verdict") or "").strip().lower()
         if not verdict:                       # tolerate an older-style reply that omits `verdict`
             verdict = "inconclusive" if call_failed else ("bug" if bug else "pass")
+        if degraded and verdict == "bug":     # never let a failover-engine verdict block a healthy app
+            verdict = "inconclusive"
         # THE BLAME CONTRACT: a bug is only real when the verdict is explicitly 'bug'. Any other verdict
         # (control-not-found / retry / inconclusive / pass) is NOT the app's fault — drop the bug text so a
         # mis-targeted or missed click can never be recorded as an app defect.

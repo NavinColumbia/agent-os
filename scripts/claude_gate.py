@@ -31,12 +31,17 @@ DB = _trace.DB
 
 
 def _auto_global_max():
-    """Total concurrent `claude -p` calls allowed across the box. Env override wins; else AUTO-SIZE — a
-    hardcoded 6 throttled the whole fleet (QA fanned out 15 browsers but their per-step model calls queued
-    6-wide, so deep QA crawled). A `claude -p` process is an API CLIENT — the heavy compute is server-side, so
-    it's cheap locally (a little RAM); the real ceiling is the provider's concurrency, not this box. Size to
-    the box generously (cores*3) with a floor of 12 and a sane cap, and let AOS_CLAUDE_GLOBAL_MAX pin it for
-    ops (raise for throughput, lower if a plan hits provider rate limits)."""
+    """Total concurrent `claude -p` calls allowed across the box. Env override wins; else AUTO-SIZE.
+
+    The binding constraint is NOT this box. A `claude -p` process is an API client — the heavy compute is
+    server-side, so locally it costs little more than RAM. What actually saturates is the PROVIDER: on a
+    subscription, sustained heavy calls get rate-limited, fail over to Codex, and degrade QA coverage. So the
+    ceiling below is a provider-capacity estimate, deliberately far under what the hardware could drive.
+
+    NOTE: this returns ~8, NOT the 'cores*3, floor 12' an earlier version of this docstring described — that
+    text outlived the code and overstated the real limit by ~4.5x on a 12-core box. Anything reasoning about
+    headroom should read GLOBAL_MAX, not this prose. Ops override: AOS_CLAUDE_GLOBAL_MAX (raise it with an API
+    key or higher tier that tolerates more concurrency; lower it if a plan still hits rate limits)."""
     env = os.environ.get("AOS_CLAUDE_GLOBAL_MAX")
     if env:
         try:

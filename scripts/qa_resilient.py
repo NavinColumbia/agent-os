@@ -111,21 +111,75 @@ def _verdict_is_contaminated(verdict_json_path):
     return contaminated, real
 
 
-# Sustained-concurrency ceiling for QA on a SUBSCRIPTION plan. The real cause of the failover storm (39
-# failovers in ~30 stories) is too many heavy model calls sustained for the ~hour a round takes — the
-# subscription rate-limits, calls fail over to Codex, and coverage degrades. The cure is to keep sustained
-# concurrency LOW so the plan is never hammered. Slow but CLEAN (owner: "don't care how long"). We start
-# conservative and DE-ESCALATE further if an attempt still shows a failover storm.
-# The REAL cure for the failover storm is factory's 529-patience (retry Anthropic overloads on the trusted
-# engine before failover), not crippling concurrency. So start at a sane concurrency and only step down if a
-# storm somehow still recurs. 529s now cost a brief wait, not a Codex degrade.
-_CONC_LADDER = [8, 6, 4, 3]
+# ---------------------------------------------------------------------------------------------------------
+# ADAPTIVE CONCURRENCY (replaces a fixed [8,6,4,3] ladder that only ever ratcheted DOWN)
+#
+# The binding constraint on a SUBSCRIPTION plan is provider capacity, not this box: too many heavy model calls
+# sustained across the ~hour a round takes gets rate-limited, fails over to Codex, and degrades coverage. The
+# old ladder encoded that as a hardcoded guess and could only de-escalate — one storm permanently crippled
+# every remaining attempt (up to 30), even after the condition cleared, and it never used the headroom a
+# healthy provider offers. It also had to infer "storm" from the coarse `unknown >= 5` in a finished verdict.
+#
+# Now that QA model calls are traced (factory._qa_trace_ctx), the degradation rate is MEASURED per attempt —
+# what fraction of calls failed or fell back to Codex — and concurrency moves BOTH ways (AIMD, the same shape
+# TCP uses): additive increase while clean, multiplicative decrease on degradation. Bounds are derived, not
+# invented: the ceiling is the box's real browser capacity (browser_gate, RAM+CPU-sized) and the floor keeps
+# progress. Per the owner's standing rule: size to measured capacity, never a hardcoded cap.
+_CONC_FLOOR = int(os.environ.get("AOS_QA_CONC_FLOOR", "3"))     # below this a round crawls for no benefit
+_CONC_START = int(os.environ.get("AOS_QA_CONC_START", "8"))     # last known-good sustained value
+_DEGRADED_HI = float(os.environ.get("AOS_QA_DEGRADED_HI", "0.10"))  # >10% calls degraded -> back off
+_DEGRADED_LO = float(os.environ.get("AOS_QA_DEGRADED_LO", "0.02"))  # <2% -> provider is happy, take more
+_BACKOFF = float(os.environ.get("AOS_QA_BACKOFF", "0.6"))       # multiplicative decrease factor
 
 
-def _apply_throttle(level_idx):
+def _conc_ceiling():
+    """Upper bound on concurrency = the box's REAL browser capacity (browser_gate sizes it from RAM+CPU).
+    QA runs one browser per worker, so that is the honest hardware ceiling; _apply_throttle keeps the model
+    gate equal to it so calls never queue behind the browsers. Falls back to the start value if unavailable."""
+    try:
+        import browser_gate
+        return max(_CONC_FLOOR, int(browser_gate.GLOBAL_MAX))
+    except Exception:
+        return _CONC_START
+
+
+def _measure_degradation(product, since_ts):
+    """MEASURED provider health for the attempt that just ran: the fraction of its QA model calls that either
+    errored or fell back to the Codex engine. Returns (rate, calls) — rate is None when there is no evidence
+    (no traces yet), so the caller holds concurrency steady rather than reacting to noise."""
+    try:
+        import aoscfg
+        import psycopg
+        with psycopg.connect(aoscfg.DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT count(*),
+                                  count(*) FILTER (WHERE rc <> 0 OR coalesce(model,'') ILIKE '%%codex%%')
+                             FROM traces
+                            WHERE kind='agent' AND product=%s AND run_id LIKE 'qa-%%'
+                              AND ts > to_timestamp(%s)""", (product, since_ts))
+            calls, bad = cur.fetchone()
+        if not calls:
+            return None, 0
+        return (bad or 0) / float(calls), int(calls)
+    except Exception:
+        return None, 0
+
+
+def _next_concurrency(current, rate, ceiling):
+    """AIMD step (pure — unit-tested offline). Degraded above the high-water mark -> multiplicative decrease;
+    comfortably clean -> additive increase toward the hardware ceiling; in between (or no evidence) -> hold."""
+    if rate is None:
+        return current
+    if rate > _DEGRADED_HI:
+        return max(_CONC_FLOOR, int(current * _BACKOFF))
+    if rate < _DEGRADED_LO:
+        return min(ceiling, current + 1)
+    return current
+
+
+def _apply_throttle(n):
     """Pin model + browser concurrency for this attempt (env — read by claude_gate/qa_run at import time in
-    the child call path). Lower index = more concurrency; we step down the ladder as needed."""
-    n = _CONC_LADDER[min(level_idx, len(_CONC_LADDER) - 1)]
+    the child call path). Both are set to the SAME n so model calls never queue behind the browser workers."""
+    n = max(_CONC_FLOOR, int(n))
     os.environ["AOS_CLAUDE_GLOBAL_MAX"] = str(n)        # total concurrent claude calls box-wide
     os.environ["AOS_QA_PARALLEL"] = str(n)              # QA browser workers (match — no queueing past the gate)
     return n
@@ -186,7 +240,8 @@ def _attempt_stormed(verdict_json_path):
 def run(product, tenant="demo", max_attempts=30):
     _status(product=product, phase="starting", attempt=0, max_attempts=max_attempts)
     os.environ["AOS_COCKPIT_DEMO"] = "1"               # QA-mode: real-but-cheap directive dispatch
-    storm_level = 0                                     # index into _CONC_LADDER; rises when a storm recurs
+    ceiling = _conc_ceiling()                          # hardware-derived, not hardcoded
+    conc = min(_CONC_START, ceiling)                   # adapts both ways after each attempt (AIMD)
 
     for attempt in range(1, max_attempts + 1):
         # 1) DB must be up (wait for self-heal after a reboot)
@@ -208,10 +263,12 @@ def run(product, tenant="demo", max_attempts=30):
         #    sustained-concurrency throttle so the subscription isn't rate-limited into a failover storm. Fresh
         #    import picks up the throttle; the slot pool is reset so the new gate size actually applies. A
         #    subprocess also crash-isolates the attempt (a segfault can't kill this durable runner).
-        conc = _apply_throttle(storm_level)
+        conc = _apply_throttle(conc)
         _reset_claude_slots(conc)
-        _status(phase="qa_running", attempt=attempt, concurrency=conc)
-        print(f"QA_RESILIENT attempt {attempt}/{max_attempts} — qa_gate({product}) @ concurrency={conc}", flush=True)
+        _status(phase="qa_running", attempt=attempt, concurrency=conc, ceiling=ceiling)
+        print(f"QA_RESILIENT attempt {attempt}/{max_attempts} — qa_gate({product}) "
+              f"@ concurrency={conc}/{ceiling}", flush=True)
+        started = time.time()
         v = _run_qa_subprocess(product)
         if v is None:
             _status(phase="qa_crashed", attempt=attempt)
@@ -220,10 +277,17 @@ def run(product, tenant="demo", max_attempts=30):
 
         qa_ok = bool(v.get("qa_ok"))
         vj = v.get("verdict_json")
-        # if this attempt STILL stormed (many failovers), step the throttle down for the next try
-        if _attempt_stormed(vj):
-            storm_level += 1
-            print(f"QA_RESILIENT storm persisted → de-escalating concurrency (level {storm_level})", flush=True)
+        # ADAPT: steer next attempt's concurrency from this attempt's MEASURED degradation rate. The verdict's
+        # coarse storm flag is kept as a fallback signal for the window before traces exist.
+        rate, calls = _measure_degradation(product, started)
+        if rate is None and _attempt_stormed(vj):
+            rate = 1.0                                  # no trace evidence, but the verdict says it stormed
+        nxt = _next_concurrency(conc, rate, ceiling)
+        if nxt != conc:
+            direction = "de-escalating" if nxt < conc else "raising"
+            print(f"QA_RESILIENT {direction} concurrency {conc}→{nxt} "
+                  f"(degraded {0 if rate is None else rate:.0%} of {calls} calls, ceiling {ceiling})", flush=True)
+        conc = nxt
         contaminated, real_bugs = _verdict_is_contaminated(vj) if vj else (True, [])
         _status(phase="attempt_done", attempt=attempt, qa_ok=qa_ok, verdict=v.get("verdict"),
                 verdict_json=vj, real_bugs=real_bugs, contaminated=contaminated)
@@ -259,7 +323,29 @@ def _selftest():
                                  "bugs": {"items": [{"title": "Save button does nothing", "blocking": True}]}}))
         c, real = _verdict_is_contaminated(str(p))
         assert not c and real == ["Save button does nothing"], (c, real)
-    print("qa_resilient selftest: PASS (contamination classifier: infra-noise retries, real bug stops)")
+
+    # AIMD concurrency controller (pure, offline — no DB, no provider).
+    ceil = 12
+    assert _next_concurrency(8, 0.00, ceil) == 9, "clean -> additive increase"
+    assert _next_concurrency(8, 0.05, ceil) == 8, "in-band -> hold (no thrash)"
+    assert _next_concurrency(8, 0.50, ceil) == 4, "degraded -> multiplicative decrease"
+    assert _next_concurrency(8, None, ceil) == 8, "no evidence -> hold, never guess"
+    assert _next_concurrency(ceil, 0.0, ceil) == ceil, "never exceeds the hardware ceiling"
+    assert _next_concurrency(_CONC_FLOOR, 0.9, ceil) == _CONC_FLOOR, "never sinks below the floor"
+    # RECOVERY is the property the old fixed ladder lacked: it only ratcheted down, so one storm crippled
+    # every remaining attempt. After a storm clears, concurrency must climb back to the ceiling.
+    c = 8
+    for r in [0.5, 0.5] + [0.0] * 15:
+        c = _next_concurrency(c, r, ceil)
+    assert c == ceil, f"must recover to ceiling after a storm clears, got {c}"
+    # And sustained degradation must converge to the floor and stay there (stability, no oscillation below).
+    c = ceil
+    for _ in range(12):
+        c = _next_concurrency(c, 0.4, ceil)
+    assert c == _CONC_FLOOR, f"sustained degradation converges to floor, got {c}"
+
+    print("qa_resilient selftest: PASS (contamination classifier: infra-noise retries, real bug stops; "
+          "AIMD concurrency: bounded, holds on no evidence, recovers after a storm)")
     return 0
 
 

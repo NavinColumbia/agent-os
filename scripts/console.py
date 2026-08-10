@@ -810,6 +810,12 @@ function humanError(raw,ctx){const s=String(raw||'').toLowerCase();
  return ctx==='signup'?'We couldn\'t create your account — please try again.':'We couldn\'t sign you in — please try again.';}
 async function signUp(){
  const email=($('#su_email').value||'').trim();const pw=$('#su_pw').value||'';const pw2=$('#su_pw2').value||'';const name=($('#su_name').value||'').trim();const btn=$('#su_btn');
+ // Name is the FIRST field on the form and required by the server (POST /api/signup 400s without it), but
+ // it had no client check — so submitting with an empty name fired a doomed request and surfaced only a
+ // console error, leaving a first-run CEO on the form with no idea what was wrong. Validate it here, in the
+ // same shape as the other fields, so the failure is inline and nothing is sent.
+ if(!name){aInv('su_name',true);setNote('su','Enter your name.','err');$('#su_name').focus();return}
+ aInv('su_name',false);
  if(!email){aInv('su_email',true);setNote('su','Enter your email.','err');$('#su_email').focus();return}
  if(!emailOK(email)){aInv('su_email',true);setNote('su','That email doesn\'t look right — check for a typo.','err');$('#su_email').focus();return}
  if(pw.length<8){aInv('su_pw',true);setNote('su','Password must be at least 8 characters.','err');$('#su_pw').focus();return}
@@ -955,10 +961,28 @@ function setSendMode(busy){const b=$('#ctlsend');if(!b)return;if(busy){b.classLi
 async function ctlStop(){
  if(CTLABORT){try{CTLABORT.abort()}catch(_){}}
  try{await post('/api/controller/cancel',{org:ORG||0})}catch(e){}
- CTLBUSY=false;CTLABORT=null;setSendMode(false);stopTick();PROG=null;
- const t=$('#ctltyping');if(t)t.remove();const p=$('#ctlprog');if(p)p.remove();
- const cm=$('#cmsg');if(cm)cm.disabled=false;const n=$('#cnote');if(n)n.textContent='Stopped.';
- go('controller');}
+ CTLBUSY=false;CTLABORT=null;setSendMode(false);stopTick();
+ const t=$('#ctltyping');if(t)t.remove();
+ // Replace the live progress card with an explicit STOPPED state rather than deleting it. The CEO who just
+ // halted a build needs to SEE that it stopped and how long it ran; removing the card left nothing to
+ // confirm the action, and the elapsed timer/ETA simply disappeared with it.
+ const pc=$('#ctlprog');if(pc)pc.outerHTML=stoppedBubble(PROG);
+ const ranFor=(PROG&&PROG.elapsed_s)?(' It ran for '+fmtElapsed(PROG.elapsed_s).replace(' elapsed','')+'.'):'';
+ PROG=null;
+ const cm=$('#cmsg');if(cm)cm.disabled=false;
+ // NOT go(): go() wipes #view to a loading skeleton before re-rendering, which threw away the whole
+ // workstream context AND the 'Stopped.' confirmation, and left a stuck skeleton when the re-render was
+ // slow or threw. refreshView() re-renders in place with no skeleton flash and, on failure, leaves the
+ // stopped card on screen instead of a blank panel.
+ try{await refreshView()}catch(_){}
+ // The elapsed figure goes in the NOTE, not just the card: refreshView() re-renders the thread from
+ // server state, so anything written into #view is transient — the note is what the CEO still sees after.
+ const n=$('#cnote');if(n)n.textContent='Stopped. The build was cancelled.'+ranFor+' Say "retry" to resume it.';}
+// The terminal state of a halted workstream: frozen elapsed, no ETA, no Stop control.
+function stoppedBubble(p){const el=(p&&p.elapsed_s)?(' after '+esc(fmtElapsed(p.elapsed_s).replace(' elapsed',''))):'';
+ return '<div class="msg ai" id=ctlstopped style="margin:8px 0"><div><span class=bubble>'
+  +'<b>Stopped</b>'+el+'<div class=muted style="margin-top:4px">You cancelled this build. Nothing further will run.</div>'
+  +'</span></div></div>';}
 function fmtElapsed(s){s=Math.max(0,Math.floor(s));const m=Math.floor(s/60),ss=s%60;return m+'m '+(ss<10?'0':'')+ss+'s elapsed';}
 function progressBubble(p){const lab=esc(p.phase_label||'Working');const eta=p.eta_note?(' · '+esc(p.eta_note)):'';
  return '<div class="msg ai" id=ctlprog style="margin:8px 0"><div><span class=bubble><span class=spin></span> <b>'+lab+'…</b> <span id=progelapsed class=muted>'+fmtElapsed(p.elapsed_s||0)+'</span>'+eta+'<div style="margin-top:8px"><button onclick=ctlStop()>Stop</button></div></span></div></div>';}

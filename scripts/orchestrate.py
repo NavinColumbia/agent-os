@@ -260,38 +260,58 @@ def _main(a):
         suf = os.urandom(3).hex()
         dev = f"builder@app-{suf}"
         legal = f"legal-compliance-regional@{suf}"
-        # Case A: legal already active -> route directly
-        directory.register(legal, "legal-compliance-regional", None, "available", [])
-        r1 = request_collaborator(dev, "legal-compliance-regional", "review GDPR impact of new export", priority=5)
-        # prioritization: a higher-priority task jumps the queue
-        enqueue(legal, "URGENT: breach disclosure review", priority=1, requester=dev)
-        top = next_task(legal)
-        # Case B: no instance active -> hire request -> controller spawns
-        directory.release(legal)
-        # TEST ISOLATION: a leftover active 'tax-advisor' (a prior run that didn't release it, or the live
-        # fleet/scheduler) makes request_collaborator REUSE instead of HIRE, flaking this case. Guarantee a
-        # clean slate for the target role so Case B deterministically exercises the hire path.
-        with psycopg.connect(DB) as _c, _c.cursor() as _cur:
-            _cur.execute("UPDATE directory SET status='released' WHERE role='tax-advisor' AND status='active'")
-            _c.commit()
-        r2 = request_collaborator(dev, "tax-advisor", "review sales-tax nexus", priority=4)
-        # Case B': controller fulfills the spawn — the queued task must reach the new agent's queue
-        # (regression guard for #7: the task used to be dropped on the spawn path).
         tax = f"tax-advisor@{suf}"
-        ful = fulfill(r2["hire_id"], tax)
-        routed = next_task(tax)
-        # Case C: uncovered role
-        r3 = request_collaborator(dev, "astrophysicist", "model orbital decay", priority=5)
-        ok = (r1["action"] == "routed_to_existing" and top["priority"] == 1
-              and r2["action"] == "hire_requested_spawn"
-              and ful["action"] == "spawned" and ful["routed_title"] == "review sales-tax nexus"
-              and routed is not None and routed["title"] == "review sales-tax nexus" and routed["priority"] == 4
-              and r3["action"] in ("no_role", "no_exact_role_use_nearest"))
-        with psycopg.connect(DB) as c, c.cursor() as cur:   # self-clean so test data doesn't accumulate
-            cur.execute("DELETE FROM hire_requests WHERE requester=%s", (dev,))
-            cur.execute("DELETE FROM tasks WHERE assignee IN (%s,%s) OR requester=%s", (legal, tax, dev))
-            cur.execute("DELETE FROM directory WHERE agent_id IN (%s,%s,%s)", (legal, dev, tax))
-            c.commit()
+        ok = False
+        # EVERYTHING below registers synthetic agents in the LIVE directory and enqueues fixture tasks in
+        # the LIVE tasks table, so cleanup MUST be in a finally. It used to sit on the happy path: one
+        # crash (see the hire_id KeyError above) left 'tax-advisor@<suf>' active forever, which made the
+        # NEXT run route to it instead of hiring, which crashed the same way — a compounding leak that
+        # dispatched real agent sessions onto fictitious legal work ("URGENT: breach disclosure review").
+        try:
+            # Case A: legal already active -> route directly
+            directory.register(legal, "legal-compliance-regional", None, "available", [])
+            r1 = request_collaborator(dev, "legal-compliance-regional", "review GDPR impact of new export", priority=5)
+            # prioritization: a higher-priority task jumps the queue
+            enqueue(legal, "URGENT: breach disclosure review", priority=1, requester=dev)
+            top = next_task(legal)
+            # Case B: no instance active -> hire request -> controller spawns
+            directory.release(legal)
+            # TEST ISOLATION: a leftover active 'tax-advisor' (a prior run that didn't release it, or the live
+            # fleet/scheduler) makes request_collaborator REUSE instead of HIRE, flaking this case. Guarantee a
+            # clean slate for the target role so Case B deterministically exercises the hire path.
+            with psycopg.connect(DB) as _c, _c.cursor() as _cur:
+                _cur.execute("UPDATE directory SET status='released' WHERE role='tax-advisor' AND status='active'")
+                _c.commit()
+            r2 = request_collaborator(dev, "tax-advisor", "review sales-tax nexus", priority=4)
+            # Case B': controller fulfills the spawn — the queued task must reach the new agent's queue
+            # (regression guard for #7: the task used to be dropped on the spawn path).
+            # r2 only carries hire_id on the SPAWN path. If a stale active tax-advisor survives (exactly what
+            # this test used to leak), request_collaborator returns routed_to_existing instead, whose dict has
+            # no hire_id — the bare r2["hire_id"] then raised KeyError and killed the run BEFORE cleanup, so
+            # every subsequent run leaked more and routed fixture work into the leaked agent's queue. Fail the
+            # assertion honestly instead of exploding mid-test.
+            ful = fulfill(r2["hire_id"], tax) if r2.get("hire_id") else {"action": r2.get("action"),
+                                                                         "routed_title": None}
+            routed = next_task(tax)
+            # Case C: uncovered role
+            r3 = request_collaborator(dev, "astrophysicist", "model orbital decay", priority=5)
+            ok = (r1["action"] == "routed_to_existing" and top["priority"] == 1
+                  and r2["action"] == "hire_requested_spawn"
+                  and ful["action"] == "spawned" and ful["routed_title"] == "review sales-tax nexus"
+                  and routed is not None and routed["title"] == "review sales-tax nexus" and routed["priority"] == 4
+                  and r3["action"] in ("no_role", "no_exact_role_use_nearest"))
+        finally:
+            # Always reachable: purge this run's synthetic agents, its queued fixture work, and any hire
+            # request it filed — keyed on the ids/requester this run owns, so it can never touch real rows.
+            try:
+                with psycopg.connect(DB) as c, c.cursor() as cur:
+                    cur.execute("DELETE FROM hire_requests WHERE requester=%s", (dev,))
+                    cur.execute("DELETE FROM tasks WHERE assignee IN (%s,%s) OR requester=%s",
+                                (legal, tax, dev))
+                    cur.execute("DELETE FROM directory WHERE agent_id IN (%s,%s,%s)", (legal, dev, tax))
+                    c.commit()
+            except Exception:
+                pass
         print(f"A route-to-existing: {r1['action']}; priority pull: p{top['priority']} first; "
               f"B spawn-request: {r2['action']}; B' fulfilled->routed: {ful['routed_title']!r}; C uncovered: {r3['action']}")
         print("PASS: reuse-vs-spawn routing + priority queue + hire-then-route flow + uncovered-role ✅" if ok else "FAIL")

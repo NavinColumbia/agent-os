@@ -328,6 +328,17 @@ def _selftest():
     directory.register(senior_id, "staff-engineer", product=f"findings-{suf}", task="idle")
     real_agent, real_notify = factory.agent, notify.send
     real_qa_mod = sys.modules.get("qa_run")
+    # CONTAIN THE ROUTING. request_collaborator picks the least-loaded ACTIVE agent of the needed role out
+    # of the live directory — which on a working install includes real builders. So the selftest's synthetic
+    # findings were being dispatched to real builder sessions, which then worked fixture tickets. Confining
+    # directory.find to this run's own agents keeps the REAL routing/hire logic under test (we still exercise
+    # request_collaborator end to end) while making it impossible for a fixture to reach a live worker.
+    real_find = directory.find
+
+    def _confined_find(role=None, **kw):
+        return [a for a in real_find(role=role, **kw) if str(a.get("agent_id", "")).endswith(f"findings-{suf}")]
+
+    directory.find = _confined_find
     agent_roles, pages = [], []
     checks = {}
     try:
@@ -407,6 +418,7 @@ def _selftest():
         print("PASS: filed -> routed -> GATED resolve (evidence, not claims) -> SLA senior re-route + "
               "cockpit feed ✅" if ok else "FAIL")
     finally:
+        directory.find = real_find
         factory.agent, notify.send = real_agent, real_notify
         if real_qa_mod is not None:
             sys.modules["qa_run"] = real_qa_mod
@@ -416,7 +428,15 @@ def _selftest():
             cur.execute("""DELETE FROM finding_verifications WHERE finding_id IN
                            (SELECT id FROM findings WHERE source=%s)""", (f"reviewer-{suf}",))
             cur.execute("DELETE FROM findings WHERE source=%s", (f"reviewer-{suf}",))
-            cur.execute("DELETE FROM tasks WHERE assignee IN (%s,%s)", (builder_id, senior_id))
+            # Delete by REQUESTER, not just by synthetic assignee. request_collaborator routes to whatever
+            # active agent of the right role it finds in the LIVE directory, which is often a real builder,
+            # not our fixture one — those rows survived an assignee-scoped delete and real builder sessions
+            # got dispatched on fixture work (observed: tasks 1175 and 1178 worked by
+            # builder@f7bf9e-saas-rest-api and builder@623da4-saas-rest-api). The requester is ours no matter
+            # who it was routed to, so it is the only handle that reliably reaches every leaked row.
+            cur.execute("DELETE FROM tasks WHERE requester LIKE %s OR assignee IN (%s,%s)",
+                        (f"finding%:reviewer-{suf}", builder_id, senior_id))
+            cur.execute("DELETE FROM hire_requests WHERE requester LIKE %s", (f"finding%:reviewer-{suf}",))
             cur.execute("DELETE FROM directory WHERE agent_id IN (%s,%s)", (builder_id, senior_id))
             cur.execute("DELETE FROM task_board WHERE source=%s", (f"review:reviewer-{suf}",))
             cur.execute("""DELETE FROM notifications WHERE tenant_id='platform' AND category='findings'

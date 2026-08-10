@@ -13,6 +13,7 @@ Every step is audited.
   factory.py selftest                            # offline check (prompt assembly, no model calls)
 Run with the agent-os venv python. Needs the `claude` CLI authenticated; pytest in the venv.
 """
+import contextlib
 import json
 import os
 import shutil
@@ -36,25 +37,66 @@ from aoscfg import ENV as _ENV, DB as _DB
 
 import threading
 _ctx = threading.local()   # per-build context (run/product/stage) so concurrent builds don't mix traces
+# PROCESS-WIDE fallback context, set ONLY by _qa_trace_ctx for a standalone QA run. It exists because _ctx is
+# thread-local while QA fans its stories out over a ThreadPoolExecutor: the context set on the main thread is
+# invisible to the worker threads that actually make the model calls, so every QA trace was silently dropped.
+# (Builds don't need this — build_product IS the thread body and sets _ctx itself in each thread.) Consulted
+# only when the thread-local is empty, and only ever populated in a dedicated QA subprocess, so it cannot
+# mis-attribute a fleet build: inside a build _qa_trace_ctx yields early and never writes here.
+_QA_CTX = {}
 
 
 def _trace(kind, role, prompt, output, rc, elapsed=None, cost_usd=0.0, tokens_in=0, tokens_out=0, model=None):
     """Persist a step's full I/O + real economics + the model used, for debugging/replay/reproducibility."""
-    run = getattr(_ctx, "run", None)
+    run = getattr(_ctx, "run", None) or _QA_CTX.get("run")
     if not run:
         return
+    product = getattr(_ctx, "product", None) or _QA_CTX.get("product")
+    stage = getattr(_ctx, "stage", None) or _QA_CTX.get("stage")
     try:
         import redact
         with psycopg.connect(_DB) as c, c.cursor() as cur:
             cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, prompt, output, rc,
                              elapsed_s, cost_usd, tokens_in, tokens_out, model)
                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (run, getattr(_ctx, "product", None), getattr(_ctx, "stage", None), role, kind,
+                        (run, product, stage, role, kind,
                          redact.scrub((prompt or "")[:20000]), redact.scrub((output or "")[:20000]), rc,
                          elapsed, cost_usd, tokens_in, tokens_out, model))
             c.commit()
     except Exception:
         pass
+
+
+@contextlib.contextmanager
+def _qa_trace_ctx(product):
+    """Give a STANDALONE QA run (qa_resilient / loopcontroller.qa_gate, with no enclosing build) a trace
+    context, so its model calls are actually recorded.
+
+    Without this, _trace() early-returns on a missing _ctx.run and EVERY QA model call is invisible: no rc, no
+    latency, no engine, no token/cost row. Two concrete consequences we hit: (a) a live QA run driving 10
+    concurrent calls looked identical to a stalled one ("0 traces in 6 min"), so throughput had to be guessed
+    from screenshot mtimes; and (b) QA's model spend never reached appguard/projbudget/forecast, so budget
+    under-counted every QA hour. Recording them is also the prerequisite for sizing concurrency from the
+    MEASURED provider failure rate instead of a hardcoded ladder.
+
+    Inside a build the context is already set by build_product — we never clobber it (yields False). run_id is
+    'qa-<product>-<ts>' so it can never collide with the 'build-<product>' ids the build-sweep queries key on.
+    """
+    if getattr(_ctx, "run", None):
+        yield False                       # inside a build — its context already covers these traces
+        return
+    prev = (getattr(_ctx, "product", None), getattr(_ctx, "stage", None))
+    run = f"qa-{product}-{int(time.time())}"
+    _ctx.run, _ctx.product, _ctx.stage = run, product, "QA"
+    # Mirror into the process-wide fallback so QA's ThreadPoolExecutor workers — where the model calls actually
+    # happen — resolve a context too. Without this the thread-local above covers only the main thread.
+    _QA_CTX.update({"run": run, "product": product, "stage": "QA"})
+    try:
+        yield True
+    finally:
+        _ctx.run = None
+        _ctx.product, _ctx.stage = prev
+        _QA_CTX.clear()
 
 
 def _stage_done(run, stage):
@@ -1872,23 +1914,26 @@ def run_grounded_qa(product: str, kind: str = None, vision: str = None, summary:
     if not repo.exists():
         return {"passed": False, "stories": 0, "blocking_open": 0, "verdict_json": None,
                 "verdict": f"no such product repo: {repo}"}
-    plat = (platform or "").strip().lower()
-    # HONESTY GATE: a target we cannot exercise here must not be code-graded into a fake pass.
-    if plat in _UNTESTABLE_HERE:
-        return _honest_untestable_verdict(repo, product, plat)
-    kind = kind or _detect_kind(repo)
-    if vision is None:
-        ch = repo / "docs" / "CHARTER.md"
-        vision = ch.read_text()[:4000] if ch.exists() else f"The {product} product ({kind})."
-    if summary is None:
-        sp = repo / "docs" / "SPEC.md"
-        summary = sp.read_text()[:4000] if sp.exists() else vision[:2000]
-    # A UI target (declared platform OR detected kind) is verified ONLY in a real browser — even if devserve
-    # couldn't produce a URL, run_agentic_web_qa fail-closes ("no index.html to serve") rather than silently
-    # code-grading a UI no one drove.
-    if _is_ui_target(plat) or kind == "web" or target_url:
-        return run_agentic_web_qa(str(repo), product, vision, summary, target_url=target_url)
-    return run_independent_qa(str(repo), product, vision, kind)
+    # Trace context for a STANDALONE QA run, so its model calls are recorded (see _qa_trace_ctx). Wraps every
+    # path below — including the untestable-verdict early return — because they all may spawn agents.
+    with _qa_trace_ctx(product):
+        plat = (platform or "").strip().lower()
+        # HONESTY GATE: a target we cannot exercise here must not be code-graded into a fake pass.
+        if plat in _UNTESTABLE_HERE:
+            return _honest_untestable_verdict(repo, product, plat)
+        kind = kind or _detect_kind(repo)
+        if vision is None:
+            ch = repo / "docs" / "CHARTER.md"
+            vision = ch.read_text()[:4000] if ch.exists() else f"The {product} product ({kind})."
+        if summary is None:
+            sp = repo / "docs" / "SPEC.md"
+            summary = sp.read_text()[:4000] if sp.exists() else vision[:2000]
+        # A UI target (declared platform OR detected kind) is verified ONLY in a real browser — even if devserve
+        # couldn't produce a URL, run_agentic_web_qa fail-closes ("no index.html to serve") rather than silently
+        # code-grading a UI no one drove.
+        if _is_ui_target(plat) or kind == "web" or target_url:
+            return run_agentic_web_qa(str(repo), product, vision, summary, target_url=target_url)
+        return run_independent_qa(str(repo), product, vision, kind)
 
 
 def _review_verdict(repo, text: str = "") -> str:

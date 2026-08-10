@@ -118,7 +118,13 @@ def _sweep_stuck_builds(dry=False):
     try:
         import psycopg
         with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""SELECT t.product FROM traces t WHERE t.kind='agent'
+            # Scoped to BUILD runs (run_id 'build-%', the same key factory's stuck-run query uses). A
+            # standalone QA run traces under 'qa-<product>-<ts>'; without this scope a long QA sweep would
+            # keep max(ts) fresh on a product whose first build trace is >12h old and get it marked
+            # ABANDONED mid-verification. A build genuinely stuck IN its QA stage still traces under
+            # 'build-%' and is still caught.
+            cur.execute("""SELECT t.product FROM traces t
+                           WHERE t.kind='agent' AND t.run_id LIKE 'build-%%'
                            GROUP BY t.product
                            HAVING max(t.ts) > now() - interval '20 minutes'
                               AND min(t.ts) < now() - make_interval(hours => %s)

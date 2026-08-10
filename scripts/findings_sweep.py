@@ -43,6 +43,11 @@ NAMES = {0: "critical", 1: "high", 2: "med", 3: "low", 4: "untagged"}
 ESCALATE_AFTER_DAYS = {0: 2, 1: 7, 2: 30, 3: 90, 4: 30}
 COOLDOWN_DAYS = int(os.environ.get("AOS_FINDINGS_COOLDOWN_DAYS", "7"))
 OPEN_STATES = ("asked", "open", "new", "blocked", "in_progress")
+# task_board carries TWO kinds of card: findings filed by review/QA/dogfood runs (source 'review:…') and
+# the CEO's own roadmap items (source 'ceo' — "deploy publicly", "cloud horizontal scale"). Only the first
+# kind is a BUG. Reporting a June roadmap item as a "46-day OVERDUE finding" is noise that buries the four
+# real ones, so the triage view is scoped to findings; roadmap cards stay on the board where they belong.
+FINDING_SOURCES = "review:%"
 
 
 def _severity(title):
@@ -86,9 +91,9 @@ def open_findings(limit=200):
                 """SELECT id, title, status,
                           extract(epoch from (now() - created_at)) / 86400.0
                      FROM task_board
-                    WHERE status = ANY(%s)
+                    WHERE status = ANY(%s) AND source LIKE %s
                     ORDER BY created_at DESC
-                    LIMIT %s""", (list(OPEN_STATES), limit))
+                    LIMIT %s""", (list(OPEN_STATES), FINDING_SOURCES, limit))
             return rank_findings(cur.fetchall())
     except Exception:
         return []

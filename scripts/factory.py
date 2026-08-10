@@ -837,7 +837,16 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     last = {"rc": -1, "out": ""}
     saw_transient = False                            # did any attempt fail on overload/timeout (outage)?
     exhausted_primary = False                         # did the pinned model hit its subscription usage cap?
-    for attempt in range(retries + 1):
+    # TRANSIENT-PATIENCE (529 fix): Anthropic returns intermittent server-side `overloaded_error (529)` under
+    # load — a TRANSIENT hiccup, NOT a per-user rate limit (the owner's own session keeps working). The old
+    # loop gave a `light` QA call retries=0, so ONE 529 dropped it straight to the Codex failover, degrading QA
+    # to the weaker engine and injecting phantom bugs. A 529 almost always clears within a few seconds, so we
+    # give TRANSIENT failures their OWN patient retry budget on the SAME Claude model (exponential backoff),
+    # independent of the answer-quality `retries`, before ever considering failover.
+    transient_budget = int(os.environ.get("AOS_TRANSIENT_RETRIES", "6"))
+    transient_used = 0
+    attempt = 0
+    while True:
         t0 = time.time()
         try:
             with _AGENT_SEM:                          # global cap on concurrent agent subprocesses
@@ -846,12 +855,15 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
             dt = round(time.time() - t0, 1)
             audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
                          decision="timeout", payload={"attempt": attempt + 1, "timeout_s": timeout})
-            _trace("agent", role, prompt, f"TIMEOUT after {timeout}s (attempt {attempt + 1}/{retries + 1})", -1, dt, model=model)
+            _trace("agent", role, prompt, f"TIMEOUT after {timeout}s (attempt {attempt + 1})", -1, dt, model=model)
             time.sleep(4 * (attempt + 1))
             timeout = min(900, int(timeout * 1.5))      # back off: give it more time next try
             last = {"rc": -1, "out": "timeout"}
             saw_transient = True                        # a hung/overloaded provider counts as transient
-            continue
+            attempt += 1
+            if attempt <= retries:
+                continue
+            break
         dt = round(time.time() - t0, 1)
         _add_spend(cost)                                # running total for the budget cap
         audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
@@ -870,7 +882,18 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
             break
         transient = any(t in (out_text or "").lower() for t in _TRANSIENT)
         saw_transient = saw_transient or transient
-        time.sleep((8 if transient else 4) * (attempt + 1))   # longer backoff on rate-limit/overload
+        # A TRANSIENT failure (529 overload / timeout / temporarily unavailable) gets a PATIENT retry on the
+        # same Claude model before failover — this is what keeps QA on the trusted engine through an Anthropic
+        # overload blip instead of degrading to Codex on the first hiccup.
+        if transient and transient_used < transient_budget:
+            transient_used += 1
+            time.sleep(min(30, 5 * (2 ** (transient_used - 1))))   # 5,10,20,30,30,30… patient exp backoff
+            continue
+        attempt += 1
+        if attempt <= retries:                          # a NON-transient bad answer uses the quality-retry budget
+            time.sleep(4 * attempt)
+            continue
+        break
     # MODEL-EXHAUSTION FAILOVER — the pinned model (e.g. Fable 5) hit its SUBSCRIPTION usage cap, which
     # --fallback-model does NOT cover. Retry the SAME task once on the FALLBACK_MODEL (a different quota, e.g.
     # Opus) before giving up. If the fallback is ALSO capped, saw_transient lets the Codex failover try next.

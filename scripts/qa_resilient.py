@@ -116,7 +116,10 @@ def _verdict_is_contaminated(verdict_json_path):
 # subscription rate-limits, calls fail over to Codex, and coverage degrades. The cure is to keep sustained
 # concurrency LOW so the plan is never hammered. Slow but CLEAN (owner: "don't care how long"). We start
 # conservative and DE-ESCALATE further if an attempt still shows a failover storm.
-_CONC_LADDER = [4, 3, 2, 1]
+# The REAL cure for the failover storm is factory's 529-patience (retry Anthropic overloads on the trusted
+# engine before failover), not crippling concurrency. So start at a sane concurrency and only step down if a
+# storm somehow still recurs. 529s now cost a brief wait, not a Codex degrade.
+_CONC_LADDER = [8, 6, 4, 3]
 
 
 def _apply_throttle(level_idx):

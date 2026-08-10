@@ -66,16 +66,23 @@ def _clean(title):
     return _AREA_TAG.sub("", title or "", count=2).strip(" -—:")
 
 
+# A finding a human has deliberately PARKED has been triaged — the whole point of the overdue clock is to
+# catch items nobody has looked at. Continuing to page about a decision that was already made is how an
+# alert channel gets ignored, so 'blocked' items are listed but never flagged overdue or escalated.
+PARKED_STATES = ("blocked",)
+
+
 def rank_findings(rows):
     """Pure (unit-tested): [(id, title, status, created_at_days_old)] -> ranked dicts, worst first."""
     out = []
     for tid, title, status, age_days in rows:
         sev = _severity(title)
+        parked = str(status or "").lower() in PARKED_STATES
         out.append({
             "id": tid, "severity": NAMES[sev], "_rank": sev,
             "area": _area(title), "title": _clean(title), "status": status,
-            "age_days": int(age_days),
-            "overdue": age_days > ESCALATE_AFTER_DAYS[sev],
+            "age_days": int(age_days), "parked": parked,
+            "overdue": (not parked) and age_days > ESCALATE_AFTER_DAYS[sev],
         })
     out.sort(key=lambda d: (d["_rank"], -d["age_days"]))
     return out
@@ -109,9 +116,11 @@ def summary(max_lines=6):
         by_sev[it["severity"]] = by_sev.get(it["severity"], 0) + 1
     counts = " · ".join(f"{n} {s}" for s, n in sorted(by_sev.items(), key=lambda kv: RANK.get(kv[0], 4)))
     overdue = [i for i in items if i["overdue"]]
-    lines = [f"Open findings: {len(items)} ({counts}) · {len(overdue)} past their review-by date"]
+    parked = [i for i in items if i["parked"]]
+    tail = f" · {len(parked)} parked" if parked else ""
+    lines = [f"Open findings: {len(items)} ({counts}) · {len(overdue)} past their review-by date{tail}"]
     for it in items[:max_lines]:
-        flag = " ⚠ OVERDUE" if it["overdue"] else ""
+        flag = " ⚠ OVERDUE" if it["overdue"] else (" · parked" if it["parked"] else "")
         where = f" [{it['area']}]" if it["area"] else ""
         lines.append(f"  #{it['id']} {it['severity'].upper()}{where} {it['title'][:88]} "
                      f"({it['age_days']}d){flag}")
@@ -187,6 +196,10 @@ def _selftest():
     assert [x["id"] for x in r] == [5, 2, 3, 1, 4], [x["id"] for x in r]   # severity, then oldest first
     assert r[0]["severity"] == "critical" and r[0]["age_days"] == 40
     assert r[0]["title"] == "older critical" and r[0]["area"] == "x", r[0]
+    # a deliberately PARKED finding is triaged, so it must never read as overdue no matter how old
+    parked_rows = [(9, "[critical] [x] parked on the owner's budget", "blocked", 500.0)]
+    pr = rank_findings(parked_rows)[0]
+    assert pr["parked"] is True and pr["overdue"] is False, pr
     # a 3-day-old critical is overdue (threshold 2d); a 1-day-old high is not (threshold 7d)
     assert next(x for x in r if x["id"] == 2)["overdue"] is True
     assert next(x for x in r if x["id"] == 3)["overdue"] is False

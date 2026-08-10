@@ -133,6 +133,7 @@ class BrowserBridge:
         self.timeout = timeout
         self._id = 0
         self.proc = None
+        self.target_url = target_url      # the ONE origin this session may navigate to (see _pin_origin)
         self.video_path = None            # webm path the bridge reports on close() (for mp4 transcode)
         self._gate_slot = None            # global browser-concurrency slot (released in close())
         if not autostart:
@@ -157,6 +158,36 @@ class BrowserBridge:
         if token:
             self.seed_token(token, org)
         self.goto(target_url)
+
+    def _pin_origin(self, url):
+        """Force a model-chosen `goto` onto the origin THIS run is actually testing, keeping path/query/frag.
+
+        The decide-prompt constrains click/type targeting hard ("never invent an idx you did not see") but says
+        nothing about goto, so the model would happily navigate to a plausible-looking origin it made up. That
+        is exactly what stalled a real fix: the post-fix re-observation issued `goto http://localhost:3000`
+        (the generic dev-server default) while the app under test was on 127.0.0.1:8871, hit
+        chrome-error://chromewebdata for 22 straight steps, and the judge concluded "not fixed" — for a bug
+        that WAS fixed and live. The loop then re-ran forever, never converging.
+
+        Path, query and fragment are preserved, because QA legitimately drives same-app routes and query-param
+        edge cases (e.g. ?stateUrl=<bad-host> to exercise a data-source failure — that URL lives in the QUERY,
+        and must survive). Only the scheme/host/port are pinned. A relative URL resolves against the target."""
+        from urllib.parse import urljoin, urlsplit, urlunsplit
+        target = self.target_url or ""
+        if not url:
+            return target
+        if not target:
+            return url
+        try:
+            t, u = urlsplit(target), urlsplit(str(url))
+            if not u.netloc:                                   # relative path -> resolve against the target
+                return urljoin(target, str(url))
+            if (u.scheme, u.netloc) == (t.scheme, t.netloc):    # already the app under test
+                return url
+            # Off-origin: keep what the model wanted to reach WITHIN the app, drop its invented host.
+            return urlunsplit((t.scheme, t.netloc, u.path, u.query, u.fragment)) or target
+        except Exception:
+            return url                                          # never break navigation on a parse error
 
     def _readline(self):
         """Read one line from the bridge honouring the wall-clock timeout (a page load can be slow)."""
@@ -255,7 +286,7 @@ class BrowserBridge:
         if cmd in ("type", "fill"):
             return self._send({"cmd": "fill", "idx": idx, "selector": sel, "value": val})
         if cmd == "goto":
-            return self._send({"cmd": "goto", "url": val or action.get("url")})
+            return self._send({"cmd": "goto", "url": self._pin_origin(val or action.get("url"))})
         if cmd == "scroll":
             return self._send({"cmd": "eval", "expr": f"window.scrollBy(0,{int(val or 600)});true"})
         if cmd in ("wait", "noop"):
@@ -1222,7 +1253,25 @@ def _selftest_targeting():
                            "effect_registered": True}, {"url": "u"}, {"url": "u2"})
     assert v2["verdict"] == "bug" and v2["bug"] and v2["blocking"] is True, v2
 
-    print("qa_explorer targeting/contract selftest: PASS (resolution + effect + retry-safe blame contract)")
+    # ORIGIN PINNING: a model-invented `goto` must never take the session off the app under test. This is a
+    # regression guard for a real stall — a post-fix re-observation navigated to http://localhost:3000 while
+    # the app served 127.0.0.1:8871, hit chrome-error for 22 steps, and reported an ALREADY-FIXED bug as
+    # unfixed, so the QA loop never converged.
+    _b = BrowserBridge.__new__(BrowserBridge)
+    _b.target_url = "http://127.0.0.1:8871"
+    assert _b._pin_origin("http://localhost:3000") == "http://127.0.0.1:8871"
+    assert _b._pin_origin("http://localhost:3000/settings") == "http://127.0.0.1:8871/settings"
+    assert _b._pin_origin("http://127.0.0.1:8871/") == "http://127.0.0.1:8871/"      # correct origin untouched
+    assert _b._pin_origin("/admin?x=1") == "http://127.0.0.1:8871/admin?x=1"          # relative resolves
+    # a bad host inside a QUERY PARAM is a legitimate data-source-failure test and must survive intact
+    _q = "http://127.0.0.1:8871/?stateUrl=http://invalid-nonexistent-hostname-12345.test/s.json"
+    assert _b._pin_origin(_q) == _q
+    assert _b._pin_origin("") == "http://127.0.0.1:8871" and _b._pin_origin(None) == "http://127.0.0.1:8871"
+    _nb = BrowserBridge.__new__(BrowserBridge); _nb.target_url = ""                   # unconfigured -> no rewrite
+    assert _nb._pin_origin("http://x/y") == "http://x/y"
+
+    print("qa_explorer targeting/contract selftest: PASS (resolution + effect + retry-safe blame contract; "
+          "goto pinned to the app's own origin)")
 
 
 def _selftest_reobserve():

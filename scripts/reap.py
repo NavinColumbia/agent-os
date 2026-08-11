@@ -33,6 +33,9 @@ BUILD_ABANDON_H = int(os.environ.get("AOS_BUILD_ABANDON_H", "12"))         # no-
 # A research run legitimately takes ~10-30 min and the controller stretches its own estimate to ~92 before
 # complaining. 2h therefore only ever catches a run whose worker actually died.
 RESEARCH_ABANDON_MIN = int(os.environ.get("AOS_RESEARCH_ABANDON_MIN", "120"))
+# The worker beats every ~45s and the generic job reaper calls a worker dead after 180s. 10 min is far
+# beyond both, so a lapse this long means the process is genuinely gone — not merely slow.
+RESEARCH_HEARTBEAT_LAPSE_MIN = int(os.environ.get("AOS_RESEARCH_HB_LAPSE_MIN", "10"))
 
 
 def _reap_reason(ppid, etimes, max_s=MAX_RUNTIME_S):
@@ -204,10 +207,30 @@ def _sweep_stale_research(dry=False):
     try:
         import psycopg
         with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""SELECT id, thread_id FROM research_runs
-                            WHERE status='running' AND finished_at IS NULL
-                              AND started_at < now() - make_interval(mins => %s)""",
-                        (RESEARCH_ABANDON_MIN,))
+            # PREFER THE HEARTBEAT. The controller job behind this run beats every ~45s from a background
+            # timer, independent of output — a lapsed beat means the WORKER PROCESS is gone, which is the
+            # precise fact we need and is knowable in minutes rather than hours. It is only unused here
+            # because the generic heartbeat reaper deliberately skips RESEARCH (phase <> 'RESEARCH', to
+            # avoid double-advancing a run the research reconcile owns), while that reconcile waits on a
+            # status only the dead worker could write. Each decision is defensible; together they left the
+            # one trustworthy liveness signal unread for exactly the phase that cannot self-report.
+            # Observed: worker died 23:20, heartbeat stopped 23:20, run was not marked failed until 00:27 —
+            # 67 minutes of the CEO being told "still running".
+            # The elapsed-time rule stays as a backstop for a run with no job row at all.
+            cur.execute("""SELECT DISTINCT r.id, r.thread_id
+                             FROM research_runs r
+                             LEFT JOIN LATERAL (
+                                  SELECT j.heartbeat_at, j.status
+                                    FROM controller_jobs j
+                                   WHERE j.thread_id = r.thread_id AND j.kind = 'research'
+                                   ORDER BY j.id DESC LIMIT 1) j ON TRUE
+                            WHERE r.status='running' AND r.finished_at IS NULL
+                              AND (
+                                    (j.heartbeat_at IS NOT NULL
+                                     AND j.heartbeat_at < now() - make_interval(mins => %s))
+                                 OR r.started_at < now() - make_interval(mins => %s)
+                              )""",
+                        (RESEARCH_HEARTBEAT_LAPSE_MIN, RESEARCH_ABANDON_MIN))
             stale = cur.fetchall()
             if dry or not stale:
                 return len(stale)

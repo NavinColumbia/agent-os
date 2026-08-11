@@ -494,9 +494,19 @@ def _spawn_parked_worker(thread_id, kind, jid):
     """Launch the phase in a DETACHED worker process (start_new_session so it survives THIS process's death
     and isn't killed by the driver's signals). Returns True if launched, False to fall back to in-process."""
     try:
+        # Keep the worker's own output. It used to go to DEVNULL, so when a parked worker died there was
+        # NOTHING to diagnose from — a research run vanished at 23:20 and the only evidence left anywhere
+        # was a heartbeat that stopped. A detached worker is precisely the process you cannot watch, so
+        # discarding its stderr throws away the one record of why it went. Per-job file, appended, cheap.
+        _log_dir = Path(os.environ.get("AOS_WORKER_LOG_DIR", Path(__file__).resolve().parents[1] / "logs" / "workers"))
+        try:
+            _log_dir.mkdir(parents=True, exist_ok=True)
+            _log = open(_log_dir / f"job-{jid}.log", "ab", buffering=0)
+        except Exception:
+            _log = subprocess.DEVNULL          # never let logging failure block the dispatch
         p = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "run_job", str(thread_id), kind, str(jid)],
-            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, stdout=_log, stderr=_log,
             cwd=str(Path(__file__).resolve().parent))
         try:                                             # record the worker pid so parked work is observable
             with psycopg.connect(DB) as c, c.cursor() as cur:

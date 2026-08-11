@@ -19,7 +19,16 @@ import os
 import subprocess
 import sys
 
-MAX_AGE_S = int(os.environ.get("AOS_CLAUDE_MAX_S", "900"))    # a real claude call never legitimately runs this long
+# The ceiling must sit ABOVE the longest budget factory actually hands an agent, or this reaper kills real
+# work. It was 900s under the belief that "a real claude call never legitimately runs this long" — but
+# factory._fast_estimate budgets a HEAVY agent (build/engineer/research/architect/qa) up to 25 MINUTES, and
+# component builds genuinely take 6-15 min. So every build in the 15-25 min band was killed by design.
+# Measured on 2026-08-11 in one run: BUILD:retention_engine died at 907s and BUILD:web_ui_dom_charts at
+# 912s — both matching a ReapHungClaude audit entry to the SECOND — throwing away ~15 min of finished work
+# each, then paying to rebuild them. Two of 82 build-minutes lost to a guard meant to protect throughput.
+# 2400s matches reap.py's MAX_RUNTIME_S so the two reapers no longer disagree, and clears factory's 25-min
+# heavy budget with margin. Hung calls are still caught — 40 min is far beyond any real agent.
+MAX_AGE_S = int(os.environ.get("AOS_CLAUDE_MAX_S", "2400"))
 
 
 def _is_headless_agent(args: str) -> bool:

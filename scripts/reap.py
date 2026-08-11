@@ -30,6 +30,9 @@ SCRATCH_MAX_AGE_S = int(os.environ.get("AOS_SCRATCH_MAX_AGE", "3600")) # 1 h
 SCRATCH_GLOBS = ["codexrun-*", "improve-*", "research-*", "webqa-*.png"]
 BROWSER_STALE_S = int(os.environ.get("AOS_BROWSER_STALE_MIN", "60")) * 60  # 60 min — far beyond any live QA run
 BUILD_ABANDON_H = int(os.environ.get("AOS_BUILD_ABANDON_H", "12"))         # no-outcome build after 12h = dead (sentinel WARNs at 3h)
+# A research run legitimately takes ~10-30 min and the controller stretches its own estimate to ~92 before
+# complaining. 2h therefore only ever catches a run whose worker actually died.
+RESEARCH_ABANDON_MIN = int(os.environ.get("AOS_RESEARCH_ABANDON_MIN", "120"))
 
 
 def _reap_reason(ppid, etimes, max_s=MAX_RUNTIME_S):
@@ -158,12 +161,13 @@ def reap(dry=False):
     stale_browsers = _sweep_browsers(dry)             # reap leaked playwright browsers (orphaned/very old)
     stale_runs = _sweep_stale_runs(dry)               # abandon crashed 'running' orchestra runs (inflate counts)
     stuck_builds = _sweep_stuck_builds(dry)           # auto-resolve builds looping with no outcome (>12h)
+    dead_research = _sweep_stale_research(dry)        # fail research whose worker died (else "still running" forever)
     if killed and not dry:
         audit.append(actor="reap", action="ReapAgents", resource="orphans", decision="killed",
                      payload={"count": len(killed), "pids": [k["pid"] for k in killed][:10]})
     return {"reaped": killed, "scratch_cleaned": cleaned, "stale_directory_released": stale_dir,
             "stale_browsers_reaped": stale_browsers, "stale_runs_abandoned": stale_runs,
-            "stuck_builds_abandoned": stuck_builds}
+            "stuck_builds_abandoned": stuck_builds, "dead_research_failed": dead_research}
 
 
 def _sweep_stale_runs(dry=False):
@@ -176,6 +180,46 @@ def _sweep_stale_runs(dry=False):
         sys.path.insert(0, str(SCRIPTS / "orchestra"))
         import store
         return store.abandon_stale_runs()
+    except Exception:
+        return 0
+
+
+def _sweep_stale_research(dry=False):
+    """Fail a research run whose worker is gone, so the CEO stops being told it is still running.
+
+    THE GAP THIS CLOSES (finding #752, reproduced 2026-08-10): research_runs is only ever updated from
+    INSIDE the worker (research.py) — it marks itself done. When the worker dies, nothing flips the row, so
+    it stays 'running' forever. loopcontroller's recovery loop reconciles a RESEARCH thread against that
+    status and handles 'done' and 'failed' correctly, but a permanently-'running' row falls into its
+    `else: continue  # still running — leave it` branch, so the recovery machinery that already exists
+    never fires. Observed: run 532 sat 'running' for 94 minutes with NO worker process, NO claude CLI and
+    NO trace for an hour, while the controller kept telling the CEO "still running (89m elapsed; expecting
+    up to ~92 min)" and simply extended the estimate. That is the "silent loss of directed work with a
+    false-green cockpit" bug: the work was gone and every surface reported healthy.
+
+    Marking it 'failed' is all that is needed — the controller's existing reconcile then surfaces the
+    failure to the thread on its next tick. DELIBERATELY GENEROUS (default 2h): the longest legitimate run
+    seen is ~30 min and the controller itself extends to ~92, so this only ever catches genuinely dead
+    work, never a slow-but-live run. Fail-open; dry-run mutates nothing."""
+    try:
+        import psycopg
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT id, thread_id FROM research_runs
+                            WHERE status='running' AND finished_at IS NULL
+                              AND started_at < now() - make_interval(mins => %s)""",
+                        (RESEARCH_ABANDON_MIN,))
+            stale = cur.fetchall()
+            if dry or not stale:
+                return len(stale)
+            cur.execute("""UPDATE research_runs SET status='failed', finished_at=now()
+                            WHERE id = ANY(%s)""", ([r[0] for r in stale],))
+            c.commit()
+        audit.append(actor="reap", action="ResearchAbandoned", resource="research_runs",
+                     decision="failed", payload={"ids": [r[0] for r in stale],
+                                                 "threads": [r[1] for r in stale],
+                                                 "after_min": RESEARCH_ABANDON_MIN,
+                                                 "reason": "worker gone; run never reached a terminal state"})
+        return len(stale)
     except Exception:
         return 0
 

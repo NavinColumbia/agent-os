@@ -1051,6 +1051,11 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
             _set(thread_id, awaiting=None, pending_intent=None)
             _advance_owned(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True, "retried": True}
+        if _is_proceed(msg):                       # a prescribed affirmative — never a model call away
+            _resume_halts(thread_id)
+            _set(thread_id, awaiting=None)
+            _advance_owned(thread_id)
+            return {"phase": _st(thread_id)["phase"], "advanced": True}
         intent = _classify_intent(tid, thread_id, msg, phase, s["awaiting"], api_key=api_key)
         if intent["verdict"] in ("approve", "proceed"):
             _resume_halts(thread_id)   # a 'retry' after a cancel() must lift the halt before re-dispatching
@@ -1065,7 +1070,8 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         _report(tid, thread_id, "Got it — I'll fold that in and rework it, not push it through.")
         return {"phase": phase}
     if s["awaiting"] == "credentials":
-        if _classify_intent(tid, thread_id, msg, phase, "credentials", api_key=api_key)["verdict"] in ("approve", "proceed"):
+        # 'say "ready"' is what we tell them here — honour it directly.
+        if _is_proceed(msg) or _classify_intent(tid, thread_id, msg, phase, "credentials", api_key=api_key)["verdict"] in ("approve", "proceed"):
             _resume_halts(thread_id)
             _set(thread_id, awaiting=None); _advance_owned(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
@@ -2065,14 +2071,38 @@ _RETRY_RE = re.compile(
     r"(?:\s+it)?(?:\s+please)?[.!\s]*$", re.I)
 
 
+# The affirmatives the product PRESCRIBES at a gate: 'say "ready"' appears in five places (provider
+# connected, consent accepted, quota raised, credentials supplied), 'say "go ahead"' in another. Same rule
+# as retry: a word we instruct the CEO to type must be understood deterministically. Routing it through the
+# LLM classifier is what turned "retry" into filed feedback and stranded a thread with no way out.
+_PROCEED_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?[,\s]+|yes[,\s]+|yep[,\s]+|sure[,\s]+|please\s+|just\s+)*"
+    r"(?:ready|go\s*ahead|go|continue|proceed|carry\s+on|keep\s+going|resume|done)"
+    r"(?:\s+now|\s+please|\s+with\s+it)?[.!\s]*$", re.I)
+
+_NEGATION_RE = re.compile(r"\b(?:do\s*n[o']?t|dont|do not|never|no\s+need|not\s+yet|hold\s+off|wait|stop|cancel|abort)\b", re.I)
+
+
+def _standalone(msg, pattern, max_len=40):
+    """True only for an unambiguous, STANDALONE instruction: short, unnegated, and matching end-to-end.
+    Anything longer or hedged ("retry but only after we check the budget") falls through to the real
+    classifier, which is the right owner for genuine prose."""
+    t = str(msg or "").strip()
+    if not t or len(t) > max_len:
+        return False
+    if _NEGATION_RE.search(t):
+        return False
+    return bool(pattern.match(t))
+
+
 def _is_retry(msg):
     """True only for an unambiguous, standalone retry instruction (never for a negated or embedded one)."""
-    t = str(msg or "").strip()
-    if not t or len(t) > 40:
-        return False
-    if re.search(r"\b(?:do\s*n[o']?t|dont|never|no\s+need|stop|cancel)\b", t, re.I):
-        return False
-    return bool(_RETRY_RE.match(t))
+    return _standalone(msg, _RETRY_RE)
+
+
+def _is_proceed(msg):
+    """True only for an unambiguous, standalone go-ahead — the affirmatives the product tells the CEO to say."""
+    return _standalone(msg, _PROCEED_RE)
 
 
 def _classify_intent(tid, thread_id, msg, phase, awaiting, options=None, api_key=None):

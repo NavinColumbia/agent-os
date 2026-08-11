@@ -1040,6 +1040,17 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         return {"phase": phase}
 
     if s["awaiting"] in ("user_feedback", "user_approval"):
+        # DETERMINISTIC RETRY. When a phase fails we tell the CEO verbatim: 'say "retry" to run it again'.
+        # Routing that word through the LLM intent classifier meant it could come back as 'revise', which
+        # files it as FEEDBACK — so the one recovery instruction the product gives was swallowed. Observed
+        # on thread 2090: the research failed, the CEO said "retry", and got "Got it — I'll fold that in and
+        # rework it" while pending_intent quietly grew and nothing re-ran. A word we ourselves prescribe must
+        # not depend on a model call to be understood.
+        if _is_retry(msg):
+            _resume_halts(thread_id)
+            _set(thread_id, awaiting=None, pending_intent=None)
+            _advance_owned(thread_id)
+            return {"phase": _st(thread_id)["phase"], "advanced": True, "retried": True}
         intent = _classify_intent(tid, thread_id, msg, phase, s["awaiting"], api_key=api_key)
         if intent["verdict"] in ("approve", "proceed"):
             _resume_halts(thread_id)   # a 'retry' after a cancel() must lift the halt before re-dispatching
@@ -1190,6 +1201,11 @@ def advance(thread_id, job_result=None):
             text = (f"⚠️ The **{phase}** step hit a problem and stopped: {err}. "
                     f"Tell me how you'd like to proceed, or say \"retry\" to run it again.")
             meta_kind = "job_failed"
+        # Clear the live-progress fields. Without this the thread keeps reporting the LAST in-flight status
+        # ("Still working — this one's taking a little longer…") for a job that has already failed, so the
+        # status line contradicts the failure message directly above it. Observed on thread 2090 hours after
+        # the run died.
+        _job_clear(thread_id)
         _report(tid, thread_id, text, {"kind": meta_kind, "phase": phase}, urgent=True)
         audit.append(actor="loopcontroller", action="JobFailed", resource=str(thread_id), decision=phase,
                      payload={"error": str(err)[:200]})
@@ -2038,6 +2054,25 @@ _INTENT_SYS = (
     "status: asks about progress, e.g. 'done yet?'. cancel: stop/halt. steer: a new instruction to fold in. "
     "question: asks something. If unsure between approve and any negative reading, do not pick approve."
 )
+
+
+# Phrasings that mean "run that step again", as a STANDALONE instruction. Deliberately narrow: it must be
+# the whole message (modulo punctuation/politeness), so "don't retry" or a sentence merely containing the
+# word is left to the real classifier. Negation-safety is a property the selftest asserts.
+_RETRY_RE = re.compile(
+    r"^\s*(?:please\s+|just\s+|ok(?:ay)?[,\s]+)*"
+    r"(?:retry|re-?try|rerun|re-?run|try\s+again|run\s+it\s+again|start\s+it\s+again|go\s+again)"
+    r"(?:\s+it)?(?:\s+please)?[.!\s]*$", re.I)
+
+
+def _is_retry(msg):
+    """True only for an unambiguous, standalone retry instruction (never for a negated or embedded one)."""
+    t = str(msg or "").strip()
+    if not t or len(t) > 40:
+        return False
+    if re.search(r"\b(?:do\s*n[o']?t|dont|never|no\s+need|stop|cancel)\b", t, re.I):
+        return False
+    return bool(_RETRY_RE.match(t))
 
 
 def _classify_intent(tid, thread_id, msg, phase, awaiting, options=None, api_key=None):

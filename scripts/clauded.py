@@ -60,10 +60,24 @@ def stale(procs, max_age_s=MAX_AGE_S):
     return [pid for pid, age in procs if age > max_age_s]
 
 
-def reap(max_age_s=MAX_AGE_S):
+def _ceiling():
+    """Read the ceiling AT CALL TIME, not at import.
+
+    jobd imports this module once and then runs for days — it had been up 7 days holding MAX_AGE_S=900
+    from a stale import, so raising the constant in the file changed nothing for the daemon that does most
+    of the reaping. It kept killing live build agents and audited them as max_age_s:900 while the file on
+    disk said 2400. A long-lived daemon must re-read a limit that ops can change, or the config is a lie."""
+    try:
+        return int(os.environ.get("AOS_CLAUDE_MAX_S") or MAX_AGE_S)
+    except ValueError:
+        return MAX_AGE_S
+
+
+def reap(max_age_s=None):
     """Kill every `claude` process older than the ceiling (orphaned/hung). Kills the pid directly (NOT the
     process group — the group may contain a live parent driver we must not touch). Best-effort. Returns a
     summary. This frees subscription capacity so healthy calls stop throttling."""
+    max_age_s = _ceiling() if max_age_s is None else max_age_s
     victims = stale(claude_procs(), max_age_s)
     killed = []
     for pid in victims:

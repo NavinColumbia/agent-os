@@ -84,6 +84,21 @@ def reap(max_age_s=MAX_AGE_S):
     return {"reaped": len(killed), "pids": killed, "checked": len(claude_procs())}
 
 
+def _budget_ceiling_ok():
+    """The reaper ceiling MUST exceed the longest budget factory hands an agent, or this reaper kills real
+    work mid-flight. They drifted apart once (reaper 900s vs a 25-minute heavy budget) and it silently
+    killed two finished component builds, so the invariant is asserted rather than trusted to a comment."""
+    try:
+        import factory
+        # the estimator's heaviest bucket: a long prompt to a build/engineer role
+        mins, _rets = factory._heuristic_estimate("backend-engineer", "x" * 4000)
+        return MAX_AGE_S > mins * 60, mins
+    except Exception as e:
+        # A guard that silently passes is worse than no guard: if the budget function is gone or renamed,
+        # SAY so rather than reporting green on an invariant that was never evaluated.
+        return False, ("uncheckable: " + str(e)[:80])
+
+
 def _selftest():
     # pure age-filter: only procs strictly older than the ceiling are stale.
     procs = [(101, 30), (102, 599), (103, 600), (104, 601), (105, 3600)]
@@ -99,6 +114,9 @@ def _selftest():
     # claude_procs returns well-formed tuples (may be empty here — that's fine)
     for pid, age in claude_procs():
         assert isinstance(pid, int) and isinstance(age, int)
+    ok, mins = _budget_ceiling_ok()
+    assert ok, (f"reaper ceiling {MAX_AGE_S}s must exceed factory's heaviest agent budget "
+                f"({mins} min) — otherwise it kills builds that are still working")
     print("clauded selftest: PASS (reaps only stale HEADLESS agent calls; interactive sessions never touched)")
     return 0
 

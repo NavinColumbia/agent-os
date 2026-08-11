@@ -683,6 +683,66 @@ def thread_for_org(tid, org_id):
     return start(tid, org_id)["thread_id"]
 
 
+def _decision_brief(s):
+    """The work-so-far the planning phase is supposed to build on: the ORIGINAL ask, the direction the CEO
+    picked, and the headline findings behind it.
+
+    None of this reached the model before. _llm sends the system prompt, the last 12 chat turns, and
+    _ctx_brief — which returns '' whenever org_id is falsy. The substance lives in controller_state
+    (chosen_option, brief) and in the research report, not in the chat text, so after picking an option the
+    planner saw only "Great — going with that direction." / "go ahead" and said so out loud: "I don't have
+    visibility into the direction you just chose — the earlier research options and your selection didn't
+    come through in my context." It then invented an unrelated product (a personal-finance app, for a
+    directive about AWS cost reduction). Losing the decision between phases turns a research run the CEO
+    paid for into confident fiction."""
+    bits = []
+    try:
+        brief = s.get("brief") or {}
+        q = (brief.get("question") or brief.get("vision") or "").strip() if isinstance(brief, dict) else ""
+        if q:
+            bits.append("ORIGINAL ASK: " + q[:400])
+    except Exception:
+        pass
+    try:
+        ch = s.get("chosen_option") or {}
+        if isinstance(ch, dict) and ch.get("title"):
+            bits.append("DIRECTION THE CEO CHOSE: " + str(ch["title"])
+                        + ((" — " + str(ch.get("summary"))[:400]) if ch.get("summary") else ""))
+    except Exception:
+        pass
+    rep = _research_headline(s)
+    if rep:
+        bits.append("WHAT THE RESEARCH FOUND (headline):\n" + rep)
+    if not bits:
+        return ""
+    return ("\n\nWORK SO FAR — build on THIS; do not ask the CEO to restate it:\n"
+            + "\n\n".join(bits))
+
+
+def _research_headline(s, max_chars=1800):
+    """The lead section of the run's report, if it produced one. Bounded: enough to ground the plan in what
+    was actually found, small enough not to crowd the prompt."""
+    try:
+        rid = s.get("research_run_id")
+        if not rid:
+            return ""
+        with psycopg.connect(DB) as c, c.cursor() as cur:
+            cur.execute("SELECT report_path FROM research_runs WHERE id=%s AND status='done'", (int(rid),))
+            row = cur.fetchone()
+        if not row or not row[0]:
+            return ""
+        from pathlib import Path as _P
+        txt = _P(row[0]).read_text(errors="replace")
+        # take the report's own lead section rather than a blind head(): reports start with a title block
+        # then '## 1. Key findings'.
+        i = txt.find("## 1.")
+        if i == -1:
+            i = 0
+        return txt[i:i + max_chars].strip()
+    except Exception:
+        return ""
+
+
 def _ctx_brief(s):
     try:
         import orgs
@@ -993,7 +1053,8 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
                 "plan: <bullets incl. the impact map, invariants/edge cases, parallelization, and done checks; one per line '- '>\n"
                 "agentic: <free-text: the agentic feature(s) the CEO wants + how each is invoked (button/event-async/"
                 "schedule), or 'none'>\ncharter: <2-4 sentences incl. the team/external surfaces to build in>\n[[/PLAN]]"
-                + _ceo_context(tid, s.get("org_id")))   # ground the plan in the CEO's standing vision + reqs
+                + _ceo_context(tid, s.get("org_id"))    # ground the plan in the CEO's standing vision + reqs
+                + _decision_brief(s))                   # ...and in the ask/decision/findings this phase exists to serve
         reply = _llm(tid, thread_id, sysp, s, on_delta=on_delta)
         pb = _parse_block(reply, "PLAN")
         clean = re.sub(r"\[\[PLAN\]\].*?\[\[/PLAN\]\]", "", reply, flags=re.S | re.I).strip()

@@ -2174,6 +2174,16 @@ def _selftest():
     import time
     import billing
     import orgs as _orgs
+    # RUN IN-PROCESS. The selftest stubs research.start/factory.agent by monkeypatching this module, but
+    # park mode (default ON) dispatches each phase to a DETACHED WORKER — a fresh process that re-imports
+    # everything and therefore sees NONE of those stubs. So the "stubbed" RESEARCH phase was starting a
+    # REAL fleet run: three invocations on 2026-08-11 spawned research runs 533/534/535 ("How to build a
+    # YouTube competitor", the fixture question) at $9.27 + $10.19 + $8.99 = $28.45 of real spend, plus
+    # ~15 minutes each of live agents. A test must not be able to spend money. Park mechanics have their
+    # own dedicated coverage in park_selftest(), which asserts them deliberately rather than by accident.
+    global _PARK
+    _park_was = _PARK
+    _PARK = False
     tid = billing.signup("loopctl-selftest", "free")["tenant_id"]
     org = _orgs.create(tid, "Test Org", "a test")["org_id"]
     real_agent = factory.agent
@@ -2502,6 +2512,7 @@ def _selftest():
         print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel"
               " + consent-reask/sla/status-honesty + A2 agentic-intent-gate ✅" if ok else "FAIL")
     finally:
+        _PARK = _park_was
         factory.agent = real_agent
         if real_build is not None:
             factory.build_product = real_build

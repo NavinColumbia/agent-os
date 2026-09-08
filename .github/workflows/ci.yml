@@ -25,7 +25,16 @@ jobs:
         with:
           python-version: '3.12'
       - name: deps
-        run: python -m venv .venv && .venv/bin/pip install -q -r requirements.txt pytest
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -q --upgrade pip==26.1.2
+          # Legacy tests still exercise the strangler runtime. V2 production
+          # dependencies are exact-pinned by pyproject and its hash lock.
+          .venv/bin/pip install -q -r requirements.txt
+          .venv/bin/pip install -q -r pylock.toml
+          .venv/bin/pip install -q --no-deps -e .
+          .venv/bin/pip install -q pytest==9.1.1 httpx==0.28.1
+          .venv/bin/pip check
       - name: config
         # aoscfg.py resolves .env.local and the venv relative to the repo root (falling back to the prod
         # home path), so a plain repo-root .env.local is all CI needs — no symlink, no home-path duplication.

@@ -34,6 +34,26 @@ prior-node output into immutable, content-addressed evidence. Their bootstrap Po
 per object; large source bundles, build outputs, and release images still require the object/OCI-store adapter.
 No model-controlled shell command is executed by this adapter.
 
+`sandbox.run` is available only when a dedicated development/CI worker sets
+`AOS_V2_SANDBOX_BACKEND=docker`. The local adapter accepts an immutable Agent OS source bundle, uses direct argv
+inside a digest-pinned image, denies networking, runs as a non-root UID, mounts only an ephemeral workspace,
+drops every Linux capability, enables `no-new-privileges`, and caps time, memory, CPU, PIDs, file count, artifact
+bytes, and captured logs. It uses `--pull never` and never falls back to host execution, so the pinned image must
+be pre-pulled. Do not mount the Docker socket into the API or general worker container; the hosted adapter remains
+a separate Cloud Run Job/GKE sandbox boundary.
+
+For a dedicated local runner host:
+
+```bash
+docker pull python:3.12-slim-trixie@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+export AOS_V2_SANDBOX_BACKEND=docker
+agentos-v2 worker
+```
+
+Docker exit 125 is treated as retryable infrastructure failure and is not cached as customer output. Customer
+command failures and hard timeouts retain their bounded result/output evidence and may follow an explicitly
+declared repair edge.
+
 ## Configuration
 
 Required for the worker:
@@ -68,5 +88,5 @@ docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --bui
 ```
 
 It starts PostgreSQL, applies only the isolated V2 migrations (86–90), and then starts the API and worker from the exact
-same non-root image. Hosted OIDC/signup, secrets management, external-effect adapters, sandbox/build tools,
-large-object storage, metering, and managed-cloud IaC are still launch blockers.
+same non-root image. Hosted OIDC/signup, secrets management, external-effect adapters, a hosted sandbox/build
+adapter, large-object storage, metering, and managed-cloud IaC are still launch blockers.

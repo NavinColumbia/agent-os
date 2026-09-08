@@ -42,3 +42,6 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "88-workflow-action-leases-v2.sql" in compose
     assert "89-notifications-v2.sql" in compose
     assert "90-artifacts-v2.sql" in compose
+    env_example = (ROOT / "deploy" / "v2.env.example").read_text()
+    assert "AOS_V2_SANDBOX_BACKEND=disabled" in env_example
+    assert "@sha256:" in env_example

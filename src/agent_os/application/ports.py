@@ -349,6 +349,10 @@ class ArtifactStore(Protocol):
         self, organization_id: str, artifact_id: str,
     ) -> Mapping[str, Any] | None: ...
 
+    def find_by_idempotency_key(
+        self, organization_id: str, idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
+
 
 @runtime_checkable
 class SandboxRunner(Protocol):

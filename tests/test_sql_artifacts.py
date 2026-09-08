@@ -54,6 +54,8 @@ def test_artifacts_are_content_addressed_idempotent_and_tenant_isolated(store):
         "media_type": "text/plain",
         "created_at": "2026-09-08T16:00:00+00:00",
     }
+    assert store.find_by_idempotency_key("tenant-a", "request-one")["artifact_id"] == first
+    assert store.find_by_idempotency_key("tenant-b", "request-one") is None
 
 
 def test_artifact_request_key_conflicts_and_size_limit_fail_closed(store):

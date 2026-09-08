@@ -145,3 +145,8 @@ def test_worker_settings_require_explicit_model_and_production_tenants(monkeypat
     settings = WorkerSettings.from_env()
     assert settings.organization_ids == ("tenant-a", "tenant-b")
     assert settings.model == "provider:model"
+    assert settings.sandbox_backend == "disabled"
+
+    monkeypatch.setenv("AOS_V2_SANDBOX_BACKEND", "host")
+    with pytest.raises(ValueError, match="must be disabled or docker"):
+        WorkerSettings.from_env()

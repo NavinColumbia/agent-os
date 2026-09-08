@@ -20,6 +20,12 @@ class ArtifactToolNodeHandlers:
     def handlers(self):
         return {NodeKind.TOOL: self.execute}
 
+    def named_handlers(self):
+        return {
+            "artifact.publish_text": self.execute,
+            "artifact.publish_json": self.execute,
+        }
+
     @staticmethod
     def _source_value(state: WorkflowRunState, configuration: Mapping[str, Any]) -> Any:
         has_value = "value" in configuration

@@ -236,5 +236,21 @@ class SQLArtifactStore(ArtifactStore):
             ))).scalar_one_or_none()
         return None if value is None else dict(value)
 
+    def find_by_idempotency_key(
+        self, organization_id: str, idempotency_key: str,
+    ) -> Mapping[str, Any] | None:
+        with self._tenant_connection(organization_id) as connection:
+            artifact_id = connection.execute(select(artifact_writes.c.artifact_id).where(and_(
+                artifact_writes.c.tenant_id == organization_id,
+                artifact_writes.c.idempotency_key == idempotency_key,
+            ))).scalar_one_or_none()
+            if artifact_id is None:
+                return None
+            value = connection.execute(select(artifacts.c.record).where(and_(
+                artifacts.c.tenant_id == organization_id,
+                artifacts.c.artifact_id == artifact_id,
+            ))).scalar_one()
+        return dict(value)
+
     def close(self) -> None:
         self._engine.dispose()

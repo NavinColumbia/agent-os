@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, replace
 import json
 import os
+import shutil
 import signal
 import socket
 from threading import Event
@@ -21,13 +22,16 @@ from agent_os.infrastructure.agent_command_executor import DurableAgentCommandEx
 from agent_os.infrastructure.artifact_tool_nodes import ArtifactToolNodeHandlers
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
+from agent_os.infrastructure.docker_sandbox import DEFAULT_PYTHON_IMAGE, DockerSandboxRunner
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
 from agent_os.infrastructure.notification_effects import NotificationEffectHandlers
 from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
+from agent_os.infrastructure.sandbox_tool_nodes import SandboxToolNodeHandlers
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
+from agent_os.infrastructure.tool_node_router import GraphToolNodeRouter
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -70,6 +74,9 @@ class WorkerSettings:
     request_timeout_seconds: float
     max_turn_budget_cents: int
     retry_max_attempts: int | None
+    sandbox_backend: str
+    sandbox_image: str
+    sandbox_timeout_seconds: int
 
     @classmethod
     def from_env(cls, *, organization_ids: Sequence[str] = ()) -> "WorkerSettings":
@@ -91,6 +98,9 @@ class WorkerSettings:
         retry_max_attempts = None
         if max_attempts_raw:
             retry_max_attempts = _positive_int("AOS_V2_RETRY_MAX_ATTEMPTS", 1)
+        sandbox_backend = os.getenv("AOS_V2_SANDBOX_BACKEND", "disabled").strip().lower()
+        if sandbox_backend not in {"disabled", "docker"}:
+            raise ValueError("AOS_V2_SANDBOX_BACKEND must be disabled or docker")
         worker_id = os.getenv("AOS_V2_WORKER_ID", "").strip()
         if not worker_id:
             worker_id = f"{socket.gethostname()}:{os.getpid()}"
@@ -107,6 +117,9 @@ class WorkerSettings:
             request_timeout_seconds=_positive_float("AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS", 120),
             max_turn_budget_cents=_positive_int("AOS_V2_MAX_TURN_COST_CENTS", 100),
             retry_max_attempts=retry_max_attempts,
+            sandbox_backend=sandbox_backend,
+            sandbox_image=os.getenv("AOS_V2_SANDBOX_IMAGE", DEFAULT_PYTHON_IMAGE).strip(),
+            sandbox_timeout_seconds=_positive_int("AOS_V2_SANDBOX_TIMEOUT_SECONDS", 300),
         )
 
     def with_organizations(self, organization_ids: Sequence[str]) -> "WorkerSettings":
@@ -152,6 +165,19 @@ def run_worker(
         resources.callback(artifact_store.close)
         notification_effects = NotificationEffectHandlers(notification_store)
         artifact_tools = ArtifactToolNodeHandlers(artifact_store)
+        named_tool_handlers = dict(artifact_tools.named_handlers())
+        if settings.sandbox_backend == "docker":
+            docker_binary = shutil.which("docker")
+            if docker_binary is None:
+                raise ValueError("Docker sandbox backend is enabled but docker is unavailable")
+            sandbox_runner = DockerSandboxRunner(
+                artifact_store,
+                image=settings.sandbox_image,
+                docker_binary=docker_binary,
+                timeout_seconds=settings.sandbox_timeout_seconds,
+            )
+            named_tool_handlers.update(SandboxToolNodeHandlers(sandbox_runner).named_handlers())
+        tool_router = GraphToolNodeRouter(named_tool_handlers)
         runtime = PydanticAgentRuntime(
             settings.model,
             request_limit=settings.request_limit,
@@ -179,7 +205,7 @@ def run_worker(
         )
         graph_runtime = PydanticGraphNodeRuntime(
             settings.model,
-            handlers=artifact_tools.handlers(),
+            handlers=tool_router.handlers(),
             request_limit=settings.request_limit,
             output_tokens_limit=settings.output_tokens_limit,
             request_timeout_seconds=settings.request_timeout_seconds,

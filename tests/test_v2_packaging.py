@@ -41,3 +41,4 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "service_completed_successfully" in compose
     assert "88-workflow-action-leases-v2.sql" in compose
     assert "89-notifications-v2.sql" in compose
+    assert "90-artifacts-v2.sql" in compose

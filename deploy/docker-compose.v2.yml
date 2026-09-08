@@ -39,6 +39,7 @@ services:
       - ../postgres/initdb/87-workflow-graphs-v2.sql:/migrations/87-workflow-graphs-v2.sql:ro
       - ../postgres/initdb/88-workflow-action-leases-v2.sql:/migrations/88-workflow-action-leases-v2.sql:ro
       - ../postgres/initdb/89-notifications-v2.sql:/migrations/89-notifications-v2.sql:ro
+      - ../postgres/initdb/90-artifacts-v2.sql:/migrations/90-artifacts-v2.sql:ro
     command:
       - sh
       - -ec
@@ -47,6 +48,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/87-workflow-graphs-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/88-workflow-action-leases-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/89-notifications-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/90-artifacts-v2.sql
     restart: "no"
 
   api:

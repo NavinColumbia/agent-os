@@ -24,9 +24,15 @@ external publication actions stay fail-closed until an idempotent adapter is reg
 
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
-email, Slack, SMS, and push remain separate adapters. `schedule_retry`, `cancel_active_operation`, tool execution,
-and subworkflows still require explicitly registered executors; until those adapters exist, the router marks the
-effect failed with a durable explanation rather than reporting an operation that did not happen.
+email, Slack, SMS, and push remain separate adapters. `schedule_retry`, `cancel_active_operation`, arbitrary
+external/sandbox tool execution, and subworkflows still require explicitly registered executors; until those
+adapters exist, the router marks the effect failed with a durable explanation rather than reporting an operation
+that did not happen.
+
+The first allowlisted graph tools, `artifact.publish_text` and `artifact.publish_json`, turn literal or durable
+prior-node output into immutable, content-addressed evidence. Their bootstrap PostgreSQL store is capped at 2 MiB
+per object; large source bundles, build outputs, and release images still require the object/OCI-store adapter.
+No model-controlled shell command is executed by this adapter.
 
 ## Configuration
 
@@ -61,6 +67,6 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–89), and then starts the API and worker from the exact
+It starts PostgreSQL, applies only the isolated V2 migrations (86–90), and then starts the API and worker from the exact
 same non-root image. Hosted OIDC/signup, secrets management, external-effect adapters, sandbox/build tools,
-artifact storage, metering, and managed-cloud IaC are still launch blockers.
+large-object storage, metering, and managed-cloud IaC are still launch blockers.

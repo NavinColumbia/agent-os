@@ -478,8 +478,9 @@ versioned workflow graphs, authenticated control API, structured PydanticAI role
 worker that fairly advances lifecycle commands and graph actions without a whole-story timeout or duplicate model
 spend after a crash. Agent/decision, correlated-human, and evidence-aggregating terminal graph nodes now execute;
 human/operator/completion communication has an idempotent tenant inbox and authenticated API projection. It
-also still has overlapping legacy controllers, local-host assumptions, unfinished public infrastructure, static
-early-tenant worker assignment, no production tool/subworkflow/effect adapters, and no complete
+also has an immutable, tenant-isolated small-artifact ledger and allowlisted artifact publication tool nodes. It
+still has overlapping legacy controllers, local-host assumptions, unfinished public infrastructure, static
+early-tenant worker assignment, no isolated build/deploy/subworkflow adapters, and no complete
 prompt-to-public-URL customer vertical.
 This is a real durable execution spine, not yet the finished platform.
 

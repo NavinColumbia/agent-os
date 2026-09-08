@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from agent_os.api.app import create_app
 from agent_os.api.auth import HMACTokenIdentity
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
+from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 
@@ -90,11 +91,17 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(notification_store.close)
+        artifact_store = SQLArtifactStore(
+            settings.application_database_url,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(artifact_store.close)
         app = create_app(
             engine=engine,
             identity=HMACTokenIdentity(settings.auth_secret),
             graph_engine=graph_engine,
             notification_store=notification_store,
+            artifact_store=artifact_store,
             shutdown=resources.close,
         )
     except Exception:
@@ -103,5 +110,6 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.workflow_engine = engine
     app.state.graph_workflow_engine = graph_engine
     app.state.notification_store = notification_store
+    app.state.artifact_store = artifact_store
     app.state.settings = settings
     return app

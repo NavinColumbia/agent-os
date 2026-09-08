@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from typing import Any, Mapping
 
 from fastapi.testclient import TestClient
@@ -16,6 +17,8 @@ class FakeIdentity:
             return {"sub": "human-b", "org": "org-b", "roles": ["owner"]}
         if authorization == "Bearer agent-a":
             return {"sub": "agent-a", "org": "org-a", "roles": ["agent"]}
+        if authorization == "Bearer viewer-a":
+            return {"sub": "viewer-a", "org": "org-a", "roles": ["viewer"]}
         raise ValueError("authentication required")
 
 
@@ -126,3 +129,87 @@ def test_notification_inbox_uses_authenticated_tenant_and_role_scope():
     assert owner.json()["items"][0]["notification_id"] == "notice-org-a"
     assert store.calls[0] == ("org-a", "run-1", None, 25)
     assert store.calls[1] == ("org-a", None, "agent-a", 100)
+
+
+def test_artifact_upload_download_and_metadata_are_tenant_scoped():
+    class FakeArtifacts:
+        def __init__(self):
+            self.values = {}
+
+        def put(self, *, organization_id, content, media_type, idempotency_key):
+            artifact_id = f"artifact-{organization_id}"
+            self.values[(organization_id, artifact_id)] = (
+                content,
+                {"artifact_id": artifact_id, "tenant_id": organization_id,
+                 "media_type": media_type, "digest": "digest"},
+            )
+            return artifact_id
+
+        def get(self, organization_id, artifact_id):
+            found = self.values.get((organization_id, artifact_id))
+            return None if found is None else found[0]
+
+        def describe(self, organization_id, artifact_id):
+            found = self.values.get((organization_id, artifact_id))
+            return None if found is None else found[1]
+
+    store = FakeArtifacts()
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(), artifact_store=store,
+    ))
+    uploaded = api.post(
+        "/v2/artifacts",
+        headers={"Authorization": "Bearer org-a", "Idempotency-Key": "artifact-request-1"},
+        json={
+            "content_base64": base64.b64encode(b"customer source").decode(),
+            "media_type": "text/plain",
+        },
+    )
+
+    assert uploaded.status_code == 201
+    artifact_id = uploaded.json()["artifact_id"]
+    downloaded = api.get(
+        f"/v2/artifacts/{artifact_id}/content", headers={"Authorization": "Bearer org-a"},
+    )
+    assert downloaded.content == b"customer source"
+    assert downloaded.headers["etag"] == '"digest"'
+    assert downloaded.headers["content-disposition"].startswith("attachment;")
+    assert downloaded.headers["x-content-type-options"] == "nosniff"
+    hidden = api.get(
+        f"/v2/artifacts/{artifact_id}", headers={"Authorization": "Bearer org-b"},
+    )
+    assert hidden.status_code == 404
+    forbidden = api.post(
+        "/v2/artifacts",
+        headers={"Authorization": "Bearer viewer-a", "Idempotency-Key": "artifact-request-viewer"},
+        json={
+            "content_base64": base64.b64encode(b"no authority").decode(),
+            "media_type": "text/plain",
+        },
+    )
+    assert forbidden.status_code == 403
+
+
+def test_artifact_upload_rejects_invalid_base64():
+    class UnusedArtifacts:
+        def put(self, **kwargs):
+            raise AssertionError("invalid content must not reach storage")
+
+        def get(self, *args):
+            return None
+
+        def describe(self, *args):
+            return None
+
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+        artifact_store=UnusedArtifacts(),
+    ))
+
+    response = api.post(
+        "/v2/artifacts",
+        headers={"Authorization": "Bearer org-a", "Idempotency-Key": "artifact-request-2"},
+        json={"content_base64": "not base64!", "media_type": "text/plain"},
+    )
+
+    assert response.status_code == 422

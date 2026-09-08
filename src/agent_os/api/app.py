@@ -1,16 +1,19 @@
 """FastAPI control surface for the V2 product lifecycle."""
 
+import base64
+import binascii
 import hashlib
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any, Annotated, Mapping
 
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_os.api.auth import Authenticator, Principal
 from agent_os.application.ports import (
+    ArtifactStore,
     GraphWorkflowEngine,
     NotificationStore,
     OrganizationLedger,
@@ -100,8 +103,16 @@ class GraphEventRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class ArtifactUploadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content_base64: str = Field(max_length=3_000_000)
+    media_type: str = Field(min_length=1, max_length=256)
+
+
 _HUMAN_EVENTS = {EventKind.WAIT_RESOLVED, EventKind.CANCEL_REQUESTED}
 _INTERNAL_ROLES = {"agent", "operator", "system"}
+_MAX_API_ARTIFACT_BYTES = 2 * 1024 * 1024
 
 
 def _run_id(organization_id: str, idempotency_key: str) -> str:
@@ -124,6 +135,7 @@ def create_app(
     identity: Authenticator,
     graph_engine: GraphWorkflowEngine | None = None,
     notification_store: NotificationStore | None = None,
+    artifact_store: ArtifactStore | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     @asynccontextmanager
@@ -282,6 +294,67 @@ def create_app(
                 limit=limit,
             )
             return {"items": list(items)}
+
+    if artifact_store is not None:
+        @app.post("/v2/artifacts", status_code=201)
+        def upload_artifact(
+            body: ArtifactUploadRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "agent", "system"}):
+                raise HTTPException(status_code=403, detail="artifact publication requires write authority")
+            try:
+                content = base64.b64decode(body.content_base64, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise HTTPException(status_code=422, detail="content_base64 is invalid") from exc
+            if len(content) > _MAX_API_ARTIFACT_BYTES:
+                raise HTTPException(status_code=413, detail="artifact exceeds the API byte limit")
+            try:
+                artifact_id = artifact_store.put(
+                    organization_id=principal.organization_id,
+                    content=content,
+                    media_type=body.media_type,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            record = artifact_store.describe(principal.organization_id, artifact_id)
+            if record is None:
+                raise HTTPException(status_code=500, detail="artifact publication was not readable")
+            return record
+
+        @app.get("/v2/artifacts/{artifact_id}")
+        def describe_artifact(
+            artifact_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            record = artifact_store.describe(principal.organization_id, artifact_id)
+            if record is None:
+                raise HTTPException(status_code=404, detail="artifact not found")
+            return record
+
+        @app.get("/v2/artifacts/{artifact_id}/content")
+        def download_artifact(
+            artifact_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Response:
+            record = artifact_store.describe(principal.organization_id, artifact_id)
+            content = artifact_store.get(principal.organization_id, artifact_id)
+            if record is None or content is None:
+                raise HTTPException(status_code=404, detail="artifact not found")
+            return Response(
+                content=content,
+                media_type=str(record["media_type"]),
+                headers={
+                    "ETag": f'"{record["digest"]}"',
+                    "Content-Disposition": f'attachment; filename="{record["artifact_id"]}"',
+                    "Content-Security-Policy": "sandbox; default-src 'none'",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
 
     if graph_engine is not None:
         @app.post("/v2/workflows", status_code=201)

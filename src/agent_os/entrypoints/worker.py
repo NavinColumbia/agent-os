@@ -18,12 +18,14 @@ from agent_os.application.work_multiplexer import TenantWorkMultiplexer
 from agent_os.application.worker_loop import CommandWorkerLoop
 from agent_os.entrypoints.server import ServerSettings
 from agent_os.infrastructure.agent_command_executor import DurableAgentCommandExecutor
+from agent_os.infrastructure.artifact_tool_nodes import ArtifactToolNodeHandlers
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
 from agent_os.infrastructure.notification_effects import NotificationEffectHandlers
 from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
+from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 
@@ -143,7 +145,13 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(notification_store.close)
+        artifact_store = SQLArtifactStore(
+            settings.server.application_database_url,
+            create_schema=settings.server.create_schema,
+        )
+        resources.callback(artifact_store.close)
         notification_effects = NotificationEffectHandlers(notification_store)
+        artifact_tools = ArtifactToolNodeHandlers(artifact_store)
         runtime = PydanticAgentRuntime(
             settings.model,
             request_limit=settings.request_limit,
@@ -171,6 +179,7 @@ def run_worker(
         )
         graph_runtime = PydanticGraphNodeRuntime(
             settings.model,
+            handlers=artifact_tools.handlers(),
             request_limit=settings.request_limit,
             output_tokens_limit=settings.output_tokens_limit,
             request_timeout_seconds=settings.request_timeout_seconds,

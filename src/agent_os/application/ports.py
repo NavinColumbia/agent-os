@@ -332,6 +332,8 @@ class PolicyEngine(Protocol):
 
 @runtime_checkable
 class ArtifactStore(Protocol):
+    """Immutable tenant-scoped artifact bytes and metadata."""
+
     def put(
         self,
         *,
@@ -340,6 +342,12 @@ class ArtifactStore(Protocol):
         media_type: str,
         idempotency_key: str,
     ) -> str: ...
+
+    def get(self, organization_id: str, artifact_id: str) -> bytes | None: ...
+
+    def describe(
+        self, organization_id: str, artifact_id: str,
+    ) -> Mapping[str, Any] | None: ...
 
 
 @runtime_checkable

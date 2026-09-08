@@ -180,6 +180,7 @@ def run_worker(
             artifact_store,
             public_base_url=settings.server.public_base_url,
             capability_secret=settings.server.auth_secret,
+            ttl_seconds=settings.server.preview_ttl_seconds,
             create_schema=settings.server.create_schema,
         )
         resources.callback(preview_deployments.close)

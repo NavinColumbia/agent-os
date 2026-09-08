@@ -192,6 +192,45 @@ def create_app(
         if artifact_store is None:
             raise ValueError("public previews require an artifact store")
 
+        @app.get("/v2/deployments/previews")
+        def list_previews(
+            principal: Annotated[Principal, Depends(current_principal)],
+            limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(
+                    status_code=403, detail="preview inventory requires owner/operator authority",
+                )
+            return {
+                "items": list(preview_deployments.list_previews(
+                    principal.organization_id, limit=limit,
+                ))
+            }
+
+        @app.delete("/v2/deployments/previews/{deployment_id}")
+        def revoke_preview(
+            deployment_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(
+                    status_code=403, detail="preview revocation requires owner/operator authority",
+                )
+            try:
+                record = preview_deployments.revoke(
+                    organization_id=principal.organization_id,
+                    deployment_id=deployment_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if record is None:
+                raise HTTPException(status_code=404, detail="preview not found")
+            return record
+
         @app.get("/v2/public/previews/{tenant_slug}/{public_id}")
         def public_preview(tenant_slug: str, public_id: str) -> Response:
             record = preview_deployments.resolve_public(tenant_slug, public_id)

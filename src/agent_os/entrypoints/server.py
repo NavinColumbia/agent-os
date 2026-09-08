@@ -26,6 +26,7 @@ class ServerSettings:
     auth_secret: str
     application_version: str
     public_base_url: str
+    preview_ttl_seconds: int
     host: str
     port: int
     create_schema: bool
@@ -66,6 +67,9 @@ class ServerSettings:
         ).rstrip("/")
         if environment == "production" and not public_base_url.startswith("https://"):
             raise ValueError("production AOS_V2_PUBLIC_BASE_URL must use HTTPS")
+        preview_ttl_seconds = int(os.getenv("AOS_V2_PREVIEW_TTL_SECONDS", "604800"))
+        if not 60 <= preview_ttl_seconds <= 30 * 24 * 60 * 60:
+            raise ValueError("AOS_V2_PREVIEW_TTL_SECONDS must be between 60 and 2592000")
         return cls(
             environment=environment,
             system_database_url=system_database_url,
@@ -73,6 +77,7 @@ class ServerSettings:
             auth_secret=auth_secret,
             application_version=os.getenv("AOS_V2_APPLICATION_VERSION", "v2-dev"),
             public_base_url=public_base_url,
+            preview_ttl_seconds=preview_ttl_seconds,
             host=os.getenv("AOS_V2_HOST", "127.0.0.1"),
             port=port,
             create_schema=create_schema,
@@ -110,6 +115,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             artifact_store,
             public_base_url=settings.public_base_url,
             capability_secret=settings.auth_secret,
+            ttl_seconds=settings.preview_ttl_seconds,
             create_schema=settings.create_schema,
         )
         resources.callback(preview_deployments.close)

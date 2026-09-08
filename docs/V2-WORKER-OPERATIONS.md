@@ -78,8 +78,10 @@ unguessable URL is the read capability. It returns `no-store`, `nosniff`, no-ref
 and forces the generated document into an opaque-origin CSP sandbox. Inline scripts and styles may render an
 interactive demo, but network connections, forms, top-level navigation, parent-origin access, and external
 resources remain blocked. This is a disposable static evaluation surface, not production promotion, a custom
-domain, or an arbitrary backend deployment. Capability revocation/expiry and a managed object-storage adapter
-remain to be implemented before customer launch.
+domain, or an arbitrary backend deployment. Every capability expires (seven days by default). An authenticated
+owner/operator can list tenant previews with `GET /v2/deployments/previews` and idempotently revoke one with
+`DELETE /v2/deployments/previews/{deployment_id}` plus `Idempotency-Key`. A managed object-storage adapter and
+cleanup of expired bytes remain to be implemented before customer launch.
 
 ## Configuration
 
@@ -102,6 +104,7 @@ Important controls:
 - `AOS_V2_TENANT_DISCOVERY_LIMIT` (default `128`, maximum `1000` ready tenants per fair cycle)
 - `AOS_V2_WORKER_ORGANIZATIONS` (optional comma-separated static BYOC/cell allowlist)
 - `AOS_V2_PUBLIC_BASE_URL` (the externally reachable API origin; production requires HTTPS)
+- `AOS_V2_PREVIEW_TTL_SECONDS` (default `604800`; bounded from 60 seconds through 30 days)
 
 With no static allowlist, staging/production workers use the narrow `agentos_worker` database role to discover
 only tenant IDs with due or abandoned queue work. That role receives column-level access to scheduling metadata,
@@ -119,7 +122,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–92), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–93), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC/signup, secrets management, production deploy/rollback, a hosted
-sandbox/build adapter, large-object storage, metering, capability lifecycle, and managed-cloud IaC are still
-launch blockers.
+sandbox/build adapter, large-object storage/garbage collection, metering, and managed-cloud IaC are still launch
+blockers.

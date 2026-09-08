@@ -10,7 +10,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
     for name in (
         "AOS_ENVIRONMENT", "AOS_V2_SYSTEM_DATABASE_URL", "AOS_V2_APPLICATION_DATABASE_URL",
         "DATABASE_URL", "AOS_V2_AUTH_SECRET", "AOS_V2_CREATE_SCHEMA",
-        "AOS_V2_PUBLIC_BASE_URL",
+        "AOS_V2_PUBLIC_BASE_URL", "AOS_V2_PREVIEW_TTL_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = ServerSettings.from_env()
@@ -19,6 +19,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
     assert settings.create_schema is True
     assert len(settings.auth_secret) >= 32
     assert settings.public_base_url == "http://127.0.0.1:8080"
+    assert settings.preview_ttl_seconds == 604800
 
 
 def test_production_fails_closed_without_postgres_migrations_and_strong_secret(monkeypatch):
@@ -44,3 +45,7 @@ def test_production_fails_closed_without_postgres_migrations_and_strong_secret(m
     monkeypatch.setenv("AOS_V2_PUBLIC_BASE_URL", "https://agent-os.example.test/")
     settings = ServerSettings.from_env()
     assert settings.public_base_url == "https://agent-os.example.test"
+
+    monkeypatch.setenv("AOS_V2_PREVIEW_TTL_SECONDS", "59")
+    with pytest.raises(ValueError, match="between 60 and 2592000"):
+        ServerSettings.from_env()

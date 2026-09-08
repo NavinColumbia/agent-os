@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -16,7 +17,7 @@ from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 
 
-def stores(tmp_path: Path):
+def stores(tmp_path: Path, *, clock=None, ttl_seconds: int = 7 * 24 * 60 * 60):
     artifacts = SQLArtifactStore(
         f"sqlite:///{tmp_path / 'preview-artifacts.sqlite3'}", create_schema=True,
     )
@@ -25,6 +26,8 @@ def stores(tmp_path: Path):
         artifacts,
         public_base_url="https://preview.example.test",
         capability_secret="test-capability-secret-with-32-bytes",
+        clock=clock,
+        ttl_seconds=ttl_seconds,
         create_schema=True,
     )
     return artifacts, deployments
@@ -101,6 +104,14 @@ def test_static_preview_rejects_non_html_and_weak_capability_secret(tmp_path: Pa
                 artifacts,
                 public_base_url="https://preview.example.test",
                 capability_secret="weak",
+            )
+        with pytest.raises(ValueError, match="between 60 seconds and 30 days"):
+            SQLStaticPreviewDeployer(
+                f"sqlite:///{tmp_path / 'invalid-ttl.sqlite3'}",
+                artifacts,
+                public_base_url="https://preview.example.test",
+                capability_secret="test-capability-secret-with-32-bytes",
+                ttl_seconds=31 * 24 * 60 * 60,
             )
         deployments = SQLStaticPreviewDeployer(
             f"sqlite:///{tmp_path / 'valid-preview.sqlite3'}",
@@ -190,10 +201,19 @@ def test_public_preview_serves_only_the_opaque_capability_with_a_browser_sandbox
 ):
     artifacts, deployments = stores(tmp_path)
 
-    class NoPublicAuthentication:
+    class PreviewIdentity:
+        calls = 0
+
         def authenticate(self, authorization, session):
-            del authorization, session
-            raise AssertionError("the capability route must not invoke account authentication")
+            del session
+            self.calls += 1
+            if authorization == "Bearer owner-a":
+                return {"sub": "owner-a", "org": "tenant-a", "roles": ["owner"]}
+            if authorization == "Bearer owner-b":
+                return {"sub": "owner-b", "org": "tenant-b", "roles": ["owner"]}
+            if authorization == "Bearer viewer-a":
+                return {"sub": "viewer-a", "org": "tenant-a", "roles": ["viewer"]}
+            raise ValueError("authentication required")
 
     try:
         html = b"<!doctype html><title>Proof</title><h1>Prompt-built app</h1>"
@@ -209,15 +229,17 @@ def test_public_preview_serves_only_the_opaque_capability_with_a_browser_sandbox
             idempotency_key="public-preview",
         )
         path = urlparse(str(deployed["public_url"])).path
+        identity = PreviewIdentity()
         api = TestClient(create_app(
             engine=InMemoryWorkflowEngine(),
-            identity=NoPublicAuthentication(),
+            identity=identity,
             artifact_store=artifacts,
             preview_deployments=deployments,
         ))
 
         response = api.get(path)
         assert response.status_code == 200
+        assert identity.calls == 0
         assert response.content == html
         assert response.headers["cache-control"] == "no-store"
         assert response.headers["x-frame-options"] == "DENY"
@@ -229,6 +251,67 @@ def test_public_preview_serves_only_the_opaque_capability_with_a_browser_sandbox
         bad_capability = path[:-1] + ("A" if path[-1] != "A" else "B")
         assert api.get(bad_capability).status_code == 404
         assert api.get(path.replace("dGVuYW50LWE", "dGVuYW50LWI")).status_code == 404
+
+        owner_headers = {"Authorization": "Bearer owner-a"}
+        inventory = api.get("/v2/deployments/previews", headers=owner_headers)
+        assert inventory.status_code == 200
+        assert inventory.json()["items"][0]["status"] == "active"
+        assert api.get(
+            "/v2/deployments/previews", headers={"Authorization": "Bearer owner-b"},
+        ).json()["items"] == []
+        assert api.get(
+            "/v2/deployments/previews", headers={"Authorization": "Bearer viewer-a"},
+        ).status_code == 403
+        assert api.delete(
+            f"/v2/deployments/previews/{deployed['deployment_id']}",
+            headers={"Authorization": "Bearer owner-b", "Idempotency-Key": "revoke-other"},
+        ).status_code == 404
+
+        revoke_headers = {
+            "Authorization": "Bearer owner-a", "Idempotency-Key": "revoke-preview-one",
+        }
+        revoked = api.delete(
+            f"/v2/deployments/previews/{deployed['deployment_id']}", headers=revoke_headers,
+        )
+        replay = api.delete(
+            f"/v2/deployments/previews/{deployed['deployment_id']}", headers=revoke_headers,
+        )
+        assert revoked.status_code == 200
+        assert replay.json() == revoked.json()
+        assert revoked.json()["status"] == "revoked"
+        assert api.get(path).status_code == 404
+    finally:
+        deployments.close()
+        artifacts.close()
+
+
+def test_preview_capability_expires_without_deleting_its_audit_record(tmp_path: Path):
+    now = [datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)]
+    artifacts, deployments = stores(
+        tmp_path, clock=lambda: now[0], ttl_seconds=60,
+    )
+    try:
+        artifact_id = artifacts.put(
+            organization_id="tenant-a",
+            content=b"<h1>Short lived</h1>",
+            media_type="text/html",
+            idempotency_key="expiring-html",
+        )
+        deployed = deployments.deploy(
+            organization_id="tenant-a",
+            artifact_id=artifact_id,
+            idempotency_key="expiring-preview",
+        )
+        path = urlparse(str(deployed["public_url"])).path.split("/")
+        assert deployments.resolve_public(path[-2], path[-1]) is not None
+
+        now[0] += timedelta(seconds=61)
+
+        assert deployments.resolve_public(path[-2], path[-1]) is None
+        inventory = deployments.list_previews("tenant-a")
+        assert len(inventory) == 1
+        assert inventory[0]["status"] == "expired"
+        assert inventory[0]["active"] is True
     finally:
         deployments.close()
         artifacts.close()

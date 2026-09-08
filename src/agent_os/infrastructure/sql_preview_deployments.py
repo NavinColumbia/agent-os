@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -28,6 +28,7 @@ from sqlalchemy import (
     insert,
     select,
     text,
+    update,
 )
 from sqlalchemy.exc import IntegrityError
 
@@ -53,6 +54,9 @@ preview_deployments = Table(
     Column("fingerprint", String(64), nullable=False),
     Column("public_url", Text, nullable=False),
     Column("active", Boolean, nullable=False, default=True),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("revoked_at", DateTime(timezone=True)),
+    Column("revocation_key", String(256)),
     Column("record", JSON, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     UniqueConstraint("tenant_id", "public_id", name="aos_v2_preview_public_key"),
@@ -86,6 +90,10 @@ def _tenant_from_slug(value: str) -> str | None:
     return tenant_id
 
 
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
 class SQLStaticPreviewDeployer(PreviewDeploymentStore):
     """Publish a bounded HTML artifact at an unguessable, revocable URL."""
 
@@ -96,6 +104,7 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
         *,
         public_base_url: str,
         capability_secret: str,
+        ttl_seconds: int = 7 * 24 * 60 * 60,
         create_schema: bool = False,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -110,10 +119,13 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
             raise ValueError("preview deployment requires a valid HTTP(S) public base URL")
         if len(capability_secret.encode()) < 32:
             raise ValueError("preview deployment capability secret must be at least 32 bytes")
+        if not 60 <= ttl_seconds <= 30 * 24 * 60 * 60:
+            raise ValueError("preview deployment TTL must be between 60 seconds and 30 days")
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
         self._artifacts = artifact_store
         self._public_base_url = public_base_url.rstrip("/")
         self._secret = capability_secret.encode()
+        self._ttl = timedelta(seconds=ttl_seconds)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         if create_schema:
             preview_metadata.create_all(self._engine)
@@ -192,14 +204,15 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
             return dict(prior["record"])
 
         created_at = self._clock()
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
+        created_at = _utc(created_at)
+        expires_at = created_at + self._ttl
         receipt = {
             "format": "agent-os.static-preview-deployment.v1",
             "tenant_id": organization_id,
             "deployment_id": deployment_id,
             "artifact_id": artifact_id,
             "public_url": public_url,
+            "expires_at": expires_at.isoformat(),
         }
         try:
             receipt_artifact_id = self._artifacts.put(
@@ -224,6 +237,7 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
             "public_id": public_id,
             "receipt_artifact_id": receipt_artifact_id,
             "active": True,
+            "revoked_at": None,
             "created_at": created_at.isoformat(),
         }
         try:
@@ -238,6 +252,9 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
                     fingerprint=fingerprint,
                     public_url=public_url,
                     active=True,
+                    expires_at=expires_at,
+                    revoked_at=None,
+                    revocation_key=None,
                     record=record,
                     created_at=created_at,
                 ))
@@ -269,8 +286,100 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
                 preview_deployments.c.tenant_id == tenant_id,
                 preview_deployments.c.public_id == public_id,
                 preview_deployments.c.active.is_(True),
+                preview_deployments.c.expires_at > _utc(self._clock()),
             ))).scalar_one_or_none()
         return None if raw is None else dict(raw)
+
+    def list_previews(
+        self, organization_id: str, *, limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("preview list limit must be between 1 and 500")
+        now = _utc(self._clock())
+        with self._tenant_connection(organization_id) as connection:
+            rows = connection.execute(select(
+                preview_deployments.c.record,
+                preview_deployments.c.active,
+                preview_deployments.c.expires_at,
+                preview_deployments.c.revoked_at,
+            ).where(
+                preview_deployments.c.tenant_id == organization_id,
+            ).order_by(
+                preview_deployments.c.created_at.desc(),
+                preview_deployments.c.deployment_id.desc(),
+            ).limit(limit)).mappings().all()
+        results = []
+        for row in rows:
+            record = dict(row["record"])
+            active = bool(row["active"])
+            expires_at = _utc(row["expires_at"])
+            revoked_at = row["revoked_at"]
+            record.update({
+                "active": active,
+                "expires_at": expires_at.isoformat(),
+                "revoked_at": None if revoked_at is None else _utc(revoked_at).isoformat(),
+                "status": (
+                    "revoked" if not active else "expired" if expires_at <= now else "active"
+                ),
+            })
+            results.append(record)
+        return tuple(results)
+
+    def revoke(
+        self,
+        *,
+        organization_id: str,
+        deployment_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None:
+        organization_id = organization_id.strip()
+        deployment_id = deployment_id.strip()
+        idempotency_key = idempotency_key.strip()
+        if (
+            not organization_id
+            or not deployment_id
+            or not idempotency_key
+            or len(deployment_id) > 96
+            or len(idempotency_key) > 200
+        ):
+            raise ValueError("preview revocation identity is missing or unbounded")
+        key = and_(
+            preview_deployments.c.tenant_id == organization_id,
+            preview_deployments.c.deployment_id == deployment_id,
+        )
+        with self._tenant_connection(organization_id) as connection:
+            row = connection.execute(select(
+                preview_deployments.c.record,
+                preview_deployments.c.active,
+                preview_deployments.c.revoked_at,
+            ).where(key).with_for_update()).mappings().one_or_none()
+            if row is None:
+                return None
+            if not row["active"]:
+                record = dict(row["record"])
+                record.update({
+                    "active": False,
+                    "revoked_at": (
+                        None if row["revoked_at"] is None
+                        else _utc(row["revoked_at"]).isoformat()
+                    ),
+                    "status": "revoked",
+                })
+                return record
+            revoked_at = _utc(self._clock())
+            record = dict(row["record"])
+            record.update({
+                "active": False,
+                "revoked_at": revoked_at.isoformat(),
+                "status": "revoked",
+            })
+            connection.execute(update(preview_deployments).where(key).values(
+                active=False,
+                revoked_at=revoked_at,
+                revocation_key=idempotency_key,
+                record=record,
+            ))
+            return record
 
     def close(self) -> None:
         self._engine.dispose()

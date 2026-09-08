@@ -397,6 +397,18 @@ class PreviewDeploymentStore(Deployer, Protocol):
         self, tenant_slug: str, public_id: str,
     ) -> Mapping[str, Any] | None: ...
 
+    def list_previews(
+        self, organization_id: str, *, limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def revoke(
+        self,
+        *,
+        organization_id: str,
+        deployment_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
+
 
 @runtime_checkable
 class IdentityProvider(Protocol):

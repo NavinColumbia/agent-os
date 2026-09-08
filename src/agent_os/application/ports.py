@@ -390,6 +390,15 @@ class Deployer(Protocol):
 
 
 @runtime_checkable
+class PreviewDeploymentStore(Deployer, Protocol):
+    """Static public deployment authority addressed by an unguessable capability."""
+
+    def resolve_public(
+        self, tenant_slug: str, public_id: str,
+    ) -> Mapping[str, Any] | None: ...
+
+
+@runtime_checkable
 class IdentityProvider(Protocol):
     def authenticate(self, authorization: str | None, session: str | None) -> Mapping[str, Any]: ...
 

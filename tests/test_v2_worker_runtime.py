@@ -202,6 +202,7 @@ def test_worker_settings_require_explicit_model_and_production_tenants(monkeypat
     monkeypatch.setenv("AOS_V2_APPLICATION_DATABASE_URL", "postgresql://db/application")
     monkeypatch.setenv("AOS_V2_AUTH_SECRET", "x" * 32)
     monkeypatch.setenv("AOS_V2_CREATE_SCHEMA", "0")
+    monkeypatch.setenv("AOS_V2_PUBLIC_BASE_URL", "https://agent-os.example.test")
     monkeypatch.setenv("AOS_V2_MODEL", "provider:model")
     monkeypatch.delenv("AOS_V2_WORKER_ORGANIZATIONS", raising=False)
     settings = WorkerSettings.from_env()

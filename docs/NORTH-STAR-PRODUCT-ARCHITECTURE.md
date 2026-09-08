@@ -483,10 +483,13 @@ grounding boundary that persists bounded model-proposed artifacts while rejectin
 One CEO directive now durably starts a bounded mission-architect graph whose identity-free JSON proposal is
 authority-validated, tenant/version stamped, and launched as an immutable child graph; detailed terminal outcomes
 project idempotently to the coarse CEO lifecycle, and one authenticated view links all three states. Its fail-closed
-local Docker sandbox adapter serves dedicated development/CI runners. Workers can discover due tenants through a
-narrow scheduling-only database role while retaining tenant-RLS claims and round-robin fairness. It still has
-overlapping legacy controllers, local-host assumptions, unfinished public infrastructure, no managed-cloud
-sandbox/deploy/general-subworkflow adapters, and no complete prompt-to-public-URL customer vertical.
+local Docker sandbox adapter serves dedicated development/CI runners. A bounded `deploy.preview` adapter can now
+publish a small, same-tenant HTML artifact through an idempotent receipt and an unguessable public capability;
+the serving route applies an opaque-origin CSP sandbox with network, forms, navigation, and framing disabled.
+Workers can discover due tenants through a narrow scheduling-only database role while retaining tenant-RLS claims
+and round-robin fairness. It still has overlapping legacy controllers, local-host assumptions, unfinished public
+infrastructure, no managed-cloud sandbox/production-deploy/general-subworkflow adapters, and no complete
+new-customer-browser-to-production-URL vertical.
 This is a real durable execution spine, not yet the finished platform.
 
 Therefore:

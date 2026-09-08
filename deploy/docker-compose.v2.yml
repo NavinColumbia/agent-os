@@ -7,6 +7,7 @@ x-runtime-environment: &runtime-environment
   AOS_V2_APPLICATION_VERSION: ${AOS_V2_APPLICATION_VERSION:-v2-local}
   AOS_V2_CREATE_SCHEMA: "0"
   AOS_V2_AUTH_SECRET: ${AOS_V2_AUTH_SECRET:?set AOS_V2_AUTH_SECRET to at least 32 bytes}
+  AOS_V2_PUBLIC_BASE_URL: ${AOS_V2_PUBLIC_BASE_URL:-http://localhost:8080}
 
 services:
   postgres:
@@ -41,6 +42,7 @@ services:
       - ../postgres/initdb/89-notifications-v2.sql:/migrations/89-notifications-v2.sql:ro
       - ../postgres/initdb/90-artifacts-v2.sql:/migrations/90-artifacts-v2.sql:ro
       - ../postgres/initdb/91-ready-tenant-discovery-v2.sql:/migrations/91-ready-tenant-discovery-v2.sql:ro
+      - ../postgres/initdb/92-preview-deployments-v2.sql:/migrations/92-preview-deployments-v2.sql:ro
     command:
       - sh
       - -ec
@@ -51,6 +53,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/89-notifications-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/90-artifacts-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/91-ready-tenant-discovery-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/92-preview-deployments-v2.sql
     restart: "no"
 
   api:

@@ -23,6 +23,7 @@ from agent_os.infrastructure.agent_command_executor import DurableAgentCommandEx
 from agent_os.infrastructure.artifact_tool_nodes import ArtifactToolNodeHandlers
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
+from agent_os.infrastructure.deployment_tool_nodes import DeploymentToolNodeHandlers
 from agent_os.infrastructure.docker_sandbox import DEFAULT_PYTHON_IMAGE, DockerSandboxRunner
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
 from agent_os.infrastructure.mission_workflows import (
@@ -37,6 +38,7 @@ from agent_os.infrastructure.sandbox_tool_nodes import SandboxToolNodeHandlers
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
+from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_ready_tenants import SQLReadyTenantSource
 from agent_os.infrastructure.tool_node_router import GraphToolNodeRouter
 
@@ -173,9 +175,20 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(artifact_store.close)
+        preview_deployments = SQLStaticPreviewDeployer(
+            settings.server.application_database_url,
+            artifact_store,
+            public_base_url=settings.server.public_base_url,
+            capability_secret=settings.server.auth_secret,
+            create_schema=settings.server.create_schema,
+        )
+        resources.callback(preview_deployments.close)
         notification_effects = NotificationEffectHandlers(notification_store)
         artifact_tools = ArtifactToolNodeHandlers(artifact_store)
         named_tool_handlers = dict(artifact_tools.named_handlers())
+        named_tool_handlers.update(
+            DeploymentToolNodeHandlers(preview_deployments).named_handlers()
+        )
         named_tool_handlers.update(
             WorkflowLaunchToolNodeHandlers(graph_engine, artifact_store).named_handlers()
         )

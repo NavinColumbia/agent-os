@@ -18,6 +18,7 @@ from agent_os.application.ports import (
     GraphWorkflowEngine,
     NotificationStore,
     OrganizationLedger,
+    PreviewDeploymentStore,
     WorkflowEngine,
     WorkflowReceipt,
 )
@@ -137,6 +138,7 @@ def create_app(
     graph_engine: GraphWorkflowEngine | None = None,
     notification_store: NotificationStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    preview_deployments: PreviewDeploymentStore | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     @asynccontextmanager
@@ -185,6 +187,38 @@ def create_app(
     def ready() -> JSONResponse:
         report = dict(engine.health())
         return JSONResponse(status_code=200 if report.get("ok") else 503, content=report)
+
+    if preview_deployments is not None:
+        if artifact_store is None:
+            raise ValueError("public previews require an artifact store")
+
+        @app.get("/v2/public/previews/{tenant_slug}/{public_id}")
+        def public_preview(tenant_slug: str, public_id: str) -> Response:
+            record = preview_deployments.resolve_public(tenant_slug, public_id)
+            if record is None:
+                raise HTTPException(status_code=404, detail="preview not found")
+            tenant_id = str(record.get("tenant_id") or "")
+            artifact_id = str(record.get("artifact_id") or "")
+            content = artifact_store.get(tenant_id, artifact_id)
+            if not tenant_id or not artifact_id or content is None:
+                raise HTTPException(status_code=404, detail="preview not found")
+            return Response(
+                content=content,
+                media_type="text/html; charset=utf-8",
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Disposition": "inline",
+                    "Content-Security-Policy": (
+                        "sandbox allow-scripts; default-src 'none'; "
+                        "script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                        "img-src data: blob:; font-src data:; connect-src 'none'; "
+                        "form-action 'none'; base-uri 'none'"
+                    ),
+                    "Referrer-Policy": "no-referrer",
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Frame-Options": "DENY",
+                },
+            )
 
     @app.post("/v2/runs", response_model=MutationResponse, status_code=202)
     def create_run(

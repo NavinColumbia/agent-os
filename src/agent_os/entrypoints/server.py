@@ -14,6 +14,7 @@ from agent_os.api.auth import HMACTokenIdentity
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
+from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 
 
@@ -24,6 +25,7 @@ class ServerSettings:
     application_database_url: str
     auth_secret: str
     application_version: str
+    public_base_url: str
     host: str
     port: int
     create_schema: bool
@@ -58,14 +60,21 @@ class ServerSettings:
                 raise ValueError("staging/production AOS_V2_AUTH_SECRET must be at least 32 bytes")
         elif not auth_secret:
             auth_secret = "agent-os-development-secret-change-me"
+        port = int(os.getenv("PORT", os.getenv("AOS_V2_PORT", "8080")))
+        public_base_url = os.getenv(
+            "AOS_V2_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}",
+        ).rstrip("/")
+        if environment == "production" and not public_base_url.startswith("https://"):
+            raise ValueError("production AOS_V2_PUBLIC_BASE_URL must use HTTPS")
         return cls(
             environment=environment,
             system_database_url=system_database_url,
             application_database_url=application_database_url,
             auth_secret=auth_secret,
             application_version=os.getenv("AOS_V2_APPLICATION_VERSION", "v2-dev"),
+            public_base_url=public_base_url,
             host=os.getenv("AOS_V2_HOST", "127.0.0.1"),
-            port=int(os.getenv("PORT", os.getenv("AOS_V2_PORT", "8080"))),
+            port=port,
             create_schema=create_schema,
         )
 
@@ -96,12 +105,21 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(artifact_store.close)
+        preview_deployments = SQLStaticPreviewDeployer(
+            settings.application_database_url,
+            artifact_store,
+            public_base_url=settings.public_base_url,
+            capability_secret=settings.auth_secret,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(preview_deployments.close)
         app = create_app(
             engine=engine,
             identity=HMACTokenIdentity(settings.auth_secret),
             graph_engine=graph_engine,
             notification_store=notification_store,
             artifact_store=artifact_store,
+            preview_deployments=preview_deployments,
             shutdown=resources.close,
         )
     except Exception:
@@ -111,5 +129,6 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.graph_workflow_engine = graph_engine
     app.state.notification_store = notification_store
     app.state.artifact_store = artifact_store
+    app.state.preview_deployments = preview_deployments
     app.state.settings = settings
     return app

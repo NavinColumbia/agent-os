@@ -21,7 +21,7 @@ structured model output, human nodes create and resume correlated waits without 
 accept upstream evidence rather than inventing new evidence. Provider retries keep a token running and reuse the
 same action ID; recovery after a committed result does not execute the node twice. A deterministic node rejection
 is committed as a graph failure instead of leaving a permanently running token. Timer, arbitrary subworkflow, and
-external publication actions stay fail-closed until an idempotent adapter is registered.
+production release actions stay fail-closed until an idempotent adapter is registered.
 
 New CEO directives now emit `start_mission`, not a second hard-coded research/build agent chain. That durable
 command starts a built-in planner graph. The mission architect must persist an identity-free JSON graph proposal;
@@ -71,6 +71,16 @@ Docker exit 125 is treated as retryable infrastructure failure and is not cached
 command failures and hard timeouts retain their bounded result/output evidence and may follow an explicitly
 declared repair edge.
 
+`deploy.preview` is the first bounded deployment adapter. It accepts only a same-tenant immutable `text/html`
+artifact of at most 256 KiB, creates an idempotent deployment receipt, and publishes it at a tenant-fenced URL
+containing a 256-bit HMAC capability. The public route requires no account session because possession of that
+unguessable URL is the read capability. It returns `no-store`, `nosniff`, no-referrer, and deny-framing headers,
+and forces the generated document into an opaque-origin CSP sandbox. Inline scripts and styles may render an
+interactive demo, but network connections, forms, top-level navigation, parent-origin access, and external
+resources remain blocked. This is a disposable static evaluation surface, not production promotion, a custom
+domain, or an arbitrary backend deployment. Capability revocation/expiry and a managed object-storage adapter
+remain to be implemented before customer launch.
+
 ## Configuration
 
 Required for the worker:
@@ -91,6 +101,7 @@ Important controls:
 - `AOS_V2_RETRY_MAX_ATTEMPTS` (unset means transient infrastructure failures keep retrying)
 - `AOS_V2_TENANT_DISCOVERY_LIMIT` (default `128`, maximum `1000` ready tenants per fair cycle)
 - `AOS_V2_WORKER_ORGANIZATIONS` (optional comma-separated static BYOC/cell allowlist)
+- `AOS_V2_PUBLIC_BASE_URL` (the externally reachable API origin; production requires HTTPS)
 
 With no static allowlist, staging/production workers use the narrow `agentos_worker` database role to discover
 only tenant IDs with due or abandoned queue work. That role receives column-level access to scheduling metadata,
@@ -108,6 +119,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–91), and then starts the API and worker from the exact
-same non-root image. Hosted OIDC/signup, secrets management, external-effect adapters, a hosted sandbox/build
-adapter, large-object storage, metering, and managed-cloud IaC are still launch blockers.
+It starts PostgreSQL, applies only the isolated V2 migrations (86–92), and then starts the API and worker from the
+exact same non-root image. Hosted OIDC/signup, secrets management, production deploy/rollback, a hosted
+sandbox/build adapter, large-object storage, metering, capability lifecycle, and managed-cloud IaC are still
+launch blockers.

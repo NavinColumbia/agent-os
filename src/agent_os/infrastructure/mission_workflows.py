@@ -33,7 +33,7 @@ _MISSION_PLAN_MAX_NODES = 32
 _MISSION_PLAN_MAX_EDGES = 128
 _MISSION_PLAN_MAX_ITERATIONS_PER_NODE = 16
 _MISSION_PLAN_MAX_TOTAL_ITERATIONS = 128
-_MISSION_TOOL_ALLOWLIST = frozenset({"sandbox.run"})
+_MISSION_TOOL_ALLOWLIST = frozenset({"deploy.preview", "sandbox.run"})
 
 
 class PlannedNode(BaseModel):
@@ -120,6 +120,14 @@ def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
             "command": ["direct", "argument", "vector"],
             "success_condition": "outgoing condition for exit code zero",
             "failure_condition": "optional outgoing repair condition",
+        },
+        "preview_deployment_configuration": {
+            "tool": "deploy.preview",
+            "source": {
+                "node_id": "successful earlier agent node",
+                "output_path": ["artifact_ids", "html-preview-artifact-label"],
+            },
+            "success_condition": "outgoing condition after publication",
         },
         "limits": {
             "nodes": _MISSION_PLAN_MAX_NODES,
@@ -238,20 +246,22 @@ def materialize_mission_workflow(
                     f"planned terminal node has unsupported configuration: {sorted(unexpected)}"
                 )
         elif kind is NodeKind.TOOL:
-            unexpected = set(configuration) - {
-                "tool", "source", "command", "success_condition", "failure_condition",
-                "max_iterations",
+            tool = configuration.get("tool")
+            allowed_configuration = {
+                "tool", "source", "success_condition", "max_iterations",
             }
+            if tool == "sandbox.run":
+                allowed_configuration.update({"command", "failure_condition"})
+            unexpected = set(configuration) - allowed_configuration
             if unexpected:
                 raise FatalCommandError(
                     f"planned tool node has unsupported configuration: {sorted(unexpected)}"
                 )
-            tool = configuration.get("tool")
             if tool not in _MISSION_TOOL_ALLOWLIST:
                 raise FatalCommandError(f"planned workflow requested unregistered tool: {tool}")
             source = configuration.get("source")
             if not isinstance(source, Mapping):
-                raise FatalCommandError("planned sandbox tool requires a prior-node source")
+                raise FatalCommandError("planned tool requires a prior-node source")
             source_node_id = source.get("node_id")
             output_path = source.get("output_path")
             if (
@@ -268,28 +278,29 @@ def materialize_mission_workflow(
                     for part in output_path
                 )
             ):
-                raise FatalCommandError("planned sandbox source reference is invalid")
-            command = configuration.get("command")
-            if (
-                not isinstance(command, (list, tuple))
-                or not 1 <= len(command) <= 64
-                or any(
-                    not isinstance(item, str)
-                    or not item
-                    or "\0" in item
-                    or len(item) > 4_096
-                    for item in command
-                )
-            ):
-                raise FatalCommandError("planned sandbox command must be bounded direct argv")
+                raise FatalCommandError("planned tool source reference is invalid")
+            if tool == "sandbox.run":
+                command = configuration.get("command")
+                if (
+                    not isinstance(command, (list, tuple))
+                    or not 1 <= len(command) <= 64
+                    or any(
+                        not isinstance(item, str)
+                        or not item
+                        or "\0" in item
+                        or len(item) > 4_096
+                        for item in command
+                    )
+                ):
+                    raise FatalCommandError("planned sandbox command must be bounded direct argv")
             success_condition = configuration.get("success_condition")
             if not isinstance(success_condition, str) or not success_condition:
-                raise FatalCommandError("planned sandbox tool requires a success_condition")
+                raise FatalCommandError("planned tool requires a success_condition")
             configured_conditions.append((
                 proposed.node_id, "success_condition", success_condition,
             ))
             failure_condition = configuration.get("failure_condition")
-            if failure_condition is not None:
+            if tool == "sandbox.run" and failure_condition is not None:
                 if not isinstance(failure_condition, str) or not failure_condition:
                     raise FatalCommandError("planned sandbox failure_condition must be nonempty")
                 configured_conditions.append((

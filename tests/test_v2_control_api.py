@@ -266,6 +266,10 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution():
                 return None
             return {planning_run_id: planning, child_run_id: execution}.get(run_id)
 
+        def get_workflow_definition(self, tenant_id, workflow_id, version):
+            del tenant_id, workflow_id, version
+            return None
+
     api = TestClient(create_app(
         engine=lifecycle, identity=FakeIdentity(), graph_engine=MissionGraphs(),
     ))
@@ -287,6 +291,7 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution():
     assert response.json()["planning_run_id"] == planning_run_id
     assert response.json()["execution_run_id"] == child_run_id
     assert response.json()["execution"]["status"] == "active"
+    assert response.json()["deliverables"] == []
     hidden = api.get(
         f"/v2/runs/{created['run_id']}/mission",
         headers={"Authorization": "Bearer org-b"},

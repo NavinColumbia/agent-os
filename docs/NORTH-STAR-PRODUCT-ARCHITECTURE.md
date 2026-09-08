@@ -487,6 +487,8 @@ local Docker sandbox adapter serves dedicated development/CI runners. A bounded 
 publish a small, same-tenant HTML artifact through an idempotent receipt and an unguessable public capability;
 the serving route applies an opaque-origin CSP sandbox with network, forms, navigation, and framing disabled.
 Capabilities expire on a bounded TTL and tenant owners/operators can list and idempotently revoke them.
+A fast deterministic integration contract now proves the entire authenticated CEO-prompt-to-fetchable-preview
+path without provider spend; the earlier live-provider mission proof separately exercises real model grounding.
 Workers can discover due tenants through a narrow scheduling-only database role while retaining tenant-RLS claims
 and round-robin fairness. It still has overlapping legacy controllers, local-host assumptions, unfinished public
 infrastructure, no managed-cloud sandbox/production-deploy/general-subworkflow adapters, and no complete

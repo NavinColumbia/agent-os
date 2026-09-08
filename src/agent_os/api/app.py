@@ -23,8 +23,13 @@ from agent_os.application.ports import (
     WorkflowReceipt,
 )
 from agent_os.domain.lifecycle import Event, EventKind, LifecycleState, TransitionRejected
-from agent_os.domain.workflow import WorkflowDefinition, WorkflowEdge, WorkflowNode
-from agent_os.domain.workflow_runtime import WorkflowEvent, WorkflowEventKind, WorkflowTransitionRejected
+from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
+from agent_os.domain.workflow_runtime import (
+    TokenStatus,
+    WorkflowEvent,
+    WorkflowEventKind,
+    WorkflowTransitionRejected,
+)
 
 
 class DirectiveRequest(BaseModel):
@@ -458,12 +463,46 @@ def create_app(
                 if execution_run_id is None
                 else graph_engine.get_graph_run(principal.organization_id, execution_run_id)
             )
+            deliverables = []
+            if execution is not None:
+                definition = graph_engine.get_workflow_definition(
+                    principal.organization_id,
+                    execution.workflow_id,
+                    execution.workflow_version,
+                )
+                deployment_nodes = set()
+                if definition is not None:
+                    deployment_nodes = {
+                        node.node_id for node in definition.nodes
+                        if node.kind is NodeKind.TOOL
+                        and node.configuration.get("tool") == "deploy.preview"
+                    }
+                for token in execution.tokens:
+                    output = token.output
+                    if token.node_id not in deployment_nodes or token.status is not TokenStatus.SUCCEEDED:
+                        continue
+                    public_url = output.get("public_url")
+                    deployment_id = output.get("deployment_id")
+                    receipt_artifact_id = output.get("receipt_artifact_id")
+                    if not all(isinstance(item, str) and item for item in (
+                        public_url, deployment_id, receipt_artifact_id,
+                    )):
+                        continue
+                    deliverables.append({
+                        "kind": "static_preview",
+                        "node_id": token.node_id,
+                        "deployment_id": deployment_id,
+                        "public_url": public_url,
+                        "receipt_artifact_id": receipt_artifact_id,
+                        "expires_at": output.get("expires_at"),
+                    })
             return {
                 "lifecycle": lifecycle.to_dict(),
                 "planning_run_id": planning_run_id,
                 "planning": None if planning is None else planning.to_dict(),
                 "execution_run_id": execution_run_id,
                 "execution": None if execution is None else execution.to_dict(),
+                "deliverables": deliverables,
             }
 
         @app.post("/v2/workflows", status_code=201)

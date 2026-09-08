@@ -83,6 +83,12 @@ owner/operator can list tenant previews with `GET /v2/deployments/previews` and 
 `DELETE /v2/deployments/previews/{deployment_id}` plus `Idempotency-Key`. A managed object-storage adapter and
 cleanup of expired bytes remain to be implemented before customer launch.
 
+`tests/test_prompt_to_preview_vertical.py` joins the production-shaped seams in one bounded contract: authenticated
+CEO prompt, DBOS lifecycle command, mission-planner graph, authority-validated child graph, model-proposed HTML
+artifact, idempotent deployment, terminal projection, authenticated mission status, and an unauthenticated fetch of
+the generated app. It uses deterministic PydanticAI test models so CI proves orchestration in seconds without
+provider spend. It does not substitute for a hosted-provider, browser-onboarding, or managed-cloud deployment test.
+
 ## Configuration
 
 Required for the worker:

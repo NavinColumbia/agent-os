@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent_os.api.auth import Authenticator, Principal
 from agent_os.application.ports import (
     GraphWorkflowEngine,
+    NotificationStore,
     OrganizationLedger,
     WorkflowEngine,
     WorkflowReceipt,
@@ -122,6 +123,7 @@ def create_app(
     engine: WorkflowEngine,
     identity: Authenticator,
     graph_engine: GraphWorkflowEngine | None = None,
+    notification_store: NotificationStore | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     @asynccontextmanager
@@ -264,6 +266,22 @@ def create_app(
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="run not found") from exc
         return _response(receipt, run_id)
+
+    if notification_store is not None:
+        @app.get("/v2/notifications")
+        def list_notifications(
+            principal: Annotated[Principal, Depends(current_principal)],
+            run_id: Annotated[str | None, Query(max_length=256)] = None,
+            limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        ) -> Mapping[str, Any]:
+            privileged = bool(principal.roles & {"owner", "operator", "system"})
+            items = notification_store.list_notifications(
+                principal.organization_id,
+                run_id=run_id,
+                recipient_id=None if privileged else principal.subject_id,
+                limit=limit,
+            )
+            return {"items": list(items)}
 
     if graph_engine is not None:
         @app.post("/v2/workflows", status_code=201)

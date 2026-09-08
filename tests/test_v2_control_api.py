@@ -103,3 +103,26 @@ def test_authentication_idempotency_and_body_limits_fail_closed():
         json={"prompt": "Build", "organization_id": "org-b"},
     )
     assert extra_tenant.status_code == 422
+
+
+def test_notification_inbox_uses_authenticated_tenant_and_role_scope():
+    class FakeNotifications:
+        def __init__(self):
+            self.calls = []
+
+        def list_notifications(self, tenant_id, *, run_id=None, recipient_id=None, limit=100):
+            self.calls.append((tenant_id, run_id, recipient_id, limit))
+            return ({"notification_id": f"notice-{tenant_id}"},)
+
+    store = FakeNotifications()
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(), notification_store=store,
+    ))
+
+    owner = api.get("/v2/notifications?run_id=run-1&limit=25", headers={"Authorization": "Bearer org-a"})
+    agent = api.get("/v2/notifications", headers={"Authorization": "Bearer agent-a"})
+
+    assert owner.status_code == 200
+    assert owner.json()["items"][0]["notification_id"] == "notice-org-a"
+    assert store.calls[0] == ("org-a", "run-1", None, 25)
+    assert store.calls[1] == ("org-a", None, "agent-a", 100)

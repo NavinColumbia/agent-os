@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from agent_os.domain.lifecycle import Event, LifecycleState
+from agent_os.domain.notifications import Notification
 from agent_os.domain.organization_events import OrganizationEvent
 from agent_os.domain.workflow import WorkflowDefinition
 from agent_os.domain.workflow_runtime import WorkflowAction, WorkflowEvent, WorkflowRunState
@@ -272,6 +273,22 @@ class GraphNodeRuntime(Protocol):
         action: WorkflowAction,
         idempotency_key: str,
     ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class NotificationStore(Protocol):
+    """Durable in-product notification publication and tenant inbox."""
+
+    def publish_notification(self, notification: Notification) -> bool: ...
+
+    def list_notifications(
+        self,
+        tenant_id: str,
+        *,
+        run_id: str | None = None,
+        recipient_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
 
 
 @runtime_checkable

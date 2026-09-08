@@ -476,7 +476,8 @@ The repository has substantial tested governance, tenancy, QA, audit, agent-role
 V2 replacement now includes the framework-neutral lifecycle, DBOS/PostgreSQL event and command stores, arbitrary
 versioned workflow graphs, authenticated control API, structured PydanticAI role runtime, and a lease-renewing
 worker that fairly advances lifecycle commands and graph actions without a whole-story timeout or duplicate model
-spend after a crash. Agent/decision, correlated-human, and evidence-aggregating terminal graph nodes now execute. It
+spend after a crash. Agent/decision, correlated-human, and evidence-aggregating terminal graph nodes now execute;
+human/operator/completion communication has an idempotent tenant inbox and authenticated API projection. It
 also still has overlapping legacy controllers, local-host assumptions, unfinished public infrastructure, static
 early-tenant worker assignment, no production tool/subworkflow/effect adapters, and no complete
 prompt-to-public-URL customer vertical.

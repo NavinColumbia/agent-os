@@ -22,10 +22,11 @@ accept upstream evidence rather than inventing new evidence. Provider retries ke
 same action ID; recovery after a committed result does not execute the node twice. Tool, timer, subworkflow, and
 external publication actions stay fail-closed until an idempotent adapter is registered.
 
-Lifecycle commands that represent external effects are deliberately not faked. `notify_human`, `notify_operator`,
-`schedule_retry`, `cancel_active_operation`, and `publish_completion` require explicitly registered executors. Until
-those adapters exist, the router marks the command failed with a durable explanation rather than reporting a
-delivery, cancellation, timer, or publication that did not happen.
+Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
+tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
+email, Slack, SMS, and push remain separate adapters. `schedule_retry`, `cancel_active_operation`, tool execution,
+and subworkflows still require explicitly registered executors; until those adapters exist, the router marks the
+effect failed with a durable explanation rather than reporting an operation that did not happen.
 
 ## Configuration
 
@@ -60,6 +61,6 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–88), and then starts the API and worker from the exact
+It starts PostgreSQL, applies only the isolated V2 migrations (86–89), and then starts the API and worker from the exact
 same non-root image. Hosted OIDC/signup, secrets management, external-effect adapters, sandbox/build tools,
 artifact storage, metering, and managed-cloud IaC are still launch blockers.

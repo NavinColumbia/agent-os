@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 from agent_os.api.app import create_app
 from agent_os.api.auth import HMACTokenIdentity
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 
 
@@ -69,28 +71,37 @@ class ServerSettings:
 
 def build_app(settings: ServerSettings | None = None) -> FastAPI:
     settings = settings or ServerSettings.from_env()
-    engine = DBOSLifecycleEngine(
-        system_database_url=settings.system_database_url,
-        application_database_url=settings.application_database_url,
-        application_version=settings.application_version,
-        create_schema=settings.create_schema,
-    )
-    graph_engine = SQLGraphWorkflowEngine(
-        settings.application_database_url,
-        create_schema=settings.create_schema,
-    )
-
-    def shutdown() -> None:
-        graph_engine.close()
-        engine.close()
-
-    app = create_app(
-        engine=engine,
-        identity=HMACTokenIdentity(settings.auth_secret),
-        graph_engine=graph_engine,
-        shutdown=shutdown,
-    )
+    resources = ExitStack()
+    try:
+        engine = DBOSLifecycleEngine(
+            system_database_url=settings.system_database_url,
+            application_database_url=settings.application_database_url,
+            application_version=settings.application_version,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(engine.close)
+        graph_engine = SQLGraphWorkflowEngine(
+            settings.application_database_url,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(graph_engine.close)
+        notification_store = SQLNotificationStore(
+            settings.application_database_url,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(notification_store.close)
+        app = create_app(
+            engine=engine,
+            identity=HMACTokenIdentity(settings.auth_secret),
+            graph_engine=graph_engine,
+            notification_store=notification_store,
+            shutdown=resources.close,
+        )
+    except Exception:
+        resources.close()
+        raise
     app.state.workflow_engine = engine
     app.state.graph_workflow_engine = graph_engine
+    app.state.notification_store = notification_store
     app.state.settings = settings
     return app

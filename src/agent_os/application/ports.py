@@ -59,6 +59,21 @@ class GraphActionLease:
     lease_expires_at: str
 
 
+@dataclass(frozen=True)
+class ManagementWatchLease:
+    """Crash-recoverable ownership of one scheduled mission-health review."""
+
+    tenant_id: str
+    run_id: str
+    worker_id: str
+    attempt: int
+    lease_expires_at: str
+    last_signal_fingerprint: str | None
+    consecutive_signal_checks: int
+    notified_level: int
+    last_result: Mapping[str, Any] | None
+
+
 @runtime_checkable
 class WorkflowEngine(Protocol):
     """Durable lifecycle execution used by the control API."""
@@ -229,6 +244,43 @@ class GraphRunInspector(Protocol):
         *,
         action_limit: int = 1_000,
     ) -> Mapping[str, Any] | None: ...
+
+
+@runtime_checkable
+class ManagementWatchStore(Protocol):
+    """Scheduled durable health-review queue for active graph runs."""
+
+    def claim_management_watch(
+        self,
+        tenant_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> ManagementWatchLease | None: ...
+
+    def complete_management_watch(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        worker_id: str,
+        next_check_seconds: int,
+        signal_fingerprint: str | None,
+        consecutive_signal_checks: int,
+        notified_level: int,
+        result: Mapping[str, Any],
+        retire: bool = False,
+    ) -> bool: ...
+
+    def retry_management_watch(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        worker_id: str,
+        delay_seconds: int,
+        error: Mapping[str, Any],
+    ) -> bool: ...
 
 
 @runtime_checkable

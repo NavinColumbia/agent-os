@@ -208,6 +208,9 @@ def test_worker_settings_require_explicit_model_and_production_tenants(monkeypat
     settings = WorkerSettings.from_env()
     assert settings.organization_ids == ()
     assert settings.tenant_discovery_limit == 128
+    assert settings.management_check_seconds == 30
+    assert settings.slow_work_seconds == 300
+    assert settings.management_escalation_checks == 3
 
     monkeypatch.setenv("AOS_V2_WORKER_ORGANIZATIONS", "tenant-a,tenant-b,tenant-a")
     settings = WorkerSettings.from_env()
@@ -217,4 +220,9 @@ def test_worker_settings_require_explicit_model_and_production_tenants(monkeypat
 
     monkeypatch.setenv("AOS_V2_SANDBOX_BACKEND", "host")
     with pytest.raises(ValueError, match="must be disabled or docker"):
+        WorkerSettings.from_env()
+
+    monkeypatch.setenv("AOS_V2_SANDBOX_BACKEND", "disabled")
+    monkeypatch.setenv("AOS_V2_MANAGEMENT_ESCALATION_CHECKS", "101")
+    with pytest.raises(ValueError, match="cannot exceed 100"):
         WorkerSettings.from_env()

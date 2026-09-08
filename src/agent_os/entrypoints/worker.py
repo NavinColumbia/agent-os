@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 from agent_os.application.command_worker import DurableCommandWorker, RetryPolicy
 from agent_os.application.default_organization import default_organization
 from agent_os.application.graph_action_worker import DurableGraphActionWorker
+from agent_os.application.management_monitor import DurableManagementMonitor
 from agent_os.application.work_multiplexer import TenantWorkMultiplexer
 from agent_os.application.worker_loop import CommandWorkerLoop
 from agent_os.domain.lifecycle import CommandKind
@@ -88,6 +89,9 @@ class WorkerSettings:
     sandbox_image: str
     sandbox_timeout_seconds: int
     tenant_discovery_limit: int
+    management_check_seconds: int
+    slow_work_seconds: int
+    management_escalation_checks: int
 
     @classmethod
     def from_env(cls, *, organization_ids: Sequence[str] = ()) -> "WorkerSettings":
@@ -113,6 +117,15 @@ class WorkerSettings:
         tenant_discovery_limit = _positive_int("AOS_V2_TENANT_DISCOVERY_LIMIT", 128)
         if tenant_discovery_limit > 1_000:
             raise ValueError("AOS_V2_TENANT_DISCOVERY_LIMIT cannot exceed 1000")
+        management_check_seconds = _positive_int("AOS_V2_MANAGEMENT_CHECK_SECONDS", 30)
+        slow_work_seconds = _positive_int("AOS_V2_SLOW_WORK_SECONDS", 300)
+        management_escalation_checks = _positive_int("AOS_V2_MANAGEMENT_ESCALATION_CHECKS", 3)
+        if management_check_seconds > 3_600:
+            raise ValueError("AOS_V2_MANAGEMENT_CHECK_SECONDS cannot exceed 3600")
+        if slow_work_seconds > 7 * 24 * 60 * 60:
+            raise ValueError("AOS_V2_SLOW_WORK_SECONDS cannot exceed 604800")
+        if management_escalation_checks > 100:
+            raise ValueError("AOS_V2_MANAGEMENT_ESCALATION_CHECKS cannot exceed 100")
         worker_id = os.getenv("AOS_V2_WORKER_ID", "").strip()
         if not worker_id:
             worker_id = f"{socket.gethostname()}:{os.getpid()}"
@@ -133,6 +146,9 @@ class WorkerSettings:
             sandbox_image=os.getenv("AOS_V2_SANDBOX_IMAGE", DEFAULT_PYTHON_IMAGE).strip(),
             sandbox_timeout_seconds=_positive_int("AOS_V2_SANDBOX_TIMEOUT_SECONDS", 300),
             tenant_discovery_limit=tenant_discovery_limit,
+            management_check_seconds=management_check_seconds,
+            slow_work_seconds=slow_work_seconds,
+            management_escalation_checks=management_escalation_checks,
         )
 
     def with_organizations(self, organization_ids: Sequence[str]) -> "WorkerSettings":
@@ -265,9 +281,22 @@ def run_worker(
             lease_seconds=settings.lease_seconds,
             retry_policy=RetryPolicy(max_attempts=settings.retry_max_attempts),
         )
+        management_worker = DurableManagementMonitor(
+            watches=graph_engine,
+            graph=graph_engine,
+            inspector=graph_engine,
+            notifications=notification_store,
+            worker_id=settings.worker_id,
+            lease_seconds=settings.lease_seconds,
+            check_interval_seconds=settings.management_check_seconds,
+            slow_after_seconds=settings.slow_work_seconds,
+            escalation_checks=settings.management_escalation_checks,
+            retry_delay_seconds=max(1, int(settings.error_backoff_seconds)),
+        )
         tenant_worker = TenantWorkMultiplexer(
             lifecycle_worker=worker,
             graph_worker=graph_worker,
+            management_worker=management_worker,
         )
         loop_options: dict[str, Any] = {"organization_ids": settings.organization_ids}
         if not settings.organization_ids:
@@ -290,6 +319,8 @@ def run_worker(
             "tenant_mode": "static" if settings.organization_ids else "dynamic",
             "organizations": list(settings.organization_ids),
             "model": settings.model,
+            "management_check_seconds": settings.management_check_seconds,
+            "slow_work_seconds": settings.slow_work_seconds,
         })
         try:
             if once:

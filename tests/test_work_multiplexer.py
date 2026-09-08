@@ -27,6 +27,17 @@ class GraphWorker:
         return GraphActionRunReport(status, "graph" if status is not CommandRunStatus.IDLE else None)
 
 
+class ManagementWorker:
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+        self.calls = 0
+
+    def run_one(self, tenant_id):
+        self.calls += 1
+        status = self.statuses.pop(0)
+        return CommandRunReport(status, "management" if status is not CommandRunStatus.IDLE else None)
+
+
 def test_multiplexer_alternates_queue_preference_and_never_starves_graph_work():
     lifecycle = LifecycleWorker([CommandRunStatus.SUCCEEDED, CommandRunStatus.SUCCEEDED])
     graph = GraphWorker([CommandRunStatus.SUCCEEDED])
@@ -56,3 +67,19 @@ def test_multiplexer_falls_through_when_preferred_queue_is_idle():
 
     assert report.status is CommandRunStatus.SUCCEEDED
     assert report.command_id == "graph"
+
+
+def test_multiplexer_gives_management_checks_a_fair_turn_without_starving_execution():
+    lifecycle = LifecycleWorker([CommandRunStatus.SUCCEEDED])
+    graph = GraphWorker([CommandRunStatus.SUCCEEDED])
+    management = ManagementWorker([CommandRunStatus.SUCCEEDED])
+    worker = TenantWorkMultiplexer(  # type: ignore[arg-type]
+        lifecycle_worker=lifecycle,
+        graph_worker=graph,
+        management_worker=management,
+    )
+
+    assert worker.run_one("tenant-a").command_id == "lifecycle"
+    assert worker.run_one("tenant-a").command_id == "graph"
+    assert worker.run_one("tenant-a").command_id == "management"
+    assert (lifecycle.calls, graph.calls, management.calls) == (1, 1, 1)

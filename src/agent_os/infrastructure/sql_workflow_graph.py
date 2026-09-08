@@ -26,7 +26,14 @@ from sqlalchemy import (
     update,
 )
 
-from agent_os.application.ports import GraphActionLease, GraphActionOutbox, GraphWorkflowEngine, GraphWorkflowReceipt
+from agent_os.application.ports import (
+    GraphActionLease,
+    GraphActionOutbox,
+    GraphWorkflowEngine,
+    GraphWorkflowReceipt,
+    ManagementWatchLease,
+    ManagementWatchStore,
+)
 from agent_os.domain.workflow import WorkflowDefinition
 from agent_os.domain.workflow_runtime import (
     WorkflowAction,
@@ -121,6 +128,30 @@ workflow_actions = Table(
     ),
 )
 
+management_watches = Table(
+    "aos_v2_management_watches",
+    graph_metadata,
+    Column("tenant_id", String(128), primary_key=True),
+    Column("run_id", String(256), primary_key=True),
+    Column("status", String(32), nullable=False),
+    Column("next_check_at", DateTime(timezone=True), nullable=False),
+    Column("attempts", Integer, nullable=False, default=0),
+    Column("lease_owner", String(256)),
+    Column("lease_expires_at", DateTime(timezone=True)),
+    Column("last_checked_at", DateTime(timezone=True)),
+    Column("last_signal_fingerprint", String(64)),
+    Column("consecutive_signal_checks", Integer, nullable=False, default=0),
+    Column("notified_level", Integer, nullable=False, default=0),
+    Column("last_result", JSON),
+    Column("last_error", JSON),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["tenant_id", "run_id"],
+        ["aos_v2_workflow_runs.tenant_id", "aos_v2_workflow_runs.run_id"],
+        ondelete="CASCADE",
+    ),
+)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -136,7 +167,7 @@ def _fingerprint(raw: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox):
+class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox, ManagementWatchStore):
     def __init__(self, database_url: str, *, create_schema: bool = False) -> None:
         if not database_url.strip():
             raise ValueError("database_url is required")
@@ -278,6 +309,16 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox):
                 state=mutation.state.to_dict(),
                 created_at=now,
                 updated_at=now,
+            ))
+            connection.execute(insert(management_watches).values(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                status="pending",
+                next_check_at=now,
+                attempts=0,
+                consecutive_signal_checks=0,
+                notified_level=0,
+                created_at=now,
             ))
             start_event = {"event_id": request_id, "kind": "run_started", "request": request}
             connection.execute(insert(workflow_events).values(
@@ -514,6 +555,136 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox):
                         lease_expires_at=expires.isoformat(),
                     )
         raise RuntimeError("graph action claim contention exceeded retry bound")
+
+    def claim_management_watch(
+        self,
+        tenant_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> ManagementWatchLease | None:
+        if not tenant_id.strip() or not worker_id.strip():
+            raise ValueError("tenant_id and worker_id are required")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        for _ in range(8):
+            now = _now()
+            due = or_(
+                and_(
+                    management_watches.c.status == "pending",
+                    management_watches.c.next_check_at <= now,
+                ),
+                and_(
+                    management_watches.c.status == "executing",
+                    management_watches.c.lease_expires_at < now,
+                ),
+            )
+            with self._tenant_connection(tenant_id) as connection:
+                query = select(
+                    management_watches.c.run_id,
+                    management_watches.c.attempts,
+                    management_watches.c.last_signal_fingerprint,
+                    management_watches.c.consecutive_signal_checks,
+                    management_watches.c.notified_level,
+                    management_watches.c.last_result,
+                ).where(and_(
+                    management_watches.c.tenant_id == tenant_id,
+                    due,
+                )).order_by(
+                    management_watches.c.next_check_at,
+                    management_watches.c.created_at,
+                ).limit(1)
+                if connection.dialect.name == "postgresql":
+                    query = query.with_for_update(skip_locked=True)
+                row = connection.execute(query).mappings().first()
+                if row is None:
+                    return None
+                expires = now + timedelta(seconds=lease_seconds)
+                changed = connection.execute(update(management_watches).where(and_(
+                    management_watches.c.tenant_id == tenant_id,
+                    management_watches.c.run_id == row["run_id"],
+                    due,
+                )).values(
+                    status="executing",
+                    attempts=management_watches.c.attempts + 1,
+                    lease_owner=worker_id,
+                    lease_expires_at=expires,
+                ))
+                if changed.rowcount == 1:
+                    return ManagementWatchLease(
+                        tenant_id=tenant_id,
+                        run_id=str(row["run_id"]),
+                        worker_id=worker_id,
+                        attempt=int(row["attempts"]) + 1,
+                        lease_expires_at=expires.isoformat(),
+                        last_signal_fingerprint=row["last_signal_fingerprint"],
+                        consecutive_signal_checks=int(row["consecutive_signal_checks"]),
+                        notified_level=int(row["notified_level"]),
+                        last_result=None if row["last_result"] is None else dict(row["last_result"]),
+                    )
+        raise RuntimeError("management watch claim contention exceeded retry bound")
+
+    def complete_management_watch(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        worker_id: str,
+        next_check_seconds: int,
+        signal_fingerprint: str | None,
+        consecutive_signal_checks: int,
+        notified_level: int,
+        result: Mapping[str, Any],
+        retire: bool = False,
+    ) -> bool:
+        if next_check_seconds < 1 or consecutive_signal_checks < 0 or notified_level < 0:
+            raise ValueError("management watch completion values are invalid")
+        with self._tenant_connection(tenant_id) as connection:
+            now = _now()
+            changed = connection.execute(update(management_watches).where(and_(
+                management_watches.c.tenant_id == tenant_id,
+                management_watches.c.run_id == run_id,
+                management_watches.c.status == "executing",
+                management_watches.c.lease_owner == worker_id,
+            )).values(
+                status="retired" if retire else "pending",
+                next_check_at=now + timedelta(seconds=next_check_seconds),
+                lease_owner=None,
+                lease_expires_at=None,
+                last_checked_at=now,
+                last_signal_fingerprint=signal_fingerprint,
+                consecutive_signal_checks=consecutive_signal_checks,
+                notified_level=notified_level,
+                last_result=dict(result),
+                last_error=None,
+            ))
+            return changed.rowcount == 1
+
+    def retry_management_watch(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        worker_id: str,
+        delay_seconds: int,
+        error: Mapping[str, Any],
+    ) -> bool:
+        if delay_seconds < 1:
+            raise ValueError("management retry delay must be positive")
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(management_watches).where(and_(
+                management_watches.c.tenant_id == tenant_id,
+                management_watches.c.run_id == run_id,
+                management_watches.c.status == "executing",
+                management_watches.c.lease_owner == worker_id,
+            )).values(
+                status="pending",
+                next_check_at=_now() + timedelta(seconds=delay_seconds),
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=dict(error),
+            ))
+            return changed.rowcount == 1
 
     def heartbeat_graph_action(
         self,

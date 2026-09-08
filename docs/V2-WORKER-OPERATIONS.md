@@ -40,8 +40,17 @@ is healthy from an expired recoverable lease, scheduled retry, delayed dispatch,
 terminal business failure. A review interval therefore creates a diagnostic signal; it never abandons healthy
 work or pretends the whole adaptive graph is a fixed-size percentage plan. Agent nodes persist their bounded
 management proposals in workflow state, but external messages and staffing requests remain labelled proposals
-until a governed effect/approval executor applies them. Periodic manager sweeps and push delivery of nonterminal
-delay signals remain a subsequent milestone; this endpoint does not claim they already exist.
+until a governed effect/approval executor applies them.
+
+Every graph run also creates a durable management watch. The fair tenant worker claims due watches under an
+owner-fenced lease, runs the same authority-derived diagnosis, and schedules the next check without keeping a
+tenant permanently hot. Sustained `slow_but_owned`, expired/recovering lease, delayed dispatch, or contradictory
+state produces one idempotent manager notification; critical infrastructure symptoms also reach the operator.
+Only a condition that survives the configured number of consecutive checks escalates to the CEO, and a later
+healthy check publishes recovery to the same audience. Rechecking or crashing between notification publication
+and watch acknowledgement cannot duplicate the inbox item. The monitor never cancels work. A future manager-agent
+turn may add contextual repair/reassignment proposals, but deterministic health classification and delivery do
+not depend on a model being available.
 
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
@@ -128,6 +137,9 @@ Important controls:
 - `AOS_V2_WORKER_ORGANIZATIONS` (optional comma-separated static BYOC/cell allowlist)
 - `AOS_V2_PUBLIC_BASE_URL` (the externally reachable API origin; production requires HTTPS)
 - `AOS_V2_PREVIEW_TTL_SECONDS` (default `604800`; bounded from 60 seconds through 30 days)
+- `AOS_V2_MANAGEMENT_CHECK_SECONDS` (default `30`; durable review cadence)
+- `AOS_V2_SLOW_WORK_SECONDS` (default `300`; diagnostic threshold, never a kill timeout)
+- `AOS_V2_MANAGEMENT_ESCALATION_CHECKS` (default `3`; consecutive checks before CEO escalation)
 
 With no static allowlist, staging/production workers use the narrow `agentos_worker` database role to discover
 only tenant IDs with due or abandoned queue work. That role receives column-level access to scheduling metadata,
@@ -145,7 +157,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–93), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–94), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC/signup, secrets management, production deploy/rollback, a hosted
 sandbox/build adapter, large-object storage/garbage collection, metering, and managed-cloud IaC are still launch
 blockers.

@@ -45,6 +45,7 @@ services:
       - ../postgres/initdb/91-ready-tenant-discovery-v2.sql:/migrations/91-ready-tenant-discovery-v2.sql:ro
       - ../postgres/initdb/92-preview-deployments-v2.sql:/migrations/92-preview-deployments-v2.sql:ro
       - ../postgres/initdb/93-preview-capability-lifecycle-v2.sql:/migrations/93-preview-capability-lifecycle-v2.sql:ro
+      - ../postgres/initdb/94-management-watch-v2.sql:/migrations/94-management-watch-v2.sql:ro
     command:
       - sh
       - -ec
@@ -57,6 +58,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/91-ready-tenant-discovery-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/92-preview-deployments-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/93-preview-capability-lifecycle-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/94-management-watch-v2.sql
     restart: "no"
 
   api:
@@ -95,6 +97,9 @@ services:
       AOS_V2_TENANT_DISCOVERY_LIMIT: ${AOS_V2_TENANT_DISCOVERY_LIMIT:-128}
       AOS_V2_MAX_TURN_COST_CENTS: ${AOS_V2_MAX_TURN_COST_CENTS:-100}
       AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS: ${AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS:-120}
+      AOS_V2_MANAGEMENT_CHECK_SECONDS: ${AOS_V2_MANAGEMENT_CHECK_SECONDS:-30}
+      AOS_V2_SLOW_WORK_SECONDS: ${AOS_V2_SLOW_WORK_SECONDS:-300}
+      AOS_V2_MANAGEMENT_ESCALATION_CHECKS: ${AOS_V2_MANAGEMENT_ESCALATION_CHECKS:-3}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     depends_on:

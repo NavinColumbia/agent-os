@@ -7,7 +7,11 @@ from sqlalchemy import create_engine, insert
 
 from agent_os.infrastructure.dbos_lifecycle import commands, metadata
 from agent_os.infrastructure.sql_ready_tenants import SQLReadyTenantSource
-from agent_os.infrastructure.sql_workflow_graph import graph_metadata, workflow_actions
+from agent_os.infrastructure.sql_workflow_graph import (
+    graph_metadata,
+    management_watches,
+    workflow_actions,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,11 +80,24 @@ def test_ready_tenant_discovery_unifies_queues_excludes_future_work_and_rotates(
                 "available_at": now - timedelta(hours=1),
             },
         ])
+        connection.execute(insert(management_watches), {
+            "tenant_id": "tenant-e",
+            "run_id": "managed-run",
+            "status": "pending",
+            "next_check_at": now - timedelta(seconds=1),
+            "attempts": 0,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "consecutive_signal_checks": 0,
+            "notified_level": 0,
+            "created_at": now,
+        })
     source = SQLReadyTenantSource(database_url)
     try:
-        assert source.list_ready_tenants(limit=10) == ("tenant-a", "tenant-b")
+        assert source.list_ready_tenants(limit=10) == ("tenant-a", "tenant-b", "tenant-e")
         assert source.list_ready_tenants(after_tenant_id="tenant-a", limit=1) == ("tenant-b",)
-        assert source.list_ready_tenants(after_tenant_id="tenant-b", limit=1) == ("tenant-a",)
+        assert source.list_ready_tenants(after_tenant_id="tenant-b", limit=1) == ("tenant-e",)
+        assert source.list_ready_tenants(after_tenant_id="tenant-e", limit=1) == ("tenant-a",)
     finally:
         source.close()
         engine.dispose()
@@ -112,3 +129,14 @@ def test_ready_tenant_migration_exposes_only_scheduling_columns_to_a_narrow_role
     assert "GRANT SELECT ON TABLE" not in migration
     assert migration.count("_ready_global_idx") == 2
     assert migration.count("_expired_global_idx") == 2
+
+
+def test_management_watch_migration_preserves_tenant_fencing_and_narrow_discovery():
+    migration = (ROOT / "postgres/initdb/94-management-watch-v2.sql").read_text()
+
+    assert "ENABLE ROW LEVEL SECURITY" in migration
+    assert "FORCE ROW LEVEL SECURITY" in migration
+    assert "SELECT (tenant_id, status, next_check_at, lease_expires_at)" in migration
+    assert "FOR SELECT TO agentos_worker" in migration
+    assert "GRANT SELECT ON TABLE" not in migration
+    assert "REFERENCES aos_v2_workflow_runs" in migration

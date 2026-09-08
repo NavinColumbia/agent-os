@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent_os.application.command_worker import CommandRunReport, CommandRunStatus, DurableCommandWorker
 from agent_os.application.graph_action_worker import DurableGraphActionWorker
+from agent_os.application.worker_loop import TenantWorker
 
 
 class TenantWorkMultiplexer:
@@ -14,27 +15,31 @@ class TenantWorkMultiplexer:
         *,
         lifecycle_worker: DurableCommandWorker,
         graph_worker: DurableGraphActionWorker,
+        management_worker: TenantWorker | None = None,
     ) -> None:
         self._lifecycle = lifecycle_worker
         self._graph = graph_worker
-        self._prefer_graph: dict[str, bool] = {}
+        self._management = management_worker
+        self._next_queue: dict[str, int] = {}
 
-    def run_one(self, tenant_id: str) -> CommandRunReport:
-        prefer_graph = self._prefer_graph.get(tenant_id, False)
-        self._prefer_graph[tenant_id] = not prefer_graph
-        if prefer_graph:
-            graph = self._graph.run_one(tenant_id)
-            if graph.status is not CommandRunStatus.IDLE:
-                return CommandRunReport(
-                    graph.status, graph.action_id, graph.attempt,
-                    graph.retry_after_seconds, graph.error_type,
-                )
-            return self._lifecycle.run_one(tenant_id)
-        lifecycle = self._lifecycle.run_one(tenant_id)
-        if lifecycle.status is not CommandRunStatus.IDLE:
-            return lifecycle
-        graph = self._graph.run_one(tenant_id)
+    @staticmethod
+    def _graph_report(graph) -> CommandRunReport:
         return CommandRunReport(
             graph.status, graph.action_id, graph.attempt,
             graph.retry_after_seconds, graph.error_type,
         )
+
+    def run_one(self, tenant_id: str) -> CommandRunReport:
+        queues = [
+            lambda: self._lifecycle.run_one(tenant_id),
+            lambda: self._graph_report(self._graph.run_one(tenant_id)),
+        ]
+        if self._management is not None:
+            queues.append(lambda: self._management.run_one(tenant_id))
+        start = self._next_queue.get(tenant_id, 0) % len(queues)
+        self._next_queue[tenant_id] = (start + 1) % len(queues)
+        for offset in range(len(queues)):
+            report = queues[(start + offset) % len(queues)]()
+            if report.status is not CommandRunStatus.IDLE:
+                return report
+        return CommandRunReport(CommandRunStatus.IDLE)

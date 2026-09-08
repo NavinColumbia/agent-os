@@ -15,6 +15,8 @@ class NotificationCategory(str, Enum):
     RUN_SUCCEEDED = "run_succeeded"
     RUN_FAILED = "run_failed"
     RUN_CANCELLED = "run_cancelled"
+    MANAGEMENT_ATTENTION = "management_attention"
+    WORK_RECOVERED = "work_recovered"
 
 
 @dataclass(frozen=True)

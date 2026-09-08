@@ -162,3 +162,40 @@ def test_identical_customer_run_ids_do_not_collide_across_tenants(engine):
     assert run_a.actions[0].action_id == run_b.actions[0].action_id
     assert engine.claim_graph_action("tenant-a", worker_id="worker-a") is not None
     assert engine.claim_graph_action("tenant-b", worker_id="worker-b") is not None
+
+
+def test_management_watch_is_scheduled_leased_and_owner_fenced(engine):
+    engine.register_workflow(graph())
+    engine.start_graph_run(
+        "tenant-a", "delivery", 1, run_id="managed-run", request_id="managed-start",
+    )
+
+    watch = engine.claim_management_watch(
+        "tenant-a", worker_id="manager-a", lease_seconds=30,
+    )
+
+    assert watch is not None
+    assert watch.run_id == "managed-run"
+    assert watch.attempt == 1
+    assert engine.complete_management_watch(
+        "tenant-a",
+        "managed-run",
+        worker_id="manager-b",
+        next_check_seconds=30,
+        signal_fingerprint=None,
+        consecutive_signal_checks=0,
+        notified_level=0,
+        result={"health": "forged"},
+    ) is False
+    assert engine.complete_management_watch(
+        "tenant-a",
+        "managed-run",
+        worker_id="manager-a",
+        next_check_seconds=30,
+        signal_fingerprint=None,
+        consecutive_signal_checks=0,
+        notified_level=0,
+        result={"health": "healthy"},
+    ) is True
+    assert engine.claim_management_watch("tenant-a", worker_id="manager-b") is None
+    assert engine.claim_management_watch("tenant-b", worker_id="manager-b") is None

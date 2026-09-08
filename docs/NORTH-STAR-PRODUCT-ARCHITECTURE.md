@@ -489,6 +489,8 @@ the serving route applies an opaque-origin CSP sandbox with network, forms, navi
 Capabilities expire on a bounded TTL and tenant owners/operators can list and idempotently revoke them.
 A fast deterministic integration contract now proves the entire authenticated CEO-prompt-to-fetchable-preview
 path without provider spend; the earlier live-provider mission proof separately exercises real model grounding.
+CEO cancellation now propagates into both planning and execution graphs, blocks late bootstrap/launch work, and
+is race-safe and idempotent rather than being only a top-level status change.
 Workers can discover due tenants through a narrow scheduling-only database role while retaining tenant-RLS claims
 and round-robin fairness. It still has overlapping legacy controllers, local-host assumptions, unfinished public
 infrastructure, no managed-cloud sandbox/production-deploy/general-subworkflow adapters, and no complete

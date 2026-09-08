@@ -30,6 +30,7 @@ from agent_os.infrastructure.memory import InMemoryWorkflowEngine
 from agent_os.infrastructure.mission_workflows import (
     MISSION_BOOTSTRAP_WORKFLOW_ID,
     MissionBootstrapHandler,
+    MissionCancellationHandler,
     MissionGraphEffectHandlers,
     WorkflowLaunchToolNodeHandlers,
     materialize_mission_workflow,
@@ -192,9 +193,69 @@ def test_start_mission_plans_validates_and_launches_a_child_graph(tmp_path: Path
         assert artifacts.describe(
             "tenant-a", launch_token.output["launch_artifact_id"],
         ) is not None
+
+        cancelled = MissionCancellationHandler(graph, artifacts).execute(CommandEnvelope(
+            "command-cancel-mission",
+            "lifecycle-run",
+            "tenant-a",
+            "cancel-requested",
+            2,
+            0,
+            Command(CommandKind.CANCEL_ACTIVE_OPERATION, {"reason": "CEO stopped the run"}),
+        ))
+        assert cancelled["cancelled_graphs"][planning_run_id] == "cancelled"
+        assert cancelled["cancelled_graphs"][child_run_id] == "cancelled"
+        replay = MissionCancellationHandler(graph, artifacts).execute(CommandEnvelope(
+            "command-cancel-mission",
+            "lifecycle-run",
+            "tenant-a",
+            "cancel-requested",
+            2,
+            0,
+            Command(CommandKind.CANCEL_ACTIVE_OPERATION, {"reason": "CEO stopped the run"}),
+        ))
+        assert replay == cancelled
+        assert graph.get_graph_run(
+            "tenant-a", planning_run_id,
+        ).status is WorkflowRunStatus.CANCELLED
+        assert graph.get_graph_run(
+            "tenant-a", child_run_id,
+        ).status is WorkflowRunStatus.CANCELLED
     finally:
         graph.close()
         artifacts.close()
+
+
+def test_cancelled_lifecycle_cannot_start_a_late_planning_graph(tmp_path: Path):
+    lifecycle = InMemoryWorkflowEngine()
+    lifecycle.start_run(
+        LifecycleState("late-run", "tenant-a"),
+        Event("scope", EventKind.SCOPE_ACCEPTED, 0, {"prompt": "Build"}),
+    )
+    lifecycle.submit_event(
+        "tenant-a",
+        "late-run",
+        Event("cancel", EventKind.CANCEL_REQUESTED, 1, {"reason": "Stop"}),
+    )
+    graph = SQLGraphWorkflowEngine(
+        f"sqlite:///{tmp_path / 'late-cancel.sqlite3'}", create_schema=True,
+    )
+    try:
+        result = MissionBootstrapHandler(graph, lifecycle).execute(CommandEnvelope(
+            "late-start-command",
+            "late-run",
+            "tenant-a",
+            "scope",
+            1,
+            0,
+            Command(CommandKind.START_MISSION, {"prompt": "Build"}),
+        ))
+        assert result == {"planning_started": False, "reason": "lifecycle_cancelled"}
+        assert graph.get_graph_run(
+            "tenant-a", mission_planning_run_id("late-run"),
+        ) is None
+    finally:
+        graph.close()
 
 
 class OneStateGraph:

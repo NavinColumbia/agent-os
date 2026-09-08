@@ -28,6 +28,7 @@ from agent_os.infrastructure.docker_sandbox import DEFAULT_PYTHON_IMAGE, DockerS
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
 from agent_os.infrastructure.mission_workflows import (
     MissionBootstrapHandler,
+    MissionCancellationHandler,
     MissionGraphEffectHandlers,
     WorkflowLaunchToolNodeHandlers,
 )
@@ -191,7 +192,9 @@ def run_worker(
             DeploymentToolNodeHandlers(preview_deployments).named_handlers()
         )
         named_tool_handlers.update(
-            WorkflowLaunchToolNodeHandlers(graph_engine, artifact_store).named_handlers()
+            WorkflowLaunchToolNodeHandlers(
+                graph_engine, artifact_store, engine,
+            ).named_handlers()
         )
         if settings.sandbox_backend == "docker":
             docker_binary = shutil.which("docker")
@@ -220,7 +223,10 @@ def run_worker(
         )
         lifecycle_handlers = dict(notification_effects.lifecycle_handlers())
         lifecycle_handlers[CommandKind.START_MISSION] = MissionBootstrapHandler(
-            graph_engine
+            graph_engine, engine,
+        ).execute
+        lifecycle_handlers[CommandKind.CANCEL_ACTIVE_OPERATION] = MissionCancellationHandler(
+            graph_engine, artifact_store,
         ).execute
         executor = LifecycleCommandRouter(
             agent_executor=agent_executor,

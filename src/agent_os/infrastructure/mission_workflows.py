@@ -22,7 +22,11 @@ from agent_os.domain.workflow_runtime import (
     TokenStatus,
     WorkflowAction,
     WorkflowActionKind,
+    WorkflowEvent,
+    WorkflowEventKind,
     WorkflowRunState,
+    WorkflowRunStatus,
+    WorkflowTransitionRejected,
 )
 from agent_os.infrastructure.graph_output_refs import resolve_prior_output
 
@@ -80,6 +84,45 @@ def _workflow_id(tenant_id: str, planning_run_id: str, artifact_id: str) -> str:
 def _child_run_id(planning_run_id: str, workflow_id: str) -> str:
     material = f"agent-os:mission-run:v1:{planning_run_id}:{workflow_id}"
     return "mission-run-" + hashlib.sha256(material.encode()).hexdigest()[:32]
+
+
+def _cancel_graph_run(
+    graph: GraphWorkflowEngine,
+    *,
+    tenant_id: str,
+    run_id: str,
+    reason: str,
+    source_id: str,
+) -> str:
+    """Cancel one correlated graph despite bounded concurrent progress."""
+
+    event_id = "mission-cancel-" + hashlib.sha256(
+        f"{source_id}:{run_id}".encode()
+    ).hexdigest()
+    for _ in range(8):
+        state = graph.get_graph_run(tenant_id, run_id)
+        if state is None:
+            return "missing"
+        if state.status is WorkflowRunStatus.CANCELLED:
+            return "cancelled"
+        if state.status in {WorkflowRunStatus.SUCCEEDED, WorkflowRunStatus.FAILED}:
+            return state.status.value
+        try:
+            graph.submit_graph_event(
+                tenant_id,
+                run_id,
+                WorkflowEvent(
+                    event_id,
+                    WorkflowEventKind.RUN_CANCELLED,
+                    state.version,
+                    {"reason": reason},
+                ),
+            )
+            return "cancelled"
+        except WorkflowTransitionRejected as exc:
+            if "stale" not in str(exc):
+                raise FatalCommandError(f"mission graph cancellation was rejected: {exc}") from exc
+    raise FatalCommandError("mission graph cancellation exceeded its concurrency retry bound")
 
 
 def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
@@ -391,10 +434,21 @@ def materialize_mission_workflow(
 class MissionBootstrapHandler:
     """Idempotently enqueue the built-in planner graph for a lifecycle command."""
 
-    def __init__(self, graph_engine: GraphWorkflowEngine) -> None:
+    def __init__(
+        self,
+        graph_engine: GraphWorkflowEngine,
+        lifecycle_engine: WorkflowEngine | None = None,
+    ) -> None:
         self._graph = graph_engine
+        self._lifecycle = lifecycle_engine
 
     def execute(self, item: CommandEnvelope) -> Mapping[str, Any]:
+        if self._lifecycle is not None:
+            lifecycle = self._lifecycle.get_run(item.organization_id, item.run_id)
+            if lifecycle is None:
+                raise FatalCommandError("mission lifecycle disappeared before planning")
+            if lifecycle.status is LifecycleStatus.CANCELLED:
+                return {"planning_started": False, "reason": "lifecycle_cancelled"}
         definition = mission_bootstrap_definition(item.organization_id)
         self._graph.register_workflow(definition)
         planning_run_id = mission_planning_run_id(item.run_id)
@@ -422,9 +476,24 @@ class MissionBootstrapHandler:
 class WorkflowLaunchToolNodeHandlers:
     """Validate an agent-authored plan and launch it through the graph authority."""
 
-    def __init__(self, graph_engine: GraphWorkflowEngine, artifact_store: ArtifactStore) -> None:
+    def __init__(
+        self,
+        graph_engine: GraphWorkflowEngine,
+        artifact_store: ArtifactStore,
+        lifecycle_engine: WorkflowEngine | None = None,
+    ) -> None:
         self._graph = graph_engine
         self._artifacts = artifact_store
+        self._lifecycle = lifecycle_engine
+
+    def _cancelled_lifecycle(self, tenant_id: str, state: WorkflowRunState) -> bool:
+        if self._lifecycle is None:
+            return False
+        lifecycle_run_id = str(state.context.get("lifecycle_run_id") or "")
+        lifecycle = self._lifecycle.get_run(tenant_id, lifecycle_run_id)
+        if lifecycle is None:
+            raise FatalCommandError("mission lifecycle disappeared before child launch")
+        return lifecycle.status is LifecycleStatus.CANCELLED
 
     def named_handlers(self):
         return {"workflow.launch": self.execute}
@@ -441,6 +510,15 @@ class WorkflowLaunchToolNodeHandlers:
         del definition
         if node.kind is not NodeKind.TOOL or node.configuration.get("tool") != "workflow.launch":
             raise FatalCommandError("workflow launch handler received the wrong tool node")
+        if self._cancelled_lifecycle(tenant_id, state):
+            _cancel_graph_run(
+                self._graph,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                reason="CEO lifecycle was cancelled before child launch",
+                source_id=action.action_id,
+            )
+            return {"disposition": "fail", "reason": "mission was cancelled"}
         artifact_id = resolve_prior_output(
             state, node.configuration.get("source"), subject="workflow launch",
         )
@@ -483,6 +561,22 @@ class WorkflowLaunchToolNodeHandlers:
             request_id="mission-launch-" + hashlib.sha256(action.action_id.encode()).hexdigest(),
             context=child_context,
         )
+        if self._cancelled_lifecycle(tenant_id, state):
+            _cancel_graph_run(
+                self._graph,
+                tenant_id=tenant_id,
+                run_id=child_run_id,
+                reason="CEO lifecycle was cancelled during child launch",
+                source_id=action.action_id,
+            )
+            _cancel_graph_run(
+                self._graph,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                reason="CEO lifecycle was cancelled during child launch",
+                source_id=action.action_id,
+            )
+            return {"disposition": "fail", "reason": "mission was cancelled"}
         launch_record = {
             "format": "agent-os.mission-launch.v1",
             "tenant_id": tenant_id,
@@ -510,6 +604,98 @@ class WorkflowLaunchToolNodeHandlers:
                 "launch_artifact_id": launch_artifact_id,
             },
         }
+
+
+class MissionCancellationHandler:
+    """Propagate a terminal CEO cancellation into planning and child graphs."""
+
+    def __init__(
+        self,
+        graph_engine: GraphWorkflowEngine,
+        artifact_store: ArtifactStore,
+    ) -> None:
+        self._graph = graph_engine
+        self._artifacts = artifact_store
+
+    def _derived_child_run_id(
+        self, tenant_id: str, planning_run_id: str, state: WorkflowRunState,
+    ) -> str | None:
+        artifact_ids = {
+            str(token.output.get("artifact_ids", {}).get(MISSION_PLAN_ARTIFACT_LABEL) or "")
+            for token in state.tokens
+            if token.node_id == "plan" and isinstance(token.output.get("artifact_ids"), Mapping)
+        }
+        artifact_ids.discard("")
+        if len(artifact_ids) != 1:
+            return None
+        artifact_id = next(iter(artifact_ids))
+        record = self._artifacts.describe(tenant_id, artifact_id)
+        content = self._artifacts.get(tenant_id, artifact_id)
+        if record is None or record.get("media_type") != "application/json" or content is None:
+            return None
+        try:
+            proposal = json.loads(content)
+            definition = materialize_mission_workflow(
+                proposal,
+                tenant_id=tenant_id,
+                planning_run_id=planning_run_id,
+                artifact_id=artifact_id,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, FatalCommandError, ValueError):
+            return None
+        return _child_run_id(planning_run_id, definition.workflow_id)
+
+    def execute(self, item: CommandEnvelope) -> Mapping[str, Any]:
+        reason = str(item.command.payload.get("reason") or "CEO cancelled the mission")
+        planning_run_id = mission_planning_run_id(item.run_id)
+        planning = self._graph.get_graph_run(item.organization_id, planning_run_id)
+        child_run_ids = set()
+        if planning is not None:
+            child_run_ids.update(
+                str(token.output["child_run_id"])
+                for token in planning.tokens
+                if token.output.get("child_run_id")
+            )
+            derived = self._derived_child_run_id(
+                item.organization_id, planning_run_id, planning,
+            )
+            if derived is not None:
+                child_run_ids.add(derived)
+
+        results = {
+            child_run_id: _cancel_graph_run(
+                self._graph,
+                tenant_id=item.organization_id,
+                run_id=child_run_id,
+                reason=reason,
+                source_id=item.command_id,
+            )
+            for child_run_id in sorted(child_run_ids)
+        }
+        results[planning_run_id] = _cancel_graph_run(
+            self._graph,
+            tenant_id=item.organization_id,
+            run_id=planning_run_id,
+            reason=reason,
+            source_id=item.command_id,
+        )
+        # Re-read after cancelling planning to catch a launch result that
+        # committed immediately before our cancellation version fence.
+        refreshed = self._graph.get_graph_run(item.organization_id, planning_run_id)
+        if refreshed is not None:
+            for child_run_id in sorted({
+                str(token.output["child_run_id"])
+                for token in refreshed.tokens
+                if token.output.get("child_run_id")
+            }):
+                results[child_run_id] = _cancel_graph_run(
+                    self._graph,
+                    tenant_id=item.organization_id,
+                    run_id=child_run_id,
+                    reason=reason,
+                    source_id=item.command_id,
+                )
+        return {"cancelled_graphs": results}
 
 
 class MissionGraphEffectHandlers:

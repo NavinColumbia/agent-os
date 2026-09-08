@@ -34,10 +34,16 @@ than the orchestration engine.
 
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
-email, Slack, SMS, and push remain separate adapters. `schedule_retry`, `cancel_active_operation`, arbitrary
-external/sandbox tool execution, and subworkflows still require explicitly registered executors; until those
-adapters exist, the router marks the effect failed with a durable explanation rather than reporting an operation
-that did not happen.
+email, Slack, SMS, and push remain separate adapters. `schedule_retry`, arbitrary external tool execution, and
+general subworkflows still require explicitly registered executors; until those adapters exist, the router marks
+the effect failed with a durable explanation rather than reporting an operation that did not happen.
+
+`cancel_active_operation` now has a mission-aware executor. A terminal CEO cancellation is propagated to both the
+planner and any launched child graph, turns all live graph tokens into cancelled tokens, and produces the graph's
+normal durable cancellation action/notification. A cancelled lifecycle is checked before late planning and both
+before and after child launch. The cancellation handler can derive the deterministic child run ID from committed
+plan evidence, so a launch/cancel race cannot quietly orphan continuing work. Replaying the same cancellation is
+idempotent.
 
 The first allowlisted graph tools, `artifact.publish_text` and `artifact.publish_json`, turn literal or durable
 prior-node output into immutable, content-addressed evidence. Their bootstrap PostgreSQL store is capped at 2 MiB

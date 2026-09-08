@@ -15,6 +15,13 @@
 - retries transient provider/database errors from durable state with backoff and no whole-story timeout;
 - handles SIGTERM/SIGINT between commands and emits structured JSON operational events.
 
+The same process fairly alternates the lifecycle-command and arbitrary graph-action queues per tenant. Graph
+actions use independent renewable leases and deterministic begin/result events. Agent and decision nodes use
+structured model output, human nodes create and resume correlated waits without model spend, and terminal nodes
+accept upstream evidence rather than inventing new evidence. Provider retries keep a token running and reuse the
+same action ID; recovery after a committed result does not execute the node twice. Tool, timer, subworkflow, and
+external publication actions stay fail-closed until an idempotent adapter is registered.
+
 Lifecycle commands that represent external effects are deliberately not faked. `notify_human`, `notify_operator`,
 `schedule_retry`, `cancel_active_operation`, and `publish_completion` require explicitly registered executors. Until
 those adapters exist, the router marks the command failed with a durable explanation rather than reporting a
@@ -53,6 +60,6 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations, and then starts the API and worker from the exact
+It starts PostgreSQL, applies only the isolated V2 migrations (86–88), and then starts the API and worker from the exact
 same non-root image. Hosted OIDC/signup, secrets management, external-effect adapters, sandbox/build tools,
 artifact storage, metering, and managed-cloud IaC are still launch blockers.

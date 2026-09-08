@@ -39,3 +39,4 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "dockerfile: deploy/Dockerfile.v2" in compose
     assert "command: [\"agentos-v2\", \"worker\"]" in compose
     assert "service_completed_successfully" in compose
+    assert "88-workflow-action-leases-v2.sql" in compose

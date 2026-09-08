@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from threading import Event
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
-from agent_os.application.command_worker import CommandRunReport, CommandRunStatus, DurableCommandWorker
+from agent_os.application.command_worker import CommandRunReport, CommandRunStatus
 
 
 WorkerObserver = Callable[[Mapping[str, Any]], None]
+
+
+class TenantWorker(Protocol):
+    def run_one(self, organization_id: str) -> CommandRunReport: ...
 
 
 class CommandWorkerLoop:
@@ -18,7 +22,7 @@ class CommandWorkerLoop:
     def __init__(
         self,
         *,
-        worker: DurableCommandWorker,
+        worker: TenantWorker,
         organization_ids: Sequence[str],
         idle_poll_seconds: float = 1,
         error_backoff_seconds: float = 5,

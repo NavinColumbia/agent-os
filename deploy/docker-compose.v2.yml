@@ -37,12 +37,14 @@ services:
     volumes:
       - ../postgres/initdb/86-lifecycle-v2.sql:/migrations/86-lifecycle-v2.sql:ro
       - ../postgres/initdb/87-workflow-graphs-v2.sql:/migrations/87-workflow-graphs-v2.sql:ro
+      - ../postgres/initdb/88-workflow-action-leases-v2.sql:/migrations/88-workflow-action-leases-v2.sql:ro
     command:
       - sh
       - -ec
       - |
         psql -v ON_ERROR_STOP=1 -f /migrations/86-lifecycle-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/87-workflow-graphs-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/88-workflow-action-leases-v2.sql
     restart: "no"
 
   api:

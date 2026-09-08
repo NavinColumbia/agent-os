@@ -56,7 +56,7 @@ class CommandRunReport:
     error_type: str | None = None
 
 
-def _is_retryable(exc: Exception) -> bool:
+def is_retryable_execution_error(exc: Exception) -> bool:
     if isinstance(exc, RetryableCommandError):
         return True
     if isinstance(exc, FatalCommandError):
@@ -86,7 +86,7 @@ class DurableCommandWorker:
         worker_id: str,
         lease_seconds: int = 60,
         retry_policy: RetryPolicy | None = None,
-        retry_classifier: Callable[[Exception], bool] = _is_retryable,
+        retry_classifier: Callable[[Exception], bool] = is_retryable_execution_error,
         workflow_engine: WorkflowEngine | None = None,
         workflow_result_waiter: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> None:

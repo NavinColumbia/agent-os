@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from typing import Any, Mapping
@@ -20,12 +20,13 @@ from sqlalchemy import (
     and_,
     create_engine,
     insert,
+    or_,
     select,
     text,
     update,
 )
 
-from agent_os.application.ports import GraphWorkflowEngine, GraphWorkflowReceipt
+from agent_os.application.ports import GraphActionLease, GraphActionOutbox, GraphWorkflowEngine, GraphWorkflowReceipt
 from agent_os.domain.workflow import WorkflowDefinition
 from agent_os.domain.workflow_runtime import (
     WorkflowAction,
@@ -94,14 +95,21 @@ workflow_actions = Table(
     "aos_v2_workflow_actions",
     graph_metadata,
     Column("action_id", String(64), primary_key=True),
-    Column("tenant_id", String(128), nullable=False),
+    Column("tenant_id", String(128), primary_key=True),
     Column("run_id", String(256), nullable=False),
     Column("source_event_id", String(256), nullable=False),
     Column("state_version", Integer, nullable=False),
     Column("position", Integer, nullable=False),
     Column("action", JSON, nullable=False),
     Column("status", String(32), nullable=False),
+    Column("attempts", Integer, nullable=False, default=0),
+    Column("available_at", DateTime(timezone=True), nullable=False),
+    Column("lease_owner", String(256)),
+    Column("lease_expires_at", DateTime(timezone=True)),
     Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True)),
+    Column("result", JSON),
+    Column("last_error", JSON),
     ForeignKeyConstraint(
         ["tenant_id", "run_id", "source_event_id"],
         [
@@ -128,7 +136,7 @@ def _fingerprint(raw: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-class SQLGraphWorkflowEngine(GraphWorkflowEngine):
+class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox):
     def __init__(self, database_url: str, *, create_schema: bool = False) -> None:
         if not database_url.strip():
             raise ValueError("database_url is required")
@@ -216,6 +224,8 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine):
             "position": position,
             "action": action.to_dict(),
             "status": "pending",
+            "attempts": 0,
+            "available_at": now,
             "created_at": now,
         } for position, action in enumerate(actions)])
 
@@ -368,6 +378,197 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine):
                 workflow_runs.c.run_id == run_id,
             ))).scalar_one_or_none()
         return None if raw is None else WorkflowRunState.from_dict(raw)
+
+    def get_workflow_definition(
+        self,
+        tenant_id: str,
+        workflow_id: str,
+        version: int,
+    ) -> WorkflowDefinition | None:
+        with self._tenant_connection(tenant_id) as connection:
+            raw = connection.execute(select(workflow_definitions.c.definition).where(and_(
+                workflow_definitions.c.tenant_id == tenant_id,
+                workflow_definitions.c.workflow_id == workflow_id,
+                workflow_definitions.c.version == version,
+            ))).scalar_one_or_none()
+        return None if raw is None else WorkflowDefinition.from_dict(raw)
+
+    def claim_graph_action(
+        self,
+        tenant_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> GraphActionLease | None:
+        if not tenant_id.strip() or not worker_id.strip():
+            raise ValueError("tenant_id and worker_id are required")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        for _ in range(8):
+            now = _now()
+            due = or_(
+                and_(workflow_actions.c.status == "pending", workflow_actions.c.available_at <= now),
+                and_(workflow_actions.c.status == "executing", workflow_actions.c.lease_expires_at < now),
+            )
+            with self._tenant_connection(tenant_id) as connection:
+                query = select(
+                    workflow_actions.c.action_id,
+                    workflow_actions.c.run_id,
+                    workflow_actions.c.source_event_id,
+                    workflow_actions.c.state_version,
+                    workflow_actions.c.position,
+                    workflow_actions.c.action,
+                    workflow_actions.c.attempts,
+                ).where(and_(
+                    workflow_actions.c.tenant_id == tenant_id,
+                    due,
+                )).order_by(
+                    workflow_actions.c.available_at,
+                    workflow_actions.c.created_at,
+                    workflow_actions.c.position,
+                ).limit(1)
+                if connection.dialect.name == "postgresql":
+                    query = query.with_for_update(skip_locked=True)
+                row = connection.execute(query).mappings().first()
+                if row is None:
+                    return None
+                expires = now + timedelta(seconds=lease_seconds)
+                changed = connection.execute(update(workflow_actions).where(and_(
+                    workflow_actions.c.tenant_id == tenant_id,
+                    workflow_actions.c.action_id == row["action_id"],
+                    due,
+                )).values(
+                    status="executing",
+                    attempts=workflow_actions.c.attempts + 1,
+                    lease_owner=worker_id,
+                    lease_expires_at=expires,
+                ))
+                if changed.rowcount == 1:
+                    return GraphActionLease(
+                        envelope={
+                            "tenant_id": tenant_id,
+                            "run_id": row["run_id"],
+                            "source_event_id": row["source_event_id"],
+                            "state_version": int(row["state_version"]),
+                            "position": int(row["position"]),
+                            "action": row["action"],
+                        },
+                        worker_id=worker_id,
+                        attempt=int(row["attempts"]) + 1,
+                        lease_expires_at=expires.isoformat(),
+                    )
+        raise RuntimeError("graph action claim contention exceeded retry bound")
+
+    def heartbeat_graph_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> bool:
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        with self._tenant_connection(tenant_id) as connection:
+            now = _now()
+            changed = connection.execute(update(workflow_actions).where(and_(
+                workflow_actions.c.tenant_id == tenant_id,
+                workflow_actions.c.action_id == action_id,
+                workflow_actions.c.status == "executing",
+                workflow_actions.c.lease_owner == worker_id,
+                workflow_actions.c.lease_expires_at >= now,
+            )).values(lease_expires_at=now + timedelta(seconds=lease_seconds)))
+            return changed.rowcount == 1
+
+    def complete_graph_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        worker_id: str,
+        result: Mapping[str, Any],
+    ) -> bool:
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(workflow_actions).where(and_(
+                workflow_actions.c.tenant_id == tenant_id,
+                workflow_actions.c.action_id == action_id,
+                workflow_actions.c.status == "executing",
+                workflow_actions.c.lease_owner == worker_id,
+            )).values(
+                status="succeeded",
+                completed_at=_now(),
+                result=dict(result),
+                last_error=None,
+                lease_owner=None,
+                lease_expires_at=None,
+            ))
+            return changed.rowcount == 1
+
+    def retry_graph_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+        delay_seconds: int,
+    ) -> bool:
+        if delay_seconds < 0:
+            raise ValueError("delay_seconds cannot be negative")
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(workflow_actions).where(and_(
+                workflow_actions.c.tenant_id == tenant_id,
+                workflow_actions.c.action_id == action_id,
+                workflow_actions.c.status == "executing",
+                workflow_actions.c.lease_owner == worker_id,
+            )).values(
+                status="pending",
+                available_at=_now() + timedelta(seconds=delay_seconds),
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=dict(error),
+            ))
+            return changed.rowcount == 1
+
+    def fail_graph_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+    ) -> bool:
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(workflow_actions).where(and_(
+                workflow_actions.c.tenant_id == tenant_id,
+                workflow_actions.c.action_id == action_id,
+                workflow_actions.c.status == "executing",
+                workflow_actions.c.lease_owner == worker_id,
+            )).values(
+                status="failed",
+                completed_at=_now(),
+                last_error=dict(error),
+                lease_owner=None,
+                lease_expires_at=None,
+            ))
+            return changed.rowcount == 1
+
+    def get_graph_action_record(self, tenant_id: str, action_id: str) -> Mapping[str, Any] | None:
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(
+                workflow_actions.c.action_id,
+                workflow_actions.c.status,
+                workflow_actions.c.attempts,
+                workflow_actions.c.available_at,
+                workflow_actions.c.lease_owner,
+                workflow_actions.c.lease_expires_at,
+                workflow_actions.c.result,
+                workflow_actions.c.last_error,
+            ).where(and_(
+                workflow_actions.c.tenant_id == tenant_id,
+                workflow_actions.c.action_id == action_id,
+            ))).mappings().first()
+        return None if row is None else dict(row)
 
     def close(self) -> None:
         self._engine.dispose()

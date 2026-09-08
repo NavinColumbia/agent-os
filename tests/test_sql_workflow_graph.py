@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -96,3 +97,58 @@ def test_graph_events_commit_state_and_actions_together_with_full_history_dedup(
             "stale", WorkflowEventKind.NODE_BEGAN, 0,
             {"token_id": completed.state.ready()[0].token_id},
         ))
+
+
+def test_graph_action_outbox_is_tenant_fenced_recoverable_and_lease_owned(engine):
+    engine.register_workflow(graph())
+    started = engine.start_graph_run(
+        "tenant-a", "delivery", 1, run_id="leased-run", request_id="leased-start",
+    )
+    action_id = started.actions[0].action_id
+
+    first = engine.claim_graph_action("tenant-a", worker_id="worker-a", lease_seconds=30)
+
+    assert first is not None and first.attempt == 1
+    assert first.envelope["action"]["action_id"] == action_id
+    assert engine.claim_graph_action("tenant-a", worker_id="worker-b") is None
+    assert engine.claim_graph_action("tenant-b", worker_id="worker-b") is None
+    assert engine.complete_graph_action(
+        "tenant-a", action_id, worker_id="worker-b", result={"forged": True},
+    ) is False
+    assert engine.heartbeat_graph_action(
+        "tenant-a", action_id, worker_id="worker-a", lease_seconds=45,
+    ) is True
+    assert engine.retry_graph_action(
+        "tenant-a", action_id, worker_id="worker-a",
+        error={"type": "ConnectionError", "retryable": True}, delay_seconds=0,
+    ) is True
+
+    retry = engine.claim_graph_action("tenant-a", worker_id="worker-b")
+    assert retry is not None and retry.attempt == 2
+    assert engine.complete_graph_action(
+        "tenant-a", action_id, worker_id="worker-b", result={"evidence_ids": ["proof"]},
+    ) is True
+    record = engine.get_graph_action_record("tenant-a", action_id)
+    assert record is not None
+    assert record["status"] == "succeeded"
+    assert record["attempts"] == 2
+    assert record["last_error"] is None
+
+
+def test_identical_customer_run_ids_do_not_collide_across_tenants(engine):
+    tenant_a = graph()
+    tenant_b = replace(tenant_a, tenant_id="tenant-b")
+    engine.register_workflow(tenant_a)
+    engine.register_workflow(tenant_b)
+
+    run_a = engine.start_graph_run(
+        "tenant-a", "delivery", 1, run_id="customer-chosen", request_id="start-a",
+    )
+    run_b = engine.start_graph_run(
+        "tenant-b", "delivery", 1, run_id="customer-chosen", request_id="start-b",
+    )
+
+    # Deterministic action IDs may match; the durable identity is tenant + ID.
+    assert run_a.actions[0].action_id == run_b.actions[0].action_id
+    assert engine.claim_graph_action("tenant-a", worker_id="worker-a") is not None
+    assert engine.claim_graph_action("tenant-b", worker_id="worker-b") is not None

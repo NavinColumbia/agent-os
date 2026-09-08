@@ -48,6 +48,16 @@ class GraphWorkflowReceipt:
     duplicate: bool = False
 
 
+@dataclass(frozen=True)
+class GraphActionLease:
+    """Crash-recoverable ownership of one arbitrary-workflow action."""
+
+    envelope: Mapping[str, Any]
+    worker_id: str
+    attempt: int
+    lease_expires_at: str
+
+
 @runtime_checkable
 class WorkflowEngine(Protocol):
     """Durable lifecycle execution used by the control API."""
@@ -186,6 +196,82 @@ class GraphWorkflowEngine(Protocol):
     ) -> GraphWorkflowReceipt: ...
 
     def get_graph_run(self, tenant_id: str, run_id: str) -> WorkflowRunState | None: ...
+
+    def get_workflow_definition(
+        self,
+        tenant_id: str,
+        workflow_id: str,
+        version: int,
+    ) -> WorkflowDefinition | None: ...
+
+
+@runtime_checkable
+class GraphActionOutbox(Protocol):
+    """Tenant-fenced lease delivery for actions emitted by workflow graphs."""
+
+    def claim_graph_action(
+        self,
+        tenant_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> GraphActionLease | None: ...
+
+    def heartbeat_graph_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> bool: ...
+
+    def complete_graph_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        worker_id: str,
+        result: Mapping[str, Any],
+    ) -> bool: ...
+
+    def retry_graph_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+        delay_seconds: int,
+    ) -> bool: ...
+
+    def fail_graph_action(
+        self,
+        tenant_id: str,
+        action_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+    ) -> bool: ...
+
+
+@runtime_checkable
+class GraphActionExecutor(Protocol):
+    def execute(self, envelope: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class GraphNodeRuntime(Protocol):
+    def execute_node(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        definition: WorkflowDefinition,
+        state: WorkflowRunState,
+        action: WorkflowAction,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
 
 
 @runtime_checkable

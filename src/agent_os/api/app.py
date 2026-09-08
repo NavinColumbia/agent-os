@@ -13,9 +13,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_os.api.auth import Authenticator, Principal
 from agent_os.application.mission import mission_planning_run_id
+from agent_os.application.mission_control import project_mission_control
 from agent_os.application.ports import (
     ArtifactStore,
     GraphWorkflowEngine,
+    GraphRunInspector,
     NotificationStore,
     OrganizationLedger,
     PreviewDeploymentStore,
@@ -436,6 +438,58 @@ def create_app(
             )
 
     if graph_engine is not None:
+        @app.get("/v2/runs/{run_id}/management")
+        def get_mission_management(
+            run_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+            slow_after_seconds: Annotated[int, Query(ge=30, le=86_400)] = 300,
+        ) -> Mapping[str, Any]:
+            lifecycle = engine.get_run(principal.organization_id, run_id)
+            if lifecycle is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            planning_run_id = mission_planning_run_id(run_id)
+            planning = graph_engine.get_graph_run(principal.organization_id, planning_run_id)
+            if planning is None:
+                raise HTTPException(status_code=404, detail="mission planning has not started")
+            child_run_ids = {
+                str(token.output["child_run_id"])
+                for token in planning.tokens
+                if token.output.get("child_run_id")
+            }
+            if len(child_run_ids) > 1:
+                raise HTTPException(status_code=500, detail="mission has conflicting execution runs")
+            execution_run_id = next(iter(child_run_ids), None)
+            execution = None if execution_run_id is None else graph_engine.get_graph_run(
+                principal.organization_id, execution_run_id,
+            )
+            selected = execution or planning
+            definition = graph_engine.get_workflow_definition(
+                principal.organization_id,
+                selected.workflow_id,
+                selected.workflow_version,
+            )
+            if definition is None:
+                raise HTTPException(status_code=500, detail="mission workflow definition is missing")
+            observation = None
+            if isinstance(graph_engine, GraphRunInspector):
+                observation = graph_engine.inspect_graph_run(
+                    principal.organization_id, selected.run_id,
+                )
+            organization_events: tuple[Mapping[str, Any], ...] = ()
+            if isinstance(engine, OrganizationLedger):
+                organization_events = engine.load_organization_events(
+                    principal.organization_id, run_id, limit=5_000,
+                )
+            return project_mission_control(
+                lifecycle_run_id=run_id,
+                planning_state=planning,
+                execution_state=execution,
+                definition=definition,
+                observation=observation,
+                organization_events=organization_events,
+                slow_after_seconds=slow_after_seconds,
+            )
+
         @app.get("/v2/runs/{run_id}/mission")
         def get_mission_execution(
             run_id: str,

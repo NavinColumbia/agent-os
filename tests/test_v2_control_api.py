@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from agent_os.api.app import create_app
 from agent_os.application.mission import mission_planning_run_id
+from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.domain.workflow_runtime import (
     NodeToken,
     TokenStatus,
@@ -267,8 +268,17 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution():
             return {planning_run_id: planning, child_run_id: execution}.get(run_id)
 
         def get_workflow_definition(self, tenant_id, workflow_id, version):
-            del tenant_id, workflow_id, version
-            return None
+            if tenant_id != "org-a" or workflow_id != "mission-workflow" or version != 1:
+                return None
+            return WorkflowDefinition(
+                "mission-workflow", "org-a", "Mission", 1, "work",
+                (
+                    WorkflowNode("work", NodeKind.AGENT, "Build the product", "engineer"),
+                    WorkflowNode("done", NodeKind.TERMINAL, "Accept proof"),
+                ),
+                (WorkflowEdge("work", "done"),),
+                "agent:mission-architect",
+            )
 
     api = TestClient(create_app(
         engine=lifecycle, identity=FakeIdentity(), graph_engine=MissionGraphs(),
@@ -292,6 +302,14 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution():
     assert response.json()["execution_run_id"] == child_run_id
     assert response.json()["execution"]["status"] == "active"
     assert response.json()["deliverables"] == []
+    management = api.get(
+        f"/v2/runs/{created['run_id']}/management",
+        headers={"Authorization": "Bearer org-a"},
+    )
+    assert management.status_code == 200
+    assert management.json()["execution_run_id"] == child_run_id
+    assert management.json()["work_items"][0]["owner_id"] == "agent:engineer"
+    assert management.json()["progress"]["live"] == 1
     hidden = api.get(
         f"/v2/runs/{created['run_id']}/mission",
         headers={"Authorization": "Bearer org-b"},

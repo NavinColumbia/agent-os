@@ -219,6 +219,19 @@ class GraphWorkflowEngine(Protocol):
 
 
 @runtime_checkable
+class GraphRunInspector(Protocol):
+    """Bounded operational facts for truthful mission-management projections."""
+
+    def inspect_graph_run(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        action_limit: int = 1_000,
+    ) -> Mapping[str, Any] | None: ...
+
+
+@runtime_checkable
 class GraphActionOutbox(Protocol):
     """Tenant-fenced lease delivery for actions emitted by workflow graphs."""
 

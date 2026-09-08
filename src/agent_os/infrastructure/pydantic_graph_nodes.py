@@ -20,6 +20,12 @@ from agent_os.infrastructure.proposed_artifacts import (
     ProposedArtifact,
     persist_and_validate_artifacts,
 )
+from agent_os.infrastructure.pydantic_agents import (
+    HiringRequest,
+    ProposedDecision,
+    ProposedMessage,
+    ProposedWork,
+)
 
 
 class GraphNodeDisposition(str, Enum):
@@ -41,6 +47,13 @@ class GraphAgentNodeOutput(BaseModel):
     correlation_id: str | None = None
     reason: str | None = None
     retryable: bool = False
+    observations: list[str] = Field(default_factory=list, max_length=100)
+    risks: list[str] = Field(default_factory=list, max_length=100)
+    messages: list[ProposedMessage] = Field(default_factory=list, max_length=100)
+    proposed_work: list[ProposedWork] = Field(default_factory=list, max_length=100)
+    hiring_requests: list[HiringRequest] = Field(default_factory=list, max_length=32)
+    decisions: list[ProposedDecision] = Field(default_factory=list, max_length=100)
+    next_actions: list[str] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
     def validate_disposition(self) -> "GraphAgentNodeOutput":
@@ -69,7 +82,9 @@ conditions. Never report completion without durable evidence IDs. If human autho
 required, return a correlated wait. If work cannot proceed, fail honestly and state whether retry is useful.
 Create new evidence through the bounded artifacts field. Cite an evidence ID only when it appears in the
 authoritative prior-token context; never invent one. Source code uses a source-bundle artifact with a files map.
-Your structured output is a proposal; deterministic workflow policy commits the transition.
+Proactively report risks, decisions, messages, delegations, missing specialists, and next actions. A hiring or
+external message is a proposal until the organization authority applies it. Your structured output is a
+proposal; deterministic workflow policy commits the transition.
 """.strip()
 
 
@@ -275,6 +290,15 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             "summary": output.summary,
             "artifacts": list(artifact_records),
             "artifact_ids": artifact_ids,
+            "organization_actions": {
+                "observations": list(output.observations),
+                "risks": list(output.risks),
+                "messages": [item.model_dump(mode="json") for item in output.messages],
+                "proposed_work": [item.model_dump(mode="json") for item in output.proposed_work],
+                "hiring_requests": [item.model_dump(mode="json") for item in output.hiring_requests],
+                "decisions": [item.model_dump(mode="json") for item in output.decisions],
+                "next_actions": list(output.next_actions),
+            },
             "usage": {
                 "requests": result.usage.requests,
                 "tool_calls": result.usage.tool_calls,

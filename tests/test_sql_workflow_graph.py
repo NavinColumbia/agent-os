@@ -134,6 +134,16 @@ def test_graph_action_outbox_is_tenant_fenced_recoverable_and_lease_owned(engine
     assert record["attempts"] == 2
     assert record["last_error"] is None
 
+    inspection = engine.inspect_graph_run("tenant-a", "leased-run")
+    assert inspection is not None
+    assert inspection["run_id"] == "leased-run"
+    assert inspection["actions"][0]["action_id"] == action_id
+    assert inspection["actions"][0]["status"] == "succeeded"
+    assert isinstance(inspection["created_at"], str)
+    assert engine.inspect_graph_run("tenant-b", "leased-run") is None
+    with pytest.raises(ValueError, match="between 1 and 5000"):
+        engine.inspect_graph_run("tenant-a", "leased-run", action_limit=0)
+
 
 def test_identical_customer_run_ids_do_not_collide_across_tenants(engine):
     tenant_a = graph()

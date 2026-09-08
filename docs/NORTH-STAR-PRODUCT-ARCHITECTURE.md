@@ -408,6 +408,13 @@ Before public paid access, the thin vertical must prove:
 - status derives from authoritative workflow/domain state and includes last progress, current owner, reason,
   evidence, expected next update, and customer options.
 
+The initial V2 management projection now implements the read side of the final item: it joins adaptive graph
+tokens to tenant-fenced queue attempts and leases, exposes mission-scoped roles and managers, and retains bounded
+agent proposals for communication, delegation, staffing, risks, and decisions. It treats “slow but owned” as a
+diagnostic condition rather than a timeout. The write side is still incremental: standing cross-mission
+organizations, governed proposal application, periodic manager sweeps, and proactive nonterminal signal delivery
+must be completed before this is described as the persistent AI organization runtime.
+
 Initial external SLOs should be honest rather than copying the aspirational 99.99% North-Star target:
 
 - control API/console availability: 99.9% monthly for the first paid release;

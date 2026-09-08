@@ -32,6 +32,17 @@ projects the lifecycle, planning graph, and detailed execution graph together. A
 idempotently projected back to the coarse CEO lifecycle, while the six phases remain a UI/status projection rather
 than the orchestration engine.
 
+`GET /v2/runs/{run_id}/management` is the first CEO/manager read model over that execution truth. It projects
+mission-scoped roles, accountable owners and managers, materialized work, attempts, evidence, human waits,
+risks, decisions, delegation/staffing proposals, and recommended management actions. It reads bounded action
+timing and lease records under tenant RLS. In particular, it distinguishes a slow action whose renewable lease
+is healthy from an expired recoverable lease, scheduled retry, delayed dispatch, contradictory state, and
+terminal business failure. A review interval therefore creates a diagnostic signal; it never abandons healthy
+work or pretends the whole adaptive graph is a fixed-size percentage plan. Agent nodes persist their bounded
+management proposals in workflow state, but external messages and staffing requests remain labelled proposals
+until a governed effect/approval executor applies them. Periodic manager sweeps and push delivery of nonterminal
+delay signals remain a subsequent milestone; this endpoint does not claim they already exist.
+
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
 email, Slack, SMS, and push remain separate adapters. `schedule_retry`, arbitrary external tool execution, and

@@ -393,6 +393,62 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox):
             ))).scalar_one_or_none()
         return None if raw is None else WorkflowDefinition.from_dict(raw)
 
+    def inspect_graph_run(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        action_limit: int = 1_000,
+    ) -> Mapping[str, Any] | None:
+        """Return bounded queue/timing facts without exposing another tenant."""
+
+        if not 1 <= action_limit <= 5_000:
+            raise ValueError("graph inspection action_limit must be between 1 and 5000")
+        with self._tenant_connection(tenant_id) as connection:
+            run = connection.execute(select(
+                workflow_runs.c.run_id,
+                workflow_runs.c.workflow_id,
+                workflow_runs.c.workflow_version,
+                workflow_runs.c.state_version,
+                workflow_runs.c.created_at,
+                workflow_runs.c.updated_at,
+            ).where(and_(
+                workflow_runs.c.tenant_id == tenant_id,
+                workflow_runs.c.run_id == run_id,
+            ))).mappings().first()
+            if run is None:
+                return None
+            rows = connection.execute(select(
+                workflow_actions.c.action_id,
+                workflow_actions.c.state_version,
+                workflow_actions.c.action,
+                workflow_actions.c.status,
+                workflow_actions.c.attempts,
+                workflow_actions.c.available_at,
+                workflow_actions.c.lease_owner,
+                workflow_actions.c.lease_expires_at,
+                workflow_actions.c.created_at,
+                workflow_actions.c.completed_at,
+                workflow_actions.c.last_error,
+            ).where(and_(
+                workflow_actions.c.tenant_id == tenant_id,
+                workflow_actions.c.run_id == run_id,
+            )).order_by(
+                workflow_actions.c.state_version.desc(),
+                workflow_actions.c.position.desc(),
+            ).limit(action_limit)).mappings().all()
+
+        def serialized(row: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                key: value.isoformat() if isinstance(value, datetime) else value
+                for key, value in row.items()
+            }
+
+        return {
+            **serialized(run),
+            "actions": [serialized(row) for row in rows],
+        }
+
     def claim_graph_action(
         self,
         tenant_id: str,

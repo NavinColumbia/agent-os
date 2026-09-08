@@ -50,6 +50,53 @@ def test_agent_node_uses_structured_output_and_only_declared_conditions():
     assert result["output"]["summary"] == "Verified the path."
 
 
+def test_agent_node_persists_bounded_management_proposals_in_durable_output():
+    definition = agent_graph()
+    started = start_workflow(definition, run_id="run-management")
+    action = started.actions[0]
+    running = begin_node(started.state, action.token_id, expected_version=0).state
+    output = {
+        "summary": "Found a missing reviewer and delegated follow-up.",
+        "disposition": "complete",
+        "satisfied_conditions": ["verified"],
+        "evidence_ids": ["evidence-1"],
+        "output": {},
+        "risks": ["No independent security review"],
+        "messages": [{
+            "audience": "human", "kind": "update", "recipient_ids": ["human:ceo"],
+            "subject": "Review gap", "body": "Security review is still missing.",
+        }],
+        "proposed_work": [{
+            "objective": "Review authentication", "owner_role": "security-specialist",
+            "acceptance_criteria": ["Threats documented"],
+        }],
+        "hiring_requests": [{
+            "role": "security-specialist", "reason": "No reviewer is assigned",
+            "capabilities": ["security"],
+        }],
+        "decisions": [{
+            "intent": "Gate launch", "considered_options": ["launch", "review"],
+            "chosen_option": "review", "rationale": "Reduce risk", "confidence": 0.9,
+            "reversible": True,
+        }],
+        "next_actions": ["Assign the review"],
+    }
+    runtime = PydanticGraphNodeRuntime(TestModel(custom_output_args=output))
+
+    result = runtime.execute_node(
+        tenant_id="tenant-a", run_id="run-management", definition=definition,
+        state=running, action=action, idempotency_key=action.action_id,
+    )
+
+    actions = result["output"]["organization_actions"]
+    assert actions["risks"] == ["No independent security review"]
+    assert actions["messages"][0]["recipient_ids"] == ["human:ceo"]
+    assert actions["proposed_work"][0]["owner_role"] == "security-specialist"
+    assert actions["hiring_requests"][0]["requested_count"] == 1
+    assert actions["decisions"][0]["chosen_option"] == "review"
+    assert actions["next_actions"] == ["Assign the review"]
+
+
 def test_agent_node_rejects_a_hallucinated_branch():
     definition = agent_graph()
     started = start_workflow(definition, run_id="run-branch")

@@ -1,0 +1,15 @@
+# V2 production service dependencies. Keep aligned with pyproject.toml.
+click==8.2.1
+cryptography==49.0.0
+dbos==2.24.0
+fastapi==0.138.0
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+psycopg[binary]==3.3.4
+psycopg-pool==3.3.1
+pydantic==2.13.4
+pydantic-ai-slim[anthropic,mcp,openai]==2.41.0
+python-dotenv==1.2.2
+requests==2.34.2
+sqlalchemy==2.0.51
+uvicorn==0.49.0

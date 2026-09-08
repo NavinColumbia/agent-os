@@ -1,0 +1,25 @@
+# DBOS's SQLite development mode uses unixepoch('subsec'), which requires
+# SQLite 3.42+. Debian bookworm ships 3.40; trixie provides a compatible
+# runtime. Hosted staging/production uses PostgreSQL regardless.
+FROM python:3.12-slim-trixie AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    AOS_ENVIRONMENT=production \
+    AOS_V2_HOST=0.0.0.0 \
+    PORT=8080
+
+RUN groupadd --system --gid 10001 agentos \
+    && useradd --system --uid 10001 --gid agentos --home-dir /nonexistent --shell /usr/sbin/nologin agentos
+
+WORKDIR /app
+COPY pyproject.toml pylock.toml README.md ./
+COPY src ./src
+RUN python -m pip install --no-cache-dir --upgrade pip==26.1.2 \
+    && python -m pip install --no-cache-dir -r pylock.toml \
+    && python -m pip install --no-cache-dir --no-deps .
+
+USER 10001:10001
+EXPOSE 8080
+CMD ["agentos-v2", "serve"]

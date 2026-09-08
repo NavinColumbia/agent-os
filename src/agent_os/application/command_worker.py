@@ -7,7 +7,8 @@ from enum import Enum
 from threading import Event as ThreadEvent, Thread
 from typing import Any, Callable, Mapping
 
-from agent_os.application.ports import CommandExecutor, CommandOutbox
+from agent_os.application.ports import CommandExecutor, CommandOutbox, WorkflowEngine
+from agent_os.domain.lifecycle import Event
 
 
 class CommandRunStatus(str, Enum):
@@ -86,6 +87,8 @@ class DurableCommandWorker:
         lease_seconds: int = 60,
         retry_policy: RetryPolicy | None = None,
         retry_classifier: Callable[[Exception], bool] = _is_retryable,
+        workflow_engine: WorkflowEngine | None = None,
+        workflow_result_waiter: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> None:
         if not worker_id.strip() or lease_seconds < 3:
             raise ValueError("worker_id and a lease of at least three seconds are required")
@@ -95,6 +98,8 @@ class DurableCommandWorker:
         self._lease_seconds = lease_seconds
         self._retry = retry_policy or RetryPolicy()
         self._retry_classifier = retry_classifier
+        self._workflow_engine = workflow_engine
+        self._workflow_result_waiter = workflow_result_waiter
 
     def run_one(self, organization_id: str) -> CommandRunReport:
         lease = self._outbox.claim_command(
@@ -132,6 +137,19 @@ class DurableCommandWorker:
         heartbeat.start()
         try:
             result = self._executor.execute(envelope)
+            followup = result.get("lifecycle_event")
+            if followup is not None:
+                if self._workflow_engine is None:
+                    raise FatalCommandError("executor produced a lifecycle event but no workflow engine is configured")
+                if not isinstance(followup, Mapping):
+                    raise FatalCommandError("lifecycle_event must be an object")
+                receipt = self._workflow_engine.submit_event(
+                    organization_id,
+                    str(envelope["run_id"]),
+                    Event.from_dict(followup),
+                )
+                if self._workflow_result_waiter is not None:
+                    self._workflow_result_waiter(receipt.workflow_id)
         except Exception as exc:
             stopped.set()
             heartbeat.join(timeout=1)

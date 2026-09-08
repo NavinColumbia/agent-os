@@ -3,6 +3,10 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+from click.testing import CliRunner
+
+from agent_os.entrypoints.cli import main
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,3 +25,17 @@ def test_runtime_image_installs_locked_dependencies_before_local_package():
     dockerfile = (ROOT / "deploy" / "Dockerfile.v2").read_text()
     assert "pip install --no-cache-dir -r pylock.toml" in dockerfile
     assert "pip install --no-cache-dir --no-deps ." in dockerfile
+
+
+def test_packaged_cli_exposes_api_and_worker_processes():
+    result = CliRunner().invoke(main, ["--help"])
+    assert result.exit_code == 0
+    assert "serve" in result.output
+    assert "worker" in result.output
+
+
+def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
+    compose = (ROOT / "deploy" / "docker-compose.v2.yml").read_text()
+    assert "dockerfile: deploy/Dockerfile.v2" in compose
+    assert "command: [\"agentos-v2\", \"worker\"]" in compose
+    assert "service_completed_successfully" in compose

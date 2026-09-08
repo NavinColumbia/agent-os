@@ -132,11 +132,15 @@ class PydanticAgentRuntime(AgentRuntime):
         tools: Sequence[Any] = (),
         request_limit: int = 12,
         output_tokens_limit: int = 8_000,
+        request_timeout_seconds: float = 120,
     ) -> None:
+        if request_limit < 1 or output_tokens_limit < 1 or request_timeout_seconds <= 0:
+            raise ValueError("agent runtime limits must be positive")
         self._model = model
         self._tools = tuple(tools)
         self._request_limit = request_limit
         self._output_tokens_limit = output_tokens_limit
+        self._request_timeout_seconds = request_timeout_seconds
 
     def run_agent(
         self,
@@ -171,6 +175,11 @@ class PydanticAgentRuntime(AgentRuntime):
                 "agent_os.run_id": run_id,
                 "agent_os.role": role,
             },
+            # Bound each provider request while allowing the durable mission to
+            # take as long as useful work genuinely requires. The command lease
+            # is renewed independently and transient call failures are retried
+            # from durable state by the worker.
+            model_settings={"timeout": self._request_timeout_seconds},
             usage_limits=UsageLimits(
                 cost_limit=Decimal(budget_cents) / Decimal(100),
                 request_limit=self._request_limit,

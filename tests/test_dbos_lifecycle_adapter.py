@@ -7,8 +7,12 @@ from pathlib import Path
 import pytest
 
 from dbos import DBOS
+from agent_os.application.command_worker import CommandRunStatus, DurableCommandWorker
+from agent_os.application.default_organization import default_organization
 from agent_os.domain.lifecycle import Event, EventKind, LifecyclePhase, LifecycleState
 from agent_os.domain.organization_events import OrganizationEvent, OrganizationEventKind
+from agent_os.infrastructure.agent_command_executor import DurableAgentCommandExecutor
+from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine, sqlalchemy_url
 
 
@@ -144,6 +148,61 @@ def test_command_outbox_is_tenant_fenced_retryable_and_worker_lease_owned(engine
     assert record["attempts"] == 2
     assert record["result"] == {"evidence_ids": ["artifact-1"]}
     assert record["last_error"] is None
+
+
+def test_real_worker_commits_agent_evidence_advances_lifecycle_and_queues_next_phase(engine):
+    started = engine.start_run(
+        LifecycleState(run_id="run-worker", organization_id="org-a"),
+        Event("scope-worker", EventKind.SCOPE_ACCEPTED, 0, {"prompt": "Build the product"}),
+    )
+    start_result = engine.get_result(started.workflow_id)
+    first_command_id = start_result["commands"][0]["command_id"]
+
+    class CompletingRuntime:
+        def run_agent(self, **kwargs):
+            return {
+                "output": {
+                    "summary": "Research completed with a durable report.",
+                    "disposition": "complete",
+                    "progress_percent": 100,
+                    "evidence_ids": ["research-report-1"],
+                    "observations": [],
+                    "risks": [],
+                    "messages": [],
+                    "proposed_work": [],
+                    "hiring_requests": [],
+                    "decisions": [],
+                    "next_actions": ["Create the specification"],
+                },
+                "usage": {"total_tokens": 10},
+                "idempotency_key": kwargs["idempotency_key"],
+            }
+
+    agent_executor = DurableAgentCommandExecutor(
+        runtime=CompletingRuntime(),
+        ledger=engine,
+        organization_loader=default_organization,
+    )
+    worker = DurableCommandWorker(
+        outbox=engine,
+        executor=LifecycleCommandRouter(agent_executor=agent_executor),
+        worker_id="worker-integration",
+        lease_seconds=3,
+        workflow_engine=engine,
+        workflow_result_waiter=engine.get_result,
+    )
+
+    report = worker.run_one("org-a")
+
+    assert report.status is CommandRunStatus.SUCCEEDED
+    assert engine.get_command_record("org-a", first_command_id)["status"] == "succeeded"
+    state = engine.get_run("org-a", "run-worker")
+    assert state is not None and state.phase is LifecyclePhase.SPECIFY and state.version == 2
+    activity = engine.load_organization_events("org-a", "run-worker")
+    assert [item["kind"] for item in activity][-3:] == [
+        "agent_turn_recorded", "evidence_recorded", "work_progress_reported",
+    ]
+    assert engine.list_commands("org-a", "run-worker")[-1]["command"]["kind"] == "start_specification"
 
 
 def test_internal_organization_history_is_durable_versioned_and_tenant_isolated(engine):

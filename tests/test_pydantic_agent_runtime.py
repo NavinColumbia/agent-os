@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from pydantic_ai.models.test import TestModel
 
 from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
@@ -67,3 +69,8 @@ def test_agent_turn_can_delegate_hire_message_decide_and_raise_risk_without_netw
     assert turn["messages"][0]["correlation_id"] == "question-jurisdiction"
     assert turn["decisions"][0]["chosen_option"] == "paper"
     assert result["idempotency_key"] == "turn-1"
+
+
+def test_agent_runtime_rejects_unbounded_or_zero_limits():
+    with pytest.raises(ValueError, match="limits must be positive"):
+        PydanticAgentRuntime(TestModel(), request_timeout_seconds=0)

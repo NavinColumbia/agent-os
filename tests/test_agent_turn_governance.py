@@ -104,8 +104,14 @@ class MemoryLedger:
 
 
 class FakeRuntime:
+    def __init__(self, turn=None) -> None:
+        self.turn = output() if turn is None else turn
+        self.calls = 0
+
     def run_agent(self, **kwargs) -> Mapping[str, Any]:
-        return {"output": output(), "usage": {"total_tokens": 100}, "idempotency_key": kwargs["idempotency_key"]}
+        self.calls += 1
+        self.last_call = kwargs
+        return {"output": self.turn, "usage": {"total_tokens": 100}, "idempotency_key": kwargs["idempotency_key"]}
 
 
 def test_lifecycle_agent_command_is_committed_to_the_organization_ledger():
@@ -139,3 +145,62 @@ def test_committing_same_deterministic_plan_can_be_made_idempotent_by_the_ledger
     ledger = MemoryLedger()
     receipts = commit_agent_turn(ledger, plan)
     assert receipts[-1].stream_version == len(plan.events)
+
+
+def test_completed_agent_turn_emits_a_deterministic_lifecycle_event_and_replay_costs_nothing():
+    complete = {
+        **output(),
+        "disposition": "complete",
+        "progress_percent": 100,
+        "evidence_ids": ["research-report-1"],
+        "messages": [],
+        "hiring_requests": [],
+        "decisions": [],
+    }
+    runtime = FakeRuntime(complete)
+    ledger = MemoryLedger()
+    executor = DurableAgentCommandExecutor(runtime=runtime, ledger=ledger)
+    envelope = CommandEnvelope(
+        "cmd-complete", "run-1", "tenant-1", "scope", 1, 0,
+        Command(CommandKind.START_RESEARCH, {"prompt": "Research"}),
+    ).to_dict()
+
+    first = executor.execute(envelope)
+    replay = executor.execute(envelope)
+
+    assert first["lifecycle_event"]["kind"] == "research_completed"
+    assert first["lifecycle_event"]["payload"]["report_id"] == "research-report-1"
+    assert replay["lifecycle_event"] == first["lifecycle_event"]
+    assert replay["agent_turn"]["replayed"] is True
+    assert runtime.calls == 1
+
+
+def test_agent_receives_authoritative_directory_and_cannot_raise_its_cost_cap():
+    complete = {
+        **output(),
+        "disposition": "complete",
+        "progress_percent": 100,
+        "evidence_ids": ["report-1"],
+        "messages": [],
+        "hiring_requests": [],
+        "decisions": [],
+    }
+    runtime = FakeRuntime(complete)
+    ledger = MemoryLedger()
+    executor = DurableAgentCommandExecutor(
+        runtime=runtime,
+        ledger=ledger,
+        organization_loader=lambda tenant_id, run_id: organization(),
+        max_turn_budget_cents=75,
+    )
+    item = CommandEnvelope(
+        "cmd-budget", "run-1", "tenant-1", "scope", 1, 0,
+        Command(CommandKind.START_RESEARCH, {"prompt": "Research", "budget_cents": 100_000}),
+    )
+
+    executor.execute(item.to_dict())
+
+    assert runtime.last_call["budget_cents"] == 75
+    context = runtime.last_call["context"]
+    assert context["humans"][0]["id"] == "human:ceo"
+    assert context["agents"][0]["id"] == "chief"

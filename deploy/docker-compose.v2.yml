@@ -1,0 +1,94 @@
+name: agent-os-v2
+
+x-runtime-environment: &runtime-environment
+  AOS_ENVIRONMENT: staging
+  AOS_V2_SYSTEM_DATABASE_URL: postgresql://agentos:${AOS_V2_POSTGRES_PASSWORD}@postgres:5432/agentos
+  AOS_V2_APPLICATION_DATABASE_URL: postgresql://agentos:${AOS_V2_POSTGRES_PASSWORD}@postgres:5432/agentos
+  AOS_V2_APPLICATION_VERSION: ${AOS_V2_APPLICATION_VERSION:-v2-local}
+  AOS_V2_CREATE_SCHEMA: "0"
+  AOS_V2_AUTH_SECRET: ${AOS_V2_AUTH_SECRET:?set AOS_V2_AUTH_SECRET to at least 32 bytes}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: agentos
+      POSTGRES_PASSWORD: ${AOS_V2_POSTGRES_PASSWORD:?set AOS_V2_POSTGRES_PASSWORD}
+      POSTGRES_DB: agentos
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentos -d agentos"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - agent-os-v2-postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  migrate:
+    image: postgres:16
+    environment:
+      PGHOST: postgres
+      PGUSER: agentos
+      PGPASSWORD: ${AOS_V2_POSTGRES_PASSWORD:?set AOS_V2_POSTGRES_PASSWORD}
+      PGDATABASE: agentos
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../postgres/initdb/86-lifecycle-v2.sql:/migrations/86-lifecycle-v2.sql:ro
+      - ../postgres/initdb/87-workflow-graphs-v2.sql:/migrations/87-workflow-graphs-v2.sql:ro
+    command:
+      - sh
+      - -ec
+      - |
+        psql -v ON_ERROR_STOP=1 -f /migrations/86-lifecycle-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/87-workflow-graphs-v2.sql
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.v2
+    environment:
+      <<: *runtime-environment
+      PORT: "8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${AOS_V2_PUBLIC_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=3).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.v2
+    command: ["agentos-v2", "worker"]
+    environment:
+      <<: *runtime-environment
+      AOS_V2_MODEL: ${AOS_V2_MODEL:?set an explicit PydanticAI provider:model}
+      AOS_V2_WORKER_ORGANIZATIONS: ${AOS_V2_WORKER_ORGANIZATIONS:?set comma-separated tenant IDs}
+      AOS_V2_MAX_TURN_COST_CENTS: ${AOS_V2_MAX_TURN_COST_CENTS:-100}
+      AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS: ${AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS:-120}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # One provider request is bounded, but a complete agent turn may contain
+    # retries/tool cleanup. Give SIGTERM enough time to stop without lease theft.
+    stop_grace_period: 10m
+
+volumes:
+  agent-os-v2-postgres:

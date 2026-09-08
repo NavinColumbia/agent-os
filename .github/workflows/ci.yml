@@ -20,8 +20,8 @@ jobs:
           --health-cmd "pg_isready -U agentos -d agentos"
           --health-interval 10s --health-timeout 5s --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: deps
@@ -56,3 +56,15 @@ jobs:
         run: .venv/bin/python scripts/security_scan.py
       - name: unit tests
         run: .venv/bin/python -m pytest tests/ -q
+
+  container:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: build locked non-root runtime image
+        run: docker build -f deploy/Dockerfile.v2 -t agent-os-v2:ci .
+      - name: smoke packaged API and worker entrypoints
+        run: |
+          docker run --rm agent-os-v2:ci agentos-v2 --help
+          docker run --rm agent-os-v2:ci agentos-v2 worker --help

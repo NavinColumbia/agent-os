@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from threading import Event
 
 import click
 
 from agent_os.api.auth import HMACTokenIdentity
 from agent_os.entrypoints.server import ServerSettings, build_app
+from agent_os.entrypoints.worker import WorkerSettings, install_shutdown_handlers, run_worker
 
 
 @click.group()
@@ -23,6 +25,26 @@ def serve() -> None:
 
     settings = ServerSettings.from_env()
     uvicorn.run(build_app(settings), host=settings.host, port=settings.port)
+
+
+@main.command()
+@click.option(
+    "--organization",
+    "organizations",
+    multiple=True,
+    help="Tenant organization to poll; repeat it, or set AOS_V2_WORKER_ORGANIZATIONS.",
+)
+@click.option("--once", is_flag=True, help="Run one fair polling cycle and exit.")
+def worker(organizations: tuple[str, ...], once: bool) -> None:
+    """Run the durable, lease-renewing agent command worker."""
+
+    try:
+        settings = WorkerSettings.from_env(organization_ids=organizations)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    stop = Event()
+    install_shutdown_handlers(stop)
+    run_worker(settings, once=once, stop=stop)
 
 
 @main.command("issue-local-token")

@@ -7,7 +7,7 @@ from agent_os.application.command_worker import (
     RetryPolicy,
     RetryableCommandError,
 )
-from agent_os.application.ports import CommandLease
+from agent_os.application.ports import CommandLease, WorkflowReceipt
 
 
 class FakeOutbox:
@@ -27,7 +27,7 @@ class FakeOutbox:
         self.owner = worker_id
         self.state = "executing"
         return CommandLease(
-            {"command_id": "cmd-1", "organization_id": organization_id},
+            {"command_id": "cmd-1", "organization_id": organization_id, "run_id": "run-1"},
             worker_id,
             self.attempt,
             "later",
@@ -92,6 +92,46 @@ def test_provider_throttle_retries_from_durable_state_without_a_story_timeout():
     assert first.status is CommandRunStatus.RETRY_SCHEDULED
     assert second.status is CommandRunStatus.SUCCEEDED
     assert outbox.attempt == 2
+
+
+class FakeWorkflowEngine:
+    def __init__(self) -> None:
+        self.events = []
+
+    def submit_event(self, organization_id, run_id, event):
+        self.events.append((organization_id, run_id, event))
+        return WorkflowReceipt("workflow-followup")
+
+
+def test_lifecycle_followup_is_durably_accepted_before_command_acknowledgement():
+    outbox = FakeOutbox()
+    workflow = FakeWorkflowEngine()
+    waited = []
+    executor = SequenceExecutor({
+        "result": {"evidence": "report"},
+        "lifecycle_event": {
+            "event_id": "command-result-1",
+            "kind": "research_completed",
+            "expected_version": 1,
+            "payload": {"report_id": "report-1"},
+        },
+    })
+    worker = DurableCommandWorker(
+        outbox=outbox,
+        executor=executor,
+        worker_id="worker-1",
+        lease_seconds=3,
+        workflow_engine=workflow,
+        workflow_result_waiter=lambda workflow_id: waited.append(workflow_id) or {"ok": True},
+    )
+
+    report = worker.run_one("tenant-1")
+
+    assert report.status is CommandRunStatus.SUCCEEDED
+    assert workflow.events[0][0:2] == ("tenant-1", "run-1")
+    assert workflow.events[0][2].kind.value == "research_completed"
+    assert waited == ["workflow-followup"]
+    assert outbox.state == "succeeded"
 
 
 def test_permanent_invalid_action_fails_instead_of_looping_forever():

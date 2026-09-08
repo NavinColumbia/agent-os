@@ -198,6 +198,8 @@ class AgentRuntime(Protocol):
         role: str,
         prompt: str,
         idempotency_key: str,
+        budget_cents: int = 100,
+        context: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]: ...
 
 

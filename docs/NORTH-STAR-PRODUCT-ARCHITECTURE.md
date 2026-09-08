@@ -472,11 +472,13 @@ This gate—not a synthetic multi-agent demo—is the proof that the product exi
 
 ## Current-state truth
 
-The repository has substantial tested governance, tenancy, QA, audit, agent-role, and resilience behavior. It
-also has overlapping controllers, direct SQL and process control throughout application/UI code, local-host
-assumptions, dated status claims, unfinished public infrastructure, and no implemented V2 workflow/customer
-vertical. The new pure lifecycle aggregate and contract tests are the first replacement slice, not a finished
-platform.
+The repository has substantial tested governance, tenancy, QA, audit, agent-role, and resilience behavior. The
+V2 replacement now includes the framework-neutral lifecycle, DBOS/PostgreSQL event and command stores, arbitrary
+versioned workflow graphs, authenticated control API, structured PydanticAI role runtime, and a lease-renewing
+worker that advances agent commands without a whole-story timeout or duplicate model spend after a crash. It
+also still has overlapping legacy controllers, local-host assumptions, unfinished public infrastructure, static
+early-tenant worker assignment, no graph-action worker, and no complete prompt-to-public-URL customer vertical.
+This is a real durable execution spine, not yet the finished platform.
 
 Therefore:
 

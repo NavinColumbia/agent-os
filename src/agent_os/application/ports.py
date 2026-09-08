@@ -99,6 +99,18 @@ class CommandExecutor(Protocol):
 
 
 @runtime_checkable
+class ReadyTenantSource(Protocol):
+    """Discover tenant shards that currently have claimable durable work."""
+
+    def list_ready_tenants(
+        self,
+        *,
+        after_tenant_id: str | None = None,
+        limit: int = 128,
+    ) -> tuple[str, ...]: ...
+
+
+@runtime_checkable
 class CommandOutbox(Protocol):
     """Lease-based command delivery; an expired worker claim is reclaimable."""
 

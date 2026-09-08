@@ -109,6 +109,72 @@ def test_worker_loop_contains_one_tenant_failure_and_continues_other_tenants():
     assert worker.organizations == ["tenant-a", "tenant-b"]
 
 
+def test_worker_loop_discovers_ready_tenants_with_a_fair_cursor():
+    class StubSource:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def list_ready_tenants(self, *, after_tenant_id=None, limit=128):
+            self.calls.append((after_tenant_id, limit))
+            return ("tenant-b", "tenant-c") if len(self.calls) == 1 else ("tenant-a",)
+
+    worker = StubWorker()
+    source = StubSource()
+    loop = CommandWorkerLoop(  # type: ignore[arg-type]
+        worker=worker,
+        organization_source=source,
+        tenant_batch_size=2,
+    )
+
+    assert len(loop.run_cycle()) == 2
+    assert len(loop.run_cycle()) == 1
+    assert source.calls == [(None, 2), ("tenant-c", 2)]
+    assert worker.organizations == ["tenant-b", "tenant-c", "tenant-a"]
+
+
+def test_worker_loop_contains_tenant_discovery_failure_and_can_retry():
+    observed = []
+
+    class BrokenSource:
+        def list_ready_tenants(self, **kwargs):
+            del kwargs
+            raise ConnectionError("catalog unavailable")
+
+    worker = StubWorker()
+    loop = CommandWorkerLoop(  # type: ignore[arg-type]
+        worker=worker,
+        organization_source=BrokenSource(),
+        observer=observed.append,
+    )
+
+    assert loop.run_cycle() == ()
+    assert worker.organizations == []
+    assert observed == [{
+        "event": "worker_discovery_error",
+        "error_type": "ConnectionError",
+        "message": "catalog unavailable",
+    }]
+
+
+def test_worker_loop_rejects_an_unbounded_or_duplicate_discovery_batch():
+    class InvalidSource:
+        def list_ready_tenants(self, **kwargs):
+            del kwargs
+            return ("tenant-a", "tenant-a")
+
+    observed = []
+    loop = CommandWorkerLoop(  # type: ignore[arg-type]
+        worker=StubWorker(),
+        organization_source=InvalidSource(),
+        tenant_batch_size=2,
+        observer=observed.append,
+    )
+
+    assert loop.run_cycle() == ()
+    assert observed[0]["event"] == "worker_discovery_error"
+    assert observed[0]["error_type"] == "ValueError"
+
+
 def test_bootstrap_organization_contains_every_agent_lifecycle_role_and_ceo():
     organization = default_organization("tenant-a")
     required = {
@@ -138,8 +204,9 @@ def test_worker_settings_require_explicit_model_and_production_tenants(monkeypat
     monkeypatch.setenv("AOS_V2_CREATE_SCHEMA", "0")
     monkeypatch.setenv("AOS_V2_MODEL", "provider:model")
     monkeypatch.delenv("AOS_V2_WORKER_ORGANIZATIONS", raising=False)
-    with pytest.raises(ValueError, match="WORKER_ORGANIZATIONS"):
-        WorkerSettings.from_env()
+    settings = WorkerSettings.from_env()
+    assert settings.organization_ids == ()
+    assert settings.tenant_discovery_limit == 128
 
     monkeypatch.setenv("AOS_V2_WORKER_ORGANIZATIONS", "tenant-a,tenant-b,tenant-a")
     settings = WorkerSettings.from_env()

@@ -31,6 +31,7 @@ from agent_os.infrastructure.sandbox_tool_nodes import SandboxToolNodeHandlers
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
+from agent_os.infrastructure.sql_ready_tenants import SQLReadyTenantSource
 from agent_os.infrastructure.tool_node_router import GraphToolNodeRouter
 
 
@@ -77,6 +78,7 @@ class WorkerSettings:
     sandbox_backend: str
     sandbox_image: str
     sandbox_timeout_seconds: int
+    tenant_discovery_limit: int
 
     @classmethod
     def from_env(cls, *, organization_ids: Sequence[str] = ()) -> "WorkerSettings":
@@ -92,8 +94,6 @@ class WorkerSettings:
             configured = _organization_ids(os.getenv("AOS_V2_WORKER_ORGANIZATIONS", ""))
         if not configured and server.environment in {"development", "test"}:
             configured = ("local-company",)
-        if not configured:
-            raise ValueError("AOS_V2_WORKER_ORGANIZATIONS is required in staging/production")
         max_attempts_raw = os.getenv("AOS_V2_RETRY_MAX_ATTEMPTS", "").strip()
         retry_max_attempts = None
         if max_attempts_raw:
@@ -101,6 +101,9 @@ class WorkerSettings:
         sandbox_backend = os.getenv("AOS_V2_SANDBOX_BACKEND", "disabled").strip().lower()
         if sandbox_backend not in {"disabled", "docker"}:
             raise ValueError("AOS_V2_SANDBOX_BACKEND must be disabled or docker")
+        tenant_discovery_limit = _positive_int("AOS_V2_TENANT_DISCOVERY_LIMIT", 128)
+        if tenant_discovery_limit > 1_000:
+            raise ValueError("AOS_V2_TENANT_DISCOVERY_LIMIT cannot exceed 1000")
         worker_id = os.getenv("AOS_V2_WORKER_ID", "").strip()
         if not worker_id:
             worker_id = f"{socket.gethostname()}:{os.getpid()}"
@@ -120,6 +123,7 @@ class WorkerSettings:
             sandbox_backend=sandbox_backend,
             sandbox_image=os.getenv("AOS_V2_SANDBOX_IMAGE", DEFAULT_PYTHON_IMAGE).strip(),
             sandbox_timeout_seconds=_positive_int("AOS_V2_SANDBOX_TIMEOUT_SECONDS", 300),
+            tenant_discovery_limit=tenant_discovery_limit,
         )
 
     def with_organizations(self, organization_ids: Sequence[str]) -> "WorkerSettings":
@@ -226,16 +230,25 @@ def run_worker(
             lifecycle_worker=worker,
             graph_worker=graph_worker,
         )
+        loop_options: dict[str, Any] = {"organization_ids": settings.organization_ids}
+        if not settings.organization_ids:
+            tenant_source = SQLReadyTenantSource(settings.server.application_database_url)
+            resources.callback(tenant_source.close)
+            loop_options = {
+                "organization_source": tenant_source,
+                "tenant_batch_size": settings.tenant_discovery_limit,
+            }
         loop = CommandWorkerLoop(
             worker=tenant_worker,
-            organization_ids=settings.organization_ids,
             idle_poll_seconds=settings.idle_poll_seconds,
             error_backoff_seconds=settings.error_backoff_seconds,
             observer=_emit,
+            **loop_options,
         )
         _emit({
             "event": "worker_started",
             "worker_id": settings.worker_id,
+            "tenant_mode": "static" if settings.organization_ids else "dynamic",
             "organizations": list(settings.organization_ids),
             "model": settings.model,
         })

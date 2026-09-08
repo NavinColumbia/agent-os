@@ -32,7 +32,10 @@ def serve() -> None:
     "--organization",
     "organizations",
     multiple=True,
-    help="Tenant organization to poll; repeat it, or set AOS_V2_WORKER_ORGANIZATIONS.",
+    help=(
+        "Optional static tenant allowlist; repeat it, or set AOS_V2_WORKER_ORGANIZATIONS. "
+        "Production workers discover ready tenants when no allowlist is set."
+    ),
 )
 @click.option("--once", is_flag=True, help="Run one fair polling cycle and exit.")
 def worker(organizations: tuple[str, ...], once: bool) -> None:

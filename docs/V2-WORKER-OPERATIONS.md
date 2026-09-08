@@ -4,7 +4,7 @@
 
 `agentos-v2 worker` is the long-running execution process for the V2 lifecycle command outbox. It:
 
-- polls configured tenant shards fairly;
+- discovers ready tenant shards from PostgreSQL, or polls an explicit BYOC/cell allowlist;
 - atomically claims one due command under a renewable, owner-fenced lease;
 - keeps the lease alive during long agent turns;
 - caps each model turn by requests, output tokens, provider-call timeout, and configured cost;
@@ -59,7 +59,6 @@ declared repair edge.
 Required for the worker:
 
 - `AOS_V2_MODEL`: explicit PydanticAI `provider:model`; there is no spend-bearing default.
-- `AOS_V2_WORKER_ORGANIZATIONS`: comma-separated tenant IDs in staging/production.
 - the same database variables and application version used by the API.
 - the credential for the selected provider, such as `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`.
 
@@ -73,10 +72,15 @@ Important controls:
 - `AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS` (default `120` per provider call)
 - `AOS_V2_MAX_TURN_COST_CENTS` (default `100`)
 - `AOS_V2_RETRY_MAX_ATTEMPTS` (unset means transient infrastructure failures keep retrying)
+- `AOS_V2_TENANT_DISCOVERY_LIMIT` (default `128`, maximum `1000` ready tenants per fair cycle)
+- `AOS_V2_WORKER_ORGANIZATIONS` (optional comma-separated static BYOC/cell allowlist)
 
-The initial tenant list is an explicit cell/shard assignment suitable for early deployments and tens of customers.
-Before general self-service signup, replace static assignment with the tenant catalog/admission scheduler described
-in the North Star. Do not give a cross-tenant worker an unrestricted customer request credential.
+With no static allowlist, staging/production workers use the narrow `agentos_worker` database role to discover
+only tenant IDs with due or abandoned queue work. That role receives column-level access to scheduling metadata,
+not customer command/action payloads. Actual claims and mutations still enter the existing `agentos_app` tenant
+role with RLS, and renewable leases coordinate replicas. Discovery rotates from a cursor so a tenant with a deep
+backlog cannot permanently hide later tenant IDs. A production database runtime principal must be allowed to
+`SET ROLE` to both `agentos_worker` and `agentos_app`; it must not own tables or receive `BYPASSRLS`.
 
 ## Bounded local deployment proof
 
@@ -87,6 +91,6 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–90), and then starts the API and worker from the exact
+It starts PostgreSQL, applies only the isolated V2 migrations (86–91), and then starts the API and worker from the exact
 same non-root image. Hosted OIDC/signup, secrets management, external-effect adapters, a hosted sandbox/build
 adapter, large-object storage, metering, and managed-cloud IaC are still launch blockers.

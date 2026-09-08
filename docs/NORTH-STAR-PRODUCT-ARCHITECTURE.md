@@ -479,9 +479,10 @@ worker that fairly advances lifecycle commands and graph actions without a whole
 spend after a crash. Agent/decision, correlated-human, and evidence-aggregating terminal graph nodes now execute;
 human/operator/completion communication has an idempotent tenant inbox and authenticated API projection. It
 also has an immutable, tenant-isolated small-artifact ledger, allowlisted artifact publication tool nodes, and a
-fail-closed local Docker sandbox adapter for dedicated development/CI runners. It still has overlapping legacy
-controllers, local-host assumptions, unfinished public infrastructure, static early-tenant worker assignment, no
-managed-cloud sandbox/deploy/subworkflow adapters, and no complete
+fail-closed local Docker sandbox adapter for dedicated development/CI runners. Workers can discover due tenants
+through a narrow scheduling-only database role while retaining tenant-RLS claims and round-robin fairness. It still
+has overlapping legacy controllers, local-host assumptions, unfinished public infrastructure, no managed-cloud
+sandbox/deploy/subworkflow adapters, and no complete
 prompt-to-public-URL customer vertical.
 This is a real durable execution spine, not yet the finished platform.
 

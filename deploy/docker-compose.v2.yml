@@ -40,6 +40,7 @@ services:
       - ../postgres/initdb/88-workflow-action-leases-v2.sql:/migrations/88-workflow-action-leases-v2.sql:ro
       - ../postgres/initdb/89-notifications-v2.sql:/migrations/89-notifications-v2.sql:ro
       - ../postgres/initdb/90-artifacts-v2.sql:/migrations/90-artifacts-v2.sql:ro
+      - ../postgres/initdb/91-ready-tenant-discovery-v2.sql:/migrations/91-ready-tenant-discovery-v2.sql:ro
     command:
       - sh
       - -ec
@@ -49,6 +50,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/88-workflow-action-leases-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/89-notifications-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/90-artifacts-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/91-ready-tenant-discovery-v2.sql
     restart: "no"
 
   api:
@@ -83,7 +85,8 @@ services:
     environment:
       <<: *runtime-environment
       AOS_V2_MODEL: ${AOS_V2_MODEL:?set an explicit PydanticAI provider:model}
-      AOS_V2_WORKER_ORGANIZATIONS: ${AOS_V2_WORKER_ORGANIZATIONS:?set comma-separated tenant IDs}
+      AOS_V2_WORKER_ORGANIZATIONS: ${AOS_V2_WORKER_ORGANIZATIONS:-}
+      AOS_V2_TENANT_DISCOVERY_LIMIT: ${AOS_V2_TENANT_DISCOVERY_LIMIT:-128}
       AOS_V2_MAX_TURN_COST_CENTS: ${AOS_V2_MAX_TURN_COST_CENTS:-100}
       AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS: ${AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS:-120}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}

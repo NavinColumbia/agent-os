@@ -8,9 +8,10 @@ from typing import Any, Callable, Mapping
 
 from agent_os.application.agent_turn import AgentTurnContext, commit_agent_turn, plan_agent_turn
 from agent_os.application.lifecycle import CommandEnvelope
-from agent_os.application.ports import AgentRuntime, CommandExecutor, OrganizationLedger
+from agent_os.application.ports import ArtifactStore, AgentRuntime, CommandExecutor, OrganizationLedger
 from agent_os.domain.lifecycle import CommandKind
 from agent_os.domain.organization import Organization
+from agent_os.infrastructure.proposed_artifacts import persist_and_validate_artifacts
 
 
 _ROLES: dict[CommandKind, str] = {
@@ -156,6 +157,7 @@ class DurableAgentCommandExecutor(CommandExecutor):
         runtime: AgentRuntime,
         ledger: OrganizationLedger,
         organization_loader: Callable[[str, str], Organization | None] | None = None,
+        artifact_store: ArtifactStore | None = None,
         clock: Callable[[], datetime] | None = None,
         max_turn_budget_cents: int = 100,
     ) -> None:
@@ -164,6 +166,7 @@ class DurableAgentCommandExecutor(CommandExecutor):
         self._runtime = runtime
         self._ledger = ledger
         self._organization_loader = organization_loader
+        self._artifact_store = artifact_store
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._max_turn_budget_cents = max_turn_budget_cents
 
@@ -215,9 +218,23 @@ class DurableAgentCommandExecutor(CommandExecutor):
             budget_cents=turn_budget,
             context=_organization_context(organization),
         )
-        output = result.get("output")
-        if not isinstance(output, Mapping):
+        raw_output = result.get("output")
+        if not isinstance(raw_output, Mapping):
             raise ValueError("agent runtime result must contain structured output")
+        allowed_evidence = {
+            str(evidence_id)
+            for event in history
+            if event.get("kind") == "evidence_recorded"
+            for evidence_id in event.get("payload", {}).get("evidence_ids", ())
+        }
+        output = persist_and_validate_artifacts(
+            store=self._artifact_store,
+            organization_id=item.organization_id,
+            idempotency_key=item.command_id,
+            output=raw_output,
+            allowed_evidence_ids=allowed_evidence,
+        )
+        recorded_result = {**dict(result), "output": dict(output)}
         context = AgentTurnContext(
             tenant_id=item.organization_id,
             run_id=item.run_id,
@@ -229,7 +246,7 @@ class DurableAgentCommandExecutor(CommandExecutor):
         plan = plan_agent_turn(context, output, organization=organization)
         receipts = commit_agent_turn(self._ledger, plan)
         return {
-            "agent_turn": dict(result),
+            "agent_turn": recorded_result,
             "organization_event_versions": [receipt.stream_version for receipt in receipts],
             "rejected_actions": list(plan.rejected_actions),
             "lifecycle_event": _followup_event(item, output),

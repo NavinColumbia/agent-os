@@ -7,6 +7,7 @@ from agent_os.application.command_worker import FatalCommandError
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.domain.workflow_runtime import begin_node, complete_node, resume_wait, start_workflow, wait_node
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
+from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 
 
 def agent_graph() -> WorkflowDefinition:
@@ -160,3 +161,57 @@ def test_terminal_node_aggregates_real_upstream_evidence():
 
     assert result["evidence_ids"] == ["verified-build"]
     assert result["output"]["accepted_upstream_evidence"] == ["verified-build"]
+
+
+def test_graph_agent_persists_new_evidence_and_rejects_invented_ids(tmp_path):
+    definition = agent_graph()
+    started = start_workflow(definition, run_id="run-evidence")
+    action = started.actions[0]
+    running = begin_node(started.state, action.token_id, expected_version=0).state
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'graph-artifacts.sqlite3'}", create_schema=True,
+    )
+    proposed = {
+        "summary": "Built a small application.",
+        "disposition": "complete",
+        "satisfied_conditions": ["verified"],
+        "evidence_ids": [],
+        "artifacts": [{
+            "label": "application-source",
+            "media_type": "application/vnd.agent-os.source-bundle+json",
+            "files": {"index.html": "<h1>Built</h1>"},
+        }],
+        "output": {"decision": "test"},
+        "recipient_ids": [],
+        "correlation_id": None,
+        "reason": None,
+        "retryable": False,
+    }
+    try:
+        runtime = PydanticGraphNodeRuntime(
+            TestModel(custom_output_args=proposed),
+            artifact_store=artifacts,
+        )
+        result = runtime.execute_node(
+            tenant_id="tenant-a", run_id="run-evidence", definition=definition,
+            state=running, action=action, idempotency_key=action.action_id,
+        )
+        artifact_id = result["evidence_ids"][0]
+        assert artifacts.describe("tenant-a", artifact_id)["media_type"].endswith(
+            "source-bundle+json"
+        )
+        assert result["artifacts"][0]["artifact_id"] == artifact_id
+        assert result["output"]["artifact_ids"] == {"application-source": artifact_id}
+
+        hallucinated = {**proposed, "evidence_ids": ["invented"], "artifacts": []}
+        runtime = PydanticGraphNodeRuntime(
+            TestModel(custom_output_args=hallucinated),
+            artifact_store=artifacts,
+        )
+        with pytest.raises(FatalCommandError, match="unknown or cross-tenant"):
+            runtime.execute_node(
+                tenant_id="tenant-a", run_id="run-evidence", definition=definition,
+                state=running, action=action, idempotency_key="different-action",
+            )
+    finally:
+        artifacts.close()

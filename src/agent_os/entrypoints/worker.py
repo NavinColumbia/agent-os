@@ -192,6 +192,7 @@ def run_worker(
             runtime=runtime,
             ledger=engine,
             organization_loader=default_organization,
+            artifact_store=artifact_store,
             max_turn_budget_cents=settings.max_turn_budget_cents,
         )
         executor = LifecycleCommandRouter(
@@ -210,6 +211,7 @@ def run_worker(
         graph_runtime = PydanticGraphNodeRuntime(
             settings.model,
             handlers=tool_router.handlers(),
+            artifact_store=artifact_store,
             request_limit=settings.request_limit,
             output_tokens_limit=settings.output_tokens_limit,
             request_timeout_seconds=settings.request_timeout_seconds,

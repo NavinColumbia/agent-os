@@ -34,6 +34,12 @@ prior-node output into immutable, content-addressed evidence. Their bootstrap Po
 per object; large source bundles, build outputs, and release images still require the object/OCI-store adapter.
 No model-controlled shell command is executed by this adapter.
 
+Lifecycle and graph agents may also propose up to 16 bounded text, JSON, HTML, or source-bundle artifacts in a
+structured turn. The authority layer validates and content-addresses those objects, replaces the proposal bodies
+with durable artifact records, and only then permits their IDs to support completion. A model-supplied evidence
+ID must already exist in the same tenant or come from authoritative upstream evidence; invented, cross-tenant,
+and nested decision citations fail before workflow progress is committed.
+
 `sandbox.run` is available only when a dedicated development/CI worker sets
 `AOS_V2_SANDBOX_BACKEND=docker`. The local adapter accepts an immutable Agent OS source bundle, uses direct argv
 inside a digest-pinned image, denies networking, runs as a non-root UID, mounts only an ephemeral workspace,

@@ -13,9 +13,13 @@ from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.models import Model
 
 from agent_os.application.command_worker import FatalCommandError
-from agent_os.application.ports import GraphNodeRuntime
+from agent_os.application.ports import ArtifactStore, GraphNodeRuntime
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowNode
 from agent_os.domain.workflow_runtime import TokenStatus, WorkflowAction, WorkflowRunState
+from agent_os.infrastructure.proposed_artifacts import (
+    ProposedArtifact,
+    persist_and_validate_artifacts,
+)
 
 
 class GraphNodeDisposition(str, Enum):
@@ -30,7 +34,8 @@ class GraphAgentNodeOutput(BaseModel):
     summary: str = Field(min_length=1)
     disposition: GraphNodeDisposition
     satisfied_conditions: list[str] = Field(default_factory=list)
-    evidence_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    artifacts: list[ProposedArtifact] = Field(default_factory=list, max_length=16)
     output: dict[str, Any] = Field(default_factory=dict)
     recipient_ids: list[str] = Field(default_factory=list)
     correlation_id: str | None = None
@@ -39,7 +44,9 @@ class GraphAgentNodeOutput(BaseModel):
 
     @model_validator(mode="after")
     def validate_disposition(self) -> "GraphAgentNodeOutput":
-        if self.disposition is GraphNodeDisposition.COMPLETE and not self.evidence_ids:
+        if self.disposition is GraphNodeDisposition.COMPLETE and not (
+            self.evidence_ids or self.artifacts
+        ):
             raise ValueError("graph node completion requires evidence")
         if self.disposition is GraphNodeDisposition.WAIT:
             if not self.recipient_ids or not self.correlation_id or not self.reason:
@@ -60,6 +67,8 @@ You are the accountable owner of one node inside a durable, non-linear company w
 Complete only this node. Use authoritative context, expose uncertainty, and choose only listed outgoing
 conditions. Never report completion without durable evidence IDs. If human authority or missing facts are
 required, return a correlated wait. If work cannot proceed, fail honestly and state whether retry is useful.
+Create new evidence through the bounded artifacts field. Cite an evidence ID only when it appears in the
+authoritative prior-token context; never invent one. Source code uses a source-bundle artifact with a files map.
 Your structured output is a proposal; deterministic workflow policy commits the transition.
 """.strip()
 
@@ -73,6 +82,7 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         *,
         tools: Sequence[Any] = (),
         handlers: Mapping[NodeKind, GraphNodeHandler] | None = None,
+        artifact_store: ArtifactStore | None = None,
         request_limit: int = 12,
         output_tokens_limit: int = 8_000,
         request_timeout_seconds: float = 120,
@@ -90,6 +100,7 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         self._model = model
         self._tools = tuple(tools)
         self._handlers = dict(handlers or {})
+        self._artifact_store = artifact_store
         self._request_limit = request_limit
         self._output_tokens_limit = output_tokens_limit
         self._request_timeout_seconds = request_timeout_seconds
@@ -236,10 +247,30 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         unknown = set(output.satisfied_conditions) - set(available_conditions)
         if unknown:
             raise FatalCommandError(f"graph agent selected unknown conditions: {sorted(unknown)}")
-        raw = output.model_dump(mode="json")
+        prior_evidence = {
+            evidence_id
+            for prior in state.tokens
+            if prior.token_id != token.token_id
+            for evidence_id in prior.evidence_ids
+        }
+        raw = dict(persist_and_validate_artifacts(
+            store=self._artifact_store,
+            organization_id=tenant_id,
+            idempotency_key=idempotency_key,
+            output=output.model_dump(mode="json"),
+            allowed_evidence_ids=prior_evidence,
+        ))
+        artifact_records = raw.get("artifacts", ())
+        artifact_ids = {
+            str(record["label"]): str(record["artifact_id"])
+            for record in artifact_records
+            if isinstance(record, Mapping) and record.get("label") and record.get("artifact_id")
+        }
         raw["output"] = {
             **raw["output"],
             "summary": output.summary,
+            "artifacts": list(artifact_records),
+            "artifact_ids": artifact_ids,
             "usage": {
                 "requests": result.usage.requests,
                 "tool_calls": result.usage.tool_calls,

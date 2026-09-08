@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
-from agent_os.domain.workflow_runtime import begin_node, start_workflow
+from agent_os.domain.workflow_runtime import begin_node, complete_node, start_workflow
 from agent_os.infrastructure.sandbox_tool_nodes import SandboxToolNodeHandlers
 
 
 class StubRunner:
     def __init__(self, exit_code: int):
         self.exit_code = exit_code
+        self.calls = []
 
     def run(self, **kwargs):
+        self.calls.append(kwargs)
         return {
             "exit_code": self.exit_code,
             "timed_out": False,
@@ -69,3 +71,52 @@ def test_sandbox_tool_routes_test_failure_to_the_declared_repair_loop():
     assert result["disposition"] == "complete"
     assert result["satisfied_conditions"] == ["repair"]
     assert result["output"]["exit_code"] == 7
+
+
+def test_sandbox_tool_selects_a_labeled_artifact_from_prior_node_output():
+    definition = WorkflowDefinition(
+        "sandbox-chain", "tenant-a", "Build and test", 1, "build",
+        (
+            WorkflowNode("build", NodeKind.AGENT, "Build source", "engineer"),
+            WorkflowNode("test", NodeKind.TOOL, "Test source", configuration={
+                "tool": "sandbox.run",
+                "source": {
+                    "node_id": "build",
+                    "output_path": ["artifact_ids", "application-source"],
+                },
+                "command": ["python", "test_app.py"],
+                "success_condition": "passed",
+            }),
+            WorkflowNode("done", NodeKind.TERMINAL, "Done"),
+        ),
+        (
+            WorkflowEdge("build", "test", "built"),
+            WorkflowEdge("test", "done", "passed"),
+        ),
+        "architect",
+    )
+    started = start_workflow(definition, run_id="run-chain")
+    build_action = started.actions[0]
+    build_running = begin_node(started.state, build_action.token_id, expected_version=0).state
+    built = complete_node(
+        definition,
+        build_running,
+        build_action.token_id,
+        expected_version=1,
+        satisfied_conditions=frozenset({"built"}),
+        evidence_ids=("artifact-source",),
+        output={"artifact_ids": {"application-source": "artifact-source"}},
+    )
+    test_action = built.actions[0]
+    test_running = begin_node(
+        built.state, test_action.token_id, expected_version=2,
+    ).state
+    node = next(item for item in definition.nodes if item.node_id == "test")
+
+    runner = StubRunner(0)
+    result = SandboxToolNodeHandlers(runner).execute(
+        "tenant-a", "run-chain", definition, test_running, test_action, node,
+    )
+
+    assert result["disposition"] == "complete"
+    assert runner.calls[0]["artifact_id"] == "artifact-source"

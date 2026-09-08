@@ -3,12 +3,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+import pytest
+
+from agent_os.application.command_worker import FatalCommandError
 from agent_os.application.agent_turn import AgentTurnContext, commit_agent_turn, plan_agent_turn
 from agent_os.application.lifecycle import CommandEnvelope
 from agent_os.application.ports import OrganizationEventReceipt
 from agent_os.domain.lifecycle import Command, CommandKind
 from agent_os.domain.organization import AgentProfile, HumanParticipant, Organization, Team
 from agent_os.infrastructure.agent_command_executor import DurableAgentCommandExecutor
+from agent_os.infrastructure.pydantic_agents import AgentTurnOutput
+from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 
 
 def organization() -> Organization:
@@ -204,3 +209,97 @@ def test_agent_receives_authoritative_directory_and_cannot_raise_its_cost_cap():
     context = runtime.last_call["context"]
     assert context["humans"][0]["id"] == "human:ceo"
     assert context["agents"][0]["id"] == "chief"
+
+
+def test_agent_turn_output_accepts_top_level_artifact_as_completion_evidence():
+    turn = AgentTurnOutput.model_validate({
+        "summary": "Implemented and documented the result.",
+        "disposition": "complete",
+        "progress_percent": 100,
+        "artifacts": [{
+            "label": "implementation-report",
+            "media_type": "text/markdown",
+            "content": "# Verified implementation",
+        }],
+    })
+
+    assert turn.artifacts[0].label == "implementation-report"
+
+
+def test_lifecycle_completion_persists_proposed_evidence_and_replays_without_model_spend(tmp_path):
+    complete = {
+        **output(),
+        "disposition": "complete",
+        "progress_percent": 100,
+        "evidence_ids": [],
+        "artifacts": [{
+            "label": "research-report",
+            "media_type": "text/markdown",
+            "content": "# Verified research",
+        }],
+        "messages": [],
+        "hiring_requests": [],
+        "decisions": [],
+    }
+    runtime = FakeRuntime(complete)
+    ledger = MemoryLedger()
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'lifecycle-artifacts.sqlite3'}", create_schema=True,
+    )
+    executor = DurableAgentCommandExecutor(
+        runtime=runtime,
+        ledger=ledger,
+        artifact_store=artifacts,
+    )
+    envelope = CommandEnvelope(
+        "cmd-grounded", "run-1", "tenant-1", "scope", 1, 0,
+        Command(CommandKind.START_RESEARCH, {"prompt": "Research"}),
+    ).to_dict()
+    try:
+        first = executor.execute(envelope)
+        replay = executor.execute(envelope)
+        evidence_id = first["lifecycle_event"]["payload"]["report_id"]
+
+        assert evidence_id.startswith("artifact-")
+        assert artifacts.get("tenant-1", evidence_id) == b"# Verified research"
+        assert first["agent_turn"]["output"]["artifacts"] == [{
+            "label": "research-report",
+            "artifact_id": evidence_id,
+            "media_type": "text/markdown",
+            "byte_length": 19,
+        }]
+        assert "content" not in first["agent_turn"]["output"]["artifacts"][0]
+        assert replay["lifecycle_event"] == first["lifecycle_event"]
+        assert runtime.calls == 1
+    finally:
+        artifacts.close()
+
+
+def test_lifecycle_completion_rejects_invented_evidence_before_committing_progress(tmp_path):
+    complete = {
+        **output(),
+        "disposition": "complete",
+        "progress_percent": 100,
+        "evidence_ids": ["made-up-report"],
+        "artifacts": [],
+        "messages": [],
+        "hiring_requests": [],
+        "decisions": [],
+    }
+    ledger = MemoryLedger()
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'hallucinated-artifacts.sqlite3'}", create_schema=True,
+    )
+    executor = DurableAgentCommandExecutor(
+        runtime=FakeRuntime(complete), ledger=ledger, artifact_store=artifacts,
+    )
+    envelope = CommandEnvelope(
+        "cmd-hallucinated", "run-1", "tenant-1", "scope", 1, 0,
+        Command(CommandKind.START_RESEARCH, {"prompt": "Research"}),
+    ).to_dict()
+    try:
+        with pytest.raises(FatalCommandError, match="unknown or cross-tenant"):
+            executor.execute(envelope)
+        assert ledger.events == []
+    finally:
+        artifacts.close()

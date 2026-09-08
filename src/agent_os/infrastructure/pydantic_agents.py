@@ -18,6 +18,7 @@ from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.models import Model
 
 from agent_os.application.ports import AgentRuntime
+from agent_os.infrastructure.proposed_artifacts import ProposedArtifact
 
 
 class TurnDisposition(str, Enum):
@@ -75,7 +76,7 @@ class ProposedDecision(BaseModel):
     considered_options: list[str] = Field(min_length=1)
     chosen_option: str
     rationale: str
-    evidence_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
     confidence: float = Field(ge=0, le=1)
     reversible: bool
     needs_human_approval: bool = False
@@ -93,7 +94,8 @@ class AgentTurnOutput(BaseModel):
     summary: str
     disposition: TurnDisposition
     progress_percent: int = Field(ge=0, le=100)
-    evidence_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    artifacts: list[ProposedArtifact] = Field(default_factory=list, max_length=16)
     observations: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     messages: list[ProposedMessage] = Field(default_factory=list)
@@ -104,7 +106,9 @@ class AgentTurnOutput(BaseModel):
 
     @model_validator(mode="after")
     def completion_has_evidence(self) -> "AgentTurnOutput":
-        if self.disposition is TurnDisposition.COMPLETE and not self.evidence_ids:
+        if self.disposition is TurnDisposition.COMPLETE and not (
+            self.evidence_ids or self.artifacts
+        ):
             raise ValueError("completion requires evidence")
         if self.disposition is TurnDisposition.WAIT_FOR_HUMAN:
             if not any(message.requires_response for message in self.messages):
@@ -118,6 +122,8 @@ Exercise judgment within your role. Inspect evidence, identify uncertainty, and 
 You may propose parallel work, specialists, hiring, peer/upward/human messages, risks, challenges, and decisions.
 Never claim completion without durable evidence. Do not conceal blockers or wait silently. Request human input
 only when judgment, authority, credentials, physical action, or genuinely missing information requires it.
+Create new evidence through the bounded artifacts field. Use evidence_ids only for durable evidence IDs supplied
+in authoritative context; never invent an ID. Source code must be a source-bundle artifact with a files map.
 Consequential proposals are reviewed by durable policy and approval layers after this turn.
 """.strip()
 

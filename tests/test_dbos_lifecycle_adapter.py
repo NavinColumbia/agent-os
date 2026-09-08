@@ -14,6 +14,7 @@ from agent_os.domain.organization_events import OrganizationEvent, OrganizationE
 from agent_os.infrastructure.agent_command_executor import DurableAgentCommandExecutor
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine, sqlalchemy_url
+from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 
 
 @pytest.fixture
@@ -165,7 +166,12 @@ def test_real_worker_commits_agent_evidence_advances_lifecycle_and_queues_next_p
                     "summary": "Research completed with a durable report.",
                     "disposition": "complete",
                     "progress_percent": 100,
-                    "evidence_ids": ["research-report-1"],
+                    "evidence_ids": [],
+                    "artifacts": [{
+                        "label": "research-report",
+                        "media_type": "text/markdown",
+                        "content": "# Research report\n\nVerified evidence.",
+                    }],
                     "observations": [],
                     "risks": [],
                     "messages": [],
@@ -178,27 +184,38 @@ def test_real_worker_commits_agent_evidence_advances_lifecycle_and_queues_next_p
                 "idempotency_key": kwargs["idempotency_key"],
             }
 
-    agent_executor = DurableAgentCommandExecutor(
-        runtime=CompletingRuntime(),
-        ledger=engine,
-        organization_loader=default_organization,
-    )
-    worker = DurableCommandWorker(
-        outbox=engine,
-        executor=LifecycleCommandRouter(agent_executor=agent_executor),
-        worker_id="worker-integration",
-        lease_seconds=3,
-        workflow_engine=engine,
-        workflow_result_waiter=engine.get_result,
-    )
+    artifacts = SQLArtifactStore(engine._application_database_url, create_schema=True)
+    try:
+        agent_executor = DurableAgentCommandExecutor(
+            runtime=CompletingRuntime(),
+            ledger=engine,
+            organization_loader=default_organization,
+            artifact_store=artifacts,
+        )
+        worker = DurableCommandWorker(
+            outbox=engine,
+            executor=LifecycleCommandRouter(agent_executor=agent_executor),
+            worker_id="worker-integration",
+            lease_seconds=3,
+            workflow_engine=engine,
+            workflow_result_waiter=engine.get_result,
+        )
 
-    report = worker.run_one("org-a")
+        report = worker.run_one("org-a")
+
+        activity = engine.load_organization_events("org-a", "run-worker")
+        evidence_id = next(
+            item["payload"]["evidence_ids"][0]
+            for item in activity if item["kind"] == "evidence_recorded"
+        )
+        assert artifacts.get("org-a", evidence_id) == b"# Research report\n\nVerified evidence."
+    finally:
+        artifacts.close()
 
     assert report.status is CommandRunStatus.SUCCEEDED
     assert engine.get_command_record("org-a", first_command_id)["status"] == "succeeded"
     state = engine.get_run("org-a", "run-worker")
     assert state is not None and state.phase is LifecyclePhase.SPECIFY and state.version == 2
-    activity = engine.load_organization_events("org-a", "run-worker")
     assert [item["kind"] for item in activity][-3:] == [
         "agent_turn_recorded", "evidence_recorded", "work_progress_reported",
     ]

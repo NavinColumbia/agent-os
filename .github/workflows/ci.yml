@@ -28,11 +28,13 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install -q --upgrade pip==26.1.2
-          # Legacy tests still exercise the strangler runtime. V2 production
-          # dependencies are exact-pinned by pyproject and its hash lock.
-          .venv/bin/pip install -q -r requirements.txt
+          # Production dependencies come from the hash lock. Legacy tests still
+          # exercise the strangler runtime, whose compatibility dependencies are
+          # exact-pinned by the project's `legacy` extra. Do not install the
+          # historical unbounded requirements.txt here: doing so makes CI drift
+          # whenever a transitive package publishes a new release.
           .venv/bin/pip install -q -r pylock.toml
-          .venv/bin/pip install -q --no-deps -e .
+          .venv/bin/pip install -q -e '.[legacy]'
           .venv/bin/pip install -q pytest==9.1.1 httpx==0.28.1
           .venv/bin/pip check
       - name: config

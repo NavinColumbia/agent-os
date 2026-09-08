@@ -480,11 +480,13 @@ spend after a crash. Agent/decision, correlated-human, and evidence-aggregating 
 human/operator/completion communication has an idempotent tenant inbox and authenticated API projection. It
 also has an immutable, tenant-isolated small-artifact ledger, allowlisted artifact publication tool nodes, and a
 grounding boundary that persists bounded model-proposed artifacts while rejecting invented/cross-tenant evidence.
-Its fail-closed local Docker sandbox adapter serves dedicated development/CI runners. Workers can discover due
-tenants through a narrow scheduling-only database role while retaining tenant-RLS claims and round-robin fairness.
-It still has overlapping legacy controllers, local-host assumptions, unfinished public infrastructure, no
-managed-cloud sandbox/deploy/subworkflow adapters, and no complete
-prompt-to-public-URL customer vertical.
+One CEO directive now durably starts a bounded mission-architect graph whose identity-free JSON proposal is
+authority-validated, tenant/version stamped, and launched as an immutable child graph; detailed terminal outcomes
+project idempotently to the coarse CEO lifecycle, and one authenticated view links all three states. Its fail-closed
+local Docker sandbox adapter serves dedicated development/CI runners. Workers can discover due tenants through a
+narrow scheduling-only database role while retaining tenant-RLS claims and round-robin fairness. It still has
+overlapping legacy controllers, local-host assumptions, unfinished public infrastructure, no managed-cloud
+sandbox/deploy/general-subworkflow adapters, and no complete prompt-to-public-URL customer vertical.
 This is a real durable execution spine, not yet the finished platform.
 
 Therefore:

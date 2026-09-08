@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from pydantic_ai.models.test import TestModel
+
+from agent_os.application.command_worker import CommandRunStatus, FatalCommandError
+from agent_os.application.graph_action_worker import DurableGraphActionWorker
+from agent_os.application.lifecycle import CommandEnvelope
+from agent_os.domain.lifecycle import (
+    Command,
+    CommandKind,
+    Event,
+    EventKind,
+    LifecycleState,
+    LifecycleStatus,
+)
+from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowNode
+from agent_os.domain.workflow_runtime import (
+    NodeToken,
+    TokenStatus,
+    WorkflowAction,
+    WorkflowActionKind,
+    WorkflowRunState,
+    WorkflowRunStatus,
+)
+from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
+from agent_os.infrastructure.memory import InMemoryWorkflowEngine
+from agent_os.infrastructure.mission_workflows import (
+    MISSION_BOOTSTRAP_WORKFLOW_ID,
+    MissionBootstrapHandler,
+    MissionGraphEffectHandlers,
+    WorkflowLaunchToolNodeHandlers,
+    materialize_mission_workflow,
+    mission_planning_run_id,
+)
+from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
+from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
+from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
+from agent_os.infrastructure.tool_node_router import GraphToolNodeRouter
+
+
+def proposed_workflow() -> dict:
+    return {
+        "name": "Implement the directive",
+        "entry_node_id": "build",
+        "nodes": [
+            {
+                "node_id": "build",
+                "kind": "agent",
+                "purpose": "Produce a verified implementation artifact.",
+                "owner_role": "engineer",
+                "configuration": {
+                    "max_iterations": 2,
+                    "agent_context": {"required_artifact": "application-source"},
+                },
+            },
+            {
+                "node_id": "done",
+                "kind": "terminal",
+                "purpose": "Accept the implementation evidence.",
+                "configuration": {"max_iterations": 1},
+            },
+        ],
+        "edges": [{"source": "build", "target": "done", "condition": "ready"}],
+    }
+
+
+def test_materialized_plan_is_tenant_owned_bounded_and_cannot_request_unknown_tools():
+    definition = materialize_mission_workflow(
+        proposed_workflow(),
+        tenant_id="tenant-a",
+        planning_run_id="plan-a",
+        artifact_id="artifact-plan",
+    )
+
+    assert definition.tenant_id == "tenant-a"
+    assert definition.created_by == "agent:mission-architect"
+    assert definition.version == 1
+    assert definition.workflow_id.startswith("mission-")
+
+    bad = proposed_workflow()
+    bad["nodes"][0] = {
+        "node_id": "build",
+        "kind": "tool",
+        "purpose": "Escape the authority layer.",
+        "configuration": {"tool": "host.shell", "max_iterations": 1},
+    }
+    with pytest.raises(FatalCommandError, match="unregistered tool"):
+        materialize_mission_workflow(
+            bad,
+            tenant_id="tenant-a",
+            planning_run_id="plan-b",
+            artifact_id="artifact-bad",
+        )
+
+
+def test_plan_rejects_a_reachable_trap_with_no_terminal_path():
+    bad = proposed_workflow()
+    bad["nodes"].append({
+        "node_id": "loop",
+        "kind": "decision",
+        "purpose": "Loop forever.",
+        "configuration": {"max_iterations": 2},
+    })
+    bad["edges"] = [
+        {"source": "build", "target": "loop", "condition": "ready"},
+        {"source": "build", "target": "done", "condition": "skip"},
+        {"source": "loop", "target": "loop", "condition": "again"},
+    ]
+    with pytest.raises(FatalCommandError, match="no terminal path"):
+        materialize_mission_workflow(
+            bad,
+            tenant_id="tenant-a",
+            planning_run_id="plan-trap",
+            artifact_id="artifact-trap",
+        )
+
+
+def test_start_mission_plans_validates_and_launches_a_child_graph(tmp_path: Path):
+    graph = SQLGraphWorkflowEngine(
+        f"sqlite:///{tmp_path / 'mission-graph.sqlite3'}", create_schema=True,
+    )
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'mission-artifacts.sqlite3'}", create_schema=True,
+    )
+    try:
+        envelope = CommandEnvelope(
+            "command-start-mission",
+            "lifecycle-run",
+            "tenant-a",
+            "scope-accepted",
+            1,
+            0,
+            Command(CommandKind.START_MISSION, {
+                "prompt": "Build a tested application",
+                "requested_by": "human:ceo",
+            }),
+        )
+        started = MissionBootstrapHandler(graph).execute(envelope)
+        planning_run_id = mission_planning_run_id("lifecycle-run")
+        assert started["planning_run_id"] == planning_run_id
+        assert graph.get_workflow_definition(
+            "tenant-a", MISSION_BOOTSTRAP_WORKFLOW_ID, 1,
+        ) is not None
+
+        planner_output = {
+            "summary": "Designed the bounded mission team.",
+            "disposition": "complete",
+            "satisfied_conditions": ["planned"],
+            "evidence_ids": [],
+            "artifacts": [{
+                "label": "mission-workflow",
+                "media_type": "application/json",
+                "json_value": proposed_workflow(),
+            }],
+            "output": {},
+            "recipient_ids": [],
+            "correlation_id": None,
+            "reason": None,
+            "retryable": False,
+        }
+        launch = WorkflowLaunchToolNodeHandlers(graph, artifacts)
+        runtime = PydanticGraphNodeRuntime(
+            TestModel(custom_output_args=planner_output),
+            handlers=GraphToolNodeRouter(launch.named_handlers()).handlers(),
+            artifact_store=artifacts,
+            max_turn_budget_cents=1,
+        )
+        worker = DurableGraphActionWorker(
+            outbox=graph,
+            executor=DurableGraphActionExecutor(engine=graph, node_runtime=runtime),
+            worker_id="mission-planner-worker",
+            lease_seconds=30,
+        )
+
+        reports = [worker.run_one("tenant-a"), worker.run_one("tenant-a")]
+
+        assert [report.status for report in reports] == [
+            CommandRunStatus.SUCCEEDED, CommandRunStatus.SUCCEEDED,
+        ]
+        planning = graph.get_graph_run("tenant-a", planning_run_id)
+        launch_token = next(token for token in planning.tokens if token.node_id == "launch")
+        child_run_id = launch_token.output["child_run_id"]
+        child = graph.get_graph_run("tenant-a", child_run_id)
+        assert child is not None and child.status is WorkflowRunStatus.ACTIVE
+        assert child.context["lifecycle_run_id"] == "lifecycle-run"
+        assert child.context["mission_execution"] is True
+        plan_id = launch_token.output["workflow_plan_artifact_id"]
+        assert artifacts.describe("tenant-a", plan_id)["media_type"] == "application/json"
+        assert artifacts.describe(
+            "tenant-a", launch_token.output["launch_artifact_id"],
+        ) is not None
+    finally:
+        graph.close()
+        artifacts.close()
+
+
+class OneStateGraph:
+    def __init__(self, state: WorkflowRunState) -> None:
+        self.state = state
+
+    def get_graph_run(self, tenant_id: str, run_id: str):
+        if tenant_id == self.state.tenant_id and run_id == self.state.run_id:
+            return self.state
+        return None
+
+
+def test_successful_child_graph_projects_once_to_the_coarse_ceo_lifecycle():
+    lifecycle = InMemoryWorkflowEngine()
+    lifecycle.start_run(
+        LifecycleState("lifecycle-run", "tenant-a"),
+        Event("scope", EventKind.SCOPE_ACCEPTED, 0, {"prompt": "Build"}),
+    )
+    token = NodeToken(
+        "terminal-token", "done", TokenStatus.SUCCEEDED, 1,
+        evidence_ids=("artifact-release", "artifact-tests"),
+    )
+    graph_state = WorkflowRunState(
+        "mission-run", "tenant-a", "mission-workflow", 1, 2,
+        WorkflowRunStatus.SUCCEEDED,
+        (token,),
+        {
+            "mission_execution": True,
+            "lifecycle_run_id": "lifecycle-run",
+            "lifecycle_expected_version": 1,
+        },
+        (token.token_id,),
+    )
+    action = WorkflowAction(
+        "mission-succeeded-action", WorkflowActionKind.RUN_SUCCEEDED,
+        token.token_id, token.node_id, {"terminal_token_ids": [token.token_id]},
+    )
+    handlers = MissionGraphEffectHandlers(
+        lifecycle_engine=lifecycle,
+        graph_engine=OneStateGraph(graph_state),
+        notification_handlers={},
+    ).graph_handlers()
+
+    first = handlers[WorkflowActionKind.RUN_SUCCEEDED]({
+        "tenant_id": "tenant-a", "run_id": "mission-run",
+    }, action)
+    replay = handlers[WorkflowActionKind.RUN_SUCCEEDED]({
+        "tenant_id": "tenant-a", "run_id": "mission-run",
+    }, action)
+
+    state = lifecycle.get_run("tenant-a", "lifecycle-run")
+    assert state.status is LifecycleStatus.SUCCEEDED
+    assert state.artifact_revision == "artifact-release"
+    assert first["projected"] is True
+    assert replay["duplicate"] is True

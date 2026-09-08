@@ -17,6 +17,7 @@ from agent_os.application.default_organization import default_organization
 from agent_os.application.graph_action_worker import DurableGraphActionWorker
 from agent_os.application.work_multiplexer import TenantWorkMultiplexer
 from agent_os.application.worker_loop import CommandWorkerLoop
+from agent_os.domain.lifecycle import CommandKind
 from agent_os.entrypoints.server import ServerSettings
 from agent_os.infrastructure.agent_command_executor import DurableAgentCommandExecutor
 from agent_os.infrastructure.artifact_tool_nodes import ArtifactToolNodeHandlers
@@ -24,6 +25,11 @@ from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.docker_sandbox import DEFAULT_PYTHON_IMAGE, DockerSandboxRunner
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
+from agent_os.infrastructure.mission_workflows import (
+    MissionBootstrapHandler,
+    MissionGraphEffectHandlers,
+    WorkflowLaunchToolNodeHandlers,
+)
 from agent_os.infrastructure.notification_effects import NotificationEffectHandlers
 from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
@@ -170,6 +176,9 @@ def run_worker(
         notification_effects = NotificationEffectHandlers(notification_store)
         artifact_tools = ArtifactToolNodeHandlers(artifact_store)
         named_tool_handlers = dict(artifact_tools.named_handlers())
+        named_tool_handlers.update(
+            WorkflowLaunchToolNodeHandlers(graph_engine, artifact_store).named_handlers()
+        )
         if settings.sandbox_backend == "docker":
             docker_binary = shutil.which("docker")
             if docker_binary is None:
@@ -195,9 +204,13 @@ def run_worker(
             artifact_store=artifact_store,
             max_turn_budget_cents=settings.max_turn_budget_cents,
         )
+        lifecycle_handlers = dict(notification_effects.lifecycle_handlers())
+        lifecycle_handlers[CommandKind.START_MISSION] = MissionBootstrapHandler(
+            graph_engine
+        ).execute
         executor = LifecycleCommandRouter(
             agent_executor=agent_executor,
-            handlers=notification_effects.lifecycle_handlers(),
+            handlers=lifecycle_handlers,
         )
         worker = DurableCommandWorker(
             outbox=engine,
@@ -222,7 +235,11 @@ def run_worker(
             executor=DurableGraphActionExecutor(
                 engine=graph_engine,
                 node_runtime=graph_runtime,
-                effect_handlers=notification_effects.graph_handlers(),
+                effect_handlers=MissionGraphEffectHandlers(
+                    lifecycle_engine=engine,
+                    graph_engine=graph_engine,
+                    notification_handlers=notification_effects.graph_handlers(),
+                ).graph_handlers(),
             ),
             worker_id=settings.worker_id,
             lease_seconds=settings.lease_seconds,

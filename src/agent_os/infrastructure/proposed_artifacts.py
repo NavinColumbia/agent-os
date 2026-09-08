@@ -44,14 +44,18 @@ class ProposedArtifact(BaseModel):
     ]
     content: str | None = Field(default=None, min_length=1, max_length=200_000)
     files: dict[str, str] | None = Field(default=None, min_length=1, max_length=2_000)
+    json_value: dict[str, Any] | list[Any] | None = None
 
     @model_validator(mode="after")
     def content_matches_media_type(self) -> "ProposedArtifact":
         if self.media_type == SOURCE_BUNDLE_MEDIA_TYPE:
-            if self.files is None or self.content is not None:
-                raise ValueError("source-bundle artifacts require files and no content")
-        elif self.content is None or self.files is not None:
-            raise ValueError("text/JSON artifacts require content and no files")
+            if self.files is None or self.content is not None or self.json_value is not None:
+                raise ValueError("source-bundle artifacts require files only")
+        elif self.media_type == "application/json":
+            if self.files is not None or (self.content is None) == (self.json_value is None):
+                raise ValueError("JSON artifacts require exactly one of content or json_value")
+        elif self.content is None or self.files is not None or self.json_value is not None:
+            raise ValueError("text artifacts require content only")
         return self
 
 
@@ -63,7 +67,11 @@ def _artifact_content(proposal: ProposedArtifact) -> bytes:
             raise FatalCommandError(f"proposed source bundle is invalid: {exc}") from exc
     elif proposal.media_type == "application/json":
         try:
-            value = json.loads(proposal.content or "")
+            value = (
+                proposal.json_value
+                if proposal.json_value is not None
+                else json.loads(proposal.content or "")
+            )
             content = json.dumps(
                 value,
                 allow_nan=False,
@@ -71,7 +79,7 @@ def _artifact_content(proposal: ProposedArtifact) -> bytes:
                 separators=(",", ":"),
                 sort_keys=True,
             ).encode("utf-8")
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        except (json.JSONDecodeError, RecursionError, TypeError, ValueError) as exc:
             raise FatalCommandError("proposed JSON artifact is invalid") from exc
     elif proposal.media_type in _TEXT_MEDIA_TYPES:
         content = (proposal.content or "").encode("utf-8")

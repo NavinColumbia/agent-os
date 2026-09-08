@@ -100,14 +100,49 @@ class DurableGraphActionExecutor(GraphActionExecutor):
         )
         if definition is None:
             raise FatalCommandError("workflow definition disappeared while its run is active")
-        result = self._node_runtime.execute_node(
-            tenant_id=tenant_id,
-            run_id=run_id,
-            definition=definition,
-            state=state,
-            action=action,
-            idempotency_key=action.action_id,
-        )
+        try:
+            result = self._node_runtime.execute_node(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                definition=definition,
+                state=state,
+                action=action,
+                idempotency_key=action.action_id,
+            )
+        except FatalCommandError as exc:
+            current = self._engine.get_graph_run(tenant_id, run_id)
+            if current is None:
+                raise FatalCommandError("graph run disappeared while recording node failure") from exc
+            current_token = current.token(action.token_id)
+            if current_token.status is not TokenStatus.RUNNING:
+                return {
+                    "action_id": action.action_id,
+                    "replayed": True,
+                    "token_status": current_token.status.value,
+                    "state_version": current.version,
+                }
+            receipt = self._engine.submit_graph_event(
+                tenant_id,
+                run_id,
+                WorkflowEvent(
+                    _event_id(action.action_id, "result"),
+                    WorkflowEventKind.NODE_FAILED,
+                    current.version,
+                    {
+                        "token_id": action.token_id,
+                        "action_id": action.action_id,
+                        "reason": str(exc)[:2_000],
+                        "retryable": False,
+                    },
+                ),
+            )
+            return {
+                "action_id": action.action_id,
+                "replayed": False,
+                "token_status": receipt.state.token(action.token_id).status.value,
+                "state_version": receipt.state.version,
+                "emitted_actions": [item.action_id for item in receipt.actions],
+            }
         if not isinstance(result, Mapping):
             raise FatalCommandError("graph node runtime must return a result object")
 

@@ -52,7 +52,7 @@ def advance_to_verify() -> LifecycleState:
 def test_happy_path_is_small_monotonic_and_emits_one_command_per_boundary():
     state = new_state()
     cases = [
-        (EventKind.SCOPE_ACCEPTED, LifecyclePhase.RESEARCH, CommandKind.START_RESEARCH,
+        (EventKind.SCOPE_ACCEPTED, LifecyclePhase.RESEARCH, CommandKind.START_MISSION,
          {"brief_id": "brief-1"}),
         (EventKind.RESEARCH_COMPLETED, LifecyclePhase.SPECIFY, CommandKind.START_SPECIFICATION,
          {"report_id": "report-1"}),
@@ -75,6 +75,33 @@ def test_happy_path_is_small_monotonic_and_emits_one_command_per_boundary():
     assert state.status is LifecycleStatus.SUCCEEDED
     assert state.version == len(cases)
     assert state.artifact_revision == "sha256:one"
+
+
+def test_dynamic_mission_graph_can_project_directly_to_verified_completion():
+    state = new_state()
+    state, commands = apply(state, EventKind.SCOPE_ACCEPTED, prompt="Build an application")
+    assert commands[0].kind is CommandKind.START_MISSION
+
+    state, commands = apply(
+        state,
+        EventKind.MISSION_COMPLETED,
+        summary="The generated mission graph completed.",
+        evidence_ids=["artifact-release", "artifact-test-report"],
+    )
+
+    assert state.phase is LifecyclePhase.RELEASE
+    assert state.status is LifecycleStatus.SUCCEEDED
+    assert state.artifact_revision == "artifact-release"
+    assert commands[0].kind is CommandKind.PUBLISH_COMPLETION
+    assert commands[0].payload["evidence_ids"] == [
+        "artifact-release", "artifact-test-report",
+    ]
+
+
+def test_dynamic_mission_completion_requires_evidence():
+    state, _ = apply(new_state(), EventKind.SCOPE_ACCEPTED)
+    with pytest.raises(TransitionRejected, match="durable evidence"):
+        apply(state, EventKind.MISSION_COMPLETED, summary="Unsupported claim", evidence_ids=[])
 
 
 def test_phase_skips_and_backwards_transitions_are_rejected():

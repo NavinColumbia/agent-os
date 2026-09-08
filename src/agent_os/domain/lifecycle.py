@@ -48,6 +48,7 @@ class WaitKind(str, Enum):
 
 class EventKind(str, Enum):
     SCOPE_ACCEPTED = "scope_accepted"
+    MISSION_COMPLETED = "mission_completed"
     RESEARCH_COMPLETED = "research_completed"
     SPECIFICATION_APPROVED = "specification_approved"
     BUILD_COMPLETED = "build_completed"
@@ -64,6 +65,7 @@ class EventKind(str, Enum):
 
 
 class CommandKind(str, Enum):
+    START_MISSION = "start_mission"
     START_RESEARCH = "start_research"
     START_SPECIFICATION = "start_specification"
     START_BUILD = "start_build"
@@ -233,7 +235,7 @@ class TransitionRejected(ValueError):
 
 _FORWARD: dict[tuple[LifecyclePhase, EventKind], tuple[LifecyclePhase, CommandKind]] = {
     (LifecyclePhase.INTAKE, EventKind.SCOPE_ACCEPTED):
-        (LifecyclePhase.RESEARCH, CommandKind.START_RESEARCH),
+        (LifecyclePhase.RESEARCH, CommandKind.START_MISSION),
     (LifecyclePhase.RESEARCH, EventKind.RESEARCH_COMPLETED):
         (LifecyclePhase.SPECIFY, CommandKind.START_SPECIFICATION),
     (LifecyclePhase.SPECIFY, EventKind.SPECIFICATION_APPROVED):
@@ -393,6 +395,30 @@ def evolve(state: LifecycleState, event: Event) -> Transition:
             }),),
             status=LifecycleStatus.FAILED,
             failure=failure,
+        )
+
+    if event.kind is EventKind.MISSION_COMPLETED:
+        raw_evidence = event.payload.get("evidence_ids", ())
+        if (
+            not isinstance(raw_evidence, (list, tuple))
+            or not raw_evidence
+            or any(not isinstance(item, str) or not item.strip() for item in raw_evidence)
+        ):
+            raise TransitionRejected("mission completion requires durable evidence_ids")
+        evidence_ids = list(dict.fromkeys(item.strip() for item in raw_evidence))
+        summary = _required_text(event.payload, "summary")
+        return _commit(
+            state,
+            event,
+            (Command(CommandKind.PUBLISH_COMPLETION, {
+                "summary": summary,
+                "evidence_ids": evidence_ids,
+            }),),
+            phase=LifecyclePhase.RELEASE,
+            status=LifecycleStatus.SUCCEEDED,
+            artifact_revision=evidence_ids[0],
+            wait=None,
+            failure=None,
         )
 
     forward = _FORWARD.get((state.phase, event.kind))

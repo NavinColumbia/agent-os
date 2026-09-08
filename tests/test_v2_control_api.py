@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 from typing import Any, Mapping
 
 from fastapi.testclient import TestClient
 
 from agent_os.api.app import create_app
+from agent_os.application.mission import mission_planning_run_id
+from agent_os.domain.workflow_runtime import (
+    NodeToken,
+    TokenStatus,
+    WorkflowRunState,
+    WorkflowRunStatus,
+)
 from agent_os.infrastructure.memory import InMemoryWorkflowEngine
 
 
@@ -213,3 +221,74 @@ def test_artifact_upload_rejects_invalid_base64():
     )
 
     assert response.status_code == 422
+
+
+def test_mission_status_links_authenticated_lifecycle_planning_and_execution():
+    lifecycle = InMemoryWorkflowEngine()
+    planning_run_id = mission_planning_run_id(
+        "run-" + hashlib.sha256(
+            b"agent-os:directive:v2:org-a:request-mission-status"
+        ).hexdigest()[:32]
+    )
+    child_run_id = "mission-run-child"
+    planning = WorkflowRunState(
+        planning_run_id,
+        "org-a",
+        "agent-os-mission-bootstrap",
+        1,
+        2,
+        WorkflowRunStatus.ACTIVE,
+        (
+            NodeToken(
+                "launch-token",
+                "launch",
+                TokenStatus.SUCCEEDED,
+                1,
+                evidence_ids=("artifact-launch",),
+                output={"child_run_id": child_run_id},
+            ),
+            NodeToken("done-token", "done", TokenStatus.READY, 1),
+        ),
+    )
+    execution = WorkflowRunState(
+        child_run_id,
+        "org-a",
+        "mission-workflow",
+        1,
+        0,
+        WorkflowRunStatus.ACTIVE,
+        (NodeToken("work-token", "work", TokenStatus.READY, 1),),
+    )
+
+    class MissionGraphs:
+        def get_graph_run(self, tenant_id, run_id):
+            if tenant_id != "org-a":
+                return None
+            return {planning_run_id: planning, child_run_id: execution}.get(run_id)
+
+    api = TestClient(create_app(
+        engine=lifecycle, identity=FakeIdentity(), graph_engine=MissionGraphs(),
+    ))
+    created = api.post(
+        "/v2/runs",
+        headers={
+            "Authorization": "Bearer org-a",
+            "Idempotency-Key": "request-mission-status",
+        },
+        json={"prompt": "Build a product"},
+    ).json()
+
+    response = api.get(
+        f"/v2/runs/{created['run_id']}/mission",
+        headers={"Authorization": "Bearer org-a"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["planning_run_id"] == planning_run_id
+    assert response.json()["execution_run_id"] == child_run_id
+    assert response.json()["execution"]["status"] == "active"
+    hidden = api.get(
+        f"/v2/runs/{created['run_id']}/mission",
+        headers={"Authorization": "Bearer org-b"},
+    )
+    assert hidden.status_code == 404

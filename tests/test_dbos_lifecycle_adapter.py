@@ -8,13 +8,10 @@ import pytest
 
 from dbos import DBOS
 from agent_os.application.command_worker import CommandRunStatus, DurableCommandWorker
-from agent_os.application.default_organization import default_organization
-from agent_os.domain.lifecycle import Event, EventKind, LifecyclePhase, LifecycleState
+from agent_os.domain.lifecycle import CommandKind, Event, EventKind, LifecyclePhase, LifecycleState
 from agent_os.domain.organization_events import OrganizationEvent, OrganizationEventKind
-from agent_os.infrastructure.agent_command_executor import DurableAgentCommandExecutor
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine, sqlalchemy_url
-from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 
 
 @pytest.fixture
@@ -46,7 +43,7 @@ def test_dbos_adapter_persists_state_event_and_replay_stable_command(engine):
     assert result["state"] == state.to_dict()
     command = engine.list_commands("org-1", "run-1")[0]
     assert command == result["commands"][0]
-    assert command["command"]["kind"] == "start_research"
+    assert command["command"]["kind"] == "start_mission"
 
     duplicate = engine.submit_event("org-1", "run-1", event)
     assert duplicate.workflow_id == receipt.workflow_id
@@ -70,7 +67,7 @@ def test_start_run_can_atomically_accept_the_initial_directive(engine):
     assert result["created"] is True
     assert result["state"]["phase"] == "research"
     assert engine.get_run("org-1", "run-directive").phase is LifecyclePhase.RESEARCH
-    assert engine.list_commands("org-1", "run-directive")[0]["command"]["kind"] == "start_research"
+    assert engine.list_commands("org-1", "run-directive")[0]["command"]["kind"] == "start_mission"
     activity = engine.load_organization_events("org-1", "run-directive")
     assert len(activity) == 1
     assert activity[0]["kind"] == "mission_chartered"
@@ -151,7 +148,7 @@ def test_command_outbox_is_tenant_fenced_retryable_and_worker_lease_owned(engine
     assert record["last_error"] is None
 
 
-def test_real_worker_commits_agent_evidence_advances_lifecycle_and_queues_next_phase(engine):
+def test_real_worker_routes_initial_directive_to_the_mission_bootstrap_handler(engine):
     started = engine.start_run(
         LifecycleState(run_id="run-worker", organization_id="org-a"),
         Event("scope-worker", EventKind.SCOPE_ACCEPTED, 0, {"prompt": "Build the product"}),
@@ -159,67 +156,40 @@ def test_real_worker_commits_agent_evidence_advances_lifecycle_and_queues_next_p
     start_result = engine.get_result(started.workflow_id)
     first_command_id = start_result["commands"][0]["command_id"]
 
-    class CompletingRuntime:
-        def run_agent(self, **kwargs):
-            return {
-                "output": {
-                    "summary": "Research completed with a durable report.",
-                    "disposition": "complete",
-                    "progress_percent": 100,
-                    "evidence_ids": [],
-                    "artifacts": [{
-                        "label": "research-report",
-                        "media_type": "text/markdown",
-                        "content": "# Research report\n\nVerified evidence.",
-                    }],
-                    "observations": [],
-                    "risks": [],
-                    "messages": [],
-                    "proposed_work": [],
-                    "hiring_requests": [],
-                    "decisions": [],
-                    "next_actions": ["Create the specification"],
-                },
-                "usage": {"total_tokens": 10},
-                "idempotency_key": kwargs["idempotency_key"],
-            }
+    calls = []
 
-    artifacts = SQLArtifactStore(engine._application_database_url, create_schema=True)
-    try:
-        agent_executor = DurableAgentCommandExecutor(
-            runtime=CompletingRuntime(),
-            ledger=engine,
-            organization_loader=default_organization,
-            artifact_store=artifacts,
-        )
-        worker = DurableCommandWorker(
-            outbox=engine,
-            executor=LifecycleCommandRouter(agent_executor=agent_executor),
-            worker_id="worker-integration",
-            lease_seconds=3,
-            workflow_engine=engine,
-            workflow_result_waiter=engine.get_result,
-        )
+    class NoAgentCommands:
+        @staticmethod
+        def supports(kind):
+            return False
 
-        report = worker.run_one("org-a")
+        def execute(self, envelope):
+            raise AssertionError(f"unexpected agent command: {envelope}")
 
-        activity = engine.load_organization_events("org-a", "run-worker")
-        evidence_id = next(
-            item["payload"]["evidence_ids"][0]
-            for item in activity if item["kind"] == "evidence_recorded"
-        )
-        assert artifacts.get("org-a", evidence_id) == b"# Research report\n\nVerified evidence."
-    finally:
-        artifacts.close()
+    def bootstrap(item):
+        calls.append(item)
+        return {"planning_run_id": "plan-run-worker"}
+
+    worker = DurableCommandWorker(
+        outbox=engine,
+        executor=LifecycleCommandRouter(
+            agent_executor=NoAgentCommands(),
+            handlers={CommandKind.START_MISSION: bootstrap},
+        ),
+        worker_id="worker-integration",
+        lease_seconds=3,
+        workflow_engine=engine,
+        workflow_result_waiter=engine.get_result,
+    )
+
+    report = worker.run_one("org-a")
 
     assert report.status is CommandRunStatus.SUCCEEDED
     assert engine.get_command_record("org-a", first_command_id)["status"] == "succeeded"
     state = engine.get_run("org-a", "run-worker")
-    assert state is not None and state.phase is LifecyclePhase.SPECIFY and state.version == 2
-    assert [item["kind"] for item in activity][-3:] == [
-        "agent_turn_recorded", "evidence_recorded", "work_progress_reported",
-    ]
-    assert engine.list_commands("org-a", "run-worker")[-1]["command"]["kind"] == "start_specification"
+    assert state is not None and state.phase is LifecyclePhase.RESEARCH and state.version == 1
+    assert calls[0].command.kind is CommandKind.START_MISSION
+    assert calls[0].command.payload["prompt"] == "Build the product"
 
 
 def test_internal_organization_history_is_durable_versioned_and_tenant_isolated(engine):

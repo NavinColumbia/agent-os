@@ -126,3 +126,29 @@ def test_prior_durable_evidence_may_be_cited_but_bad_proposals_fail_closed(tmp_p
             )
     finally:
         artifacts.close()
+
+
+def test_structured_json_value_is_canonicalized_without_string_escaping(tmp_path: Path):
+    artifacts = store(tmp_path)
+    try:
+        result = persist_and_validate_artifacts(
+            store=artifacts,
+            organization_id="tenant-a",
+            idempotency_key="structured-json",
+            output={
+                "disposition": "complete",
+                "evidence_ids": [],
+                "artifacts": [{
+                    "label": "mission-workflow",
+                    "media_type": "application/json",
+                    "json_value": {"nodes": [{"node_id": "build"}], "name": "Mission"},
+                }],
+            },
+        )
+
+        artifact_id = result["evidence_ids"][0]
+        assert artifacts.get("tenant-a", artifact_id) == (
+            b'{"name":"Mission","nodes":[{"node_id":"build"}]}'
+        )
+    finally:
+        artifacts.close()

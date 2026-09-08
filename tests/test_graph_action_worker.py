@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_os.application.command_worker import CommandRunStatus, RetryPolicy
+from agent_os.application.command_worker import CommandRunStatus, FatalCommandError, RetryPolicy
 from agent_os.application.graph_action_worker import DurableGraphActionWorker
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
@@ -130,3 +130,24 @@ def test_graph_effect_without_explicit_handler_fails_closed_and_is_not_acknowled
     assert record is not None
     assert record["status"] == "failed"
     assert "not acknowledged as delivered" in record["last_error"]["message"]
+
+
+def test_fatal_node_rejection_becomes_a_durable_graph_failure_not_a_stuck_token(engine):
+    started = start(engine, "run-rejected")
+    runtime = SequenceNodeRuntime(FatalCommandError("generated plan violates policy"))
+    worker = DurableGraphActionWorker(
+        outbox=engine,
+        executor=DurableGraphActionExecutor(engine=engine, node_runtime=runtime),
+        worker_id="worker-a",
+        lease_seconds=3,
+    )
+
+    report = worker.run_one("tenant-a")
+
+    assert report.status is CommandRunStatus.SUCCEEDED
+    state = engine.get_graph_run("tenant-a", "run-rejected")
+    assert state.status.value == "failed"
+    assert state.token(started.actions[0].token_id).status.value == "failed"
+    assert state.failure == "generated plan violates policy"
+    record = engine.get_graph_action_record("tenant-a", started.actions[0].action_id)
+    assert record["status"] == "succeeded"

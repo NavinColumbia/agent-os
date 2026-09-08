@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Mapping
 
 from agent_os.application.command_worker import FatalCommandError
 from agent_os.application.ports import SandboxRunner
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowNode
-from agent_os.domain.workflow_runtime import TokenStatus, WorkflowAction, WorkflowRunState
+from agent_os.domain.workflow_runtime import WorkflowAction, WorkflowRunState
+from agent_os.infrastructure.graph_output_refs import resolve_prior_output
 
 
 class SandboxToolNodeHandlers:
@@ -27,44 +28,9 @@ class SandboxToolNodeHandlers:
             )
         if direct:
             return direct
-        if not isinstance(source, Mapping):
-            raise FatalCommandError("sandbox source must be an object")
-        node_id = str(source.get("node_id") or "")
-        output_path = source.get("output_path")
-        if output_path is None:
-            output_path = [str(source.get("output_key") or "artifact_id")]
-        if (
-            not isinstance(output_path, (list, tuple))
-            or not output_path
-            or len(output_path) > 16
-            or any(
-                isinstance(part, bool)
-                or not isinstance(part, (str, int))
-                or (isinstance(part, str) and not part)
-                or (isinstance(part, int) and part < 0)
-                for part in output_path
-            )
-        ):
-            raise FatalCommandError("sandbox source output_path must contain bounded keys or indexes")
-        candidates = [
-            token for token in state.tokens
-            if token.node_id == node_id and token.status is TokenStatus.SUCCEEDED
-        ]
-        if not node_id or not candidates:
-            raise FatalCommandError("sandbox source node has no successful durable output")
-        selected = max(candidates, key=lambda token: (token.iteration, token.token_id))
-        artifact_id: Any = dict(selected.output)
-        for part in output_path:
-            if isinstance(part, str) and isinstance(artifact_id, Mapping):
-                artifact_id = artifact_id.get(part)
-            elif isinstance(part, int) and isinstance(artifact_id, (list, tuple)):
-                artifact_id = artifact_id[part] if part < len(artifact_id) else None
-            else:
-                artifact_id = None
-            if artifact_id is None:
-                break
+        artifact_id = resolve_prior_output(state, source, subject="sandbox")
         if not isinstance(artifact_id, str) or not artifact_id:
-            raise FatalCommandError("sandbox source output_path does not contain an artifact ID")
+            raise FatalCommandError("sandbox source output is not an artifact ID")
         return artifact_id
 
     @staticmethod

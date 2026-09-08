@@ -87,7 +87,7 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         output_tokens_limit: int = 8_000,
         request_timeout_seconds: float = 120,
         max_turn_budget_cents: int = 100,
-        context_character_limit: int = 50_000,
+        context_character_limit: int = 64_000,
     ) -> None:
         if (
             request_limit < 1
@@ -200,9 +200,13 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             f"Node: {node.node_id}. Purpose: {node.purpose}. "
             f"Allowed conditional paths: {available_conditions}."
         )
+        node_requirements = node.configuration.get("agent_context", {})
+        if not isinstance(node_requirements, Mapping):
+            raise FatalCommandError("agent node configuration agent_context must be an object")
         authoritative = {
             "run_context": dict(state.context),
             "action": dict(action.payload),
+            "node_requirements": dict(node_requirements),
             "prior_tokens": [{
                 "node_id": prior.node_id,
                 "status": prior.status.value,

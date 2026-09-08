@@ -19,8 +19,18 @@ The same process fairly alternates the lifecycle-command and arbitrary graph-act
 actions use independent renewable leases and deterministic begin/result events. Agent and decision nodes use
 structured model output, human nodes create and resume correlated waits without model spend, and terminal nodes
 accept upstream evidence rather than inventing new evidence. Provider retries keep a token running and reuse the
-same action ID; recovery after a committed result does not execute the node twice. Tool, timer, subworkflow, and
+same action ID; recovery after a committed result does not execute the node twice. A deterministic node rejection
+is committed as a graph failure instead of leaving a permanently running token. Timer, arbitrary subworkflow, and
 external publication actions stay fail-closed until an idempotent adapter is registered.
+
+New CEO directives now emit `start_mission`, not a second hard-coded research/build agent chain. That durable
+command starts a built-in planner graph. The mission architect must persist an identity-free JSON graph proposal;
+`workflow.launch` supplies tenant/creator/version identities, permits only registered node/tool kinds, caps the
+plan at 32 nodes and 128 edges, limits per-node and total iterations, rejects any node without a terminal path,
+registers the immutable definition, and launches its correlated child run. `GET /v2/runs/{run_id}/mission`
+projects the lifecycle, planning graph, and detailed execution graph together. A terminal child outcome is
+idempotently projected back to the coarse CEO lifecycle, while the six phases remain a UI/status projection rather
+than the orchestration engine.
 
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
@@ -38,7 +48,8 @@ Lifecycle and graph agents may also propose up to 16 bounded text, JSON, HTML, o
 structured turn. The authority layer validates and content-addresses those objects, replaces the proposal bodies
 with durable artifact records, and only then permits their IDs to support completion. A model-supplied evidence
 ID must already exist in the same tenant or come from authoritative upstream evidence; invented, cross-tenant,
-and nested decision citations fail before workflow progress is committed.
+and nested decision citations fail before workflow progress is committed. JSON can be proposed as a structured
+`json_value`, avoiding fragile nested JSON string escaping.
 
 `sandbox.run` is available only when a dedicated development/CI worker sets
 `AOS_V2_SANDBOX_BACKEND=docker`. The local adapter accepts an immutable Agent OS source bundle, uses direct argv

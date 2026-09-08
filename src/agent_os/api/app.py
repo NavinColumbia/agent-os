@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_os.api.auth import Authenticator, Principal
+from agent_os.application.mission import mission_planning_run_id
 from agent_os.application.ports import (
     ArtifactStore,
     GraphWorkflowEngine,
@@ -357,6 +358,41 @@ def create_app(
             )
 
     if graph_engine is not None:
+        @app.get("/v2/runs/{run_id}/mission")
+        def get_mission_execution(
+            run_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            lifecycle = engine.get_run(principal.organization_id, run_id)
+            if lifecycle is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            planning_run_id = mission_planning_run_id(run_id)
+            planning = graph_engine.get_graph_run(
+                principal.organization_id, planning_run_id,
+            )
+            child_run_ids = set()
+            if planning is not None:
+                child_run_ids = {
+                    str(token.output["child_run_id"])
+                    for token in planning.tokens
+                    if token.output.get("child_run_id")
+                }
+            if len(child_run_ids) > 1:
+                raise HTTPException(status_code=500, detail="mission has conflicting execution runs")
+            execution_run_id = next(iter(child_run_ids), None)
+            execution = (
+                None
+                if execution_run_id is None
+                else graph_engine.get_graph_run(principal.organization_id, execution_run_id)
+            )
+            return {
+                "lifecycle": lifecycle.to_dict(),
+                "planning_run_id": planning_run_id,
+                "planning": None if planning is None else planning.to_dict(),
+                "execution_run_id": execution_run_id,
+                "execution": None if execution is None else execution.to_dict(),
+            }
+
         @app.post("/v2/workflows", status_code=201)
         def register_workflow(
             body: WorkflowDefinitionRequest,

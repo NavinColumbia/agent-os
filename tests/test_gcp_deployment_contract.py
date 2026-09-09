@@ -77,9 +77,12 @@ def test_release_order_is_migrate_then_activate_and_images_require_digests():
     assert 'sandbox_tag="${runtime_repository}/sandbox:${release_id}"' in deploy
     assert '-var="sandbox_image=${sandbox_image}"' in deploy
 
-    workflow_text = text("deploy/gcp/github-actions-deploy.yml")
+    workflow_text = text(".github/workflows/deploy-gcp.yml")
     workflow = yaml.safe_load(workflow_text)
     assert isinstance(workflow, dict)
+    assert "workflow_dispatch:" in workflow_text
+    assert "\n  push:" not in workflow_text
+    assert "environment: production" in workflow_text
     migration_step = workflow_text.index("-target='google_cloud_run_v2_job.migrate[0]'")
     serving_step = workflow_text.index("apply API and worker revisions")
     assert migration_step < serving_step
@@ -105,7 +108,7 @@ def test_public_readiness_monitoring_has_multi_region_alert_and_channel_wiring()
     assert 'duration        = "120s"' in monitoring
     assert "notification_channels = var.alert_notification_channels" in monitoring
     assert 'variable "alert_notification_channels"' in variables
-    assert "AOS_ALERT_NOTIFICATION_CHANNELS || '[]'" in text("deploy/gcp/github-actions-deploy.yml")
+    assert "AOS_ALERT_NOTIFICATION_CHANNELS || '[]'" in text(".github/workflows/deploy-gcp.yml")
     assert '"roles/monitoring.uptimeCheckConfigEditor"' in cicd
     assert '"roles/monitoring.alertPolicyEditor"' in cicd
 
@@ -210,7 +213,7 @@ def test_generated_backend_apps_have_a_third_least_privilege_scale_to_zero_plane
     versions = text("deploy/gcp/versions.tf")
     variables = text("deploy/gcp/variables.tf")
     deploy = text("deploy/gcp/deploy.sh")
-    workflow = text("deploy/gcp/github-actions-deploy.yml")
+    workflow = text(".github/workflows/deploy-gcp.yml")
 
     assert 'variable "app_project_id"' in variables
     assert 'alias   = "apps"' in versions

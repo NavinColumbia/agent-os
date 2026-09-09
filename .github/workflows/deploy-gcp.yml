@@ -1,3 +1,4 @@
+# Manual, production-environment-gated release of an exact green commit.
 name: deploy-gcp
 
 on:

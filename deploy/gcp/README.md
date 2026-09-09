@@ -151,10 +151,10 @@ Runtime credentials stay in GCP Secret Manager and are never copied into GitHub.
 Stripe secrets; the API identity cannot read the model-provider key. GitHub deployment can update Cloud Run and
 submit builds but cannot read secret payloads.
 
-`github-actions-deploy.yml` is the reviewed deployment-workflow template. Install it as
-`.github/workflows/deploy-gcp.yml` when enabling the production GitHub environment. It refuses a commit unless its
-existing `test` and `container` checks are green, then repeats OpenTofu validation, migration-first release, and the
-deployed readiness check.
+`.github/workflows/deploy-gcp.yml` is the installed, manual-only production workflow. GitHub's `production`
+environment is the deployment authority boundary. The workflow refuses a commit unless its existing `test` and
+`container` checks are green, then repeats the offline launch preflight, OpenTofu validation, exact-commit build,
+migration-first release, and deployed DNS/TLS/readiness check.
 
 ## Ordered release contract
 

@@ -504,7 +504,9 @@ CEO cancellation now propagates into both planning and execution graphs, blocks 
 is race-safe and idempotent rather than being only a top-level status change.
 Workers can discover due tenants through a narrow scheduling-only database role while retaining tenant-RLS claims
 and round-robin fairness. It still has overlapping legacy controllers, local-host assumptions, unfinished public
-infrastructure, no managed-cloud sandbox/production-deploy/general-subworkflow adapters, and no complete
+infrastructure, no hosted identity signup/session/invite UI (although provider-neutral OIDC/JWKS access-token
+verification now fails closed in production), no managed-cloud sandbox/production-deploy/general-subworkflow
+adapters, and no complete
 new-customer-browser-to-production-URL vertical.
 This is a real durable execution spine, not yet the finished platform.
 

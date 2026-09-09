@@ -163,6 +163,14 @@ Important controls:
 - `AOS_V2_SLOW_WORK_SECONDS` (default `300`; diagnostic threshold, never a kill timeout)
 - `AOS_V2_MANAGEMENT_ESCALATION_CHECKS` (default `3`; consecutive checks before CEO escalation)
 
+The control API supports two identity modes behind the same tenant-binding boundary. `hmac` is only the local/BYOC
+evaluation token flow; public production rejects it. Production requires `AOS_V2_IDENTITY_MODE=oidc` plus an HTTPS
+issuer, API audience, and JWKS URL. The verifier accepts only an explicit asymmetric algorithm allowlist, caches a
+bounded rotating key set, validates `iss`, `aud`, `sub`, `iat`, `exp`, and multi-audience `azp`, caps token lifetime,
+and maps configurable organization/role claims only after signature validation. It never accepts a request tenant
+header or an access token from a browser cookie. `AOS_V2_CAPABILITY_SECRET` independently signs public preview
+capabilities and must not be reused as a local-token secret in production.
+
 With no static allowlist, staging/production workers use the narrow `agentos_worker` database role to discover
 only tenant IDs with due or abandoned queue work. That role receives column-level access to scheduling metadata,
 not customer command/action payloads. Actual claims and mutations still enter the existing `agentos_app` tenant
@@ -180,6 +188,7 @@ docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --bui
 ```
 
 It starts PostgreSQL, applies only the isolated V2 migrations (86–96), and then starts the API and worker from the
-exact same non-root image. Hosted OIDC/signup, secrets management, production deploy/rollback, a hosted
+exact same non-root image. Hosted OIDC access-token verification is implemented, but provider signup/session/invite
+UX, secrets management, production deploy/rollback, a hosted
 sandbox/build adapter, large-object storage/garbage collection, metering, and managed-cloud IaC are still launch
 blockers.

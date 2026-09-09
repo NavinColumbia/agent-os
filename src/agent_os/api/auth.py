@@ -1,4 +1,4 @@
-"""Small identity boundary used until the hosted OIDC provider is configured."""
+"""Identity adapters for local evaluation and hosted OIDC access tokens."""
 
 from __future__ import annotations
 
@@ -8,7 +8,12 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
+from urllib.parse import urlparse
+
+import jwt
+from jwt import PyJWKClient
+from jwt.exceptions import PyJWTError
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,10 @@ class Principal:
         roles = frozenset(str(role).strip() for role in roles_raw if str(role).strip())
         if not subject or not organization or not roles:
             raise ValueError("identity must contain subject, organization, and roles")
+        if len(subject) > 255 or len(organization) > 255:
+            raise ValueError("identity subject and organization must not exceed 255 characters")
+        if len(roles) > 32 or any(len(role) > 64 for role in roles):
+            raise ValueError("identity roles exceed the supported bounds")
         return cls(subject, organization, roles)
 
 
@@ -98,3 +107,141 @@ class HMACTokenIdentity:
         if not isinstance(payload, dict) or int(payload.get("exp", 0)) <= int(time.time()):
             raise ValueError("authentication token expired")
         return payload
+
+
+class SigningKeyProvider(Protocol):
+    def get_signing_key_from_jwt(self, token: str) -> Any: ...
+
+
+class OIDCTokenIdentity:
+    """Validate provider-neutral OIDC access tokens against rotating JWKS keys.
+
+    Identity-provider claims are normalized at this boundary.  Tenant identity
+    is always taken from a verified organization claim, never a request header.
+    Hosted browser sessions belong in an upstream BFF; accepting a bearer token
+    from this service's cookie would introduce a CSRF-prone second auth path.
+    """
+
+    _SUPPORTED_ALGORITHMS = frozenset({"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"})
+
+    def __init__(
+        self,
+        *,
+        issuer: str,
+        audience: str,
+        jwks_url: str,
+        organization_claim: str = "org_id",
+        roles_claim: str = "roles",
+        algorithms: Sequence[str] = ("RS256", "ES256"),
+        leeway_seconds: int = 60,
+        maximum_token_lifetime_seconds: int = 86_400,
+        jwks_cache_seconds: int = 300,
+        jwks_timeout_seconds: float = 5.0,
+        signing_keys: SigningKeyProvider | None = None,
+    ) -> None:
+        self._issuer = issuer.rstrip("/")
+        self._audience = audience.strip()
+        self._organization_claim = organization_claim.strip()
+        self._roles_claim = roles_claim.strip()
+        self._algorithms = tuple(dict.fromkeys(item.strip().upper() for item in algorithms if item.strip()))
+        self._leeway_seconds = leeway_seconds
+        self._maximum_token_lifetime_seconds = maximum_token_lifetime_seconds
+
+        for label, value in (("issuer", self._issuer), ("JWKS URL", jwks_url)):
+            parsed = urlparse(value)
+            if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.fragment:
+                raise ValueError(f"OIDC {label} must be an HTTPS URL without credentials or a fragment")
+        if not self._audience or len(self._audience) > 255:
+            raise ValueError("OIDC audience is required and must not exceed 255 characters")
+        if (
+            not self._organization_claim
+            or not self._roles_claim
+            or len(self._organization_claim) > 255
+            or len(self._roles_claim) > 255
+        ):
+            raise ValueError("OIDC organization and roles claim names are required")
+        if not self._algorithms or any(item not in self._SUPPORTED_ALGORITHMS for item in self._algorithms):
+            raise ValueError("OIDC algorithms must be an explicit asymmetric allowlist")
+        if not 0 <= leeway_seconds <= 300:
+            raise ValueError("OIDC clock leeway must be between 0 and 300 seconds")
+        if not 60 <= maximum_token_lifetime_seconds <= 86_400:
+            raise ValueError("OIDC maximum token lifetime must be between 60 and 86400 seconds")
+        if not 60 <= jwks_cache_seconds <= 3600:
+            raise ValueError("OIDC JWKS cache must be between 60 and 3600 seconds")
+        if not 1 <= jwks_timeout_seconds <= 30:
+            raise ValueError("OIDC JWKS timeout must be between 1 and 30 seconds")
+
+        self._signing_keys = signing_keys or PyJWKClient(
+            jwks_url,
+            cache_keys=True,
+            max_cached_keys=16,
+            cache_jwk_set=True,
+            lifespan=jwks_cache_seconds,
+            timeout=jwks_timeout_seconds,
+        )
+
+    def authenticate(self, authorization: str | None, session: str | None) -> Mapping[str, Any]:
+        if not authorization:
+            if session:
+                raise ValueError("hosted authentication requires a Bearer access token")
+            raise ValueError("authentication required")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            raise ValueError("authorization must use Bearer")
+        if len(token) > 16_384:
+            raise ValueError("authentication token exceeds the supported size")
+
+        try:
+            header = jwt.get_unverified_header(token)
+        except (PyJWTError, TypeError, KeyError) as exc:
+            raise ValueError("invalid authentication token") from exc
+        algorithm = str(header.get("alg") or "").upper()
+        key_id = str(header.get("kid") or "").strip()
+        if algorithm not in self._algorithms or not key_id:
+            raise ValueError("authentication token uses an unsupported signing key")
+        try:
+            signing_key = self._signing_keys.get_signing_key_from_jwt(token)
+            payload = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=self._algorithms,
+                audience=self._audience,
+                issuer=self._issuer,
+                leeway=self._leeway_seconds,
+                options={"require": ["sub", "iat", "exp"]},
+            )
+        except (PyJWTError, TypeError, KeyError, ValueError) as exc:
+            raise ValueError("invalid authentication token") from exc
+
+        issued_at = payload.get("iat")
+        expires_at = payload.get("exp")
+        if not isinstance(issued_at, (int, float)) or isinstance(issued_at, bool):
+            raise ValueError("authentication token has an invalid issued-at claim")
+        if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+            raise ValueError("authentication token has an invalid expiration claim")
+        if expires_at - issued_at > self._maximum_token_lifetime_seconds:
+            raise ValueError("authentication token lifetime exceeds policy")
+        audiences = payload.get("aud")
+        if isinstance(audiences, list) and len(audiences) > 1 and payload.get("azp") != self._audience:
+            raise ValueError("authentication token authorized party is invalid")
+
+        organization = payload.get(self._organization_claim)
+        roles = payload.get(self._roles_claim)
+        subject = payload.get("sub")
+        if not isinstance(subject, str) or not subject.strip():
+            raise ValueError("authentication token has an invalid subject claim")
+        if not isinstance(organization, str) or not organization.strip():
+            raise ValueError("authentication token is missing the organization claim")
+        if (
+            not isinstance(roles, (list, tuple, set, frozenset))
+            or not all(isinstance(role, str) for role in roles)
+        ):
+            raise ValueError("authentication token is missing the roles claim")
+        # Validate all normalized bounds here so direct Authenticator consumers
+        # receive the same guarantees as FastAPI's Principal dependency.
+        principal = Principal.from_mapping({"sub": subject, "org": organization, "roles": roles})
+        return {
+            "sub": principal.subject_id,
+            "org": principal.organization_id,
+            "roles": sorted(principal.roles),
+        }

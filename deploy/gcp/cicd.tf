@@ -64,10 +64,11 @@ resource "google_project_iam_member" "github_deploy" {
 
 resource "google_service_account_iam_member" "github_runtime_act_as" {
   for_each = local.github_ci_enabled ? {
-    api     = google_service_account.api.name
-    worker  = google_service_account.worker.name
-    migrate = google_service_account.migrate.name
-    builder = google_service_account.builder.name
+    api           = google_service_account.api.name
+    worker        = google_service_account.worker.name
+    migrate       = google_service_account.migrate.name
+    builder       = google_service_account.builder.name
+    static_router = google_service_account.static_router.name
   } : {}
 
   service_account_id = each.value

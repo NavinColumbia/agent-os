@@ -9,6 +9,10 @@ import click
 
 from agent_os.api.auth import HMACTokenIdentity
 from agent_os.entrypoints.server import ServerSettings, build_app
+from agent_os.entrypoints.static_site_router import (
+    StaticSiteRouterSettings,
+    build_static_site_router,
+)
 from agent_os.entrypoints.worker import WorkerSettings, install_shutdown_handlers, run_worker
 
 
@@ -25,6 +29,19 @@ def serve() -> None:
 
     settings = ServerSettings.from_env()
     uvicorn.run(build_app(settings), host=settings.host, port=settings.port)
+
+
+@main.command("static-router")
+def static_router() -> None:
+    """Serve immutable generated applications from private object storage."""
+
+    import uvicorn
+
+    try:
+        settings = StaticSiteRouterSettings.from_env()
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    uvicorn.run(build_static_site_router(settings), host=settings.host, port=settings.port)
 
 
 @main.command()

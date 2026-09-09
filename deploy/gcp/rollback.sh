@@ -9,7 +9,7 @@ for command_name in gcloud tofu curl date rg; do
 done
 
 required_variables=(
-    GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID AOS_V2_PUBLIC_BASE_URL
+    GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID AOS_V2_PUBLIC_BASE_URL AOS_V2_APPS_BASE_URL
     AOS_V2_OIDC_ISSUER AOS_V2_OIDC_AUDIENCE AOS_V2_OIDC_JWKS_URL
     AOS_V2_OIDC_AUTHORIZATION_URL AOS_V2_OIDC_TOKEN_URL AOS_V2_OIDC_CLIENT_ID
     AOS_V2_STRIPE_STARTER_PRICE_ID AOS_V2_STRIPE_GROWTH_PRICE_ID AOS_V2_MODEL
@@ -38,6 +38,7 @@ export TF_VAR_sandbox_project_id="$GCP_SANDBOX_PROJECT_ID"
 export TF_VAR_region="$gcp_region"
 export TF_VAR_environment="$deployment_environment"
 export TF_VAR_public_base_url="$AOS_V2_PUBLIC_BASE_URL"
+export TF_VAR_apps_base_url="$AOS_V2_APPS_BASE_URL"
 export TF_VAR_state_bucket_name="$state_bucket"
 export TF_VAR_github_repository_id="$github_repository_id"
 export TF_VAR_oidc_issuer="$AOS_V2_OIDC_ISSUER"
@@ -101,10 +102,14 @@ export TF_VAR_release_id="$rollback_release_id"
 # production migrations are required to be backward-compatible expand/contract changes.
 tofu -chdir="$tofu_root" apply -auto-approve -input=false \
     -target='google_cloud_run_v2_service.api[0]' \
+    -target='google_cloud_run_v2_service.static_router[0]' \
     -target='google_cloud_run_v2_worker_pool.worker[0]'
 
 api_url=$(tofu -chdir="$tofu_root" output -raw api_url)
+apps_url=$(tofu -chdir="$tofu_root" output -raw static_apps_url)
 curl --fail --silent --show-error --retry 8 --retry-all-errors \
     --retry-delay 3 "${api_url}/ready"
+curl --fail --silent --show-error --retry 8 --retry-all-errors \
+    --retry-delay 3 "${apps_url}/health"
 echo
-echo "Agent OS serving plane rolled back to ${rollback_image} and is healthy at ${api_url}"
+echo "Agent OS serving plane rolled back to ${rollback_image}; API and app router are healthy"

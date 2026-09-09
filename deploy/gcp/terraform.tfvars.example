@@ -3,6 +3,7 @@ sandbox_project_id = "replace-with-separate-sandbox-project-id"
 region          = "us-central1"
 environment     = "production"
 public_base_url = "https://agentos.example.com"
+apps_base_url   = "https://apps.agentos.example.com"
 state_bucket_name = "replace-with-gcp-project-id-agentos-tofu-state"
 
 oidc_issuer            = "https://replace-with-issuer.example.com"

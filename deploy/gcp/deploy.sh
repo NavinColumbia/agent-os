@@ -13,7 +13,7 @@ if [[ ! -x .venv/bin/python ]]; then
 fi
 
 required_variables=(
-    GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID AOS_V2_PUBLIC_BASE_URL
+    GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID AOS_V2_PUBLIC_BASE_URL AOS_V2_APPS_BASE_URL
     AOS_V2_OIDC_ISSUER AOS_V2_OIDC_AUDIENCE AOS_V2_OIDC_JWKS_URL
     AOS_V2_OIDC_AUTHORIZATION_URL AOS_V2_OIDC_TOKEN_URL AOS_V2_OIDC_CLIENT_ID
     AOS_V2_STRIPE_STARTER_PRICE_ID AOS_V2_STRIPE_GROWTH_PRICE_ID AOS_V2_MODEL
@@ -39,6 +39,7 @@ export TF_VAR_sandbox_project_id="$GCP_SANDBOX_PROJECT_ID"
 export TF_VAR_region="$gcp_region"
 export TF_VAR_environment="$deployment_environment"
 export TF_VAR_public_base_url="$AOS_V2_PUBLIC_BASE_URL"
+export TF_VAR_apps_base_url="$AOS_V2_APPS_BASE_URL"
 export TF_VAR_state_bucket_name="$state_bucket"
 export TF_VAR_github_repository_id="$github_repository_id"
 export TF_VAR_oidc_issuer="$AOS_V2_OIDC_ISSUER"
@@ -149,8 +150,11 @@ tofu -chdir="$tofu_root" apply -auto-approve \
     -var="sandbox_image=${sandbox_image}"
 
 api_url=$(tofu -chdir="$tofu_root" output -raw api_url)
+apps_url=$(tofu -chdir="$tofu_root" output -raw static_apps_url)
 curl --fail --silent --show-error --retry 8 --retry-all-errors \
     --retry-delay 3 "${api_url}/ready"
+curl --fail --silent --show-error --retry 8 --retry-all-errors \
+    --retry-delay 3 "${apps_url}/health"
 echo
-echo "Agent OS ${release_id} is healthy at ${api_url}"
-echo "Configure DNS/OIDC/Stripe to use ${AOS_V2_PUBLIC_BASE_URL} before customer traffic."
+echo "Agent OS ${release_id} is healthy at ${api_url}; app router: ${apps_url}"
+echo "Configure DNS/OIDC/Stripe for ${AOS_V2_PUBLIC_BASE_URL} and app DNS for ${AOS_V2_APPS_BASE_URL} before customer traffic."

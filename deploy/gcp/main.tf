@@ -34,6 +34,11 @@ check "production_inputs" {
     condition     = var.sandbox_project_id != var.project_id
     error_message = "Untrusted sandboxes must run in a GCP project separate from the control plane."
   }
+
+  assert {
+    condition     = var.apps_base_url != var.public_base_url
+    error_message = "Generated applications must use an origin separate from the control API."
+  }
 }
 
 locals {
@@ -117,7 +122,13 @@ locals {
     AOS_V2_SANDBOX_SIGNING_SERVICE_ACCOUNT = google_service_account.worker.email
     AOS_V2_SANDBOX_REVISION                = var.sandbox_image
     AOS_V2_SANDBOX_TIMEOUT_SECONDS         = tostring(var.sandbox_timeout_seconds)
+    AOS_V2_PUBLISHED_APP_BUCKET            = google_storage_bucket.published_apps.name
+    AOS_V2_APPS_BASE_URL                   = var.apps_base_url
   })
+
+  static_router_environment = {
+    AOS_V2_PUBLISHED_APP_BUCKET = google_storage_bucket.published_apps.name
+  }
 
   api_secret_environment = {
     AOS_V2_SYSTEM_DATABASE_URL      = "system_database_url"
@@ -177,6 +188,19 @@ resource "google_storage_bucket" "artifacts" {
   }
 }
 
+resource "google_storage_bucket" "published_apps" {
+  name                        = "${var.project_id}-${local.prefix}-published-apps"
+  location                    = var.region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = false
+  labels                      = local.labels
+
+  versioning {
+    enabled = true
+  }
+}
+
 resource "google_storage_bucket_iam_member" "artifact_readers" {
   for_each = {
     api    = google_service_account.api.email
@@ -207,6 +231,11 @@ resource "google_service_account" "api" {
 resource "google_service_account" "worker" {
   account_id   = "${local.prefix}-worker"
   display_name = "Agent OS ${var.environment} worker"
+}
+
+resource "google_service_account" "static_router" {
+  account_id   = "${local.prefix}-apps"
+  display_name = "Agent OS ${var.environment} published-app router"
 }
 
 resource "google_service_account" "migrate" {
@@ -262,15 +291,72 @@ resource "google_secret_manager_secret_iam_member" "migrate" {
 
 resource "google_artifact_registry_repository_iam_member" "runtime_readers" {
   for_each = {
-    api     = google_service_account.api.email
-    worker  = google_service_account.worker.email
-    migrate = google_service_account.migrate.email
+    api           = google_service_account.api.email
+    worker        = google_service_account.worker.email
+    migrate       = google_service_account.migrate.email
+    static_router = google_service_account.static_router.email
   }
 
   location   = google_artifact_registry_repository.runtime.location
   repository = google_artifact_registry_repository.runtime.name
   role       = "roles/artifactregistry.reader"
   member     = "serviceAccount:${each.value}"
+}
+
+resource "google_project_iam_custom_role" "published_app_release_writer" {
+  role_id     = replace("${local.prefix}_app_release_writer", "-", "_")
+  title       = "Agent OS ${var.environment} app release writer"
+  description = "Create and collision-check immutable published-app releases"
+  permissions = [
+    "storage.objects.create",
+    "storage.objects.get",
+  ]
+}
+
+resource "google_project_iam_custom_role" "published_app_route_writer" {
+  role_id     = replace("${local.prefix}_app_route_writer", "-", "_")
+  title       = "Agent OS ${var.environment} app route writer"
+  description = "Create, read, and atomically update published-app route pointers"
+  permissions = [
+    "storage.objects.create",
+    "storage.objects.get",
+    "storage.objects.update",
+  ]
+}
+
+resource "google_project_iam_custom_role" "published_app_reader" {
+  role_id     = replace("${local.prefix}_app_reader", "-", "_")
+  title       = "Agent OS ${var.environment} app object reader"
+  description = "Read exact published-app objects without bucket listing authority"
+  permissions = ["storage.objects.get"]
+}
+
+resource "google_storage_bucket_iam_member" "published_app_release_writer" {
+  bucket = google_storage_bucket.published_apps.name
+  role   = google_project_iam_custom_role.published_app_release_writer.name
+  member = "serviceAccount:${google_service_account.worker.email}"
+
+  condition {
+    title      = "immutable_release_prefix_only"
+    expression = "resource.name.startsWith('projects/_/buckets/${google_storage_bucket.published_apps.name}/objects/releases/')"
+  }
+}
+
+resource "google_storage_bucket_iam_member" "published_app_route_writer" {
+  bucket = google_storage_bucket.published_apps.name
+  role   = google_project_iam_custom_role.published_app_route_writer.name
+  member = "serviceAccount:${google_service_account.worker.email}"
+
+  condition {
+    title      = "route_pointer_prefix_only"
+    expression = "resource.name.startsWith('projects/_/buckets/${google_storage_bucket.published_apps.name}/objects/routes/')"
+  }
+}
+
+resource "google_storage_bucket_iam_member" "published_app_reader" {
+  bucket = google_storage_bucket.published_apps.name
+  role   = google_project_iam_custom_role.published_app_reader.name
+  member = "serviceAccount:${google_service_account.static_router.email}"
 }
 
 resource "google_artifact_registry_repository_iam_member" "builder_writer" {
@@ -441,6 +527,93 @@ resource "google_cloud_run_v2_service_iam_member" "public_api" {
   member   = "allUsers"
 }
 
+resource "google_cloud_run_v2_service" "static_router" {
+  count = var.activate_services ? 1 : 0
+
+  name                = "${local.prefix}-apps"
+  location            = var.region
+  deletion_protection = var.deletion_protection
+  ingress             = "INGRESS_TRAFFIC_ALL"
+  labels              = local.labels
+
+  template {
+    service_account                  = google_service_account.static_router.email
+    timeout                          = "30s"
+    max_instance_request_concurrency = 80
+
+    scaling {
+      min_instance_count = 0
+      max_instance_count = var.static_router_max_instances
+    }
+
+    containers {
+      image   = var.application_image
+      command = ["agentos-v2"]
+      args    = ["static-router"]
+
+      ports {
+        name           = "http1"
+        container_port = 8080
+      }
+
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+        cpu_idle          = true
+        startup_cpu_boost = true
+      }
+
+      startup_probe {
+        initial_delay_seconds = 1
+        timeout_seconds       = 3
+        period_seconds        = 3
+        failure_threshold     = 20
+        http_get {
+          path = "/health"
+          port = 8080
+        }
+      }
+
+      liveness_probe {
+        initial_delay_seconds = 10
+        timeout_seconds       = 3
+        period_seconds        = 30
+        failure_threshold     = 3
+        http_get {
+          path = "/health"
+          port = 8080
+        }
+      }
+
+      dynamic "env" {
+        for_each = local.static_router_environment
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.required,
+    google_artifact_registry_repository_iam_member.runtime_readers,
+    google_storage_bucket_iam_member.published_app_reader,
+  ]
+}
+
+resource "google_cloud_run_v2_service_iam_member" "public_static_router" {
+  count = var.activate_services ? 1 : 0
+
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.static_router[0].name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
 resource "google_cloud_run_v2_worker_pool" "worker" {
   count = var.activate_services ? 1 : 0
 
@@ -504,6 +677,8 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
     google_artifact_registry_repository_iam_member.runtime_readers,
     google_storage_bucket_iam_member.artifact_readers,
     google_storage_bucket_iam_member.artifact_writers,
+    google_storage_bucket_iam_member.published_app_release_writer,
+    google_storage_bucket_iam_member.published_app_route_writer,
     google_cloud_run_v2_job_iam_member.worker_sandbox_runner,
     google_service_account_iam_member.worker_self_signer,
   ]

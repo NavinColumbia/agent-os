@@ -105,6 +105,16 @@ variable "public_base_url" {
   }
 }
 
+variable "apps_base_url" {
+  description = "Separate HTTPS origin used only for generated static applications."
+  type        = string
+
+  validation {
+    condition     = can(regex("^https://[A-Za-z0-9.-]+(?::[0-9]+)?$", var.apps_base_url))
+    error_message = "apps_base_url must be an HTTPS origin without a path."
+  }
+}
+
 variable "oidc_issuer" {
   type = string
 }
@@ -216,6 +226,16 @@ variable "api_max_instances" {
   validation {
     condition     = var.api_max_instances >= 1 && var.api_max_instances <= 100
     error_message = "api_max_instances must be between 1 and 100 for the bootstrap cell."
+  }
+}
+
+variable "static_router_max_instances" {
+  type    = number
+  default = 20
+
+  validation {
+    condition     = var.static_router_max_instances >= 1 && var.static_router_max_instances <= 1000
+    error_message = "static_router_max_instances must be between 1 and 1000."
   }
 }
 

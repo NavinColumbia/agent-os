@@ -11,6 +11,7 @@ import signal
 import socket
 from threading import Event
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlparse
 
 from agent_os.application.command_worker import DurableCommandWorker, RetryPolicy
 from agent_os.application.graph_action_worker import DurableGraphActionWorker
@@ -28,6 +29,7 @@ from agent_os.infrastructure.deployment_tool_nodes import DeploymentToolNodeHand
 from agent_os.infrastructure.docker_sandbox import DEFAULT_PYTHON_IMAGE, DockerSandboxRunner
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
 from agent_os.infrastructure.gcs_artifacts import build_artifact_store
+from agent_os.infrastructure.gcs_static_sites import GCSStaticSiteDeployer
 from agent_os.infrastructure.mission_workflows import (
     MissionBootstrapHandler,
     MissionCancellationHandler,
@@ -96,6 +98,8 @@ class WorkerSettings:
     sandbox_bucket: str
     sandbox_signing_service_account: str
     sandbox_revision: str
+    published_app_bucket: str
+    apps_base_url: str
     tenant_discovery_limit: int
     management_check_seconds: int
     slow_work_seconds: int
@@ -147,6 +151,30 @@ class WorkerSettings:
                 "cloud-run-job sandbox requires project, region, job, bucket, "
                 "signing service account, and revision settings"
             )
+        published_app_bucket = os.getenv("AOS_V2_PUBLISHED_APP_BUCKET", "").strip()
+        apps_base_url = os.getenv("AOS_V2_APPS_BASE_URL", "").strip()
+        if bool(published_app_bucket) != bool(apps_base_url):
+            raise ValueError(
+                "production static publishing requires both bucket and public base URL"
+            )
+        if apps_base_url:
+            parsed_apps_url = urlparse(apps_base_url)
+            if (
+                parsed_apps_url.scheme != "https"
+                or not parsed_apps_url.netloc
+                or parsed_apps_url.path not in {"", "/"}
+                or parsed_apps_url.query
+                or parsed_apps_url.fragment
+                or parsed_apps_url.username
+                or parsed_apps_url.password
+            ):
+                raise ValueError("AOS_V2_APPS_BASE_URL must be an HTTPS origin")
+            if apps_base_url.rstrip("/") == server.public_base_url:
+                raise ValueError("published apps require an origin separate from the control API")
+        if server.environment == "production" and not published_app_bucket:
+            raise ValueError(
+                "production requires AOS_V2_PUBLISHED_APP_BUCKET and AOS_V2_APPS_BASE_URL"
+            )
         tenant_discovery_limit = _positive_int("AOS_V2_TENANT_DISCOVERY_LIMIT", 128)
         if tenant_discovery_limit > 1_000:
             raise ValueError("AOS_V2_TENANT_DISCOVERY_LIMIT cannot exceed 1000")
@@ -184,6 +212,8 @@ class WorkerSettings:
             sandbox_bucket=sandbox_bucket,
             sandbox_signing_service_account=sandbox_signing_service_account,
             sandbox_revision=sandbox_revision,
+            published_app_bucket=published_app_bucket,
+            apps_base_url=apps_base_url,
             tenant_discovery_limit=tenant_discovery_limit,
             management_check_seconds=management_check_seconds,
             slow_work_seconds=slow_work_seconds,
@@ -254,11 +284,21 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(preview_deployments.close)
+        static_deployer = None
+        if settings.published_app_bucket:
+            static_deployer = GCSStaticSiteDeployer(
+                artifact_store,
+                bucket_name=settings.published_app_bucket,
+                public_base_url=settings.apps_base_url,
+                capability_secret=settings.server.capability_secret,
+            )
         notification_effects = NotificationEffectHandlers(notification_store)
         artifact_tools = ArtifactToolNodeHandlers(artifact_store)
         named_tool_handlers = dict(artifact_tools.named_handlers())
         named_tool_handlers.update(
-            DeploymentToolNodeHandlers(preview_deployments).named_handlers()
+            DeploymentToolNodeHandlers(
+                preview_deployments, static_deployer,
+            ).named_handlers()
         )
         named_tool_handlers.update(
             WorkflowLaunchToolNodeHandlers(

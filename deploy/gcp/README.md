@@ -1,11 +1,18 @@
 # GCP production cell
 
-This is the low-fixed-cost, first-customer deployment path. It creates a scale-to-zero Cloud Run API, one manually
-scaled Cloud Run worker pool, a one-shot migration Job, private Artifact Registry and Cloud Storage repositories,
+This is the low-fixed-cost, first-customer deployment path. It creates a scale-to-zero Cloud Run API, a separate
+scale-to-zero generated-app router, one manually scaled Cloud Run worker pool, a one-shot migration Job, private
+Artifact Registry and Cloud Storage repositories,
 separate least-privilege service accounts, Secret Manager containers, and optional repository-ID-bound GitHub OIDC.
 It also creates a scale-to-zero, secretless Cloud Run sandbox Job in a second GCP project. It deliberately does
 **not** create GKE, Cloud SQL, public artifact buckets, permanent sandbox capacity, or secret values in OpenTofu
 state.
+
+Production static releases use a second private bucket. The worker can create/get immutable release objects and
+create/get/update route pointers through prefix-conditioned custom roles, but cannot delete either. A separate
+service account can get exact objects but cannot list the bucket. Its public Cloud Run router receives no database,
+model, OIDC, Stripe, or control-plane secret. The control API and generated apps must use different HTTPS origins.
+`deploy.static` additionally requires durable `approved: true` evidence from a preceding Human workflow node.
 
 Generated source, build output, and QA evidence use the private artifact bucket through Application Default
 Credentials; no storage key is created. Artifact bytes are immutable generation-guarded GCS objects. Tenant-scoped
@@ -36,6 +43,7 @@ export GCP_PROJECT_ID=your-project
 export GCP_SANDBOX_PROJECT_ID=your-separate-sandbox-project
 export GCP_REGION=us-central1
 export AOS_V2_PUBLIC_BASE_URL=https://your-domain.example
+export AOS_V2_APPS_BASE_URL=https://apps.your-domain.example
 
 export AOS_V2_OIDC_ISSUER=https://your-provider.example
 export AOS_V2_OIDC_AUDIENCE=agent-os-api
@@ -79,7 +87,8 @@ argv, resource/time/log/output ceilings, and immutable result evidence. Temporar
 bucket's 30-day cleanup rule. A future project-pool allocator will tighten the boundary from one separate untrusted
 execution project to Google's recommended one-project-per-paying-tenant model.
 
-The active cell also creates a one-minute HTTPS uptime check against the customer-facing `/ready` endpoint from
+The active cell also creates one-minute HTTPS uptime checks against the customer-facing `/ready` endpoint and the
+separate generated-app `/health` endpoint from
 USA, Europe, and Asia-Pacific, logs failed probes, and opens a critical alert after multiple regions fail for two
 minutes. Pass one or more existing Monitoring notification-channel resource names to
 `TF_VAR_alert_notification_channels`; the policy is still created without a destination so missing paging wiring is
@@ -91,7 +100,7 @@ After the first apply, set these GitHub repository/environment variables from th
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_DEPLOY_SERVICE_ACCOUNT`
 - `GCP_PROJECT_ID`, `GCP_SANDBOX_PROJECT_ID`, `GCP_REGION`, and `GCP_STATE_BUCKET`
-- all non-secret `AOS_V2_OIDC_*`, Stripe price, public URL, and model values used above
+- all non-secret `AOS_V2_OIDC_*`, Stripe price, control/app public URLs, and model values used above
 - `AOS_ALERT_NOTIFICATION_CHANNELS`, a JSON list of full Monitoring notification-channel resource names (or `[]`)
 
 Runtime credentials stay in GCP Secret Manager and are never copied into GitHub. The worker identity cannot read
@@ -125,11 +134,11 @@ export AOS_ROLLBACK_APPLICATION_IMAGE='us-central1-docker.pkg.dev/project/reposi
 deploy/gcp/rollback.sh
 ```
 
-Rollback updates only the API and worker to the prior digest and verifies `/ready`. It deliberately neither changes
+Rollback updates only the API, worker, and public app router to the prior digest and verifies both origins. It deliberately neither changes
 nor executes the migration Job. Database revisions must therefore follow the documented expand/contract contract;
 destructive schema reversal is an incident-specific, reviewed recovery action rather than an automated rollback.
 
 The GCP plane does not make the current product fully launch-ready by itself. A real domain, OIDC organization
 tenant, Stripe products/webhook, managed PostgreSQL, model key, artifact garbage collector,
-production generated-app deployer, backup/restore drills, notification-channel delivery, and an external smoke test
+backup/restore drills, notification-channel delivery, and an external smoke test
 must still be configured or proven.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -37,7 +38,7 @@ _MISSION_PLAN_MAX_NODES = 32
 _MISSION_PLAN_MAX_EDGES = 128
 _MISSION_PLAN_MAX_ITERATIONS_PER_NODE = 16
 _MISSION_PLAN_MAX_TOTAL_ITERATIONS = 128
-_MISSION_TOOL_ALLOWLIST = frozenset({"deploy.preview", "sandbox.run"})
+_MISSION_TOOL_ALLOWLIST = frozenset({"deploy.preview", "deploy.static", "sandbox.run"})
 
 
 class PlannedNode(BaseModel):
@@ -172,6 +173,19 @@ def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
             },
             "success_condition": "outgoing condition after publication",
         },
+        "production_static_deployment_configuration": {
+            "tool": "deploy.static",
+            "source": {
+                "node_id": "successful earlier agent or sandbox node",
+                "output_path": ["artifact_ids", "tested-source-bundle-label"],
+            },
+            "approval": {
+                "node_id": "successful earlier human approval node",
+                "output_path": ["human_response", "approved"],
+            },
+            "app_slug": "stable lowercase DNS label",
+            "success_condition": "outgoing condition after production publication",
+        },
         "limits": {
             "nodes": _MISSION_PLAN_MAX_NODES,
             "edges": _MISSION_PLAN_MAX_EDGES,
@@ -236,6 +250,7 @@ def materialize_mission_workflow(
 
     nodes: list[WorkflowNode] = []
     tool_sources: list[tuple[str, str]] = []
+    production_approvals: list[tuple[str, str]] = []
     configured_conditions: list[tuple[str, str, str]] = []
     total_iterations = 0
     for proposed in plan.nodes:
@@ -295,6 +310,8 @@ def materialize_mission_workflow(
             }
             if tool == "sandbox.run":
                 allowed_configuration.update({"command", "failure_condition"})
+            elif tool == "deploy.static":
+                allowed_configuration.update({"approval", "app_slug"})
             unexpected = set(configuration) - allowed_configuration
             if unexpected:
                 raise FatalCommandError(
@@ -336,6 +353,32 @@ def materialize_mission_workflow(
                     )
                 ):
                     raise FatalCommandError("planned sandbox command must be bounded direct argv")
+            elif tool == "deploy.static":
+                app_slug = configuration.get("app_slug")
+                if (
+                    not isinstance(app_slug, str)
+                    or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", app_slug)
+                ):
+                    raise FatalCommandError(
+                        "planned static deployment app_slug must be a lowercase DNS label"
+                    )
+                approval = configuration.get("approval")
+                if not isinstance(approval, Mapping):
+                    raise FatalCommandError(
+                        "planned static deployment requires a prior human approval"
+                    )
+                approval_node_id = approval.get("node_id")
+                approval_output_path = approval.get("output_path")
+                if (
+                    not isinstance(approval_node_id, str)
+                    or not approval_node_id
+                    or approval_output_path != ["human_response", "approved"]
+                ):
+                    raise FatalCommandError(
+                        "planned static deployment approval reference is invalid"
+                    )
+                tool_sources.append((proposed.node_id, approval_node_id))
+                production_approvals.append((proposed.node_id, approval_node_id))
             success_condition = configuration.get("success_condition")
             if not isinstance(success_condition, str) or not success_condition:
                 raise FatalCommandError("planned tool requires a success_condition")
@@ -427,6 +470,13 @@ def materialize_mission_workflow(
         if tool_node_id not in reachable or tool_node_id == source_node_id:
             raise FatalCommandError(
                 f"planned tool {tool_node_id} does not follow its source node {source_node_id}"
+            )
+    nodes_by_id = {node.node_id: node for node in definition.nodes}
+    for tool_node_id, approval_node_id in production_approvals:
+        approval_node = nodes_by_id.get(approval_node_id)
+        if approval_node is None or approval_node.kind is not NodeKind.HUMAN:
+            raise FatalCommandError(
+                f"planned static deployment {tool_node_id} approval must reference a human node"
             )
     return definition
 

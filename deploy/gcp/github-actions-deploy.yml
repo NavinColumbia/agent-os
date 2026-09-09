@@ -27,6 +27,7 @@ jobs:
       TF_VAR_region: ${{ vars.GCP_REGION }}
       TF_VAR_environment: production
       TF_VAR_public_base_url: ${{ vars.AOS_V2_PUBLIC_BASE_URL }}
+      TF_VAR_apps_base_url: ${{ vars.AOS_V2_APPS_BASE_URL }}
       TF_VAR_state_bucket_name: ${{ vars.GCP_STATE_BUCKET }}
       TF_VAR_github_repository_id: ${{ github.repository_id }}
       TF_VAR_oidc_issuer: ${{ vars.AOS_V2_OIDC_ISSUER }}
@@ -109,7 +110,7 @@ jobs:
             --project "${{ vars.GCP_PROJECT_ID }}" \
             --region "${{ vars.GCP_REGION }}" --wait
 
-      - name: apply API and worker revisions
+      - name: apply API and worker revisions, including app router
         run: tofu -chdir=deploy/gcp apply -auto-approve -input=false
 
       - name: verify deployed readiness
@@ -117,3 +118,6 @@ jobs:
           api_url=$(tofu -chdir=deploy/gcp output -raw api_url)
           curl --fail --silent --show-error --retry 8 --retry-all-errors \
             --retry-delay 3 "${api_url}/ready"
+          apps_url=$(tofu -chdir=deploy/gcp output -raw static_apps_url)
+          curl --fail --silent --show-error --retry 8 --retry-all-errors \
+            --retry-delay 3 "${apps_url}/health"

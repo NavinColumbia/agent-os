@@ -159,6 +159,21 @@ owner/operator can list tenant previews with `GET /v2/deployments/previews` and 
 `DELETE /v2/deployments/previews/{deployment_id}` plus `Idempotency-Key`. A managed object-storage adapter and
 cleanup of expired bytes remain to be implemented before customer launch.
 
+`deploy.static` is the first production promotion adapter. It consumes a bounded same-tenant
+`application/vnd.agent-os.source-bundle+json` artifact with `index.html`, stores each release below an immutable
+content digest in a private GCS bucket, and advances an opaque stable route with generation compare-and-swap.
+The workflow validator requires both a preceding source node and a preceding Human node; the runtime re-resolves
+the durable human output and accepts only the exact boolean `approved: true`. A deterministic receipt makes crash
+replay idempotent. The stable URL redirects without caching to a year-cacheable immutable revision.
+
+Published content is served by `agentos-v2 static-router`, a separate public Cloud Run service and origin. Its
+identity can only read exact objects from the publication bucket and receives no database, OIDC, model, billing, or
+control-plane secret. The publishing worker has prefix-conditioned object permissions and no delete permission.
+Credential-bearing paths and high-signal credential patterns are rejected before upload. HTML receives a
+restrictive CSP, generated apps cannot connect to the network, and the service never handles CEO
+sessions. This adapter intentionally covers static applications only; dynamic services, custom per-app domains,
+rollback/promotion inventory, deletion/retention, abuse response, and a real cloud smoke test remain separate gates.
+
 `tests/test_prompt_to_preview_vertical.py` joins the production-shaped seams in one bounded contract: authenticated
 CEO prompt, DBOS lifecycle command, mission-planner graph, authority-validated child graph, model-proposed HTML
 artifact, idempotent deployment, terminal projection, authenticated mission status, and an unauthenticated fetch of
@@ -172,6 +187,7 @@ Required for the worker:
 - `AOS_V2_MODEL`: explicit PydanticAI `provider:model`; there is no spend-bearing default.
 - the same database variables and application version used by the API.
 - the credential for the selected provider, such as `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`.
+- in hosted production, `AOS_V2_PUBLISHED_APP_BUCKET` and a separate HTTPS `AOS_V2_APPS_BASE_URL`.
 
 Important controls:
 
@@ -234,20 +250,20 @@ docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --bui
 It starts PostgreSQL, applies only the isolated V2 migrations (86–99), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
 actual provider tenant plus its multi-user invite/organization configuration, secrets management, production
-deploy/rollback, a hosted
-sandbox/build adapter, artifact garbage collection, usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch
+configuration, artifact garbage collection, usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch
 blockers.
 
 ## Managed GCP production-cell automation
 
 `deploy/gcp` now contains the first OpenTofu production cell and a credential-late deployment script. It creates a
-scale-to-zero Cloud Run API, manually sized Cloud Run worker pool, digest-pinned one-shot migration Job, private
+scale-to-zero Cloud Run API and secretless generated-app router, manually sized Cloud Run worker pool,
+digest-pinned one-shot migration Job, private
 Artifact Registry/bucket, separate runtime/build/migration identities, Secret Manager containers, remote versioned
 state, and optional GitHub workload identity bound to the repository's immutable numeric ID. Secret values are added
 out-of-band and never enter OpenTofu state. The migration credential is readable only by the Job; the Job verifies
 that the named application login is non-superuser/non-`BYPASSRLS` before granting the two narrow runtime roles. The
 API cannot read the model key and the worker cannot read Stripe keys. A release executes migrations before it creates
-or updates serving revisions, then checks the deployed health endpoint.
+or updates serving revisions, then checks both deployed health endpoints.
 
 The HCL is pinned to OpenTofu 1.12.6 and Google provider 7.22.x and validates against the real provider schema. The
 migration image is base-digest-pinned, non-root, and locally proven against a clean PostgreSQL instance. No GCP

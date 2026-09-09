@@ -6,6 +6,10 @@ output "artifact_bucket" {
   value = google_storage_bucket.artifacts.name
 }
 
+output "published_app_bucket" {
+  value = google_storage_bucket.published_apps.name
+}
+
 output "runtime_secret_ids" {
   value = { for key, secret in google_secret_manager_secret.runtime : key => secret.secret_id }
 }
@@ -16,6 +20,10 @@ output "migration_job" {
 
 output "api_url" {
   value = try(google_cloud_run_v2_service.api[0].uri, null)
+}
+
+output "static_apps_url" {
+  value = try(google_cloud_run_v2_service.static_router[0].uri, null)
 }
 
 output "application_image" {

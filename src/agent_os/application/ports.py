@@ -560,6 +560,20 @@ class Deployer(Protocol):
 
 
 @runtime_checkable
+class StaticSiteDeployer(Protocol):
+    """Publish one immutable static bundle behind a stable application route."""
+
+    def deploy_static(
+        self,
+        *,
+        organization_id: str,
+        artifact_id: str,
+        app_slug: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class PreviewDeploymentStore(Deployer, Protocol):
     """Static public deployment authority addressed by an unguessable capability."""
 

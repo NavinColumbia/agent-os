@@ -214,12 +214,20 @@ def test_worker_settings_require_explicit_model_and_production_tenants(monkeypat
     monkeypatch.delenv("AOS_V2_TENANT_DERIVATION_SECRET", raising=False)
     monkeypatch.setenv("AOS_V2_MODEL", "provider:model")
     monkeypatch.delenv("AOS_V2_WORKER_ORGANIZATIONS", raising=False)
+    monkeypatch.delenv("AOS_V2_PUBLISHED_APP_BUCKET", raising=False)
+    monkeypatch.delenv("AOS_V2_APPS_BASE_URL", raising=False)
+    with pytest.raises(ValueError, match="production requires AOS_V2_PUBLISHED_APP_BUCKET"):
+        WorkerSettings.from_env()
+    monkeypatch.setenv("AOS_V2_PUBLISHED_APP_BUCKET", "example-published-apps")
+    monkeypatch.setenv("AOS_V2_APPS_BASE_URL", "https://apps.example.test")
     settings = WorkerSettings.from_env()
     assert settings.organization_ids == ()
     assert settings.tenant_discovery_limit == 128
     assert settings.management_check_seconds == 30
     assert settings.slow_work_seconds == 300
     assert settings.management_escalation_checks == 3
+    assert settings.published_app_bucket == "example-published-apps"
+    assert settings.apps_base_url == "https://apps.example.test"
 
     monkeypatch.setenv("AOS_V2_WORKER_ORGANIZATIONS", "tenant-a,tenant-b,tenant-a")
     settings = WorkerSettings.from_env()

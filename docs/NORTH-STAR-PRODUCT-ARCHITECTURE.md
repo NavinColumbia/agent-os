@@ -498,6 +498,14 @@ local Docker sandbox adapter serves dedicated development/CI runners. A bounded 
 publish a small, same-tenant HTML artifact through an idempotent receipt and an unguessable public capability;
 the serving route applies an opaque-origin CSP sandbox with network, forms, navigation, and framing disabled.
 Capabilities expire on a bounded TTL and tenant owners/operators can list and idempotently revoke them.
+A separate production-static adapter now accepts a bounded source bundle, writes content-addressed immutable
+releases to a private object bucket, and atomically advances an opaque stable route. Promotion is impossible unless
+the workflow supplies durable `approved: true` evidence from a successful Human node. Generated traffic terminates
+at a secretless, database-free, read-only Cloud Run router on a different origin from the CEO/control API; route
+pointers are never cached while revision assets are immutable-cacheable. IAM conditions restrict the worker's
+create/read permission to release objects and create/read/update permission to route pointers, with no delete
+permission, while the router receives exact-object read only. The cell monitors and rolls back this router together
+with the API/worker serving revision.
 A fast deterministic integration contract now proves the entire authenticated CEO-prompt-to-fetchable-preview
 path without provider spend; the earlier live-provider mission proof separately exercises real model grounding.
 CEO cancellation now propagates into both planning and execution graphs, blocks late bootstrap/launch work, and
@@ -520,8 +528,9 @@ generation, length, and digest. Production refuses the small inline SQL adapter.
 controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
 multi-user invite/organization onboarding (although provider-neutral OIDC/JWKS verification now supports a
 zero-touch personal-company path derived from the verified issuer/subject),
-no per-paying-tenant sandbox-project allocator, production-deploy, or general-subworkflow
-adapters (although the first secretless cross-project Cloud Run Job sandbox is now wired), and no complete
+no per-paying-tenant sandbox-project allocator, dynamic/backend production deployer, or general-subworkflow
+adapters (although the first secretless cross-project Cloud Run Job sandbox and human-gated static production
+publisher are now wired), and no complete
 new-customer-browser-to-production-URL vertical.
 This is a real durable execution spine, not yet the finished platform.
 

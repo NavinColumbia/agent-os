@@ -148,3 +148,40 @@ def test_hosted_sandbox_is_cross_project_secretless_and_network_denied():
     assert "AOS_V2_MODEL" not in sandbox
     assert "Dockerfile.sandbox-v2" in build
     assert "${_REPOSITORY}/sandbox:${_RELEASE_ID}" in build
+
+
+def test_generated_apps_use_a_separate_secretless_origin_and_prefix_scoped_storage_roles():
+    main = text("deploy/gcp/main.tf")
+    variables = text("deploy/gcp/variables.tf")
+    monitoring = text("deploy/gcp/monitoring.tf")
+    deploy = text("deploy/gcp/deploy.sh")
+
+    assert 'variable "apps_base_url"' in variables
+    assert 'var.apps_base_url != var.public_base_url' in main
+    assert 'resource "google_storage_bucket" "published_apps"' in main
+    assert 'public_access_prevention    = "enforced"' in main
+    assert 'resource "google_cloud_run_v2_service" "static_router"' in main
+    router = main.split('resource "google_cloud_run_v2_service" "static_router"', 1)[1]
+    router = router.split('resource "google_cloud_run_v2_service_iam_member"', 1)[0]
+    assert 'args    = ["static-router"]' in router
+    assert "secret_key_ref" not in router
+    assert "AOS_V2_SYSTEM_DATABASE_URL" not in router
+    assert "google_service_account.static_router.email" in router
+    assert 'permissions = ["storage.objects.get"]' in main
+    assert "objects/releases/" in main
+    assert "objects/routes/" in main
+    assert '"storage.objects.delete"' not in main
+    worker = main.split('resource "google_cloud_run_v2_worker_pool" "worker"', 1)[1]
+    assert "google_storage_bucket_iam_member.published_app_release_writer" in worker
+    assert "google_storage_bucket_iam_member.published_app_route_writer" in worker
+    assert 'resource "google_monitoring_uptime_check_config" "static_apps"' in monitoring
+    assert 'path           = "/health"' in monitoring
+    assert "AOS_V2_APPS_BASE_URL" in deploy
+    assert '${apps_url}/health' in deploy
+
+
+def test_rollback_keeps_public_app_router_on_the_same_known_good_revision():
+    rollback = text("deploy/gcp/rollback.sh")
+
+    assert "-target='google_cloud_run_v2_service.static_router[0]'" in rollback
+    assert '${apps_url}/health' in rollback

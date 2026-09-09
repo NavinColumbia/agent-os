@@ -97,6 +97,62 @@ def test_materialized_plan_is_tenant_owned_bounded_and_cannot_request_unknown_to
         )
 
 
+def test_production_publication_plan_requires_a_preceding_human_approval():
+    plan = {
+        "name": "Build, approve, and publish",
+        "entry_node_id": "build",
+        "nodes": [
+            {
+                "node_id": "build", "kind": "agent", "purpose": "Build tested source",
+                "owner_role": "engineer", "configuration": {"max_iterations": 2},
+            },
+            {
+                "node_id": "approve", "kind": "human", "purpose": "Approve production",
+                "configuration": {
+                    "max_iterations": 1, "recipient_ids": ["human:ceo"],
+                    "response_condition": "approved",
+                },
+            },
+            {
+                "node_id": "publish", "kind": "tool", "purpose": "Publish production app",
+                "configuration": {
+                    "tool": "deploy.static",
+                    "source": {
+                        "node_id": "build", "output_path": ["artifact_ids", "source"],
+                    },
+                    "approval": {
+                        "node_id": "approve", "output_path": ["human_response", "approved"],
+                    },
+                    "app_slug": "customer-portal", "success_condition": "published",
+                    "max_iterations": 1,
+                },
+            },
+            {
+                "node_id": "done", "kind": "terminal", "purpose": "Accept release",
+                "configuration": {"max_iterations": 1},
+            },
+        ],
+        "edges": [
+            {"source": "build", "target": "approve", "condition": "built"},
+            {"source": "approve", "target": "publish", "condition": "approved"},
+            {"source": "publish", "target": "done", "condition": "published"},
+        ],
+    }
+    definition = materialize_mission_workflow(
+        plan, tenant_id="tenant-a", planning_run_id="plan", artifact_id="artifact",
+    )
+    publish = next(item for item in definition.nodes if item.node_id == "publish")
+    assert publish.configuration["tool"] == "deploy.static"
+
+    plan["nodes"][1]["kind"] = "decision"
+    plan["nodes"][1]["owner_role"] = "manager"
+    plan["nodes"][1]["configuration"] = {"max_iterations": 1}
+    with pytest.raises(FatalCommandError, match="approval must reference a human node"):
+        materialize_mission_workflow(
+            plan, tenant_id="tenant-a", planning_run_id="bad", artifact_id="artifact-bad",
+        )
+
+
 def test_plan_rejects_a_reachable_trap_with_no_terminal_path():
     bad = proposed_workflow()
     bad["nodes"].append({

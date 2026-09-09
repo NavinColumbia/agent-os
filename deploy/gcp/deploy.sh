@@ -18,7 +18,7 @@ required_variables=(
     AOS_V2_OIDC_ISSUER AOS_V2_OIDC_AUDIENCE AOS_V2_OIDC_JWKS_URL
     AOS_V2_OIDC_AUTHORIZATION_URL AOS_V2_OIDC_TOKEN_URL AOS_V2_OIDC_CLIENT_ID
     AOS_V2_STRIPE_STARTER_PRICE_ID AOS_V2_STRIPE_GROWTH_PRICE_ID AOS_V2_MODEL
-    AOS_V2_MIGRATION_DATABASE_URL AOS_V2_DATABASE_RUNTIME_ROLE
+    AOS_V2_DATABASE_RUNTIME_ROLE AOS_ALERT_NOTIFICATION_CHANNELS
 )
 for variable_name in "${required_variables[@]}"; do
     if [[ -z "${!variable_name:-}" ]]; then
@@ -59,8 +59,11 @@ export TF_VAR_stripe_growth_price_id="$AOS_V2_STRIPE_GROWTH_PRICE_ID"
 export TF_VAR_model="$AOS_V2_MODEL"
 export TF_VAR_database_runtime_role="$AOS_V2_DATABASE_RUNTIME_ROLE"
 export TF_VAR_model_provider_secret_environment="${AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT:-OPENAI_API_KEY}"
+export TF_VAR_alert_notification_channels="$AOS_ALERT_NOTIFICATION_CHANNELS"
 export TF_VAR_release_id="$release_id"
 export TF_VAR_app_builder_image="$app_builder_image"
+
+.venv/bin/python deploy/gcp/launch_preflight.py
 
 gcloud projects describe "$GCP_PROJECT_ID" >/dev/null
 gcloud projects describe "$GCP_SANDBOX_PROJECT_ID" >/dev/null

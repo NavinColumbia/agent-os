@@ -84,9 +84,14 @@ export AOS_V2_APP_BUILDER_IMAGE='gcr.io/cloud-builders/docker@sha256:3d00b6c1a9b
 # Optional: an existing Cloud DNS zone name. Leave unset for any other DNS provider.
 export GCP_DNS_MANAGED_ZONE=your-cloud-dns-zone
 
-# Optional, repeatable; create the email/Slack/PagerDuty channel in Monitoring first.
-export TF_VAR_alert_notification_channels='["projects/your-project/notificationChannels/123456"]'
+# Required for paying-customer launch; create and test an email/Slack/PagerDuty channel first.
+export AOS_ALERT_NOTIFICATION_CHANNELS='["projects/your-project/notificationChannels/123456"]'
 ```
+
+Run `.venv/bin/python deploy/gcp/launch_preflight.py --require-bootstrap-secrets` before the first activation. It
+is offline, never prints a credential value, and names every missing or malformed input. Repeat deployments use the
+same non-secret check automatically but can reuse existing Secret Manager versions without re-exporting secret
+payloads.
 
 Then run `deploy/gcp/deploy.sh`. On a new cell it creates/version-enables the remote state bucket and bootstraps
 foundation resources without a runtime. On both first and repeat releases it adds only missing secret versions,

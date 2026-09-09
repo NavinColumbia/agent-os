@@ -79,6 +79,7 @@ jobs:
 
       - name: initialize and validate desired infrastructure
         run: |
+          python deploy/gcp/launch_preflight.py
           tofu -chdir=deploy/gcp init -input=false \
             -backend-config="bucket=${{ vars.GCP_STATE_BUCKET }}" \
             -backend-config="prefix=agent-os/production"

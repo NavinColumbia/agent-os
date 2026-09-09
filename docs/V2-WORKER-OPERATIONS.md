@@ -52,6 +52,18 @@ and watch acknowledgement cannot duplicate the inbox item. The monitor never can
 turn may add contextual repair/reassignment proposals, but deterministic health classification and delivery do
 not depend on a model being available.
 
+The first standing organization write model is also live. `aos_v2_companies` and its append-only tenant event
+stream survive individual directives. `GET /v2/company/organization` projects the bootstrap teams plus approved
+changes; `GET /v2/company/activity` exposes the immutable history. An owner/operator may idempotently add a
+bounded AI role with `POST /v2/company/agents` or retire a non-core role with
+`POST /v2/company/agents/{agent_id}/retire`. The authority prevents retirement of the accountable mission
+manager, current team managers, and managers that still own direct reports. Active standing roles, reporting
+lines, capabilities, tool grants, hiring authority, and per-turn spending authority are supplied to graph agents
+as authoritative context and therefore carry into later directives. Mission-created graph roles remain scoped
+to that mission unless an authorized company change promotes them. Human/vendor hiring, team mutation, automatic
+application of model staffing proposals, and reassignment/onboarding bundles remain approval/effect milestones;
+this directory does not pretend an event record hired a real person or granted an unconfigured tool.
+
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
 email, Slack, SMS, and push remain separate adapters. `schedule_retry`, arbitrary external tool execution, and
@@ -157,7 +169,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–94), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–95), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC/signup, secrets management, production deploy/rollback, a hosted
 sandbox/build adapter, large-object storage/garbage collection, metering, and managed-cloud IaC are still launch
 blockers.

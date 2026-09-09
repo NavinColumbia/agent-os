@@ -13,7 +13,6 @@ from threading import Event
 from typing import Any, Mapping, Sequence
 
 from agent_os.application.command_worker import DurableCommandWorker, RetryPolicy
-from agent_os.application.default_organization import default_organization
 from agent_os.application.graph_action_worker import DurableGraphActionWorker
 from agent_os.application.management_monitor import DurableManagementMonitor
 from agent_os.application.work_multiplexer import TenantWorkMultiplexer
@@ -38,6 +37,7 @@ from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
 from agent_os.infrastructure.sandbox_tool_nodes import SandboxToolNodeHandlers
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
+from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
@@ -182,6 +182,11 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(graph_engine.close)
+        company_directory = SQLCompanyDirectory(
+            settings.server.application_database_url,
+            create_schema=settings.server.create_schema,
+        )
+        resources.callback(company_directory.close)
         notification_store = SQLNotificationStore(
             settings.server.application_database_url,
             create_schema=settings.server.create_schema,
@@ -233,7 +238,7 @@ def run_worker(
         agent_executor = DurableAgentCommandExecutor(
             runtime=runtime,
             ledger=engine,
-            organization_loader=default_organization,
+            organization_loader=lambda tenant_id, _: company_directory.get_organization(tenant_id),
             artifact_store=artifact_store,
             max_turn_budget_cents=settings.max_turn_budget_cents,
         )
@@ -265,6 +270,7 @@ def run_worker(
             output_tokens_limit=settings.output_tokens_limit,
             request_timeout_seconds=settings.request_timeout_seconds,
             max_turn_budget_cents=settings.max_turn_budget_cents,
+            organization_loader=company_directory.get_organization,
         )
         graph_worker = DurableGraphActionWorker(
             outbox=graph_engine,

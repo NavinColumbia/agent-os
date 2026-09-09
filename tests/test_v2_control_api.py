@@ -16,6 +16,7 @@ from agent_os.domain.workflow_runtime import (
     WorkflowRunStatus,
 )
 from agent_os.infrastructure.memory import InMemoryWorkflowEngine
+from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 
 
 class FakeIdentity:
@@ -138,6 +139,69 @@ def test_notification_inbox_uses_authenticated_tenant_and_role_scope():
     assert owner.json()["items"][0]["notification_id"] == "notice-org-a"
     assert store.calls[0] == ("org-a", "run-1", None, 25)
     assert store.calls[1] == ("org-a", None, "agent-a", 100)
+
+
+def test_standing_company_agents_are_managed_by_tenant_authority_and_survive_runs(tmp_path):
+    directory = SQLCompanyDirectory(
+        f"sqlite:///{tmp_path / 'api-company.sqlite3'}", create_schema=True,
+    )
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(), company_directory=directory,
+    ))
+    payload = {
+        "role": "growth-researcher",
+        "team_id": "research",
+        "manager_id": "agent:research-lead",
+        "capabilities": ["market-research"],
+        "tool_grants": ["artifact.read"],
+        "spending_limit_cents": 100,
+    }
+    try:
+        forbidden = api.post(
+            "/v2/company/agents",
+            headers={"Authorization": "Bearer viewer-a", "Idempotency-Key": "company-agent-viewer"},
+            json=payload,
+        )
+        first = api.post(
+            "/v2/company/agents",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "company-agent-001"},
+            json=payload,
+        )
+        replay = api.post(
+            "/v2/company/agents",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "company-agent-001"},
+            json=payload,
+        )
+
+        assert forbidden.status_code == 403
+        assert first.status_code == 201 and first.json()["duplicate"] is False
+        assert replay.status_code == 201 and replay.json()["duplicate"] is True
+        agent_id = first.json()["payload"]["agent_id"]
+        organization = api.get(
+            "/v2/company/organization", headers={"Authorization": "Bearer org-a"},
+        ).json()
+        assert any(item["agent_id"] == agent_id for item in organization["agents"])
+        other = api.get(
+            "/v2/company/organization", headers={"Authorization": "Bearer org-b"},
+        ).json()
+        assert all(item["agent_id"] != agent_id for item in other["agents"])
+        activity = api.get(
+            "/v2/company/activity", headers={"Authorization": "Bearer org-a"},
+        ).json()
+        assert activity["next_version"] == 1
+
+        retired = api.post(
+            f"/v2/company/agents/{agent_id}/retire",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "company-agent-retire"},
+            json={"reason": "Capacity no longer required"},
+        )
+        assert retired.status_code == 200
+        after = api.get(
+            "/v2/company/organization", headers={"Authorization": "Bearer org-a"},
+        ).json()
+        assert next(item for item in after["agents"] if item["agent_id"] == agent_id)["status"] == "retired"
+    finally:
+        directory.close()
 
 
 def test_artifact_upload_download_and_metadata_are_tenant_scoped():

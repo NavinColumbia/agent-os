@@ -13,6 +13,7 @@ from agent_os.api.app import create_app
 from agent_os.api.auth import HMACTokenIdentity
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
+from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
@@ -100,6 +101,11 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(graph_engine.close)
+        company_directory = SQLCompanyDirectory(
+            settings.application_database_url,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(company_directory.close)
         notification_store = SQLNotificationStore(
             settings.application_database_url,
             create_schema=settings.create_schema,
@@ -126,6 +132,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             notification_store=notification_store,
             artifact_store=artifact_store,
             preview_deployments=preview_deployments,
+            company_directory=company_directory,
             shutdown=resources.close,
         )
     except Exception:
@@ -136,5 +143,6 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.notification_store = notification_store
     app.state.artifact_store = artifact_store
     app.state.preview_deployments = preview_deployments
+    app.state.company_directory = company_directory
     app.state.settings = settings
     return app

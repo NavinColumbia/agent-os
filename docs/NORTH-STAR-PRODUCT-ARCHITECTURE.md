@@ -413,8 +413,10 @@ tokens to tenant-fenced queue attempts and leases, exposes mission-scoped roles 
 agent proposals for communication, delegation, staffing, risks, and decisions. It treats “slow but owned” as a
 diagnostic condition rather than a timeout. Durable periodic watches now deliver deduplicated nonterminal manager
 signals, bounded persistent-condition escalation, and recovery notices. The write side is still incremental:
-standing cross-mission organizations, governed proposal application, and contextual manager-agent
-repair/reassignment turns must be completed before this is described as the persistent AI organization runtime.
+an immutable standing company stream now preserves authorized AI-role hiring and retirement across directives
+and injects that roster into agent context. Human/vendor/team changes, governed application of model proposals,
+and contextual manager-agent repair/reassignment turns must still be completed before this is described as the
+full persistent AI organization runtime.
 
 Initial external SLOs should be honest rather than copying the aspirational 99.99% North-Star target:
 

@@ -14,6 +14,7 @@ from pydantic_ai.models import Model
 
 from agent_os.application.command_worker import FatalCommandError
 from agent_os.application.ports import ArtifactStore, GraphNodeRuntime
+from agent_os.domain.organization import Organization
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowNode
 from agent_os.domain.workflow_runtime import TokenStatus, WorkflowAction, WorkflowRunState
 from agent_os.infrastructure.proposed_artifacts import (
@@ -103,6 +104,7 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         request_timeout_seconds: float = 120,
         max_turn_budget_cents: int = 100,
         context_character_limit: int = 64_000,
+        organization_loader: Callable[[str], Organization] | None = None,
     ) -> None:
         if (
             request_limit < 1
@@ -121,6 +123,7 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         self._request_timeout_seconds = request_timeout_seconds
         self._max_turn_budget_cents = max_turn_budget_cents
         self._context_character_limit = context_character_limit
+        self._organization_loader = organization_loader
 
     @staticmethod
     def _node(definition: WorkflowDefinition, node_id: str) -> WorkflowNode:
@@ -230,6 +233,33 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
                 "output": dict(prior.output),
             } for prior in state.tokens if prior.token_id != token.token_id],
         }
+        if self._organization_loader is not None:
+            organization = self._organization_loader(tenant_id)
+            active_agents = sorted(
+                (item for item in organization.agents.values() if item.status.value == "active"),
+                key=lambda item: item.agent_id,
+            )
+            visible_agents = active_agents[:128]
+            authoritative["standing_organization"] = {
+                "organization_id": organization.organization_id,
+                "teams": [{
+                    "team_id": item.team_id,
+                    "purpose": item.purpose,
+                    "manager_id": item.manager_id,
+                } for item in organization.teams.values()],
+                "agents": [{
+                    "agent_id": item.agent_id,
+                    "role": item.role,
+                    "team_id": item.team_id,
+                    "manager_id": item.manager_id,
+                    "capabilities": sorted(item.capabilities),
+                    "tool_grants": sorted(item.tool_grants),
+                    "hiring_authority": item.hiring_authority,
+                    "spending_limit_cents": item.spending_limit_cents,
+                } for item in visible_agents],
+                "active_agent_count": len(active_agents),
+                "directory_truncated": len(visible_agents) != len(active_agents),
+            }
         context_text = json.dumps(
             authoritative, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
         )

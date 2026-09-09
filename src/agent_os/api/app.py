@@ -16,6 +16,7 @@ from agent_os.application.mission import mission_planning_run_id
 from agent_os.application.mission_control import project_mission_control
 from agent_os.application.ports import (
     ArtifactStore,
+    CompanyDirectory,
     GraphWorkflowEngine,
     GraphRunInspector,
     NotificationStore,
@@ -119,6 +120,24 @@ class ArtifactUploadRequest(BaseModel):
     media_type: str = Field(min_length=1, max_length=256)
 
 
+class AgentHireRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: str = Field(min_length=1, max_length=128)
+    team_id: str = Field(min_length=1, max_length=128)
+    manager_id: str = Field(default="agent:mission-manager", min_length=1, max_length=256)
+    capabilities: list[str] = Field(default_factory=list, max_length=64)
+    tool_grants: list[str] = Field(default_factory=list, max_length=64)
+    hiring_authority: bool = False
+    spending_limit_cents: int = Field(default=0, ge=0, le=100_000_000)
+
+
+class AgentRetireRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2_000)
+
+
 _HUMAN_EVENTS = {EventKind.WAIT_RESOLVED, EventKind.CANCEL_REQUESTED}
 _INTERNAL_ROLES = {"agent", "operator", "system"}
 _MAX_API_ARTIFACT_BYTES = 2 * 1024 * 1024
@@ -138,6 +157,48 @@ def _response(receipt: WorkflowReceipt, run_id: str) -> MutationResponse:
     )
 
 
+def _organization_view(organization) -> Mapping[str, Any]:
+    return {
+        "tenant_id": organization.tenant_id,
+        "organization_id": organization.organization_id,
+        "name": organization.name,
+        "teams": [{
+            "team_id": item.team_id,
+            "name": item.name,
+            "purpose": item.purpose,
+            "manager_id": item.manager_id,
+        } for item in organization.teams.values()],
+        "agents": [{
+            "agent_id": item.agent_id,
+            "role": item.role,
+            "team_id": item.team_id,
+            "manager_id": item.manager_id,
+            "capabilities": sorted(item.capabilities),
+            "tool_grants": sorted(item.tool_grants),
+            "hiring_authority": item.hiring_authority,
+            "spending_limit_cents": item.spending_limit_cents,
+            "status": item.status.value,
+        } for item in organization.agents.values()],
+        "humans": [{
+            "participant_id": item.participant_id,
+            "display_name": item.display_name,
+            "team_id": item.team_id,
+            "responsibilities": list(item.responsibilities),
+            "manager_id": item.manager_id,
+            "response_sla_seconds": item.response_sla_seconds,
+            "quality_criteria": list(item.quality_criteria),
+            "active": item.active,
+        } for item in organization.humans.values()],
+        "services": [{
+            "participant_id": item.participant_id,
+            "name": item.name,
+            "capabilities": sorted(item.capabilities),
+            "owner_id": item.owner_id,
+            "active": item.active,
+        } for item in organization.services.values()],
+    }
+
+
 def create_app(
     *,
     engine: WorkflowEngine,
@@ -146,6 +207,7 @@ def create_app(
     notification_store: NotificationStore | None = None,
     artifact_store: ArtifactStore | None = None,
     preview_deployments: PreviewDeploymentStore | None = None,
+    company_directory: CompanyDirectory | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     @asynccontextmanager
@@ -194,6 +256,80 @@ def create_app(
     def ready() -> JSONResponse:
         report = dict(engine.health())
         return JSONResponse(status_code=200 if report.get("ok") else 503, content=report)
+
+    if company_directory is not None:
+        @app.get("/v2/company/organization")
+        def get_company_organization(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            return _organization_view(
+                company_directory.get_organization(principal.organization_id)
+            )
+
+        @app.get("/v2/company/activity")
+        def get_company_activity(
+            principal: Annotated[Principal, Depends(current_principal)],
+            after_version: Annotated[int, Query(ge=0)] = 0,
+            limit: Annotated[int, Query(ge=1, le=500)] = 200,
+        ) -> Mapping[str, Any]:
+            events = company_directory.list_company_events(
+                principal.organization_id,
+                after_version=after_version,
+                limit=limit,
+            )
+            next_version = after_version if not events else int(events[-1]["stream_version"])
+            return {"items": list(events), "next_version": next_version}
+
+        @app.post("/v2/company/agents", status_code=201)
+        def hire_company_agent(
+            body: AgentHireRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="standing agent creation requires owner authority")
+            try:
+                event = company_directory.hire_agent(
+                    tenant_id=principal.organization_id,
+                    role=body.role,
+                    team_id=body.team_id,
+                    manager_id=body.manager_id,
+                    capabilities=tuple(body.capabilities),
+                    tool_grants=tuple(body.tool_grants),
+                    hiring_authority=body.hiring_authority,
+                    spending_limit_cents=body.spending_limit_cents,
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return event
+
+        @app.post("/v2/company/agents/{agent_id}/retire")
+        def retire_company_agent(
+            agent_id: str,
+            body: AgentRetireRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="standing agent retirement requires owner authority")
+            try:
+                return company_directory.retire_agent(
+                    tenant_id=principal.organization_id,
+                    agent_id=agent_id,
+                    reason=body.reason,
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail="standing agent not found") from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     if preview_deployments is not None:
         if artifact_store is None:

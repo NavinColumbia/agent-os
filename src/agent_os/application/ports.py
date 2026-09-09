@@ -12,6 +12,7 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 
 from agent_os.domain.lifecycle import Event, LifecycleState
 from agent_os.domain.notifications import Notification
+from agent_os.domain.organization import Organization
 from agent_os.domain.organization_events import OrganizationEvent
 from agent_os.domain.workflow import WorkflowDefinition
 from agent_os.domain.workflow_runtime import WorkflowAction, WorkflowEvent, WorkflowRunState
@@ -193,6 +194,46 @@ class OrganizationLedger(Protocol):
         self,
         tenant_id: str,
         run_id: str,
+        *,
+        after_version: int = 0,
+        limit: int = 500,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+
+@runtime_checkable
+class CompanyDirectory(Protocol):
+    """Standing tenant organization and its immutable change history."""
+
+    def get_organization(self, tenant_id: str) -> Organization: ...
+
+    def hire_agent(
+        self,
+        *,
+        tenant_id: str,
+        role: str,
+        team_id: str,
+        manager_id: str,
+        capabilities: tuple[str, ...],
+        tool_grants: tuple[str, ...],
+        hiring_authority: bool,
+        spending_limit_cents: int,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def retire_agent(
+        self,
+        *,
+        tenant_id: str,
+        agent_id: str,
+        reason: str,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def list_company_events(
+        self,
+        tenant_id: str,
         *,
         after_version: int = 0,
         limit: int = 500,

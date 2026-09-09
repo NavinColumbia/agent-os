@@ -174,6 +174,12 @@ restrictive CSP, generated apps cannot connect to the network, and the service n
 sessions. This adapter intentionally covers static applications only; dynamic services, custom per-app domains,
 rollback/promotion inventory, deletion/retention, abuse response, and a real cloud smoke test remain separate gates.
 
+The CEO inbox renders live graph waits with Approve, Decline, and free-response controls. The API recomputes
+actionability from the current durable token rather than trusting a stale notification. Only owners/operators or
+the Human node's named recipient may resume it; response objects are bounded, owner retries are idempotent, and
+viewers cannot decide or cancel work. A Human node may declare a distinct `rejection_condition`, so a negative
+decision reaches a repair/stop branch and cannot accidentally satisfy its affirmative path.
+
 `tests/test_prompt_to_preview_vertical.py` joins the production-shaped seams in one bounded contract: authenticated
 CEO prompt, DBOS lifecycle command, mission-planner graph, authority-validated child graph, model-proposed HTML
 artifact, idempotent deployment, terminal projection, authenticated mission status, and an unauthenticated fetch of

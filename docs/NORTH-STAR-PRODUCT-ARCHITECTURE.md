@@ -513,7 +513,12 @@ is race-safe and idempotent rather than being only a top-level status change.
 Workers can discover due tenants through a narrow scheduling-only database role while retaining tenant-RLS claims
 and round-robin fairness. A packaged responsive CEO workspace now consumes the real tenant-scoped mission,
 management, company, notification, staffing-decision, cancellation, and preview APIs; hosted mode uses an external
-OIDC authorization-code/PKCE flow and keeps access tokens in page memory. Model turns now reserve a serialized,
+OIDC authorization-code/PKCE flow and keeps access tokens in page memory. The inbox projects whether each durable
+human wait is still actionable and lets the CEO approve, decline, or
+reply without constructing graph events. Only an owner/operator or the workflow's named recipient can resume it;
+viewer cancellation/decision attempts are denied, replay is idempotent, and explicit rejection can follow a
+separate declared graph branch.
+Model turns now reserve a serialized,
 tenant-scoped monthly budget before provider access and settle replay-safe token/request/cost evidence afterward;
 unknown provider prices retain the conservative reservation instead of being treated as free. It still has no
 prepaid credit/usage-invoice/tax implementation, but it now creates Stripe-hosted subscription Checkout and Portal

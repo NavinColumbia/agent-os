@@ -3,6 +3,7 @@
 import base64
 import binascii
 import hashlib
+import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -165,6 +166,7 @@ _HUMAN_EVENTS = {EventKind.WAIT_RESOLVED, EventKind.CANCEL_REQUESTED}
 _INTERNAL_ROLES = {"agent", "operator", "system"}
 _MAX_API_ARTIFACT_BYTES = 2 * 1024 * 1024
 _MAX_STRIPE_WEBHOOK_BYTES = 1_000_000
+_MAX_HUMAN_RESPONSE_BYTES = 16 * 1024
 _WEB_ROOT = Path(__file__).with_name("web")
 _PUBLIC_IDENTITY_KEYS = {
     "identity_mode", "authorization_url", "token_url", "client_id", "scope", "audience",
@@ -691,6 +693,10 @@ def create_app(
         body: EventRequest,
         principal: Annotated[Principal, Depends(current_principal)],
     ) -> MutationResponse:
+        if body.kind in _HUMAN_EVENTS and not (
+            principal.roles & {"owner", "operator", "system"}
+        ):
+            raise HTTPException(status_code=403, detail="human lifecycle events require owner authority")
         if body.kind not in _HUMAN_EVENTS and not (principal.roles & _INTERNAL_ROLES):
             raise HTTPException(status_code=403, detail="this event is restricted to the internal agent runtime")
         try:
@@ -709,6 +715,8 @@ def create_app(
         body: CancellationRequest,
         principal: Annotated[Principal, Depends(current_principal)],
     ) -> MutationResponse:
+        if not (principal.roles & {"owner", "operator", "system"}):
+            raise HTTPException(status_code=403, detail="mission cancellation requires owner authority")
         try:
             receipt = engine.cancel_run(
                 principal.organization_id,
@@ -735,7 +743,31 @@ def create_app(
                 recipient_id=None if privileged else principal.subject_id,
                 limit=limit,
             )
-            return {"items": list(items)}
+            graph_states: dict[str, Any] = {}
+            rendered = []
+            for raw in items:
+                item = dict(raw)
+                if item.get("category") == "human_action_required":
+                    run_key = str(item.get("run_id") or "")
+                    correlation = str(item.get("correlation_id") or "")
+                    if graph_engine is not None and run_key and correlation:
+                        if run_key not in graph_states:
+                            graph_states[run_key] = graph_engine.get_graph_run(
+                                principal.organization_id, run_key,
+                            )
+                        graph_state = graph_states[run_key]
+                        item["actionable"] = bool(
+                            graph_state is not None
+                            and any(
+                                token.status is TokenStatus.WAITING
+                                and token.wait_correlation_id == correlation
+                                for token in graph_state.tokens
+                            )
+                        )
+                    else:
+                        item["actionable"] = False
+                rendered.append(item)
+            return {"items": rendered}
 
     if artifact_store is not None:
         @app.post("/v2/artifacts", status_code=201)
@@ -1062,8 +1094,69 @@ def create_app(
             body: GraphEventRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            human_allowed = {WorkflowEventKind.WAIT_RESUMED, WorkflowEventKind.RUN_CANCELLED}
-            if body.kind not in human_allowed and not (principal.roles & _INTERNAL_ROLES):
+            state_value = graph_engine.get_graph_run(principal.organization_id, run_id)
+            if state_value is None:
+                raise HTTPException(status_code=404, detail="graph run not found")
+            owner_authority = bool(principal.roles & {"owner", "operator", "system"})
+            if body.kind is WorkflowEventKind.RUN_CANCELLED and not owner_authority:
+                raise HTTPException(status_code=403, detail="graph cancellation requires owner authority")
+            if body.kind is WorkflowEventKind.WAIT_RESUMED:
+                correlation_id = body.payload.get("correlation_id")
+                response = body.payload.get("response")
+                if (
+                    not isinstance(correlation_id, str)
+                    or not 1 <= len(correlation_id) <= 256
+                    or not isinstance(response, Mapping)
+                    or not 1 <= len(response) <= 32
+                    or any(not isinstance(key, str) or not 1 <= len(key) <= 128 for key in response)
+                ):
+                    raise HTTPException(status_code=422, detail="human response is invalid")
+                try:
+                    response_size = len(json.dumps(
+                        response,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode())
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(status_code=422, detail="human response is invalid") from exc
+                if response_size > _MAX_HUMAN_RESPONSE_BYTES:
+                    raise HTTPException(status_code=413, detail="human response is too large")
+                waiting = [
+                    token for token in state_value.tokens
+                    if token.status is TokenStatus.WAITING
+                    and token.wait_correlation_id == correlation_id
+                ]
+                if len(waiting) != 1 and not owner_authority:
+                    raise HTTPException(status_code=409, detail="human request is no longer actionable")
+                if waiting:
+                    definition = graph_engine.get_workflow_definition(
+                        principal.organization_id,
+                        state_value.workflow_id,
+                        state_value.workflow_version,
+                    )
+                    target_node = None if definition is None else next(
+                        (node for node in definition.nodes if node.node_id == waiting[0].node_id),
+                        None,
+                    )
+                    recipients = (
+                        ()
+                        if target_node is None
+                        else target_node.configuration.get("recipient_ids", ["human:ceo"])
+                    )
+                    recipient_authority = (
+                        isinstance(recipients, (list, tuple))
+                        and principal.subject_id in recipients
+                    )
+                    if not owner_authority and not recipient_authority:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="human response requires owner or named-recipient authority",
+                        )
+            elif body.kind is not WorkflowEventKind.RUN_CANCELLED and not (
+                principal.roles & _INTERNAL_ROLES
+            ):
                 raise HTTPException(status_code=403, detail="node execution events require an agent/operator")
             try:
                 receipt = graph_engine.submit_graph_event(

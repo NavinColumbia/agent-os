@@ -202,6 +202,51 @@ def test_human_node_creates_a_deterministic_correlated_wait_without_model_spend(
     assert completed["evidence_ids"][0].startswith("human-response-")
 
 
+def test_human_rejection_selects_only_an_explicit_rejection_path():
+    definition = WorkflowDefinition(
+        "human-decision", "tenant-a", "Human decision", 1, "approval",
+        (
+            WorkflowNode(
+                "approval", NodeKind.HUMAN, "Approve release",
+                configuration={
+                    "response_condition": "approved",
+                    "rejection_condition": "rejected",
+                },
+            ),
+            WorkflowNode("ship", NodeKind.TERMINAL, "Ship"),
+            WorkflowNode("repair", NodeKind.TERMINAL, "Repair"),
+        ),
+        (
+            WorkflowEdge("approval", "ship", "approved"),
+            WorkflowEdge("approval", "repair", "rejected"),
+        ),
+        "architect",
+    )
+    started = start_workflow(definition, run_id="run-reject")
+    action = started.actions[0]
+    running = begin_node(started.state, action.token_id, expected_version=0).state
+    waiting = wait_node(
+        running, action.token_id, expected_version=1,
+        correlation_id="decision", reason="Approve release", recipient_ids=("human:ceo",),
+    )
+    resumed = resume_wait(
+        waiting.state, expected_version=2,
+        correlation_id="decision", response={"approved": False},
+    )
+    resumed_action = resumed.actions[0]
+    resumed_running = begin_node(
+        resumed.state, resumed_action.token_id, expected_version=3,
+    ).state
+
+    result = PydanticGraphNodeRuntime(TestModel()).execute_node(
+        tenant_id="tenant-a", run_id="run-reject", definition=definition,
+        state=resumed_running, action=resumed_action,
+        idempotency_key=resumed_action.action_id,
+    )
+
+    assert result["satisfied_conditions"] == ["rejected"]
+
+
 def test_terminal_node_aggregates_real_upstream_evidence():
     definition = agent_graph()
     started = start_workflow(definition, run_id="run-terminal")

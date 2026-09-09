@@ -214,7 +214,53 @@ async function loadInbox() {
       el("strong", "", item.title || label(item.kind || item.category || "Company update")),
       el("small", "", item.message || item.body || item.reason || JSON.stringify(item.payload || {})),
     );
+    if (item.category === "human_action_required" && item.actionable && item.correlation_id) {
+      const actions = el("div", "human-actions");
+      const answer = document.createElement("input");
+      answer.type = "text"; answer.maxLength = 2000; answer.placeholder = "Optional decision context";
+      answer.setAttribute("aria-label", "Decision context");
+      const approve = el("button", "", "Approve");
+      const decline = el("button", "", "Decline");
+      const reply = el("button", "quiet", "Reply");
+      approve.type = decline.type = reply.type = "button";
+      approve.addEventListener("click", () => resolveHumanRequest(item, {
+        approved: true, answer: answer.value.trim() || "Approved in the CEO workspace",
+      }, actions));
+      decline.addEventListener("click", () => resolveHumanRequest(item, {
+        approved: false, answer: answer.value.trim() || "Declined in the CEO workspace",
+      }, actions));
+      reply.addEventListener("click", () => {
+        const value = answer.value.trim();
+        if (!value) return setFlash("Enter a response first.", "error");
+        resolveHumanRequest(item, {answer: value}, actions);
+      });
+      actions.append(answer, approve, decline, reply);
+      node.append(actions);
+    } else if (item.category === "human_action_required") {
+      node.append(el("small", "", "Resolved or no longer actionable"));
+    }
     content.append(node);
+  }
+}
+
+async function resolveHumanRequest(item, response, actions) {
+  for (const control of actions.querySelectorAll("button,input")) control.disabled = true;
+  try {
+    const run = await api(`/v2/graph-runs/${encodeURIComponent(item.run_id)}`);
+    await api(`/v2/graph-runs/${encodeURIComponent(item.run_id)}/events`, {
+      method: "POST",
+      body: JSON.stringify({
+        event_id: `human-response-${crypto.randomUUID()}`,
+        kind: "wait_resumed",
+        expected_version: run.version,
+        payload: {correlation_id: item.correlation_id, response},
+      }),
+    });
+    setFlash("Your response was recorded and the team can continue.");
+    await loadInbox();
+  } catch (error) {
+    for (const control of actions.querySelectorAll("button,input")) control.disabled = false;
+    setFlash(error.message, "error");
   }
 }
 
@@ -385,7 +431,9 @@ async function loadMissionDetail(item, silent = false) {
     if (missionResult?.deliverables?.length) {
       const deliverables = detailSection("Deliverables");
       for (const result of missionResult.deliverables) {
-        const link = el("a", "", "Open published preview ↗");
+        const link = el(
+          "a", "", result.kind === "static_site" ? "Open production app ↗" : "Open published preview ↗",
+        );
         link.href = result.public_url; link.target = "_blank"; link.rel = "noopener noreferrer";
         deliverables.append(link);
       }

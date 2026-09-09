@@ -145,6 +145,9 @@ def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
                 "configuration": {
                     "max_iterations": "integer 1..16",
                     "agent_context": "optional bounded instructions for that node",
+                    "recipient_ids": "human nodes: intended participant IDs",
+                    "response_condition": "human nodes: affirmative/normal outgoing condition",
+                    "rejection_condition": "approval nodes: outgoing condition when approved is false",
                 },
             }],
             "edges": [{
@@ -276,7 +279,8 @@ def materialize_mission_workflow(
                 raise FatalCommandError("planned agent_context must be an object")
         elif kind is NodeKind.HUMAN:
             unexpected = set(configuration) - {
-                "max_iterations", "recipient_ids", "response_condition", "correlation_id",
+                "max_iterations", "recipient_ids", "response_condition", "rejection_condition",
+                "correlation_id",
             }
             if unexpected:
                 raise FatalCommandError(
@@ -296,6 +300,17 @@ def materialize_mission_workflow(
                     raise FatalCommandError("planned human response_condition must be nonempty")
                 configured_conditions.append((
                     proposed.node_id, "response_condition", response_condition,
+                ))
+            rejection_condition = configuration.get("rejection_condition")
+            if rejection_condition is not None:
+                if not isinstance(rejection_condition, str) or not rejection_condition:
+                    raise FatalCommandError("planned human rejection_condition must be nonempty")
+                if rejection_condition == response_condition:
+                    raise FatalCommandError(
+                        "planned human response and rejection conditions must differ"
+                    )
+                configured_conditions.append((
+                    proposed.node_id, "rejection_condition", rejection_condition,
                 ))
         elif kind is NodeKind.TERMINAL:
             unexpected = set(configuration) - {"max_iterations"}

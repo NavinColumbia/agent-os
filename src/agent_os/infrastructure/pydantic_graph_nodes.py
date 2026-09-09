@@ -164,7 +164,14 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
                 conditions = [edge.condition for edge in definition.outgoing(node.node_id)
                               if edge.condition != "always"]
                 configured_condition = node.configuration.get("response_condition")
-                if configured_condition is not None:
+                rejection_condition = node.configuration.get("rejection_condition")
+                if response.get("approved") is False and rejection_condition is not None:
+                    selected = [str(rejection_condition)]
+                elif response.get("approved") is False and configured_condition is not None:
+                    raise FatalCommandError(
+                        "rejected human response has no declared rejection condition"
+                    )
+                elif configured_condition is not None:
                     selected = [str(configured_condition)]
                 elif len(set(conditions)) == 1:
                     selected = [conditions[0]]

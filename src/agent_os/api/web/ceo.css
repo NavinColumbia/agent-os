@@ -109,6 +109,12 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .person, .notice, .release { padding: .9rem; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.022); }
 .person strong, .notice strong, .release strong { display: block; font-size: .82rem; }
 .person small, .notice small, .release small { display: block; margin-top: .3rem; color: var(--muted); font-size: .68rem; line-height: 1.5; }
+.human-actions { display: grid; grid-template-columns: minmax(160px,1fr) auto auto auto; gap: .45rem; margin-top: .8rem; }
+.human-actions input, .human-actions button { min-width: 0; padding: .52rem .65rem; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--text); font-size: .68rem; }
+.human-actions button { cursor: pointer; }
+.human-actions button:nth-of-type(1) { color: var(--lime); }
+.human-actions button:nth-of-type(2) { color: var(--red); }
+.human-actions button:disabled, .human-actions input:disabled { cursor: wait; opacity: .55; }
 .card-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); gap: .7rem; }
 .plan-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(230px,1fr)); gap: .75rem; }
 .plan-card { min-height: 190px; padding: 1.2rem; border: 1px solid var(--line); border-radius: 14px; background: rgba(18,23,25,.62); }
@@ -153,6 +159,8 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
   .stats { grid-template-columns: repeat(2,1fr); }
   .mission { grid-template-columns: minmax(0,1fr) auto; }
   .mission .phase { display: none; }
+  .human-actions { grid-template-columns: 1fr 1fr 1fr; }
+  .human-actions input { grid-column: 1 / -1; }
   .auth-card { padding: 2rem; }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }

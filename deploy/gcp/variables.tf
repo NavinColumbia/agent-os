@@ -202,6 +202,20 @@ variable "deletion_protection" {
   default = true
 }
 
+variable "alert_notification_channels" {
+  description = "Existing Cloud Monitoring notification-channel resource names used by production alerts."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for channel in var.alert_notification_channels :
+      can(regex("^projects/[^/]+/notificationChannels/[0-9]+$", channel))
+    ])
+    error_message = "Each alert channel must be a full projects/PROJECT/notificationChannels/ID resource name."
+  }
+}
+
 variable "state_bucket_name" {
   description = "Existing versioned GCS bucket used by the gcs backend and CI deploy identity."
   type        = string

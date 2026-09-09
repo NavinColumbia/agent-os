@@ -18,6 +18,22 @@ output "api_url" {
   value = try(google_cloud_run_v2_service.api[0].uri, null)
 }
 
+output "application_image" {
+  value = var.application_image
+}
+
+output "migration_image" {
+  value = var.migration_image
+}
+
+output "readiness_uptime_check" {
+  value = try(google_monitoring_uptime_check_config.public_ready[0].name, null)
+}
+
+output "readiness_alert_policy" {
+  value = try(google_monitoring_alert_policy.public_ready[0].name, null)
+}
+
 output "worker_pool" {
   value = try(google_cloud_run_v2_worker_pool.worker[0].name, null)
 }

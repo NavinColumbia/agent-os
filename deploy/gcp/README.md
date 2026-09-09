@@ -54,6 +54,9 @@ export AOS_V2_APPLICATION_DATABASE_URL='postgresql://runtime-user:password@host/
 export AOS_V2_MODEL=openai:gpt-5-mini
 export AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT=OPENAI_API_KEY
 export AOS_V2_MODEL_PROVIDER_KEY=replace
+
+# Optional, repeatable; create the email/Slack/PagerDuty channel in Monitoring first.
+export TF_VAR_alert_notification_channels='["projects/your-project/notificationChannels/123456"]'
 ```
 
 Then run `deploy/gcp/deploy.sh`. On a new cell it creates/version-enables the remote state bucket and bootstraps
@@ -63,6 +66,12 @@ then rolls the API/worker and checks `/ready`. An existing serving plane is neve
 bootstrap shape. Set `AOS_ROTATE_SECRETS=1` only for an intentional rotation; the tenant-derivation secret is
 permanently excluded.
 
+The active cell also creates a one-minute HTTPS uptime check against the customer-facing `/ready` endpoint from
+USA, Europe, and Asia-Pacific, logs failed probes, and opens a critical alert after multiple regions fail for two
+minutes. Pass one or more existing Monitoring notification-channel resource names to
+`TF_VAR_alert_notification_channels`; the policy is still created without a destination so missing paging wiring is
+visible in infrastructure state rather than silently invented. Test every configured channel before launch.
+
 The script defaults GitHub repository ID to this repository's immutable ID (`1276674620`), not its reusable name.
 After the first apply, set these GitHub repository/environment variables from the OpenTofu outputs:
 
@@ -70,6 +79,7 @@ After the first apply, set these GitHub repository/environment variables from th
 - `GCP_DEPLOY_SERVICE_ACCOUNT`
 - `GCP_PROJECT_ID`, `GCP_REGION`, and `GCP_STATE_BUCKET`
 - all non-secret `AOS_V2_OIDC_*`, Stripe price, public URL, and model values used above
+- `AOS_ALERT_NOTIFICATION_CHANNELS`, a JSON list of full Monitoring notification-channel resource names (or `[]`)
 
 Runtime credentials stay in GCP Secret Manager and are never copied into GitHub. The worker identity cannot read
 Stripe secrets; the API identity cannot read the model-provider key. GitHub deployment can update Cloud Run and
@@ -88,6 +98,25 @@ compatible with the prior revision. The API
 scales from zero to a bounded maximum; the worker pool defaults to one instance and can be set to zero to halt spend
 without discarding durable work.
 
+## Serving-plane rollback
+
+Use `deploy/gcp/rollback.sh` from the same authenticated deployment environment. Keep all non-secret exports from
+the normal deployment, then identify a known-good application release (or its exact image digest):
+
+```bash
+export AOS_ROLLBACK_RELEASE_ID=known-good-git-sha
+deploy/gcp/rollback.sh
+
+# Equivalent when an immutable reference is already known:
+export AOS_ROLLBACK_APPLICATION_IMAGE='us-central1-docker.pkg.dev/project/repository/agent-os@sha256:...'
+deploy/gcp/rollback.sh
+```
+
+Rollback updates only the API and worker to the prior digest and verifies `/ready`. It deliberately neither changes
+nor executes the migration Job. Database revisions must therefore follow the documented expand/contract contract;
+destructive schema reversal is an incident-specific, reviewed recovery action rather than an automated rollback.
+
 The GCP plane does not make the current product fully launch-ready by itself. A real domain, OIDC organization
 tenant, Stripe products/webhook, managed PostgreSQL, model key, hosted untrusted sandbox, artifact garbage collector,
-production generated-app deployer, alerts/backups, and an external smoke test must still be configured or proven.
+production generated-app deployer, backup/restore drills, notification-channel delivery, and an external smoke test
+must still be configured or proven.

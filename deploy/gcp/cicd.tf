@@ -3,6 +3,8 @@ locals {
   deploy_project_roles = toset([
     "roles/artifactregistry.reader",
     "roles/cloudbuild.builds.editor",
+    "roles/monitoring.alertPolicyEditor",
+    "roles/monitoring.uptimeCheckConfigEditor",
     "roles/run.admin",
     "roles/secretmanager.viewer",
     "roles/serviceusage.serviceUsageConsumer",

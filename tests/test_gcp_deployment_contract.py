@@ -83,3 +83,38 @@ def test_release_order_is_migrate_then_activate_and_images_require_digests():
     assert "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3" in workflow_text
     for floating_action in ("actions/checkout@v5", "google-github-actions/auth@v3", "setup-gcloud@v3"):
         assert floating_action not in workflow_text
+
+
+def test_public_readiness_monitoring_has_multi_region_alert_and_channel_wiring():
+    main = text("deploy/gcp/main.tf")
+    monitoring = text("deploy/gcp/monitoring.tf")
+    variables = text("deploy/gcp/variables.tf")
+    cicd = text("deploy/gcp/cicd.tf")
+
+    assert '"monitoring.googleapis.com"' in main
+    assert 'resource "google_monitoring_uptime_check_config" "public_ready"' in monitoring
+    assert 'path           = "/ready"' in monitoring
+    assert 'selected_regions   = ["USA", "EUROPE", "ASIA_PACIFIC"]' in monitoring
+    assert 'validate_ssl   = true' in monitoring
+    assert 'log_check_failures = true' in monitoring
+    assert 'resource "google_monitoring_alert_policy" "public_ready"' in monitoring
+    assert 'cross_series_reducer = "REDUCE_COUNT_FALSE"' in monitoring
+    assert 'duration        = "120s"' in monitoring
+    assert "notification_channels = var.alert_notification_channels" in monitoring
+    assert 'variable "alert_notification_channels"' in variables
+    assert "AOS_ALERT_NOTIFICATION_CHANNELS || '[]'" in text("deploy/gcp/github-actions-deploy.yml")
+    assert '"roles/monitoring.uptimeCheckConfigEditor"' in cicd
+    assert '"roles/monitoring.alertPolicyEditor"' in cicd
+
+
+def test_rollback_is_digest_pinned_serving_only_and_health_checked():
+    rollback = text("deploy/gcp/rollback.sh")
+
+    assert 'current_migration_image=$(tofu -chdir="$tofu_root" output -raw migration_image)' in rollback
+    assert rollback.count('@sha256:[0-9a-f]{64}$') == 2
+    assert "-target='google_cloud_run_v2_service.api[0]'" in rollback
+    assert "-target='google_cloud_run_v2_worker_pool.worker[0]'" in rollback
+    assert "google_cloud_run_v2_job.migrate" not in rollback
+    assert "gcloud run jobs execute" not in rollback
+    assert '${api_url}/ready' in rollback
+    subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/rollback.sh")], check=True)

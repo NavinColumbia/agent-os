@@ -41,6 +41,7 @@ jobs:
       TF_VAR_model: ${{ vars.AOS_V2_MODEL }}
       TF_VAR_database_runtime_role: ${{ vars.AOS_V2_DATABASE_RUNTIME_ROLE }}
       TF_VAR_model_provider_secret_environment: ${{ vars.AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT }}
+      TF_VAR_alert_notification_channels: ${{ vars.AOS_ALERT_NOTIFICATION_CHANNELS || '[]' }}
       TF_VAR_activate_services: "true"
 
     steps:

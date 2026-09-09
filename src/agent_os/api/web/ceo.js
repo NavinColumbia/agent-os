@@ -98,6 +98,12 @@ async function connect(token) {
     byId("auth-gate").classList.add("hidden");
     byId("workspace").classList.remove("hidden");
     await refreshView();
+    const billingNotice = sessionStorage.getItem("aos.billing.notice");
+    if (billingNotice) {
+      sessionStorage.removeItem("aos.billing.notice");
+      selectView("billing");
+      setFlash(billingNotice === "success" ? "Subscription received. Entitlements update after Stripe confirms it." : "Billing account refreshed.");
+    }
     state.timer = window.setInterval(() => {
       if (!document.hidden && state.token) refreshView(true);
     }, 10000);
@@ -230,12 +236,55 @@ async function loadPreviews() {
   }
 }
 
+async function openBillingDestination(path, body) {
+  const result = await api(path, {
+    method: "POST", headers: { "Idempotency-Key": `billing-${crypto.randomUUID()}` },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  sessionStorage.setItem("aos.billing.pending", "1");
+  window.location.assign(result.url);
+}
+
+async function loadBilling() {
+  const [account, usage] = await Promise.all([
+    api("/v2/billing"), api("/v2/usage/summary"),
+  ]);
+  byId("billing-summary").replaceChildren(
+    stat("Current plan", account.display_name || label(account.plan_id), "good"),
+    stat("Subscription", label(account.subscription_status)),
+    stat("Monthly model ceiling", `$${(account.monthly_model_budget_cents / 100).toFixed(2)}`),
+    stat("Remaining this month", `$${(usage.remaining_cents / 100).toFixed(2)}`),
+  );
+  const content = byId("billing-content");
+  content.replaceChildren();
+  const current = el("article", "plan-card current-plan");
+  current.append(el("p", "eyebrow", "CURRENT"), el("h4", "", account.display_name || label(account.plan_id)),
+    el("p", "muted", `${label(account.subscription_status)} · $${(account.monthly_model_budget_cents / 100).toFixed(2)} monthly model ceiling`));
+  if (account.stripe_customer_id) {
+    const manage = el("button", "quiet", "Manage payment and invoices ↗");
+    manage.type = "button";
+    manage.addEventListener("click", () => openBillingDestination("/v2/billing/portal").catch((error) => setFlash(error.message, "error")));
+    current.append(manage);
+  }
+  content.append(current);
+  for (const plan of account.available_plans || []) {
+    const card = el("article", "plan-card");
+    card.append(el("p", "eyebrow", "PLAN"), el("h4", "", plan.display_name),
+      el("p", "muted", `$${(plan.monthly_model_budget_cents / 100).toFixed(2)} monthly model ceiling`));
+    const upgrade = el("button", "primary", account.plan_id === plan.plan_id ? "Current plan" : `Choose ${plan.display_name}`);
+    upgrade.type = "button"; upgrade.disabled = account.plan_id === plan.plan_id;
+    upgrade.addEventListener("click", () => openBillingDestination("/v2/billing/checkout", { plan_id: plan.plan_id }).catch((error) => setFlash(error.message, "error")));
+    card.append(upgrade); content.append(card);
+  }
+}
+
 async function refreshView(silent = false) {
   try {
     if (state.view === "missions") await loadMissions();
     if (state.view === "company") await loadCompany();
     if (state.view === "inbox") await loadInbox();
     if (state.view === "previews") await loadPreviews();
+    if (state.view === "billing") await loadBilling();
     byId("last-refresh").textContent = `Updated ${new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
     if (state.selectedRun) await loadMissionDetail(state.selectedRun, true);
   } catch (error) {
@@ -382,17 +431,24 @@ function selectView(name) {
   document.querySelectorAll(".nav-item").forEach((node) => node.classList.toggle("active", node.dataset.view === name));
   document.querySelectorAll(".view").forEach((node) => node.classList.add("hidden"));
   byId(`${name}-view`).classList.remove("hidden");
-  byId("view-title").textContent = { missions: "Missions", company: "Company", inbox: "Inbox", previews: "Releases" }[name];
+  byId("view-title").textContent = { missions: "Missions", company: "Company", inbox: "Inbox", previews: "Releases", billing: "Billing" }[name];
   closeDrawer(); refreshView();
 }
 
 async function bootstrap() {
   try {
     state.config = await fetch("/v2/client-config", { cache: "no-store" }).then((response) => response.json());
+    if (state.config.billing_mode !== "stripe") {
+      const billingNav = document.querySelector('[data-view="billing"]');
+      if (billingNav) billingNav.classList.add("hidden");
+    }
+    const billingReturn = new URLSearchParams(window.location.search).get("billing");
+    if (billingReturn) sessionStorage.setItem("aos.billing.notice", billingReturn);
     if (state.config.identity_mode === "oidc") {
       byId("oidc-login").classList.remove("hidden");
       byId("auth-status").textContent = "Secure sign-in uses authorization code + PKCE.";
       if (await finishOidc()) await connect(state.token);
+      else if (billingReturn) await beginOidc();
     } else {
       byId("token-form").classList.remove("hidden");
       byId("auth-status").textContent = "Connect to the local/BYOC control plane.";

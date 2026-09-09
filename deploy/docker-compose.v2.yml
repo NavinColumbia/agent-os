@@ -63,6 +63,7 @@ services:
       - ../postgres/initdb/95-company-directory-v2.sql:/migrations/95-company-directory-v2.sql:ro
       - ../postgres/initdb/96-company-proposal-decisions-v2.sql:/migrations/96-company-proposal-decisions-v2.sql:ro
       - ../postgres/initdb/97-usage-meter-v2.sql:/migrations/97-usage-meter-v2.sql:ro
+      - ../postgres/initdb/98-billing-v2.sql:/migrations/98-billing-v2.sql:ro
     command:
       - sh
       - -ec
@@ -79,6 +80,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/95-company-directory-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/96-company-proposal-decisions-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/97-usage-meter-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/98-billing-v2.sql
     restart: "no"
 
   api:
@@ -88,6 +90,14 @@ services:
     environment:
       <<: *runtime-environment
       PORT: "8080"
+      AOS_V2_BILLING_MODE: ${AOS_V2_BILLING_MODE:-disabled}
+      AOS_V2_STRIPE_SECRET_KEY: ${AOS_V2_STRIPE_SECRET_KEY:-}
+      AOS_V2_STRIPE_WEBHOOK_SECRET: ${AOS_V2_STRIPE_WEBHOOK_SECRET:-}
+      AOS_V2_STRIPE_STARTER_PRICE_ID: ${AOS_V2_STRIPE_STARTER_PRICE_ID:-}
+      AOS_V2_STRIPE_GROWTH_PRICE_ID: ${AOS_V2_STRIPE_GROWTH_PRICE_ID:-}
+      AOS_V2_STRIPE_STARTER_MODEL_BUDGET_CENTS: ${AOS_V2_STRIPE_STARTER_MODEL_BUDGET_CENTS:-50000}
+      AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS: ${AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS:-250000}
+      AOS_V2_STRIPE_API_VERSION: ${AOS_V2_STRIPE_API_VERSION:-2025-06-30.basil}
     depends_on:
       migrate:
         condition: service_completed_successfully

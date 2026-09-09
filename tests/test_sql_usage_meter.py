@@ -60,6 +60,8 @@ def test_usage_reservation_settlement_and_summary_are_idempotent_and_tenant_scop
         assert meter.usage_summary("tenant-b")["events"] == 0
         assert meter.list_usage_events("tenant-b") == ()
         assert meter.list_usage_events("tenant-a")[0]["source_id"] == "action-1"
+        meter.set_monthly_budget(tenant_id="tenant-a", monthly_budget_cents=175)
+        assert meter.usage_summary("tenant-a")["monthly_budget_cents"] == 175
     finally:
         meter.close()
 

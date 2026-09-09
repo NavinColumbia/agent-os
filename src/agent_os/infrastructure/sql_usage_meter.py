@@ -160,9 +160,6 @@ class SQLUsageMeter(UsageMeter):
         else:
             statement = insert(usage_accounts).values(**values)
         connection.execute(statement)
-        connection.execute(update(usage_accounts).where(
-            usage_accounts.c.tenant_id == tenant_id
-        ).values(monthly_budget_cents=self._monthly_budget_cents, updated_at=now))
         return int(connection.execute(select(
             usage_accounts.c.monthly_budget_cents
         ).where(
@@ -334,6 +331,40 @@ class SQLUsageMeter(UsageMeter):
             "output_tokens": int(row["output_tokens"]),
             "total_tokens": int(row["total_tokens"]),
         }
+
+    def set_monthly_budget(
+        self,
+        *,
+        tenant_id: str,
+        monthly_budget_cents: int,
+    ) -> Mapping[str, Any]:
+        tenant_id = _bounded_text("tenant_id", tenant_id, 128)
+        if not 1 <= monthly_budget_cents <= 1_000_000_000:
+            raise ValueError("monthly model budget must be between 1 and 1000000000 cents")
+        now = _now()
+        values = {
+            "tenant_id": tenant_id,
+            "monthly_budget_cents": monthly_budget_cents,
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._tenant_connection(tenant_id) as connection:
+            if connection.dialect.name == "postgresql":
+                statement = postgres_insert(usage_accounts).values(**values).on_conflict_do_update(
+                    index_elements=[usage_accounts.c.tenant_id],
+                    set_={"monthly_budget_cents": monthly_budget_cents, "updated_at": now},
+                )
+            elif connection.dialect.name == "sqlite":
+                statement = sqlite_insert(usage_accounts).values(**values).on_conflict_do_update(
+                    index_elements=[usage_accounts.c.tenant_id],
+                    set_={"monthly_budget_cents": monthly_budget_cents, "updated_at": now},
+                )
+            else:
+                statement = update(usage_accounts).where(
+                    usage_accounts.c.tenant_id == tenant_id
+                ).values(monthly_budget_cents=monthly_budget_cents, updated_at=now)
+            connection.execute(statement)
+        return {"tenant_id": tenant_id, "monthly_budget_cents": monthly_budget_cents}
 
     def list_usage_events(
         self,

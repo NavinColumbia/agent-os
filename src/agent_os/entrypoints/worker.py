@@ -96,7 +96,10 @@ class WorkerSettings:
 
     @classmethod
     def from_env(cls, *, organization_ids: Sequence[str] = ()) -> "WorkerSettings":
-        server = ServerSettings.from_env()
+        # Payment credentials belong only in the API process. The worker uses
+        # shared identity/database/capability settings but never validates or
+        # receives Stripe secrets.
+        server = ServerSettings.from_env(require_billing=False)
         model = os.getenv("AOS_V2_MODEL", "").strip()
         if not model:
             raise ValueError(

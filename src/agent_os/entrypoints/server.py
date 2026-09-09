@@ -12,13 +12,16 @@ from fastapi import FastAPI
 
 from agent_os.api.app import create_app
 from agent_os.api.auth import Authenticator, HMACTokenIdentity, OIDCTokenIdentity
+from agent_os.application.billing import BillingCatalog, BillingPlan, BillingService
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
+from agent_os.infrastructure.sql_billing import SQLBillingStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
+from agent_os.infrastructure.stripe_billing import StripeBillingGateway
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,14 @@ class ServerSettings:
     oidc_scope: str
     oidc_authorization_audience_parameter: str
     tenant_monthly_model_budget_cents: int
+    billing_mode: str
+    stripe_secret_key: str
+    stripe_webhook_secret: str
+    stripe_starter_price_id: str
+    stripe_growth_price_id: str
+    stripe_starter_model_budget_cents: int
+    stripe_growth_model_budget_cents: int
+    stripe_api_version: str
     application_version: str
     public_base_url: str
     preview_ttl_seconds: int
@@ -51,7 +62,7 @@ class ServerSettings:
     create_schema: bool
 
     @classmethod
-    def from_env(cls) -> "ServerSettings":
+    def from_env(cls, *, require_billing: bool = True) -> "ServerSettings":
         environment = os.getenv("AOS_ENVIRONMENT", "development").strip().lower()
         if environment not in {"development", "test", "staging", "production"}:
             raise ValueError("AOS_ENVIRONMENT must be development, test, staging, or production")
@@ -100,6 +111,30 @@ class ServerSettings:
             raise ValueError(
                 "AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS must be between 1 and 1000000000"
             )
+        billing_mode = os.getenv(
+            "AOS_V2_BILLING_MODE", "stripe" if environment == "production" else "disabled",
+        ).strip().lower()
+        if billing_mode not in {"disabled", "stripe"}:
+            raise ValueError("AOS_V2_BILLING_MODE must be disabled or stripe")
+        stripe_secret_key = os.getenv("AOS_V2_STRIPE_SECRET_KEY", "").strip()
+        stripe_webhook_secret = os.getenv("AOS_V2_STRIPE_WEBHOOK_SECRET", "").strip()
+        stripe_starter_price_id = os.getenv("AOS_V2_STRIPE_STARTER_PRICE_ID", "").strip()
+        stripe_growth_price_id = os.getenv("AOS_V2_STRIPE_GROWTH_PRICE_ID", "").strip()
+        stripe_starter_model_budget_cents = int(
+            os.getenv("AOS_V2_STRIPE_STARTER_MODEL_BUDGET_CENTS", "50000")
+        )
+        stripe_growth_model_budget_cents = int(
+            os.getenv("AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS", "250000")
+        )
+        stripe_api_version = os.getenv(
+            "AOS_V2_STRIPE_API_VERSION", "2025-06-30.basil",
+        ).strip()
+        for name, value in (
+            ("AOS_V2_STRIPE_STARTER_MODEL_BUDGET_CENTS", stripe_starter_model_budget_cents),
+            ("AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS", stripe_growth_model_budget_cents),
+        ):
+            if not 1 <= value <= 1_000_000_000:
+                raise ValueError(f"{name} must be between 1 and 1000000000")
         create_schema = os.getenv(
             "AOS_V2_CREATE_SCHEMA", "1" if environment in {"development", "test"} else "0"
         ).lower() in {"1", "true", "yes", "on"}
@@ -160,6 +195,29 @@ class ServerSettings:
         ).rstrip("/")
         if environment == "production" and not public_base_url.startswith("https://"):
             raise ValueError("production AOS_V2_PUBLIC_BASE_URL must use HTTPS")
+        if require_billing and environment == "production" and billing_mode != "stripe":
+            raise ValueError("production requires AOS_V2_BILLING_MODE=stripe")
+        if require_billing and billing_mode == "stripe":
+            if not public_base_url.startswith("https://"):
+                raise ValueError("Stripe billing requires an HTTPS AOS_V2_PUBLIC_BASE_URL")
+            if not stripe_secret_key.startswith(("sk_test_", "sk_live_")):
+                raise ValueError("Stripe billing requires AOS_V2_STRIPE_SECRET_KEY")
+            if environment == "production" and not stripe_secret_key.startswith("sk_live_"):
+                raise ValueError("production Stripe billing requires an sk_live_ secret key")
+            if not stripe_webhook_secret.startswith("whsec_") or len(stripe_webhook_secret) < 16:
+                raise ValueError("Stripe billing requires AOS_V2_STRIPE_WEBHOOK_SECRET")
+            for name, value in (
+                ("AOS_V2_STRIPE_STARTER_PRICE_ID", stripe_starter_price_id),
+                ("AOS_V2_STRIPE_GROWTH_PRICE_ID", stripe_growth_price_id),
+            ):
+                if not value.startswith("price_"):
+                    raise ValueError(f"Stripe billing requires {name}")
+            if stripe_starter_price_id == stripe_growth_price_id:
+                raise ValueError("Stripe billing price IDs must be unique")
+            if stripe_starter_model_budget_cents <= tenant_monthly_model_budget_cents:
+                raise ValueError("the Stripe starter model budget must exceed the free budget")
+            if stripe_growth_model_budget_cents <= stripe_starter_model_budget_cents:
+                raise ValueError("the Stripe growth model budget must exceed the starter budget")
         preview_ttl_seconds = int(os.getenv("AOS_V2_PREVIEW_TTL_SECONDS", "604800"))
         if not 60 <= preview_ttl_seconds <= 30 * 24 * 60 * 60:
             raise ValueError("AOS_V2_PREVIEW_TTL_SECONDS must be between 60 and 2592000")
@@ -184,6 +242,14 @@ class ServerSettings:
             oidc_scope=oidc_scope,
             oidc_authorization_audience_parameter=oidc_authorization_audience_parameter,
             tenant_monthly_model_budget_cents=tenant_monthly_model_budget_cents,
+            billing_mode=billing_mode,
+            stripe_secret_key=stripe_secret_key,
+            stripe_webhook_secret=stripe_webhook_secret,
+            stripe_starter_price_id=stripe_starter_price_id,
+            stripe_growth_price_id=stripe_growth_price_id,
+            stripe_starter_model_budget_cents=stripe_starter_model_budget_cents,
+            stripe_growth_model_budget_cents=stripe_growth_model_budget_cents,
+            stripe_api_version=stripe_api_version,
             application_version=os.getenv("AOS_V2_APPLICATION_VERSION", "v2-dev"),
             public_base_url=public_base_url,
             preview_ttl_seconds=preview_ttl_seconds,
@@ -210,9 +276,10 @@ def build_identity(settings: ServerSettings) -> Authenticator:
 
 def browser_identity_config(settings: ServerSettings) -> dict[str, str]:
     if settings.identity_mode != "oidc":
-        return {"identity_mode": "hmac"}
+        return {"identity_mode": "hmac", "billing_mode": settings.billing_mode}
     return {
         "identity_mode": "oidc",
+        "billing_mode": settings.billing_mode,
         "authorization_url": settings.oidc_authorization_url,
         "token_url": settings.oidc_token_url,
         "client_id": settings.oidc_client_id,
@@ -260,6 +327,43 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(usage_meter.close)
+        billing_service = None
+        billing_store = None
+        if settings.billing_mode == "stripe":
+            billing_catalog = BillingCatalog(
+                BillingPlan(
+                    "free", "Free", settings.tenant_monthly_model_budget_cents,
+                ),
+                (
+                    BillingPlan(
+                        "starter", "Starter", settings.stripe_starter_model_budget_cents,
+                        settings.stripe_starter_price_id,
+                    ),
+                    BillingPlan(
+                        "growth", "Growth", settings.stripe_growth_model_budget_cents,
+                        settings.stripe_growth_price_id,
+                    ),
+                ),
+            )
+            billing_store = SQLBillingStore(
+                settings.application_database_url,
+                free_monthly_model_budget_cents=settings.tenant_monthly_model_budget_cents,
+                create_schema=settings.create_schema,
+            )
+            resources.callback(billing_store.close)
+            billing_gateway = StripeBillingGateway(
+                secret_key=settings.stripe_secret_key,
+                webhook_secret=settings.stripe_webhook_secret,
+                public_base_url=settings.public_base_url,
+                api_version=settings.stripe_api_version,
+            )
+            resources.callback(billing_gateway.close)
+            billing_service = BillingService(
+                catalog=billing_catalog,
+                accounts=billing_store,
+                gateway=billing_gateway,
+                usage_meter=usage_meter,
+            )
         preview_deployments = SQLStaticPreviewDeployer(
             settings.application_database_url,
             artifact_store,
@@ -278,6 +382,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             preview_deployments=preview_deployments,
             company_directory=company_directory,
             usage_meter=usage_meter,
+            billing_service=billing_service,
             client_identity_config=browser_identity_config(settings),
             shutdown=resources.close,
         )
@@ -291,5 +396,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.preview_deployments = preview_deployments
     app.state.company_directory = company_directory
     app.state.usage_meter = usage_meter
+    app.state.billing_store = billing_store
+    app.state.billing_service = billing_service
     app.state.settings = settings
     return app

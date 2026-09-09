@@ -110,6 +110,12 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .person strong, .notice strong, .release strong { display: block; font-size: .82rem; }
 .person small, .notice small, .release small { display: block; margin-top: .3rem; color: var(--muted); font-size: .68rem; line-height: 1.5; }
 .card-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); gap: .7rem; }
+.plan-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(230px,1fr)); gap: .75rem; }
+.plan-card { min-height: 190px; padding: 1.2rem; border: 1px solid var(--line); border-radius: 14px; background: rgba(18,23,25,.62); }
+.plan-card.current-plan { border-color: rgba(198,255,69,.3); }
+.plan-card h4 { margin: .25rem 0 .7rem; font-size: 1.1rem; }
+.plan-card .muted { min-height: 3rem; font-size: .74rem; line-height: 1.55; }
+.plan-card button { margin-top: 1rem; }
 .release a { color: var(--lime); font-size: .72rem; }
 .drawer { position: fixed; z-index: 8; top: 0; right: 0; width: min(620px,100%); height: 100vh; padding: 1.4rem; border-left: 1px solid var(--line); background: rgba(12,16,18,.98); box-shadow: -25px 0 80px rgba(0,0,0,.48); transform: translateX(105%); transition: transform .2s ease; overflow-y: auto; }
 .drawer.open { transform: translateX(0); }
@@ -139,7 +145,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
   .workspace { grid-template-columns: 1fr; }
   .sidebar { position: fixed; top: auto; bottom: 0; width: 100%; height: 64px; padding: .55rem; border: 0; border-top: 1px solid var(--line); flex-direction: row; }
   .brand, .sidebar-bottom { display: none; }
-  nav { width: 100%; grid-template-columns: repeat(4,1fr); gap: .2rem; margin: 0; }
+  nav { width: 100%; grid-template-columns: repeat(auto-fit,minmax(60px,1fr)); gap: .2rem; margin: 0; }
   .nav-item { justify-content: center; padding: .6rem .25rem; font-size: .67rem; }
   .nav-item > span { width: auto; }
   main { padding: 0 1rem 6rem; }

@@ -13,8 +13,10 @@ from urllib.parse import urlparse
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from agent_os.api.auth import Authenticator, Principal
+from agent_os.application.billing import BillingService
 from agent_os.application.mission import mission_planning_run_id
 from agent_os.application.mission_control import project_mission_control
 from agent_os.application.ports import (
@@ -153,13 +155,20 @@ class HiringProposalDecisionRequest(BaseModel):
     spending_limit_cents: int = Field(default=0, ge=0, le=100_000_000)
 
 
+class BillingCheckoutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str = Field(min_length=1, max_length=64)
+
+
 _HUMAN_EVENTS = {EventKind.WAIT_RESOLVED, EventKind.CANCEL_REQUESTED}
 _INTERNAL_ROLES = {"agent", "operator", "system"}
 _MAX_API_ARTIFACT_BYTES = 2 * 1024 * 1024
+_MAX_STRIPE_WEBHOOK_BYTES = 1_000_000
 _WEB_ROOT = Path(__file__).with_name("web")
 _PUBLIC_IDENTITY_KEYS = {
     "identity_mode", "authorization_url", "token_url", "client_id", "scope", "audience",
-    "authorization_audience_parameter", "redirect_uri",
+    "authorization_audience_parameter", "redirect_uri", "billing_mode",
 }
 
 
@@ -174,8 +183,13 @@ def _browser_identity_config(raw: Mapping[str, str] | None) -> tuple[dict[str, s
     mode = values.get("identity_mode", "manual")
     if mode not in {"manual", "hmac", "oidc"}:
         raise ValueError("browser identity mode must be manual, hmac, or oidc")
+    if values.get("billing_mode", "disabled") not in {"disabled", "stripe"}:
+        raise ValueError("browser billing mode must be disabled or stripe")
     if mode != "oidc":
-        return {"identity_mode": mode}, ""
+        public = {"identity_mode": mode}
+        if "billing_mode" in values:
+            public["billing_mode"] = values["billing_mode"]
+        return public, ""
     required = (
         "authorization_url", "token_url", "client_id", "scope", "audience", "redirect_uri",
     )
@@ -189,7 +203,7 @@ def _browser_identity_config(raw: Mapping[str, str] | None) -> tuple[dict[str, s
     if parameter and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", parameter) is None:
         raise ValueError("OIDC authorization audience parameter is invalid")
     parsed_token = urlparse(values["token_url"])
-    return {key: values.get(key, "") for key in _PUBLIC_IDENTITY_KEYS}, (
+    return {key: values[key] for key in _PUBLIC_IDENTITY_KEYS if key in values}, (
         f"{parsed_token.scheme}://{parsed_token.netloc}"
     )
 
@@ -260,6 +274,7 @@ def create_app(
     preview_deployments: PreviewDeploymentStore | None = None,
     company_directory: CompanyDirectory | None = None,
     usage_meter: UsageMeter | None = None,
+    billing_service: BillingService | None = None,
     client_identity_config: Mapping[str, str] | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
@@ -364,6 +379,68 @@ def create_app(
     def ready() -> JSONResponse:
         report = dict(engine.health())
         return JSONResponse(status_code=200 if report.get("ok") else 503, content=report)
+
+    if billing_service is not None:
+        @app.post("/v2/billing/webhooks/stripe", include_in_schema=False)
+        async def stripe_billing_webhook(
+            request: Request,
+            stripe_signature: Annotated[str | None, Header(alias="Stripe-Signature")] = None,
+        ) -> Mapping[str, Any]:
+            if not stripe_signature:
+                raise HTTPException(status_code=400, detail="Stripe-Signature is required")
+            payload_buffer = bytearray()
+            async for chunk in request.stream():
+                payload_buffer.extend(chunk)
+                if len(payload_buffer) > _MAX_STRIPE_WEBHOOK_BYTES:
+                    raise HTTPException(status_code=413, detail="Stripe webhook body is too large")
+            try:
+                result = await run_in_threadpool(
+                    billing_service.webhook, bytes(payload_buffer), stripe_signature,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return {"received": True, **result}
+
+        @app.get("/v2/billing")
+        def get_billing_account(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            return billing_service.account(principal.organization_id)
+
+        @app.post("/v2/billing/checkout", status_code=201)
+        def create_billing_checkout(
+            body: BillingCheckoutRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, str]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="billing changes require owner authority")
+            try:
+                return billing_service.checkout(
+                    principal.organization_id, body.plan_id, idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except ConnectionError as exc:
+                raise HTTPException(status_code=502, detail="payment provider unavailable") from exc
+
+        @app.post("/v2/billing/portal", status_code=201)
+        def create_billing_portal(
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, str]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="billing changes require owner authority")
+            try:
+                return billing_service.portal(principal.organization_id, idempotency_key)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ConnectionError as exc:
+                raise HTTPException(status_code=502, detail="payment provider unavailable") from exc
 
     if company_directory is not None:
         @app.get("/v2/company/organization")

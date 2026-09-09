@@ -29,8 +29,17 @@ so replicas cannot race past it. Successful calls settle request/tool/token coun
 micros; when a provider/model does not report a trustworthy price, the reserved maximum remains charged rather than
 pretending the call was free. A crash/retry with the same source ID cannot double-count usage. Authenticated summary
 and owner-level event APIs are available at `GET /v2/usage/summary` and `GET /v2/usage/events`; the CEO workspace
-shows current committed model budget. This is cost-control and future billing evidence, not payment collection:
-plan entitlements, invoices, credits/tax, and Stripe webhook settlement remain separate milestones.
+shows current committed model budget. Those meter records are cost-control/billing evidence, not payment collection;
+the platform uses a separate Stripe subscription boundary rather than treating provider token counts as money.
+When billing is enabled, authenticated owners can open Stripe-hosted Checkout and Customer Portal sessions. Raw-body
+signed `checkout.session.completed` and `customer.subscription.*` webhooks project idempotent, order-safe tenant
+subscription truth under PostgreSQL RLS and reconcile the plan's model-spend ceiling before later provider calls.
+Checkout redirects never grant access by themselves, a late Checkout event cannot downgrade or overwrite a
+subscription event, inactive/cancelled subscriptions fall back to the free ceiling, and production refuses test keys
+or disabled billing. Metered overage invoicing, prepaid wallet/credits, tax-policy configuration, refunds, and
+invoice history remain later commercial milestones; the current paid plans are subscription entitlements plus a
+hard provider-spend ceiling, not permission for silent overage.
+Stripe secrets are API-only configuration and are deliberately absent from the worker container.
 
 New CEO directives now emit `start_mission`, not a second hard-coded research/build agent chain. That durable
 command starts a built-in planner graph. The mission architect must persist an identity-free JSON graph proposal;
@@ -172,6 +181,12 @@ Important controls:
 - `AOS_V2_SLOW_WORK_SECONDS` (default `300`; diagnostic threshold, never a kill timeout)
 - `AOS_V2_MANAGEMENT_ESCALATION_CHECKS` (default `3`; consecutive checks before CEO escalation)
 - `AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS` (default `10000`; reserved before provider calls)
+- `AOS_V2_BILLING_MODE` (`disabled` locally; public production requires `stripe`)
+- `AOS_V2_STRIPE_SECRET_KEY` (production requires an `sk_live_` key)
+- `AOS_V2_STRIPE_WEBHOOK_SECRET` (signing secret for `/v2/billing/webhooks/stripe`)
+- `AOS_V2_STRIPE_STARTER_PRICE_ID` / `AOS_V2_STRIPE_GROWTH_PRICE_ID`
+- `AOS_V2_STRIPE_STARTER_MODEL_BUDGET_CENTS` / `AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS`
+- `AOS_V2_STRIPE_API_VERSION` (explicitly pinned; default `2025-06-30.basil`)
 
 The control API supports two identity modes behind the same tenant-binding boundary. `hmac` is only the local/BYOC
 evaluation token flow; public production rejects it. Production requires `AOS_V2_IDENTITY_MODE=oidc` plus an HTTPS
@@ -206,9 +221,9 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–97), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–98), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
 actual provider tenant plus its signup/invite/organization configuration, secrets management, production
 deploy/rollback, a hosted
-sandbox/build adapter, large-object storage/garbage collection, metering, and managed-cloud IaC are still launch
+sandbox/build adapter, large-object storage/garbage collection, usage-invoice export/prepaid credits, and managed-cloud IaC are still launch
 blockers.

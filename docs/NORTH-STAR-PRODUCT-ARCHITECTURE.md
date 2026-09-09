@@ -508,7 +508,10 @@ management, company, notification, staffing-decision, cancellation, and preview 
 OIDC authorization-code/PKCE flow and keeps access tokens in page memory. Model turns now reserve a serialized,
 tenant-scoped monthly budget before provider access and settle replay-safe token/request/cost evidence afterward;
 unknown provider prices retain the conservative reservation instead of being treated as free. It still has no
-payment collection, plan-entitlement, credit/invoice/tax, or Stripe-webhook implementation and has overlapping legacy
+prepaid credit/usage-invoice/tax implementation, but it now creates Stripe-hosted subscription Checkout and Portal
+sessions and derives paid plan entitlements only from raw-body verified, idempotent, order-safe Stripe webhooks. A
+verified subscription change reconciles the tenant's pre-provider model-spend ceiling; redirects never grant access
+and production rejects disabled billing or Stripe test keys. It still has overlapping legacy
 controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
 signup/invite/organization onboarding (although provider-neutral OIDC/JWKS verification fails closed in production),
 no managed-cloud sandbox/production-deploy/general-subworkflow

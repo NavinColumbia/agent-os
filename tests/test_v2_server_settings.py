@@ -15,6 +15,10 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
         "AOS_V2_OIDC_AUDIENCE", "AOS_V2_OIDC_JWKS_URL",
         "AOS_V2_OIDC_AUTHORIZATION_URL", "AOS_V2_OIDC_TOKEN_URL", "AOS_V2_OIDC_CLIENT_ID",
         "AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS",
+        "AOS_V2_BILLING_MODE", "AOS_V2_STRIPE_SECRET_KEY",
+        "AOS_V2_STRIPE_WEBHOOK_SECRET", "AOS_V2_STRIPE_STARTER_PRICE_ID",
+        "AOS_V2_STRIPE_GROWTH_PRICE_ID", "AOS_V2_STRIPE_STARTER_MODEL_BUDGET_CENTS",
+        "AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS", "AOS_V2_STRIPE_API_VERSION",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = ServerSettings.from_env()
@@ -27,6 +31,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
     assert settings.public_base_url == "http://127.0.0.1:8080"
     assert settings.preview_ttl_seconds == 604800
     assert settings.tenant_monthly_model_budget_cents == 10000
+    assert settings.billing_mode == "disabled"
 
 
 def test_production_fails_closed_without_postgres_migrations_and_strong_secret(monkeypatch):
@@ -42,6 +47,12 @@ def test_production_fails_closed_without_postgres_migrations_and_strong_secret(m
     monkeypatch.delenv("AOS_V2_OIDC_AUTHORIZATION_URL", raising=False)
     monkeypatch.delenv("AOS_V2_OIDC_TOKEN_URL", raising=False)
     monkeypatch.delenv("AOS_V2_OIDC_CLIENT_ID", raising=False)
+    for name in (
+        "AOS_V2_BILLING_MODE", "AOS_V2_STRIPE_SECRET_KEY",
+        "AOS_V2_STRIPE_WEBHOOK_SECRET", "AOS_V2_STRIPE_STARTER_PRICE_ID",
+        "AOS_V2_STRIPE_GROWTH_PRICE_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
     with pytest.raises(ValueError, match="system database must be PostgreSQL"):
         ServerSettings.from_env()
 
@@ -67,10 +78,20 @@ def test_production_fails_closed_without_postgres_migrations_and_strong_secret(m
         ServerSettings.from_env()
 
     monkeypatch.setenv("AOS_V2_PUBLIC_BASE_URL", "https://agent-os.example.test/")
+    with pytest.raises(ValueError, match="STRIPE_SECRET_KEY"):
+        ServerSettings.from_env()
+    monkeypatch.setenv("AOS_V2_STRIPE_SECRET_KEY", "sk_test_production_settings")
+    with pytest.raises(ValueError, match="sk_live"):
+        ServerSettings.from_env()
+    monkeypatch.setenv("AOS_V2_STRIPE_SECRET_KEY", "sk_live_production_settings")
+    monkeypatch.setenv("AOS_V2_STRIPE_WEBHOOK_SECRET", "whsec_production_settings")
+    monkeypatch.setenv("AOS_V2_STRIPE_STARTER_PRICE_ID", "price_starter")
+    monkeypatch.setenv("AOS_V2_STRIPE_GROWTH_PRICE_ID", "price_growth")
     settings = ServerSettings.from_env()
     assert settings.public_base_url == "https://agent-os.example.test"
     assert settings.identity_mode == "oidc"
     assert settings.auth_secret == ""
+    assert settings.billing_mode == "stripe"
 
     monkeypatch.setenv("AOS_V2_IDENTITY_MODE", "hmac")
     with pytest.raises(ValueError, match="production requires"):

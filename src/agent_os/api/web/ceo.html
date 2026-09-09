@@ -40,6 +40,7 @@
         <button class="nav-item" data-view="company" type="button"><span>⌘</span>Company</button>
         <button class="nav-item" data-view="inbox" type="button"><span>◇</span>Inbox <b id="inbox-count" class="count hidden">0</b></button>
         <button class="nav-item" data-view="previews" type="button"><span>↗</span>Releases</button>
+        <button class="nav-item" data-view="billing" type="button"><span>◎</span>Billing</button>
       </nav>
       <div class="sidebar-bottom">
         <div class="connection"><i></i><span>Control plane connected</span></div>
@@ -98,6 +99,12 @@
       <section id="previews-view" class="view hidden">
         <div class="section-heading"><div><p class="eyebrow">DELIVERABLES</p><h3>Published previews</h3></div></div>
         <div id="previews-content" class="card-grid"><div class="empty">Loading releases…</div></div>
+      </section>
+
+      <section id="billing-view" class="view hidden">
+        <div id="billing-summary" class="stats"></div>
+        <div class="section-heading"><div><p class="eyebrow">ACCOUNT</p><h3>Plan and usage</h3></div></div>
+        <div id="billing-content" class="plan-grid"><div class="empty">Loading billing…</div></div>
       </section>
     </main>
 

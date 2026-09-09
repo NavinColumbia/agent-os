@@ -414,9 +414,10 @@ agent proposals for communication, delegation, staffing, risks, and decisions. I
 diagnostic condition rather than a timeout. Durable periodic watches now deliver deduplicated nonterminal manager
 signals, bounded persistent-condition escalation, and recovery notices. The write side is still incremental:
 an immutable standing company stream now preserves authorized AI-role hiring and retirement across directives
-and injects that roster into agent context. Human/vendor/team changes, governed application of model proposals,
-and contextual manager-agent repair/reassignment turns must still be completed before this is described as the
-full persistent AI organization runtime.
+and injects that roster into agent context. Human/vendor/team changes, automatic policy-bounded proposal
+application, and contextual manager-agent repair/reassignment turns must still be completed before this is
+described as the full persistent AI organization runtime. AI staffing proposals now have stable identities and
+an authorized, atomic promote/reject path; automatic approval is intentionally separate from self-approval.
 
 Initial external SLOs should be honest rather than copying the aspirational 99.99% North-Star target:
 

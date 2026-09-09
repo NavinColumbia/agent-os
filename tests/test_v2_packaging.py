@@ -47,6 +47,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "93-preview-capability-lifecycle-v2.sql" in compose
     assert "94-management-watch-v2.sql" in compose
     assert "95-company-directory-v2.sql" in compose
+    assert "96-company-proposal-decisions-v2.sql" in compose
     env_example = (ROOT / "deploy" / "v2.env.example").read_text()
     assert "AOS_V2_SANDBOX_BACKEND=disabled" in env_example
     assert "AOS_V2_PUBLIC_BASE_URL=http://localhost:8080" in env_example

@@ -47,6 +47,7 @@ services:
       - ../postgres/initdb/93-preview-capability-lifecycle-v2.sql:/migrations/93-preview-capability-lifecycle-v2.sql:ro
       - ../postgres/initdb/94-management-watch-v2.sql:/migrations/94-management-watch-v2.sql:ro
       - ../postgres/initdb/95-company-directory-v2.sql:/migrations/95-company-directory-v2.sql:ro
+      - ../postgres/initdb/96-company-proposal-decisions-v2.sql:/migrations/96-company-proposal-decisions-v2.sql:ro
     command:
       - sh
       - -ec
@@ -61,6 +62,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/93-preview-capability-lifecycle-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/94-management-watch-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/95-company-directory-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/96-company-proposal-decisions-v2.sql
     restart: "no"
 
   api:

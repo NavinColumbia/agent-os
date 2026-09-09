@@ -138,6 +138,17 @@ class AgentRetireRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2_000)
 
 
+class HiringProposalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool
+    reason: str = Field(min_length=1, max_length=2_000)
+    team_id: str | None = Field(default=None, min_length=1, max_length=128)
+    manager_id: str | None = Field(default="agent:mission-manager", min_length=1, max_length=256)
+    tool_grants: list[str] = Field(default_factory=list, max_length=64)
+    spending_limit_cents: int = Field(default=0, ge=0, le=100_000_000)
+
+
 _HUMAN_EVENTS = {EventKind.WAIT_RESOLVED, EventKind.CANCEL_REQUESTED}
 _INTERNAL_ROLES = {"agent", "operator", "system"}
 _MAX_API_ARTIFACT_BYTES = 2 * 1024 * 1024
@@ -616,6 +627,11 @@ def create_app(
                 organization_events = engine.load_organization_events(
                     principal.organization_id, run_id, limit=5_000,
                 )
+            company_events: tuple[Mapping[str, Any], ...] = ()
+            if company_directory is not None:
+                company_events = company_directory.list_company_events(
+                    principal.organization_id, limit=5_000,
+                )
             return project_mission_control(
                 lifecycle_run_id=run_id,
                 planning_state=planning,
@@ -623,8 +639,62 @@ def create_app(
                 definition=definition,
                 observation=observation,
                 organization_events=organization_events,
+                company_events=company_events,
                 slow_after_seconds=slow_after_seconds,
             )
+
+        if company_directory is not None:
+            @app.post("/v2/runs/{run_id}/management/proposals/{proposal_id}/hiring-decision")
+            def decide_mission_hiring_proposal(
+                run_id: str,
+                proposal_id: str,
+                body: HiringProposalDecisionRequest,
+                principal: Annotated[Principal, Depends(current_principal)],
+            ) -> Mapping[str, Any]:
+                if not (principal.roles & {"owner", "operator", "system"}):
+                    raise HTTPException(
+                        status_code=403, detail="staffing proposal decisions require owner authority",
+                    )
+                projection = get_mission_management(run_id, principal, 300)
+                proposal = next((
+                    item for item in projection["hiring_requests"]
+                    if item.get("proposal_id") == proposal_id
+                ), None)
+                if proposal is None:
+                    raise HTTPException(status_code=404, detail="staffing proposal not found")
+                participant_kind = str(proposal.get("participant_kind") or "agent")
+                if body.approved and participant_kind != "agent":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="human/vendor staffing requires its configured legal and onboarding workflow",
+                    )
+                role = str(proposal.get("role") or "").strip()
+                capabilities = proposal.get("capabilities", ())
+                requested_count = proposal.get("requested_count", 1)
+                if (
+                    not role
+                    or not isinstance(capabilities, list)
+                    or isinstance(requested_count, bool)
+                    or not isinstance(requested_count, int)
+                ):
+                    raise HTTPException(status_code=409, detail="staffing proposal is malformed")
+                try:
+                    return company_directory.decide_hiring_proposal(
+                        tenant_id=principal.organization_id,
+                        proposal_id=proposal_id,
+                        approved=body.approved,
+                        reason=body.reason,
+                        role=role,
+                        requested_count=requested_count,
+                        team_id=body.team_id,
+                        manager_id=body.manager_id,
+                        capabilities=tuple(str(item) for item in capabilities),
+                        tool_grants=tuple(body.tool_grants),
+                        spending_limit_cents=body.spending_limit_cents,
+                        actor_id=principal.subject_id,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         @app.get("/v2/runs/{run_id}/mission")
         def get_mission_execution(

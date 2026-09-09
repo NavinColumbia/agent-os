@@ -73,6 +73,12 @@ def test_retirement_preserves_history_and_management_invariants(directory):
 
     assert retired["stream_version"] == 2
     assert directory.get_organization("tenant-a").agents[agent_id].status is AgentStatus.RETIRED
+    replay = directory.retire_agent(
+        tenant_id="tenant-a", agent_id=agent_id,
+        reason="Mission capacity is no longer needed",
+        actor_id="human:ceo", idempotency_key="retire-security",
+    )
+    assert replay["duplicate"] is True
     with pytest.raises(ValueError, match="already retired"):
         directory.retire_agent(
             tenant_id="tenant-a", agent_id=agent_id, reason="again",
@@ -103,8 +109,69 @@ def test_hiring_rejects_unknown_authority_and_unbounded_capabilities(directory):
         )
 
 
+def test_approved_ai_staffing_proposal_atomically_promotes_bounded_standing_agents(directory):
+    decided = directory.decide_hiring_proposal(
+        tenant_id="tenant-a",
+        proposal_id="proposal-security-team",
+        approved=True,
+        reason="The mission requires independent review capacity",
+        role="security-specialist",
+        requested_count=2,
+        team_id="engineering",
+        manager_id="agent:engineering-manager",
+        capabilities=("security-review",),
+        tool_grants=("artifact.read",),
+        spending_limit_cents=125,
+        actor_id="human:ceo",
+    )
+    replay = directory.decide_hiring_proposal(
+        tenant_id="tenant-a",
+        proposal_id="proposal-security-team",
+        approved=True,
+        reason="The mission requires independent review capacity",
+        role="security-specialist",
+        requested_count=2,
+        team_id="engineering",
+        manager_id="agent:engineering-manager",
+        capabilities=("security-review",),
+        tool_grants=("artifact.read",),
+        spending_limit_cents=125,
+        actor_id="human:ceo",
+    )
+
+    assert decided["kind"] == "hiring_proposal_decided"
+    assert decided["payload"]["approved"] is True
+    assert len(decided["payload"]["agents"]) == 2
+    assert replay["duplicate"] is True
+    organization = directory.get_organization("tenant-a")
+    for raw in decided["payload"]["agents"]:
+        assert organization.agents[raw["agent_id"]].role == "security-specialist"
+
+    with pytest.raises(ValueError, match="different content"):
+        directory.decide_hiring_proposal(
+            tenant_id="tenant-a", proposal_id="proposal-security-team", approved=False,
+            reason="Changed mind", role="security-specialist", requested_count=2,
+            team_id=None, manager_id=None, capabilities=("security-review",),
+            tool_grants=(), spending_limit_cents=0, actor_id="human:ceo",
+        )
+
+
+def test_rejected_staffing_proposal_records_decision_without_creating_agent(directory):
+    before = len(directory.get_organization("tenant-a").agents)
+    decision = directory.decide_hiring_proposal(
+        tenant_id="tenant-a", proposal_id="proposal-vendor", approved=False,
+        reason="Use an existing teammate", role="recruiter", requested_count=1,
+        team_id=None, manager_id=None, capabilities=("sourcing",), tool_grants=(),
+        spending_limit_cents=0, actor_id="human:ceo",
+    )
+
+    assert decision["payload"]["agents"] == []
+    assert len(directory.get_organization("tenant-a").agents) == before
+
+
 def test_company_directory_migration_is_tenant_fenced_and_append_only():
     migration = (ROOT / "postgres/initdb/95-company-directory-v2.sql").read_text()
+    extension = (ROOT / "postgres/initdb/96-company-proposal-decisions-v2.sql").read_text()
 
     assert migration.count("ENABLE ROW LEVEL SECURITY") == 2
     assert migration.count("FORCE ROW LEVEL SECURITY") == 2
@@ -112,3 +179,4 @@ def test_company_directory_migration_is_tenant_fenced_and_append_only():
     assert "GRANT SELECT, INSERT ON TABLE public.aos_v2_company_events" in migration
     assert "UPDATE ON TABLE public.aos_v2_company_events" not in migration
     assert "DELETE ON TABLE public.aos_v2_company_events" not in migration
+    assert "hiring_proposal_decided" in extension

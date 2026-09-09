@@ -180,6 +180,26 @@ class SQLCompanyDirectory(CompanyDirectory):
                 if prior is None:
                     raise ValueError("company history retires an unknown agent")
                 agents[agent_id] = replace(prior, status=AgentStatus.RETIRED)
+            elif kind == "hiring_proposal_decided" and payload.get("approved") is True:
+                raw_agents = payload.get("agents", ())
+                if not isinstance(raw_agents, list):
+                    raise ValueError("approved hiring proposal has malformed agents")
+                for raw in raw_agents:
+                    if not isinstance(raw, Mapping):
+                        raise ValueError("approved hiring proposal agent is malformed")
+                    profile = AgentProfile(
+                        agent_id=str(raw["agent_id"]),
+                        role=str(raw["role"]),
+                        team_id=str(raw["team_id"]),
+                        manager_id=str(raw["manager_id"]),
+                        capabilities=frozenset(str(item) for item in raw.get("capabilities", ())),
+                        tool_grants=frozenset(str(item) for item in raw.get("tool_grants", ())),
+                        hiring_authority=False,
+                        spending_limit_cents=int(raw.get("spending_limit_cents", 0)),
+                    )
+                    if profile.agent_id in agents:
+                        raise ValueError("company history hires the same agent identity twice")
+                    agents[profile.agent_id] = profile
         return Organization(
             base.tenant_id,
             base.organization_id,
@@ -251,6 +271,37 @@ class SQLCompanyDirectory(CompanyDirectory):
             ))
         return {**record, "duplicate": False}
 
+    def _existing(
+        self,
+        *,
+        tenant_id: str,
+        event_id: str,
+        kind: str,
+        actor_id: str,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        semantic = {
+            "event_id": event_id,
+            "tenant_id": tenant_id,
+            "kind": kind,
+            "actor_id": actor_id,
+            "payload": dict(payload),
+        }
+        fingerprint = _fingerprint(semantic)
+        with self._tenant_connection(tenant_id) as connection:
+            prior = connection.execute(select(
+                company_events.c.fingerprint,
+                company_events.c.record,
+            ).where(and_(
+                company_events.c.tenant_id == tenant_id,
+                company_events.c.event_id == event_id,
+            ))).mappings().first()
+        if prior is None:
+            return None
+        if prior["fingerprint"] != fingerprint:
+            raise ValueError("company event idempotency key was reused with different content")
+        return {**dict(prior["record"]), "duplicate": True}
+
     def hire_agent(
         self,
         *,
@@ -271,14 +322,6 @@ class SQLCompanyDirectory(CompanyDirectory):
             raise ValueError("agent capabilities and tool grants are bounded to 64 each")
         if any(not item.strip() for item in (*capabilities, *tool_grants)):
             raise ValueError("agent capabilities and tool grants must be nonempty strings")
-        organization = self.get_organization(tenant_id)
-        if len(organization.agents) >= 1_000:
-            raise ValueError("standing company agent limit reached")
-        manager = organization.agents.get(manager_id)
-        if team_id not in organization.teams:
-            raise ValueError("agent team does not exist")
-        if manager is None or manager.status is not AgentStatus.ACTIVE:
-            raise ValueError("agent manager must be an active standing agent")
         profile = AgentProfile(
             agent_id=_agent_id(tenant_id, idempotency_key),
             role=role.strip(),
@@ -289,21 +332,37 @@ class SQLCompanyDirectory(CompanyDirectory):
             hiring_authority=hiring_authority,
             spending_limit_cents=spending_limit_cents,
         )
+        event_id = _event_id(tenant_id, idempotency_key, "hire-agent")
+        payload = {
+            "agent_id": profile.agent_id,
+            "role": profile.role,
+            "team_id": profile.team_id,
+            "manager_id": profile.manager_id,
+            "capabilities": sorted(profile.capabilities),
+            "tool_grants": sorted(profile.tool_grants),
+            "hiring_authority": profile.hiring_authority,
+            "spending_limit_cents": profile.spending_limit_cents,
+        }
+        existing = self._existing(
+            tenant_id=tenant_id, event_id=event_id, kind="agent_hired",
+            actor_id=actor_id, payload=payload,
+        )
+        if existing is not None:
+            return existing
+        organization = self.get_organization(tenant_id)
+        if len(organization.agents) >= 1_000:
+            raise ValueError("standing company agent limit reached")
+        manager = organization.agents.get(manager_id)
+        if team_id not in organization.teams:
+            raise ValueError("agent team does not exist")
+        if manager is None or manager.status is not AgentStatus.ACTIVE:
+            raise ValueError("agent manager must be an active standing agent")
         return self._append(
             tenant_id=tenant_id,
-            event_id=_event_id(tenant_id, idempotency_key, "hire-agent"),
+            event_id=event_id,
             kind="agent_hired",
             actor_id=actor_id,
-            payload={
-                "agent_id": profile.agent_id,
-                "role": profile.role,
-                "team_id": profile.team_id,
-                "manager_id": profile.manager_id,
-                "capabilities": sorted(profile.capabilities),
-                "tool_grants": sorted(profile.tool_grants),
-                "hiring_authority": profile.hiring_authority,
-                "spending_limit_cents": profile.spending_limit_cents,
-            },
+            payload=payload,
         )
 
     def retire_agent(
@@ -317,6 +376,14 @@ class SQLCompanyDirectory(CompanyDirectory):
     ) -> Mapping[str, Any]:
         if not reason.strip() or not idempotency_key.strip():
             raise ValueError("retirement reason and idempotency_key are required")
+        event_id = _event_id(tenant_id, idempotency_key, "retire-agent")
+        payload = {"agent_id": agent_id, "reason": reason.strip()}
+        existing = self._existing(
+            tenant_id=tenant_id, event_id=event_id, kind="agent_retired",
+            actor_id=actor_id, payload=payload,
+        )
+        if existing is not None:
+            return existing
         organization = self.get_organization(tenant_id)
         agent = organization.agents.get(agent_id)
         if agent is None:
@@ -331,10 +398,89 @@ class SQLCompanyDirectory(CompanyDirectory):
             raise ValueError("replace the team manager before retiring this agent")
         return self._append(
             tenant_id=tenant_id,
-            event_id=_event_id(tenant_id, idempotency_key, "retire-agent"),
+            event_id=event_id,
             kind="agent_retired",
             actor_id=actor_id,
-            payload={"agent_id": agent_id, "reason": reason.strip()},
+            payload=payload,
+        )
+
+    def decide_hiring_proposal(
+        self,
+        *,
+        tenant_id: str,
+        proposal_id: str,
+        approved: bool,
+        reason: str,
+        role: str,
+        requested_count: int,
+        team_id: str | None,
+        manager_id: str | None,
+        capabilities: tuple[str, ...],
+        tool_grants: tuple[str, ...],
+        spending_limit_cents: int,
+        actor_id: str,
+    ) -> Mapping[str, Any]:
+        if not proposal_id.strip() or not reason.strip():
+            raise ValueError("proposal identity and decision reason are required")
+        if not 1 <= requested_count <= 32:
+            raise ValueError("one staffing decision may create between 1 and 32 AI agents")
+        if len(capabilities) > 64 or len(tool_grants) > 64:
+            raise ValueError("agent capabilities and tool grants are bounded to 64 each")
+        if spending_limit_cents < 0:
+            raise ValueError("agent spending limit cannot be negative")
+        agents: list[dict[str, Any]] = []
+        if approved:
+            if team_id is None or manager_id is None:
+                raise ValueError("approved AI staffing requires a team and accountable manager")
+            for position in range(requested_count):
+                profile = AgentProfile(
+                    agent_id=_agent_id(tenant_id, f"{proposal_id}:{position}"),
+                    role=role.strip(),
+                    team_id=team_id,
+                    manager_id=manager_id,
+                    capabilities=frozenset(capabilities),
+                    tool_grants=frozenset(tool_grants),
+                    hiring_authority=False,
+                    spending_limit_cents=spending_limit_cents,
+                )
+                agents.append({
+                    "agent_id": profile.agent_id,
+                    "role": profile.role,
+                    "team_id": profile.team_id,
+                    "manager_id": profile.manager_id,
+                    "capabilities": sorted(profile.capabilities),
+                    "tool_grants": sorted(profile.tool_grants),
+                    "hiring_authority": False,
+                    "spending_limit_cents": profile.spending_limit_cents,
+                })
+        event_id = _event_id(tenant_id, proposal_id, "decide-hiring-proposal")
+        payload = {
+            "proposal_id": proposal_id,
+            "approved": approved,
+            "reason": reason.strip(),
+            "agents": agents,
+        }
+        existing = self._existing(
+            tenant_id=tenant_id, event_id=event_id, kind="hiring_proposal_decided",
+            actor_id=actor_id, payload=payload,
+        )
+        if existing is not None:
+            return existing
+        if approved:
+            organization = self.get_organization(tenant_id)
+            if len(organization.agents) + requested_count > 1_000:
+                raise ValueError("standing company agent limit reached")
+            manager = organization.agents.get(str(manager_id))
+            if team_id not in organization.teams:
+                raise ValueError("agent team does not exist")
+            if manager is None or manager.status is not AgentStatus.ACTIVE:
+                raise ValueError("agent manager must be an active standing agent")
+        return self._append(
+            tenant_id=tenant_id,
+            event_id=event_id,
+            kind="hiring_proposal_decided",
+            actor_id=actor_id,
+            payload=payload,
         )
 
     def close(self) -> None:

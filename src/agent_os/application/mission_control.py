@@ -9,6 +9,8 @@ queue work.  Model-authored management actions remain labelled as proposals.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import json
 from typing import Any, Mapping, Sequence
 
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition
@@ -139,6 +141,7 @@ def _token_health(
 
 def _organization_actions(
     state: WorkflowRunState,
+    company_events: Sequence[Mapping[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
     collected: dict[str, list[dict[str, Any]]] = {
         "messages": [],
@@ -157,7 +160,7 @@ def _organization_actions(
             values = raw.get(key, ())
             if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
                 continue
-            for value in values:
+            for position, value in enumerate(values):
                 item: dict[str, Any]
                 if isinstance(value, Mapping):
                     item = dict(value)
@@ -170,7 +173,30 @@ def _organization_actions(
                 item["proposal"] = key in {
                     "messages", "proposed_work", "hiring_requests", "decisions",
                 }
+                if item["proposal"]:
+                    material = json.dumps({
+                        "run_id": state.run_id,
+                        "token_id": token.token_id,
+                        "kind": key,
+                        "position": position,
+                        "value": value,
+                    }, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                    item["proposal_id"] = "proposal-" + hashlib.sha256(material.encode()).hexdigest()
+                    item["status"] = "pending"
                 collected[key].append(item)
+    decisions = {
+        str(event.get("payload", {}).get("proposal_id")): bool(
+            event.get("payload", {}).get("approved")
+        )
+        for event in company_events
+        if event.get("kind") == "hiring_proposal_decided"
+        and isinstance(event.get("payload"), Mapping)
+        and event.get("payload", {}).get("proposal_id")
+    }
+    for item in collected["hiring_requests"]:
+        proposal_id = str(item.get("proposal_id") or "")
+        if proposal_id in decisions:
+            item["status"] = "approved" if decisions[proposal_id] else "rejected"
     return collected
 
 
@@ -182,6 +208,7 @@ def project_mission_control(
     definition: WorkflowDefinition,
     observation: Mapping[str, Any] | None = None,
     organization_events: Sequence[Mapping[str, Any]] = (),
+    company_events: Sequence[Mapping[str, Any]] = (),
     now: datetime | None = None,
     slow_after_seconds: int = 300,
 ) -> Mapping[str, Any]:
@@ -297,7 +324,7 @@ def project_mission_control(
     else:
         health = "healthy"
 
-    organization = _organization_actions(state)
+    organization = _organization_actions(state, company_events)
     communications = list(organization["messages"])
     for item in work_items:
         if item["status"] == "waiting":

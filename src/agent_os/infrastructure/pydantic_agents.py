@@ -59,11 +59,18 @@ class ProposedWork(BaseModel):
     urgency: int = Field(default=50, ge=0, le=100)
 
 
+class HiringParticipantKind(str, Enum):
+    AGENT = "agent"
+    HUMAN = "human"
+    VENDOR = "vendor"
+
+
 class HiringRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: str
     reason: str
+    participant_kind: HiringParticipantKind = HiringParticipantKind.AGENT
     capabilities: list[str] = Field(default_factory=list)
     requested_count: int = Field(default=1, ge=1, le=1000)
     estimated_budget_cents: int = Field(default=0, ge=0)

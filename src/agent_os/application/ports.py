@@ -231,6 +231,23 @@ class CompanyDirectory(Protocol):
         idempotency_key: str,
     ) -> Mapping[str, Any]: ...
 
+    def decide_hiring_proposal(
+        self,
+        *,
+        tenant_id: str,
+        proposal_id: str,
+        approved: bool,
+        reason: str,
+        role: str,
+        requested_count: int,
+        team_id: str | None,
+        manager_id: str | None,
+        capabilities: tuple[str, ...],
+        tool_grants: tuple[str, ...],
+        spending_limit_cents: int,
+        actor_id: str,
+    ) -> Mapping[str, Any]: ...
+
     def list_company_events(
         self,
         tenant_id: str,

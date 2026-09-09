@@ -288,7 +288,7 @@ def test_artifact_upload_rejects_invalid_base64():
     assert response.status_code == 422
 
 
-def test_mission_status_links_authenticated_lifecycle_planning_and_execution():
+def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp_path):
     lifecycle = InMemoryWorkflowEngine()
     planning_run_id = mission_planning_run_id(
         "run-" + hashlib.sha256(
@@ -322,7 +322,17 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution():
         1,
         0,
         WorkflowRunStatus.ACTIVE,
-        (NodeToken("work-token", "work", TokenStatus.READY, 1),),
+        (NodeToken(
+            "work-token", "work", TokenStatus.READY, 1,
+            output={"organization_actions": {"hiring_requests": [{
+                "role": "security-specialist",
+                "reason": "Independent security capacity is missing",
+                "participant_kind": "agent",
+                "capabilities": ["security-review"],
+                "requested_count": 1,
+                "estimated_budget_cents": 0,
+            }]}},
+        ),),
     )
 
     class MissionGraphs:
@@ -344,8 +354,12 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution():
                 "agent:mission-architect",
             )
 
+    directory = SQLCompanyDirectory(
+        f"sqlite:///{tmp_path / 'mission-company.sqlite3'}", create_schema=True,
+    )
     api = TestClient(create_app(
         engine=lifecycle, identity=FakeIdentity(), graph_engine=MissionGraphs(),
+        company_directory=directory,
     ))
     created = api.post(
         "/v2/runs",
@@ -374,8 +388,32 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution():
     assert management.json()["execution_run_id"] == child_run_id
     assert management.json()["work_items"][0]["owner_id"] == "agent:engineer"
     assert management.json()["progress"]["live"] == 1
+    proposal = management.json()["hiring_requests"][0]
+    assert proposal["status"] == "pending"
+    approved = api.post(
+        f"/v2/runs/{created['run_id']}/management/proposals/"
+        f"{proposal['proposal_id']}/hiring-decision",
+        headers={"Authorization": "Bearer org-a"},
+        json={
+            "approved": True,
+            "reason": "Approved within a zero-default spend boundary",
+            "team_id": "engineering",
+            "manager_id": "agent:engineering-manager",
+            "tool_grants": ["artifact.read"],
+            "spending_limit_cents": 0,
+        },
+    )
+    assert approved.status_code == 200
+    promoted_id = approved.json()["payload"]["agents"][0]["agent_id"]
+    assert promoted_id in directory.get_organization("org-a").agents
+    after_decision = api.get(
+        f"/v2/runs/{created['run_id']}/management",
+        headers={"Authorization": "Bearer org-a"},
+    ).json()
+    assert after_decision["hiring_requests"][0]["status"] == "approved"
     hidden = api.get(
         f"/v2/runs/{created['run_id']}/mission",
         headers={"Authorization": "Bearer org-b"},
     )
     assert hidden.status_code == 404
+    directory.close()

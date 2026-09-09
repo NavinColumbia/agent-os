@@ -64,6 +64,16 @@ to that mission unless an authorized company change promotes them. Human/vendor 
 application of model staffing proposals, and reassignment/onboarding bundles remain approval/effect milestones;
 this directory does not pretend an event record hired a real person or granted an unconfigured tool.
 
+Mission staffing proposals now receive content-derived stable IDs and pending/approved/rejected status in the
+management projection. An owner/operator may decide an AI-agent proposal at
+`POST /v2/runs/{run_id}/management/proposals/{proposal_id}/hiring-decision`. Approval atomically records one
+immutable decision and promotes up to 32 deterministic agent identities into a selected standing team under one
+active manager, with explicit tool and spend limits; retries cannot create duplicate identities. Rejection records
+the durable decision without creating capacity. A proposal for a human or vendor fails closed at this endpoint,
+because a database event is not employment, contracting, identity verification, or onboarding. Fully autonomous
+proposal application also remains policy work: the model cannot approve its own staffing request merely because
+the requested spend is zero.
+
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
 email, Slack, SMS, and push remain separate adapters. `schedule_retry`, arbitrary external tool execution, and
@@ -169,7 +179,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–95), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–96), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC/signup, secrets management, production deploy/rollback, a hosted
 sandbox/build adapter, large-object storage/garbage collection, metering, and managed-cloud IaC are still launch
 blockers.

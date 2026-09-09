@@ -92,11 +92,30 @@ def test_management_projection_distinguishes_slow_owned_work_from_failure():
     assert projected["health"] == "degraded"
     assert projected["progress"]["materialized_completion_ratio"] == 1 / 3
     assert projected["hiring_requests"][0]["proposal"] is True
+    assert projected["hiring_requests"][0]["proposal_id"].startswith("proposal-")
+    assert projected["hiring_requests"][0]["status"] == "pending"
     assert projected["risks"][0]["text"].startswith("Authentication")
     assert projected["communications"][0]["correlation_id"] == "approve-launch"
     specialist = next(item for item in projected["team"] if item["role"] == "quality-specialist")
     assert specialist["manager_id"] == "agent:mission-manager"
     assert specialist["mission_scoped"] is True
+
+    decided = project_mission_control(
+        lifecycle_run_id="lifecycle",
+        planning_state=planning,
+        execution_state=execution,
+        definition=definition(),
+        observation=observation,
+        company_events=({
+            "kind": "hiring_proposal_decided",
+            "payload": {
+                "proposal_id": projected["hiring_requests"][0]["proposal_id"],
+                "approved": True,
+            },
+        },),
+        now=now,
+    )
+    assert decided["hiring_requests"][0]["status"] == "approved"
 
 
 def test_expired_lease_is_recovering_work_not_a_business_timeout():

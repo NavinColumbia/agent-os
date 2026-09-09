@@ -223,7 +223,7 @@ docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --bui
 
 It starts PostgreSQL, applies only the isolated V2 migrations (86–99), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
-actual provider tenant plus its signup/invite/organization configuration, secrets management, production
+actual provider tenant plus its multi-user invite/organization configuration, secrets management, production
 deploy/rollback, a hosted
 sandbox/build adapter, artifact garbage collection, usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch
 blockers.
@@ -251,3 +251,11 @@ Downloads re-check length and SHA-256 before returning bytes. The API and worker
 creator/viewer so authenticated uploads and autonomous outputs both work, but neither can overwrite or delete
 objects. Existing inline SQL artifacts remain readable during
 migration. Production fails startup if it is configured back to the capped SQL payload adapter.
+
+Hosted OIDC can enable `AOS_V2_OIDC_PERSONAL_TENANTS=1` for zero-touch first-user onboarding. A token without the
+configured organization claim is assigned a stable tenant derived by HMAC from the already verified issuer and
+subject. The derivation key never reaches the worker or browser, provider roles are ignored on this fallback path,
+and the subject receives owner authority only inside that isolated personal company. Tokens that do carry an
+organization still require the explicit roles claim. The managed GCP cell generates and deletion-protects this key
+and excludes it from bulk rotation because rotating it would change personal tenant identities. Multi-user company
+selection, invitations, membership revocation, and provider configuration remain launch work.

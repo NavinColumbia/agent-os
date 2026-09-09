@@ -116,8 +116,10 @@ class SigningKeyProvider(Protocol):
 class OIDCTokenIdentity:
     """Validate provider-neutral OIDC access tokens against rotating JWKS keys.
 
-    Identity-provider claims are normalized at this boundary.  Tenant identity
-    is always taken from a verified organization claim, never a request header.
+    Identity-provider claims are normalized at this boundary. Tenant identity
+    is taken from a verified organization claim or, when explicitly enabled,
+    a server-keyed personal tenant derived from the verified issuer/subject;
+    it is never taken from a request header.
     Hosted browser sessions belong in an upstream BFF; accepting a bearer token
     from this service's cookie would introduce a CSRF-prone second auth path.
     """
@@ -138,6 +140,7 @@ class OIDCTokenIdentity:
         jwks_cache_seconds: int = 300,
         jwks_timeout_seconds: float = 5.0,
         signing_keys: SigningKeyProvider | None = None,
+        personal_tenant_secret: str | bytes | None = None,
     ) -> None:
         self._issuer = issuer.rstrip("/")
         self._audience = audience.strip()
@@ -146,6 +149,11 @@ class OIDCTokenIdentity:
         self._algorithms = tuple(dict.fromkeys(item.strip().upper() for item in algorithms if item.strip()))
         self._leeway_seconds = leeway_seconds
         self._maximum_token_lifetime_seconds = maximum_token_lifetime_seconds
+        if isinstance(personal_tenant_secret, str):
+            personal_tenant_secret = personal_tenant_secret.encode()
+        if personal_tenant_secret is not None and len(personal_tenant_secret) < 32:
+            raise ValueError("OIDC personal-tenant secret must be at least 32 bytes")
+        self._personal_tenant_secret = personal_tenant_secret
 
         for label, value in (("issuer", self._issuer), ("JWKS URL", jwks_url)):
             parsed = urlparse(value)
@@ -225,14 +233,22 @@ class OIDCTokenIdentity:
         if isinstance(audiences, list) and len(audiences) > 1 and payload.get("azp") != self._audience:
             raise ValueError("authentication token authorized party is invalid")
 
-        organization = payload.get(self._organization_claim)
-        roles = payload.get(self._roles_claim)
         subject = payload.get("sub")
         if not isinstance(subject, str) or not subject.strip():
             raise ValueError("authentication token has an invalid subject claim")
+        organization = payload.get(self._organization_claim)
+        roles = payload.get(self._roles_claim)
         if not isinstance(organization, str) or not organization.strip():
-            raise ValueError("authentication token is missing the organization claim")
-        if (
+            if self._personal_tenant_secret is None:
+                raise ValueError("authentication token is missing the organization claim")
+            material = f"agent-os:personal-tenant:v1:{self._issuer}:{subject.strip()}".encode()
+            organization = "tenant-" + _b64_encode(hmac.new(
+                self._personal_tenant_secret, material, hashlib.sha256,
+            ).digest())
+            # Provider claims cannot grant authority inside an automatically
+            # isolated personal company. Its sole verified subject is owner.
+            roles = ["owner"]
+        elif (
             not isinstance(roles, (list, tuple, set, frozenset))
             or not all(isinstance(role, str) for role in roles)
         ):

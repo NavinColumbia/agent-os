@@ -45,6 +45,8 @@ class ServerSettings:
     oidc_client_id: str
     oidc_scope: str
     oidc_authorization_audience_parameter: str
+    oidc_personal_tenants: bool
+    tenant_derivation_secret: str
     tenant_monthly_model_budget_cents: int
     billing_mode: str
     stripe_secret_key: str
@@ -65,7 +67,9 @@ class ServerSettings:
     create_schema: bool
 
     @classmethod
-    def from_env(cls, *, require_billing: bool = True) -> "ServerSettings":
+    def from_env(
+        cls, *, require_billing: bool = True, require_identity: bool = True,
+    ) -> "ServerSettings":
         environment = os.getenv("AOS_ENVIRONMENT", "development").strip().lower()
         if environment not in {"development", "test", "staging", "production"}:
             raise ValueError("AOS_ENVIRONMENT must be development, test, staging, or production")
@@ -107,6 +111,10 @@ class ServerSettings:
         oidc_authorization_audience_parameter = os.getenv(
             "AOS_V2_OIDC_AUTHORIZATION_AUDIENCE_PARAMETER", ""
         ).strip()
+        oidc_personal_tenants = os.getenv(
+            "AOS_V2_OIDC_PERSONAL_TENANTS", "0",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        tenant_derivation_secret = os.getenv("AOS_V2_TENANT_DERIVATION_SECRET", "")
         tenant_monthly_model_budget_cents = int(
             os.getenv("AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS", "10000")
         )
@@ -160,7 +168,7 @@ class ServerSettings:
             raise ValueError("AOS_V2_CAPABILITY_SECRET must be at least 32 bytes")
         if environment == "production" and capability_secret == auth_secret and auth_secret:
             raise ValueError("production capability and local-auth secrets must be independent")
-        if identity_mode == "oidc":
+        if identity_mode == "oidc" and require_identity:
             # Construct once during settings validation so bad URLs, algorithms,
             # and bounds fail before the process starts accepting traffic.
             OIDCTokenIdentity(
@@ -172,6 +180,9 @@ class ServerSettings:
                 algorithms=oidc_algorithms,
                 leeway_seconds=oidc_leeway_seconds,
                 maximum_token_lifetime_seconds=oidc_maximum_token_lifetime_seconds,
+                personal_tenant_secret=(
+                    tenant_derivation_secret if oidc_personal_tenants else None
+                ),
             )
             if environment == "production":
                 for label, value in (
@@ -260,6 +271,8 @@ class ServerSettings:
             oidc_client_id=oidc_client_id,
             oidc_scope=oidc_scope,
             oidc_authorization_audience_parameter=oidc_authorization_audience_parameter,
+            oidc_personal_tenants=oidc_personal_tenants,
+            tenant_derivation_secret=tenant_derivation_secret,
             tenant_monthly_model_budget_cents=tenant_monthly_model_budget_cents,
             billing_mode=billing_mode,
             stripe_secret_key=stripe_secret_key,
@@ -292,6 +305,9 @@ def build_identity(settings: ServerSettings) -> Authenticator:
             algorithms=settings.oidc_algorithms,
             leeway_seconds=settings.oidc_leeway_seconds,
             maximum_token_lifetime_seconds=settings.oidc_maximum_token_lifetime_seconds,
+            personal_tenant_secret=(
+                settings.tenant_derivation_secret if settings.oidc_personal_tenants else None
+            ),
         )
     return HMACTokenIdentity(settings.auth_secret)
 

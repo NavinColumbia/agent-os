@@ -21,6 +21,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
         "AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS", "AOS_V2_STRIPE_API_VERSION",
         "AOS_V2_ARTIFACT_BACKEND", "AOS_V2_ARTIFACT_BUCKET",
         "AOS_V2_ARTIFACT_MAX_CONTENT_BYTES",
+        "AOS_V2_OIDC_PERSONAL_TENANTS", "AOS_V2_TENANT_DERIVATION_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = ServerSettings.from_env()
@@ -37,6 +38,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
     assert settings.artifact_backend == "sql"
     assert settings.artifact_bucket == ""
     assert settings.artifact_max_content_bytes == 2 * 1024 * 1024
+    assert settings.oidc_personal_tenants is False
 
 
 def test_production_fails_closed_without_postgres_migrations_and_strong_secret(monkeypatch):
@@ -55,7 +57,8 @@ def test_production_fails_closed_without_postgres_migrations_and_strong_secret(m
     for name in (
         "AOS_V2_BILLING_MODE", "AOS_V2_STRIPE_SECRET_KEY",
         "AOS_V2_STRIPE_WEBHOOK_SECRET", "AOS_V2_STRIPE_STARTER_PRICE_ID",
-        "AOS_V2_STRIPE_GROWTH_PRICE_ID",
+        "AOS_V2_STRIPE_GROWTH_PRICE_ID", "AOS_V2_OIDC_PERSONAL_TENANTS",
+        "AOS_V2_TENANT_DERIVATION_SECRET", "AOS_V2_ARTIFACT_BUCKET",
     ):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(ValueError, match="system database must be PostgreSQL"):
@@ -101,6 +104,13 @@ def test_production_fails_closed_without_postgres_migrations_and_strong_secret(m
     assert settings.auth_secret == ""
     assert settings.billing_mode == "stripe"
     assert settings.artifact_backend == "gcs"
+
+    monkeypatch.setenv("AOS_V2_OIDC_PERSONAL_TENANTS", "1")
+    with pytest.raises(ValueError, match="personal-tenant secret"):
+        ServerSettings.from_env()
+    monkeypatch.setenv("AOS_V2_TENANT_DERIVATION_SECRET", "tenant-derivation" * 3)
+    settings = ServerSettings.from_env()
+    assert settings.oidc_personal_tenants is True
 
     monkeypatch.setenv("AOS_V2_IDENTITY_MODE", "hmac")
     with pytest.raises(ValueError, match="production requires"):

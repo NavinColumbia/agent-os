@@ -80,14 +80,16 @@ put_secret_version() {
     local logical_name=$1
     local value_variable=$2
     local allow_generated=${3:-0}
+    local allow_rotation=${4:-1}
     local secret_id
     local secret_value
     secret_id=$(tofu -chdir="$tofu_root" output -json runtime_secret_ids | \
         .venv/bin/python -c "import json,sys; print(json.load(sys.stdin)['${logical_name}'])")
-    if [[ "${AOS_ROTATE_SECRETS:-0}" != "1" ]] && \
-       gcloud secrets versions list "$secret_id" --project "$GCP_PROJECT_ID" \
-           --filter='state=ENABLED' --limit=1 --format='value(name)' | rg -q .; then
-        return
+    if gcloud secrets versions list "$secret_id" --project "$GCP_PROJECT_ID" \
+        --filter='state=ENABLED' --limit=1 --format='value(name)' | rg -q .; then
+        if [[ "${AOS_ROTATE_SECRETS:-0}" != "1" || "$allow_rotation" != "1" ]]; then
+            return
+        fi
     fi
     secret_value=${!value_variable:-}
     if [[ -z "$secret_value" && "$allow_generated" == "1" ]]; then
@@ -105,6 +107,7 @@ put_secret_version migration_database_url AOS_V2_MIGRATION_DATABASE_URL
 put_secret_version system_database_url AOS_V2_SYSTEM_DATABASE_URL
 put_secret_version application_database_url AOS_V2_APPLICATION_DATABASE_URL
 put_secret_version capability_secret AOS_V2_CAPABILITY_SECRET 1
+put_secret_version tenant_derivation_secret AOS_V2_TENANT_DERIVATION_SECRET 1 0
 put_secret_version stripe_secret_key AOS_V2_STRIPE_SECRET_KEY
 put_secret_version stripe_webhook_secret AOS_V2_STRIPE_WEBHOOK_SECRET
 put_secret_version model_provider_key AOS_V2_MODEL_PROVIDER_KEY

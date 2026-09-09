@@ -518,7 +518,8 @@ cloud account. Its private bucket is now used by a production GCS `ArtifactStore
 hold payload bytes while RLS-protected SQL retains tenant identity/idempotency, and reads verify the recorded
 generation, length, and digest. Production refuses the small inline SQL adapter. It still has overlapping legacy
 controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
-signup/invite/organization onboarding (although provider-neutral OIDC/JWKS verification fails closed in production),
+multi-user invite/organization onboarding (although provider-neutral OIDC/JWKS verification now supports a
+zero-touch personal-company path derived from the verified issuer/subject),
 no managed-cloud sandbox/production-deploy/general-subworkflow
 adapters, and no complete
 new-customer-browser-to-production-URL vertical.

@@ -11,6 +11,13 @@ Credentials; no storage key is created. Artifact bytes are immutable generation-
 identity, media type, digest, idempotency, and object generation remain in PostgreSQL under RLS. The authenticated
 API and worker can create and read objects, but neither runtime identity can overwrite or delete them.
 
+The API also enables zero-touch personal-company onboarding. If a valid OIDC token has no organization claim, a
+stable isolated tenant ID is derived from its verified issuer/subject with a server-only HMAC secret. That secret is
+generated into Secret Manager on first deploy; no extra key or provider-specific organization feature is required.
+Provider-supplied roles are ignored on this path and the sole verified subject becomes that personal company's owner.
+The derivation secret is deletion-protected and intentionally excluded from bulk secret rotation because changing it
+would change tenant identities; disaster recovery must restore the existing secret version.
+
 The transactional database is an external managed PostgreSQL service for the bootstrap cell. Its migration URL
 uses a table-owner/admin principal and is readable only by the one-shot migration identity. The system/application
 URLs use runtime principals; the application login is validated as non-superuser/non-`BYPASSRLS` and receives only
@@ -53,7 +60,8 @@ Then run `deploy/gcp/deploy.sh`. On a new cell it creates/version-enables the re
 foundation resources without a runtime. On both first and repeat releases it adds only missing secret versions,
 builds both images in Cloud Build, resolves immutable digests, updates only the migration Job, executes migrations,
 then rolls the API/worker and checks `/ready`. An existing serving plane is never reconciled against the inactive
-bootstrap shape. Set `AOS_ROTATE_SECRETS=1` only for an intentional rotation.
+bootstrap shape. Set `AOS_ROTATE_SECRETS=1` only for an intentional rotation; the tenant-derivation secret is
+permanently excluded.
 
 The script defaults GitHub repository ID to this repository's immutable ID (`1276674620`), not its reusable name.
 After the first apply, set these GitHub repository/environment variables from the OpenTofu outputs:

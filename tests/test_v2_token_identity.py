@@ -47,7 +47,9 @@ class _SigningKeys:
         return _SigningKey(self.key)
 
 
-def _oidc_fixture() -> tuple[OIDCTokenIdentity, object, _SigningKeys]:
+def _oidc_fixture(
+    *, personal_tenant_secret: str | None = None,
+) -> tuple[OIDCTokenIdentity, object, _SigningKeys]:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     keys = _SigningKeys(private_key.public_key())
     identity = OIDCTokenIdentity(
@@ -57,6 +59,7 @@ def _oidc_fixture() -> tuple[OIDCTokenIdentity, object, _SigningKeys]:
         algorithms=("RS256",),
         leeway_seconds=0,
         signing_keys=keys,
+        personal_tenant_secret=personal_tenant_secret,
     )
     return identity, private_key, keys
 
@@ -83,6 +86,34 @@ def test_oidc_token_verifies_asymmetric_signature_and_normalizes_tenant_identity
     )
     assert principal == Principal("human-1", "tenant-1", frozenset({"owner", "operator"}))
     assert keys.calls == 1
+
+
+def test_oidc_verified_subject_can_enter_a_stable_isolated_personal_company():
+    identity, private_key, _ = _oidc_fixture(personal_tenant_secret="p" * 32)
+    first = Principal.from_mapping(identity.authenticate(
+        f"Bearer {_oidc_token(private_key, org_id=None, roles=['system'])}", None,
+    ))
+    replay = Principal.from_mapping(identity.authenticate(
+        f"Bearer {_oidc_token(private_key, org_id=None, roles=None)}", None,
+    ))
+    other = Principal.from_mapping(identity.authenticate(
+        f"Bearer {_oidc_token(private_key, sub='human-2', org_id=None, roles=None)}", None,
+    ))
+
+    assert first == replay
+    assert first.organization_id.startswith("tenant-")
+    assert first.roles == {"owner"}
+    assert other.organization_id != first.organization_id
+
+
+def test_oidc_personal_tenants_require_a_strong_server_secret():
+    with pytest.raises(ValueError, match="personal-tenant secret must be at least 32 bytes"):
+        OIDCTokenIdentity(
+            issuer="https://identity.example.test",
+            audience="agent-os-api",
+            jwks_url="https://identity.example.test/jwks",
+            personal_tenant_secret="weak",
+        )
 
 
 @pytest.mark.parametrize(

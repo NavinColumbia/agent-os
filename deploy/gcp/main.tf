@@ -57,6 +57,7 @@ locals {
     system_database_url      = "${local.prefix}-system-database-url"
     application_database_url = "${local.prefix}-application-database-url"
     capability_secret        = "${local.prefix}-capability-secret"
+    tenant_derivation_secret = "${local.prefix}-tenant-derivation-secret"
     stripe_secret_key        = "${local.prefix}-stripe-secret-key"
     stripe_webhook_secret    = "${local.prefix}-stripe-webhook-secret"
     model_provider_key       = "${local.prefix}-model-provider-key"
@@ -91,6 +92,7 @@ locals {
     AOS_V2_STRIPE_STARTER_MODEL_BUDGET_CENTS = tostring(var.starter_model_budget_cents)
     AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS  = tostring(var.growth_model_budget_cents)
     AOS_V2_STRIPE_API_VERSION                = "2025-06-30.basil"
+    AOS_V2_OIDC_PERSONAL_TENANTS             = "1"
   })
 
   worker_environment = merge(local.common_environment, {
@@ -108,6 +110,7 @@ locals {
     AOS_V2_SYSTEM_DATABASE_URL      = "system_database_url"
     AOS_V2_APPLICATION_DATABASE_URL = "application_database_url"
     AOS_V2_CAPABILITY_SECRET        = "capability_secret"
+    AOS_V2_TENANT_DERIVATION_SECRET = "tenant_derivation_secret"
     AOS_V2_STRIPE_SECRET_KEY        = "stripe_secret_key"
     AOS_V2_STRIPE_WEBHOOK_SECRET    = "stripe_webhook_secret"
   }
@@ -206,8 +209,9 @@ resource "google_service_account" "builder" {
 resource "google_secret_manager_secret" "runtime" {
   for_each = local.secret_ids
 
-  secret_id = each.value
-  labels    = local.labels
+  secret_id           = each.value
+  labels              = local.labels
+  deletion_protection = var.deletion_protection
 
   replication {
     auto {}
@@ -219,7 +223,7 @@ resource "google_secret_manager_secret" "runtime" {
 resource "google_secret_manager_secret_iam_member" "api" {
   for_each = toset([
     "system_database_url", "application_database_url", "capability_secret",
-    "stripe_secret_key", "stripe_webhook_secret",
+    "tenant_derivation_secret", "stripe_secret_key", "stripe_webhook_secret",
   ])
 
   secret_id = google_secret_manager_secret.runtime[each.value].id

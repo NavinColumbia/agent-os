@@ -42,6 +42,7 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert "put_secret_version stripe_secret_key" in deploy
     assert "put_secret_version model_provider_key" in deploy
     assert "put_secret_version migration_database_url" in deploy
+    assert "put_secret_version tenant_derivation_secret AOS_V2_TENANT_DERIVATION_SECRET 1 0" in deploy
 
     worker_secrets = main.split("worker_secret_environment = {", 1)[1].split("}", 1)[0]
     api_secrets = main.split("api_secret_environment = {", 1)[1].split("}", 1)[0]
@@ -51,6 +52,8 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert "model_provider_key" not in api_secrets
     assert "migration_database_url" not in worker_secrets
     assert "migration_database_url" not in api_secrets
+    assert "tenant_derivation_secret" in api_secrets
+    assert "tenant_derivation_secret" not in worker_secrets
     assert 'AOS_V2_ARTIFACT_BACKEND                      = "gcs"' in main
     assert 'role   = "roles/storage.objectCreator"' in main
     assert 'role   = "roles/storage.objectViewer"' in main

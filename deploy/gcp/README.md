@@ -77,7 +77,9 @@ export AOS_V2_APPLICATION_DATABASE_URL='postgresql://runtime-user:password@host/
 export AOS_V2_MODEL=openai:gpt-5-mini
 export AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT=OPENAI_API_KEY
 export AOS_V2_MODEL_PROVIDER_KEY=replace
-export AOS_V2_APP_BUILDER_IMAGE='gcr.io/cloud-builders/docker@sha256:replace-with-reviewed-digest'
+
+# Optional reviewed override; the repository already carries an immutable default.
+export AOS_V2_APP_BUILDER_IMAGE='gcr.io/cloud-builders/docker@sha256:3d00b6c1a9b862621c30fc74d4f2abfc62bcbdee631ed3febd31e7edbdf6252c'
 
 # Optional: an existing Cloud DNS zone name. Leave unset for any other DNS provider.
 export GCP_DNS_MANAGED_ZONE=your-cloud-dns-zone
@@ -100,6 +102,10 @@ image spend and prints the two exact A records; add them and rerun the same comm
 observable DNS, TLS, `/ready`, and `/health` state for up to an hour (configurable with
 `AOS_V2_EDGE_READY_TIMEOUT_SECONDS`) so normal managed-certificate propagation is not mistaken for an app failure.
 The global load balancer and reserved IP have non-zero fixed cost even while Cloud Run scales to zero.
+
+Release builds archive the exact 40-character Git commit and read `cloudbuild.yaml` from that same commit. Local
+dirty and untracked files are explicitly excluded instead of being uploaded by `gcloud builds submit .`. All six
+build/push steps use the same reviewed digest-pinned Docker builder; changing it is an auditable code/config update.
 
 `GCP_SANDBOX_PROJECT_ID` and `GCP_APP_PROJECT_ID` must be existing billed projects, all three project IDs must be
 different, and each is a separate failure/security plane. The
@@ -133,7 +139,7 @@ After the first apply, set these GitHub repository/environment variables from th
 - `GCP_PROJECT_ID`, `GCP_SANDBOX_PROJECT_ID`, `GCP_APP_PROJECT_ID`, `GCP_REGION`, and `GCP_STATE_BUCKET`
 - `GCP_DNS_MANAGED_ZONE` when the two public hostnames are managed by Cloud DNS; otherwise leave it empty
 - all non-secret `AOS_V2_OIDC_*`, Stripe price, control/app public URLs, and model values used above
-- `AOS_V2_APP_BUILDER_IMAGE`, pinned to the reviewed Cloud Build Docker builder digest
+- optional `AOS_V2_APP_BUILDER_IMAGE` only when intentionally replacing the repository's reviewed pinned default
 - `AOS_ALERT_NOTIFICATION_CHANNELS`, a JSON list of full Monitoring notification-channel resource names (or `[]`)
 
 Runtime credentials stay in GCP Secret Manager and are never copied into GitHub. The worker identity cannot read

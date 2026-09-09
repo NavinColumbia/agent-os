@@ -14,7 +14,7 @@ fi
 
 required_variables=(
     GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID GCP_APP_PROJECT_ID
-    AOS_V2_PUBLIC_BASE_URL AOS_V2_APPS_BASE_URL AOS_V2_APP_BUILDER_IMAGE
+    AOS_V2_PUBLIC_BASE_URL AOS_V2_APPS_BASE_URL
     AOS_V2_OIDC_ISSUER AOS_V2_OIDC_AUDIENCE AOS_V2_OIDC_JWKS_URL
     AOS_V2_OIDC_AUTHORIZATION_URL AOS_V2_OIDC_TOKEN_URL AOS_V2_OIDC_CLIENT_ID
     AOS_V2_STRIPE_STARTER_PRICE_ID AOS_V2_STRIPE_GROWTH_PRICE_ID AOS_V2_MODEL
@@ -33,6 +33,7 @@ state_bucket=${GCP_STATE_BUCKET:-${GCP_PROJECT_ID}-agentos-tofu-state}
 state_prefix="agent-os/${deployment_environment}"
 github_repository_id=${GITHUB_REPOSITORY_ID:-1276674620}
 release_id=${AOS_RELEASE_ID:-$(git rev-parse --verify HEAD)}
+app_builder_image=${AOS_V2_APP_BUILDER_IMAGE:-gcr.io/cloud-builders/docker@sha256:3d00b6c1a9b862621c30fc74d4f2abfc62bcbdee631ed3febd31e7edbdf6252c}
 tofu_root=deploy/gcp
 
 export TF_VAR_project_id="$GCP_PROJECT_ID"
@@ -59,7 +60,7 @@ export TF_VAR_model="$AOS_V2_MODEL"
 export TF_VAR_database_runtime_role="$AOS_V2_DATABASE_RUNTIME_ROLE"
 export TF_VAR_model_provider_secret_environment="${AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT:-OPENAI_API_KEY}"
 export TF_VAR_release_id="$release_id"
-export TF_VAR_app_builder_image="$AOS_V2_APP_BUILDER_IMAGE"
+export TF_VAR_app_builder_image="$app_builder_image"
 
 gcloud projects describe "$GCP_PROJECT_ID" >/dev/null
 gcloud projects describe "$GCP_SANDBOX_PROJECT_ID" >/dev/null
@@ -147,8 +148,9 @@ put_secret_version model_provider_key AOS_V2_MODEL_PROVIDER_KEY
 
 runtime_repository=$(tofu -chdir="$tofu_root" output -raw artifact_registry_repository)
 build_service_account=$(tofu -chdir="$tofu_root" output -raw build_service_account)
-gcloud builds submit . --project "$GCP_PROJECT_ID" --config deploy/gcp/cloudbuild.yaml \
-    --substitutions="_REPOSITORY=${runtime_repository},_RELEASE_ID=${release_id},_BUILD_SERVICE_ACCOUNT=${build_service_account}"
+deploy/gcp/build-release.sh \
+    "$GCP_PROJECT_ID" "$runtime_repository" "$release_id" \
+    "$build_service_account" "$app_builder_image"
 
 application_tag="${runtime_repository}/agent-os:${release_id}"
 migration_tag="${runtime_repository}/migrations:${release_id}"

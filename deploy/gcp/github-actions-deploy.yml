@@ -47,7 +47,7 @@ jobs:
       TF_VAR_model_provider_secret_environment: ${{ vars.AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT }}
       TF_VAR_alert_notification_channels: ${{ vars.AOS_ALERT_NOTIFICATION_CHANNELS || '[]' }}
       TF_VAR_activate_services: "true"
-      TF_VAR_app_builder_image: ${{ vars.AOS_V2_APP_BUILDER_IMAGE }}
+      TF_VAR_app_builder_image: ${{ vars.AOS_V2_APP_BUILDER_IMAGE || 'gcr.io/cloud-builders/docker@sha256:3d00b6c1a9b862621c30fc74d4f2abfc62bcbdee631ed3febd31e7edbdf6252c' }}
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -90,8 +90,9 @@ jobs:
           release_id=$(git rev-parse --verify HEAD)
           repository=$(tofu -chdir=deploy/gcp output -raw artifact_registry_repository)
           builder=$(tofu -chdir=deploy/gcp output -raw build_service_account)
-          gcloud builds submit . --config deploy/gcp/cloudbuild.yaml \
-            --substitutions="_REPOSITORY=${repository},_RELEASE_ID=${release_id},_BUILD_SERVICE_ACCOUNT=${builder}"
+          deploy/gcp/build-release.sh \
+            "${{ vars.GCP_PROJECT_ID }}" "$repository" "$release_id" \
+            "$builder" "$TF_VAR_app_builder_image"
           application_tag="${repository}/agent-os:${release_id}"
           migration_tag="${repository}/migrations:${release_id}"
           sandbox_tag="${repository}/sandbox:${release_id}"

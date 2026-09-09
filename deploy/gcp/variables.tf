@@ -86,7 +86,7 @@ variable "sandbox_image" {
 variable "app_builder_image" {
   description = "Trusted Cloud Build Docker builder image pinned by sha256 digest."
   type        = string
-  default     = ""
+  default     = "gcr.io/cloud-builders/docker@sha256:3d00b6c1a9b862621c30fc74d4f2abfc62bcbdee631ed3febd31e7edbdf6252c"
 
   validation {
     condition     = !var.activate_services || can(regex("@sha256:[0-9a-f]{64}$", var.app_builder_image))

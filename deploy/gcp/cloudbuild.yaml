@@ -1,27 +1,27 @@
 steps:
-  - name: gcr.io/cloud-builders/docker
+  - name: ${_DOCKER_BUILDER_IMAGE}
     args:
       - build
       - --file=deploy/Dockerfile.v2
       - --tag=${_REPOSITORY}/agent-os:${_RELEASE_ID}
       - .
-  - name: gcr.io/cloud-builders/docker
+  - name: ${_DOCKER_BUILDER_IMAGE}
     args:
       - build
       - --file=deploy/Dockerfile.migrations-v2
       - --tag=${_REPOSITORY}/migrations:${_RELEASE_ID}
       - .
-  - name: gcr.io/cloud-builders/docker
+  - name: ${_DOCKER_BUILDER_IMAGE}
     args:
       - build
       - --file=deploy/Dockerfile.sandbox-v2
       - --tag=${_REPOSITORY}/sandbox:${_RELEASE_ID}
       - .
-  - name: gcr.io/cloud-builders/docker
+  - name: ${_DOCKER_BUILDER_IMAGE}
     args: [push, "${_REPOSITORY}/agent-os:${_RELEASE_ID}"]
-  - name: gcr.io/cloud-builders/docker
+  - name: ${_DOCKER_BUILDER_IMAGE}
     args: [push, "${_REPOSITORY}/migrations:${_RELEASE_ID}"]
-  - name: gcr.io/cloud-builders/docker
+  - name: ${_DOCKER_BUILDER_IMAGE}
     args: [push, "${_REPOSITORY}/sandbox:${_RELEASE_ID}"]
 
 images:
@@ -38,3 +38,4 @@ substitutions:
   _REPOSITORY: required
   _RELEASE_ID: required
   _BUILD_SERVICE_ACCOUNT: required
+  _DOCKER_BUILDER_IMAGE: required

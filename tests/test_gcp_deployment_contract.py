@@ -152,6 +152,21 @@ def test_hosted_sandbox_is_cross_project_secretless_and_network_denied():
     assert "${_REPOSITORY}/sandbox:${_RELEASE_ID}" in build
 
 
+def test_release_build_uses_exact_commit_source_and_only_digest_pinned_steps():
+    build = text("deploy/gcp/cloudbuild.yaml")
+    release = text("deploy/gcp/build-release.sh")
+
+    assert build.count("name: ${_DOCKER_BUILDER_IMAGE}") == 6
+    assert "name: gcr.io/cloud-builders/docker\n" not in build
+    assert "_DOCKER_BUILDER_IMAGE: required" in build
+    assert "git archive --format=tar.gz" in release
+    assert 'git show "${release_id}:deploy/gcp/cloudbuild.yaml"' in release
+    assert 'gcloud builds submit "$source_archive"' in release
+    assert "gcloud builds submit ." not in release
+    assert "@sha256:[0-9a-f]{64}" in release
+    subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/build-release.sh")], check=True)
+
+
 def test_generated_apps_use_a_separate_secretless_origin_and_prefix_scoped_storage_roles():
     main = text("deploy/gcp/main.tf")
     variables = text("deploy/gcp/variables.tf")
@@ -224,7 +239,8 @@ def test_generated_backend_apps_have_a_third_least_privilege_scale_to_zero_plane
     assert 'GCP_APP_PROJECT_ID' in deploy
     assert 'AOS_V2_APP_BUILDER_IMAGE' in deploy
     assert 'TF_VAR_app_project_id: ${{ vars.GCP_APP_PROJECT_ID }}' in workflow
-    assert 'TF_VAR_app_builder_image: ${{ vars.AOS_V2_APP_BUILDER_IMAGE }}' in workflow
+    assert "TF_VAR_app_builder_image:" in workflow
+    assert "gcr.io/cloud-builders/docker@sha256:" in workflow
 
 
 def test_public_domains_terminate_at_a_managed_tls_edge_without_run_app_bypass():

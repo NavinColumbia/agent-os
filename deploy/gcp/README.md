@@ -8,8 +8,8 @@ values in OpenTofu state.
 
 Generated source, build output, and QA evidence use the private artifact bucket through Application Default
 Credentials; no storage key is created. Artifact bytes are immutable generation-guarded GCS objects. Tenant-scoped
-identity, media type, digest, idempotency, and object generation remain in PostgreSQL under RLS. Only the worker can
-create objects; the API and worker can read them, and neither runtime identity can overwrite or delete them.
+identity, media type, digest, idempotency, and object generation remain in PostgreSQL under RLS. The authenticated
+API and worker can create and read objects, but neither runtime identity can overwrite or delete them.
 
 The transactional database is an external managed PostgreSQL service for the bootstrap cell. Its migration URL
 uses a table-owner/admin principal and is readable only by the one-shot migration identity. The system/application

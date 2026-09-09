@@ -247,6 +247,7 @@ resources have been applied yet, and this cell intentionally leaves Cloud SQL/GK
 The same production cell now selects the GCS `ArtifactStore` adapter for both API and worker. Payload bytes are
 uploaded with a create-only generation precondition and checksum verification to an opaque tenant-digest prefix;
 PostgreSQL retains the RLS-scoped identity, digest, media type, idempotency key, and immutable object generation.
-Downloads re-check length and SHA-256 before returning bytes. The worker identity has object creator/viewer while the
-API has viewer only; neither can overwrite or delete objects. Existing inline SQL artifacts remain readable during
+Downloads re-check length and SHA-256 before returning bytes. The API and worker identities have object
+creator/viewer so authenticated uploads and autonomous outputs both work, but neither can overwrite or delete
+objects. Existing inline SQL artifacts remain readable during
 migration. Production fails startup if it is configured back to the capped SQL payload adapter.

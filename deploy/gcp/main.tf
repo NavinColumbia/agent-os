@@ -172,10 +172,15 @@ resource "google_storage_bucket_iam_member" "artifact_readers" {
   member = "serviceAccount:${each.value}"
 }
 
-resource "google_storage_bucket_iam_member" "artifact_writer" {
+resource "google_storage_bucket_iam_member" "artifact_writers" {
+  for_each = {
+    api    = google_service_account.api.email
+    worker = google_service_account.worker.email
+  }
+
   bucket = google_storage_bucket.artifacts.name
   role   = "roles/storage.objectCreator"
-  member = "serviceAccount:${google_service_account.worker.email}"
+  member = "serviceAccount:${each.value}"
 }
 
 resource "google_service_account" "api" {
@@ -405,6 +410,7 @@ resource "google_cloud_run_v2_service" "api" {
     google_secret_manager_secret_iam_member.api,
     google_artifact_registry_repository_iam_member.runtime_readers,
     google_storage_bucket_iam_member.artifact_readers,
+    google_storage_bucket_iam_member.artifact_writers,
   ]
 }
 
@@ -480,6 +486,6 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
     google_secret_manager_secret_iam_member.worker,
     google_artifact_registry_repository_iam_member.runtime_readers,
     google_storage_bucket_iam_member.artifact_readers,
-    google_storage_bucket_iam_member.artifact_writer,
+    google_storage_bucket_iam_member.artifact_writers,
   ]
 }

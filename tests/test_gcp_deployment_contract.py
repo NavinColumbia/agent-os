@@ -54,6 +54,9 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert 'AOS_V2_ARTIFACT_BACKEND                      = "gcs"' in main
     assert 'role   = "roles/storage.objectCreator"' in main
     assert 'role   = "roles/storage.objectViewer"' in main
+    writers = main.split('resource "google_storage_bucket_iam_member" "artifact_writers"', 1)[1]
+    assert "api    = google_service_account.api.email" in writers
+    assert "worker = google_service_account.worker.email" in writers
     subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/deploy.sh")], check=True)
 
 

@@ -92,6 +92,15 @@ def test_launch_preflight_env_file_parser_and_permissions_are_secret_safe(tmp_pa
     assert preflight.read_env_file(path) == {"VALUE": "secret words", "PLAIN": "value"}
 
 
+def test_checked_in_launch_template_fails_closed_until_every_placeholder_is_replaced():
+    values = preflight.read_env_file(ROOT / "deploy" / "gcp" / "launch.env.example")
+    report = preflight.evaluate(values, require_bootstrap_secrets=True)
+    assert report["ok"] is False
+    required = report["checks"][0]
+    assert "GCP_PROJECT_ID" in required["detail"]
+    assert "AOS_V2_MODEL_PROVIDER_KEY" in str(report)
+
+
 def test_launch_preflight_accepts_github_workflow_terraform_aliases():
     canonical = complete_values()
     aliases = {

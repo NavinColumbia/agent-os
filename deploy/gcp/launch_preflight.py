@@ -95,6 +95,11 @@ def read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def _configured(values: Mapping[str, str], key: str) -> bool:
+    value = str(values.get(key, "")).strip()
+    return bool(value) and "CHANGE_ME" not in value
+
+
 def _hostname(value: str) -> bool:
     return (
         value.isascii()
@@ -163,7 +168,7 @@ def evaluate(values: Mapping[str, str], *, require_bootstrap_secrets: bool) -> d
     def add(name: str, ok: bool, detail: str) -> None:
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
-    missing = [key for key in NONSECRET_REQUIRED if not str(values.get(key, "")).strip()]
+    missing = [key for key in NONSECRET_REQUIRED if not _configured(values, key)]
     add(
         "required non-secret configuration",
         not missing,
@@ -278,7 +283,7 @@ def evaluate(values: Mapping[str, str], *, require_bootstrap_secrets: bool) -> d
         "at least one valid Monitoring notification channel",
     )
 
-    missing_secrets = [key for key in BOOTSTRAP_SECRETS if not str(values.get(key, "")).strip()]
+    missing_secrets = [key for key in BOOTSTRAP_SECRETS if not _configured(values, key)]
     if require_bootstrap_secrets:
         add(
             "initial Secret Manager payloads",

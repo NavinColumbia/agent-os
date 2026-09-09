@@ -93,6 +93,15 @@ is offline, never prints a credential value, and names every missing or malforme
 same non-secret check automatically but can reuse existing Secret Manager versions without re-exporting secret
 payloads.
 
+For the simplest secret-safe path, copy `deploy/gcp/launch.env.example` to `.runtime/gcp-launch.env`, replace the
+placeholders, and set mode `600`. Run `deploy/gcp/deploy-from-env.sh`; it verifies file ownership/permissions and the
+redacting bootstrap preflight before sourcing it. After the first successful secret injection, remove secret values
+from that file and use `deploy/gcp/deploy-from-env.sh --reuse-existing-secrets` for later releases. The two
+server-generated tenant/capability secrets never need founder input.
+
+Configure the OIDC SPA callback/logout/web origin as `${AOS_V2_PUBLIC_BASE_URL}/app`. Configure the Stripe webhook
+as `${AOS_V2_PUBLIC_BASE_URL}/v2/billing/webhooks/stripe`; checkout redirects alone never grant an entitlement.
+
 Then run `deploy/gcp/deploy.sh`. On a new cell it creates/version-enables the remote state bucket and bootstraps
 foundation resources without a runtime. On both first and repeat releases it adds only missing secret versions,
 builds all three images in Cloud Build, resolves immutable digests, updates only the migration Job, executes migrations,

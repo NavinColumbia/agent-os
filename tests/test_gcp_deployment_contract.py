@@ -265,3 +265,18 @@ def test_public_domains_terminate_at_a_managed_tls_edge_without_run_app_bypass()
     assert 'output "required_external_dns_records"' in outputs
     assert "edge_check.py" in deploy
     assert "--dns-only --timeout-seconds 0" in deploy
+
+
+def test_owner_only_launch_file_wrapper_runs_redacting_preflight_before_deploy():
+    wrapper = text("deploy/gcp/deploy-from-env.sh")
+    example = text("deploy/gcp/launch.env.example")
+
+    assert 'file_mode=$(stat -c \'%a\' "$environment_file")' in wrapper
+    assert 'file_owner=$(stat -c \'%u\' "$environment_file")' in wrapper
+    assert '[[ ! -f "$environment_file" || -L "$environment_file" ]]' in wrapper
+    assert "--require-bootstrap-secrets" in wrapper
+    assert wrapper.index('"${preflight[@]}"') < wrapper.index('source "$environment_file"')
+    assert "exec deploy/gcp/deploy.sh" in wrapper
+    assert "AOS_V2_STRIPE_WEBHOOK_SECRET=whsec_CHANGE_ME" in example
+    assert "AOS_V2_MODEL_PROVIDER_KEY=sk-proj-CHANGE_ME" in example
+    subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/deploy-from-env.sh")], check=True)

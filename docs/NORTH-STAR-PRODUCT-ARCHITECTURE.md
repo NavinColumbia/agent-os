@@ -511,7 +511,10 @@ unknown provider prices retain the conservative reservation instead of being tre
 prepaid credit/usage-invoice/tax implementation, but it now creates Stripe-hosted subscription Checkout and Portal
 sessions and derives paid plan entitlements only from raw-body verified, idempotent, order-safe Stripe webhooks. A
 verified subscription change reconciles the tenant's pre-provider model-spend ceiling; redirects never grant access
-and production rejects disabled billing or Stripe test keys. It still has overlapping legacy
+and production rejects disabled billing or Stripe test keys. A pinned OpenTofu GCP cell now declares the
+scale-to-zero API, worker pool, ordered migration job, private registry/storage, Secret Manager, least-privilege
+service identities, remote state and repository-ID-bound GitHub federation, but it has not been applied to a real
+cloud account. It still has overlapping legacy
 controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
 signup/invite/organization onboarding (although provider-neutral OIDC/JWKS verification fails closed in production),
 no managed-cloud sandbox/production-deploy/general-subworkflow

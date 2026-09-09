@@ -1,0 +1,114 @@
+name: deploy-gcp
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: Green commit or tag to deploy
+        required: true
+        default: master
+
+concurrency:
+  group: agent-os-production-gcp
+  cancel-in-progress: false
+
+permissions:
+  checks: read
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ vars.GCP_REGION }}
+      TF_VAR_environment: production
+      TF_VAR_public_base_url: ${{ vars.AOS_V2_PUBLIC_BASE_URL }}
+      TF_VAR_state_bucket_name: ${{ vars.GCP_STATE_BUCKET }}
+      TF_VAR_github_repository_id: ${{ github.repository_id }}
+      TF_VAR_oidc_issuer: ${{ vars.AOS_V2_OIDC_ISSUER }}
+      TF_VAR_oidc_audience: ${{ vars.AOS_V2_OIDC_AUDIENCE }}
+      TF_VAR_oidc_jwks_url: ${{ vars.AOS_V2_OIDC_JWKS_URL }}
+      TF_VAR_oidc_authorization_url: ${{ vars.AOS_V2_OIDC_AUTHORIZATION_URL }}
+      TF_VAR_oidc_token_url: ${{ vars.AOS_V2_OIDC_TOKEN_URL }}
+      TF_VAR_oidc_client_id: ${{ vars.AOS_V2_OIDC_CLIENT_ID }}
+      TF_VAR_oidc_scope: ${{ vars.AOS_V2_OIDC_SCOPE }}
+      TF_VAR_oidc_authorization_audience_parameter: ${{ vars.AOS_V2_OIDC_AUTHORIZATION_AUDIENCE_PARAMETER }}
+      TF_VAR_stripe_starter_price_id: ${{ vars.AOS_V2_STRIPE_STARTER_PRICE_ID }}
+      TF_VAR_stripe_growth_price_id: ${{ vars.AOS_V2_STRIPE_GROWTH_PRICE_ID }}
+      TF_VAR_model: ${{ vars.AOS_V2_MODEL }}
+      TF_VAR_database_runtime_role: ${{ vars.AOS_V2_DATABASE_RUNTIME_ROLE }}
+      TF_VAR_model_provider_secret_environment: ${{ vars.AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT }}
+      TF_VAR_activate_services: "true"
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: require green CI for the exact release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_id=$(git rev-parse --verify HEAD)
+          passed=$(gh api "/repos/${GITHUB_REPOSITORY}/commits/${release_id}/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select((.name == "test" or .name == "container") and .conclusion == "success")] | length')
+          test "$passed" -ge 2
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+        with:
+          tofu_version: 1.12.6
+          tofu_wrapper: false
+
+      - name: initialize and validate desired infrastructure
+        run: |
+          tofu -chdir=deploy/gcp init -input=false \
+            -backend-config="bucket=${{ vars.GCP_STATE_BUCKET }}" \
+            -backend-config="prefix=agent-os/production"
+          tofu -chdir=deploy/gcp fmt -check
+          tofu -chdir=deploy/gcp validate -no-color
+
+      - name: build and publish digest-addressed images
+        run: |
+          release_id=$(git rev-parse --verify HEAD)
+          repository=$(tofu -chdir=deploy/gcp output -raw artifact_registry_repository)
+          builder=$(tofu -chdir=deploy/gcp output -raw build_service_account)
+          gcloud builds submit . --config deploy/gcp/cloudbuild.yaml \
+            --substitutions="_REPOSITORY=${repository},_RELEASE_ID=${release_id},_BUILD_SERVICE_ACCOUNT=${builder}"
+          application_tag="${repository}/agent-os:${release_id}"
+          migration_tag="${repository}/migrations:${release_id}"
+          application_digest=$(gcloud artifacts docker images describe "$application_tag" --format='value(image_summary.digest)')
+          migration_digest=$(gcloud artifacts docker images describe "$migration_tag" --format='value(image_summary.digest)')
+          {
+            echo "TF_VAR_release_id=${release_id}"
+            echo "TF_VAR_application_image=${repository}/agent-os@${application_digest}"
+            echo "TF_VAR_migration_image=${repository}/migrations@${migration_digest}"
+          } >> "$GITHUB_ENV"
+
+      - name: migrate before releasing application revisions
+        run: |
+          tofu -chdir=deploy/gcp apply -auto-approve -input=false \
+            -target='google_cloud_run_v2_job.migrate[0]'
+          gcloud run jobs execute agentos-production-migrate \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" --wait
+
+      - name: apply API and worker revisions
+        run: tofu -chdir=deploy/gcp apply -auto-approve -input=false
+
+      - name: verify deployed readiness
+        run: |
+          api_url=$(tofu -chdir=deploy/gcp output -raw api_url)
+          curl --fail --silent --show-error --retry 8 --retry-all-errors \
+            --retry-delay 3 "${api_url}/ready"

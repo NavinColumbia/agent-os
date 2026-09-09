@@ -225,5 +225,21 @@ It starts PostgreSQL, applies only the isolated V2 migrations (86–98), and the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
 actual provider tenant plus its signup/invite/organization configuration, secrets management, production
 deploy/rollback, a hosted
-sandbox/build adapter, large-object storage/garbage collection, usage-invoice export/prepaid credits, and managed-cloud IaC are still launch
+sandbox/build adapter, large-object storage/garbage collection, usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch
 blockers.
+
+## Managed GCP production-cell automation
+
+`deploy/gcp` now contains the first OpenTofu production cell and a credential-late deployment script. It creates a
+scale-to-zero Cloud Run API, manually sized Cloud Run worker pool, digest-pinned one-shot migration Job, private
+Artifact Registry/bucket, separate runtime/build/migration identities, Secret Manager containers, remote versioned
+state, and optional GitHub workload identity bound to the repository's immutable numeric ID. Secret values are added
+out-of-band and never enter OpenTofu state. The migration credential is readable only by the Job; the Job verifies
+that the named application login is non-superuser/non-`BYPASSRLS` before granting the two narrow runtime roles. The
+API cannot read the model key and the worker cannot read Stripe keys. A release executes migrations before it creates
+or updates serving revisions, then checks the deployed health endpoint.
+
+The HCL is pinned to OpenTofu 1.12.6 and Google provider 7.22.x and validates against the real provider schema. The
+migration image is base-digest-pinned, non-root, and locally proven against a clean PostgreSQL instance. No GCP
+resources have been applied yet, and this cell intentionally leaves Cloud SQL/GKE out of the bootstrap bill. See
+`deploy/gcp/README.md` for the exact credential checklist and one-command deploy flow.

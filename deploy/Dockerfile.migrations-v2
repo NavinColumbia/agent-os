@@ -1,0 +1,21 @@
+FROM postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+
+RUN install -d -o root -g root -m 0555 /migrations
+
+COPY --chmod=0444 postgres/initdb/86-lifecycle-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/87-workflow-graphs-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/88-workflow-action-leases-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/89-notifications-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/90-artifacts-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/91-ready-tenant-discovery-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/92-preview-deployments-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/93-preview-capability-lifecycle-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/94-management-watch-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/95-company-directory-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/96-company-proposal-decisions-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/97-usage-meter-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/98-billing-v2.sql /migrations/
+COPY --chmod=0555 deploy/migrate-v2.sh /usr/local/bin/agentos-migrate-v2
+
+USER 999:999
+ENTRYPOINT ["/usr/local/bin/agentos-migrate-v2"]

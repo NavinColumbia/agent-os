@@ -1,0 +1,19 @@
+project_id      = "replace-with-gcp-project-id"
+region          = "us-central1"
+environment     = "production"
+public_base_url = "https://agentos.example.com"
+state_bucket_name = "replace-with-gcp-project-id-agentos-tofu-state"
+
+oidc_issuer            = "https://replace-with-issuer.example.com"
+oidc_audience          = "agent-os-api"
+oidc_jwks_url          = "https://replace-with-issuer.example.com/.well-known/jwks.json"
+oidc_authorization_url = "https://replace-with-issuer.example.com/authorize"
+oidc_token_url         = "https://replace-with-issuer.example.com/oauth/token"
+oidc_client_id         = "replace-with-public-spa-client-id"
+
+stripe_starter_price_id = "price_replace_starter"
+stripe_growth_price_id  = "price_replace_growth"
+
+model                 = "openai:gpt-5-mini"
+database_runtime_role = "agentos_runtime"
+github_repository_id  = "1276674620"

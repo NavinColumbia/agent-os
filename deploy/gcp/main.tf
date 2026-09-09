@@ -80,6 +80,8 @@ locals {
     AOS_V2_OIDC_ALGORITHMS                       = "RS256,ES256"
     AOS_V2_PUBLIC_BASE_URL                       = var.public_base_url
     AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS     = tostring(var.free_model_budget_cents)
+    AOS_V2_ARTIFACT_BACKEND                      = "gcs"
+    AOS_V2_ARTIFACT_MAX_CONTENT_BYTES            = tostring(var.artifact_max_content_bytes)
   }
 
   api_environment = merge(local.common_environment, {
@@ -157,6 +159,23 @@ resource "google_storage_bucket" "artifacts" {
       type = "Delete"
     }
   }
+}
+
+resource "google_storage_bucket_iam_member" "artifact_readers" {
+  for_each = {
+    api    = google_service_account.api.email
+    worker = google_service_account.worker.email
+  }
+
+  bucket = google_storage_bucket.artifacts.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${each.value}"
+}
+
+resource "google_storage_bucket_iam_member" "artifact_writer" {
+  bucket = google_storage_bucket.artifacts.name
+  role   = "roles/storage.objectCreator"
+  member = "serviceAccount:${google_service_account.worker.email}"
 }
 
 resource "google_service_account" "api" {
@@ -361,6 +380,11 @@ resource "google_cloud_run_v2_service" "api" {
         }
       }
 
+      env {
+        name  = "AOS_V2_ARTIFACT_BUCKET"
+        value = google_storage_bucket.artifacts.name
+      }
+
       dynamic "env" {
         for_each = local.api_secret_environment
         content {
@@ -380,6 +404,7 @@ resource "google_cloud_run_v2_service" "api" {
     google_project_service.required,
     google_secret_manager_secret_iam_member.api,
     google_artifact_registry_repository_iam_member.runtime_readers,
+    google_storage_bucket_iam_member.artifact_readers,
   ]
 }
 
@@ -442,6 +467,11 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
           }
         }
       }
+
+      env {
+        name  = "AOS_V2_ARTIFACT_BUCKET"
+        value = google_storage_bucket.artifacts.name
+      }
     }
   }
 
@@ -449,5 +479,7 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
     google_project_service.required,
     google_secret_manager_secret_iam_member.worker,
     google_artifact_registry_repository_iam_member.runtime_readers,
+    google_storage_bucket_iam_member.artifact_readers,
+    google_storage_bucket_iam_member.artifact_writer,
   ]
 }

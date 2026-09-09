@@ -14,7 +14,7 @@ from agent_os.api.app import create_app
 from agent_os.api.auth import Authenticator, HMACTokenIdentity, OIDCTokenIdentity
 from agent_os.application.billing import BillingCatalog, BillingPlan, BillingService
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
-from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
+from agent_os.infrastructure.gcs_artifacts import build_artifact_store
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
@@ -57,6 +57,9 @@ class ServerSettings:
     application_version: str
     public_base_url: str
     preview_ttl_seconds: int
+    artifact_backend: str
+    artifact_bucket: str
+    artifact_max_content_bytes: int
     host: str
     port: int
     create_schema: bool
@@ -221,6 +224,22 @@ class ServerSettings:
         preview_ttl_seconds = int(os.getenv("AOS_V2_PREVIEW_TTL_SECONDS", "604800"))
         if not 60 <= preview_ttl_seconds <= 30 * 24 * 60 * 60:
             raise ValueError("AOS_V2_PREVIEW_TTL_SECONDS must be between 60 and 2592000")
+        artifact_backend = os.getenv(
+            "AOS_V2_ARTIFACT_BACKEND", "gcs" if environment == "production" else "sql",
+        ).strip().lower()
+        if artifact_backend not in {"sql", "gcs"}:
+            raise ValueError("AOS_V2_ARTIFACT_BACKEND must be sql or gcs")
+        if environment == "production" and artifact_backend != "gcs":
+            raise ValueError("production requires AOS_V2_ARTIFACT_BACKEND=gcs")
+        artifact_bucket = os.getenv("AOS_V2_ARTIFACT_BUCKET", "").strip()
+        if artifact_backend == "gcs" and not artifact_bucket:
+            raise ValueError("GCS artifacts require AOS_V2_ARTIFACT_BUCKET")
+        default_artifact_limit = 64 * 1024 * 1024 if artifact_backend == "gcs" else 2 * 1024 * 1024
+        artifact_max_content_bytes = int(os.getenv(
+            "AOS_V2_ARTIFACT_MAX_CONTENT_BYTES", str(default_artifact_limit),
+        ))
+        if not 1 <= artifact_max_content_bytes <= 1024 * 1024 * 1024:
+            raise ValueError("AOS_V2_ARTIFACT_MAX_CONTENT_BYTES must be between 1 and 1073741824")
         return cls(
             environment=environment,
             system_database_url=system_database_url,
@@ -253,6 +272,9 @@ class ServerSettings:
             application_version=os.getenv("AOS_V2_APPLICATION_VERSION", "v2-dev"),
             public_base_url=public_base_url,
             preview_ttl_seconds=preview_ttl_seconds,
+            artifact_backend=artifact_backend,
+            artifact_bucket=artifact_bucket,
+            artifact_max_content_bytes=artifact_max_content_bytes,
             host=os.getenv("AOS_V2_HOST", "127.0.0.1"),
             port=port,
             create_schema=create_schema,
@@ -316,9 +338,12 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(notification_store.close)
-        artifact_store = SQLArtifactStore(
+        artifact_store = build_artifact_store(
             settings.application_database_url,
+            backend=settings.artifact_backend,
+            bucket_name=settings.artifact_bucket,
             create_schema=settings.create_schema,
+            max_content_bytes=settings.artifact_max_content_bytes,
         )
         resources.callback(artifact_store.close)
         usage_meter = SQLUsageMeter(

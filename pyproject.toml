@@ -13,6 +13,7 @@ dependencies = [
   "cryptography==49.0.0",
   "dbos==2.24.0",
   "fastapi==0.138.0",
+  "google-cloud-storage==3.13.1",
   "opentelemetry-api==1.44.0",
   "opentelemetry-sdk==1.44.0",
   "psycopg[binary]==3.3.4",

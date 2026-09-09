@@ -514,7 +514,9 @@ verified subscription change reconciles the tenant's pre-provider model-spend ce
 and production rejects disabled billing or Stripe test keys. A pinned OpenTofu GCP cell now declares the
 scale-to-zero API, worker pool, ordered migration job, private registry/storage, Secret Manager, least-privilege
 service identities, remote state and repository-ID-bound GitHub federation, but it has not been applied to a real
-cloud account. It still has overlapping legacy
+cloud account. Its private bucket is now used by a production GCS `ArtifactStore`: create-only object generations
+hold payload bytes while RLS-protected SQL retains tenant identity/idempotency, and reads verify the recorded
+generation, length, and digest. Production refuses the small inline SQL adapter. It still has overlapping legacy
 controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
 signup/invite/organization onboarding (although provider-neutral OIDC/JWKS verification fails closed in production),
 no managed-cloud sandbox/production-deploy/general-subworkflow

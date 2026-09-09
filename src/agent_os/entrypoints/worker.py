@@ -26,6 +26,7 @@ from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.deployment_tool_nodes import DeploymentToolNodeHandlers
 from agent_os.infrastructure.docker_sandbox import DEFAULT_PYTHON_IMAGE, DockerSandboxRunner
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
+from agent_os.infrastructure.gcs_artifacts import build_artifact_store
 from agent_os.infrastructure.mission_workflows import (
     MissionBootstrapHandler,
     MissionCancellationHandler,
@@ -36,7 +37,6 @@ from agent_os.infrastructure.notification_effects import NotificationEffectHandl
 from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
 from agent_os.infrastructure.sandbox_tool_nodes import SandboxToolNodeHandlers
-from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
@@ -196,9 +196,12 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(notification_store.close)
-        artifact_store = SQLArtifactStore(
+        artifact_store = build_artifact_store(
             settings.server.application_database_url,
+            backend=settings.server.artifact_backend,
+            bucket_name=settings.server.artifact_bucket,
             create_schema=settings.server.create_schema,
+            max_content_bytes=settings.server.artifact_max_content_bytes,
         )
         resources.callback(artifact_store.close)
         usage_meter = SQLUsageMeter(

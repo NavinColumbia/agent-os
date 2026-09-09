@@ -6,6 +6,11 @@ separate least-privilege service accounts, Secret Manager containers, and option
 It deliberately does **not** create GKE, Cloud SQL, public artifact buckets, permanent sandbox capacity, or secret
 values in OpenTofu state.
 
+Generated source, build output, and QA evidence use the private artifact bucket through Application Default
+Credentials; no storage key is created. Artifact bytes are immutable generation-guarded GCS objects. Tenant-scoped
+identity, media type, digest, idempotency, and object generation remain in PostgreSQL under RLS. Only the worker can
+create objects; the API and worker can read them, and neither runtime identity can overwrite or delete them.
+
 The transactional database is an external managed PostgreSQL service for the bootstrap cell. Its migration URL
 uses a table-owner/admin principal and is readable only by the one-shot migration identity. The system/application
 URLs use runtime principals; the application login is validated as non-superuser/non-`BYPASSRLS` and receives only
@@ -76,5 +81,5 @@ scales from zero to a bounded maximum; the worker pool defaults to one instance 
 without discarding durable work.
 
 The GCP plane does not make the current product fully launch-ready by itself. A real domain, OIDC organization
-tenant, Stripe products/webhook, managed PostgreSQL, model key, hosted untrusted sandbox, object-store adapter,
+tenant, Stripe products/webhook, managed PostgreSQL, model key, hosted untrusted sandbox, artifact garbage collector,
 production generated-app deployer, alerts/backups, and an external smoke test must still be configured or proven.

@@ -255,6 +255,83 @@ url = "https://files.pythonhosted.org/packages/48/a1/43fa2a4c5557cd977e83eecec26
 sha256 = "35ac8043dbcf2958488129413bfecba7304fe12a68ad4a78c5b0d15281e82814"
 
 [[packages]]
+name = "google-api-core"
+version = "2.36.0"
+
+[[packages.wheels]]
+name = "google_api_core-2.36.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/44/56/30c91c61b8f70d4c09285a005b94798729aeaf4ec8b90c1c360da8207728/google_api_core-2.36.0-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "e4d0b179260727ea5c42222426d9199285214dbef7bf48f8b16600c7f9a78944"
+
+[[packages]]
+name = "google-auth"
+version = "2.57.1"
+
+[[packages.wheels]]
+name = "google_auth-2.57.1-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/3b/27/0f7247b8002a1404fdb5412aeb15fb0fe70288eb8f88a5873d1c0d8262cf/google_auth-2.57.1-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "ab439dee60a6856412bc058f13a68eb6a59c5b81526bb89cfdcf89ce9c0a48c9"
+
+[[packages]]
+name = "google-cloud-core"
+version = "2.7.0"
+
+[[packages.wheels]]
+name = "google_cloud_core-2.7.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/cb/64/904dbc9bee128e7b87eeb60da67c8fa4d1a8acdc9a45dd2fedca67ef184d/google_cloud_core-2.7.0-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "c18a250904cfdda021eb3ae8b8238c9f9ca272a4cbbfb5cba946b3fe3022eed1"
+
+[[packages]]
+name = "google-cloud-storage"
+version = "3.13.1"
+
+[[packages.wheels]]
+name = "google_cloud_storage-3.13.1-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/06/6f/d69f0e185e08ddb58c323a0a935af2b492907b5de362bc08933b0a3b5644/google_cloud_storage-3.13.1-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "98208de6c21e85cecd3eb44551894efff33d98365500e178867d4305854a770a"
+
+[[packages]]
+name = "google-crc32c"
+version = "1.8.0"
+
+[[packages.wheels]]
+name = "google_crc32c-1.8.0-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl"
+url = "https://files.pythonhosted.org/packages/ce/a9/a780cc66f86335a6019f557a8aaca8fbb970728f0efd2430d15ff1beae0e/google_crc32c-1.8.0-cp312-cp312-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl"
+
+[packages.wheels.hashes]
+sha256 = "14f87e04d613dfa218d6135e81b78272c3b904e2a7053b841481b38a7d901411"
+
+[[packages]]
+name = "google-resumable-media"
+version = "2.10.2"
+
+[[packages.wheels]]
+name = "google_resumable_media-2.10.2-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/55/30/3e976681b5319715ab022363f58f6f8e10f546a1777756fe3ebd918857e4/google_resumable_media-2.10.2-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "e3cedc827a4ea41e216582d74346f1fb9fceb625a8c3c53912f2ca1d663334d7"
+
+[[packages]]
+name = "googleapis-common-protos"
+version = "1.75.3"
+
+[[packages.wheels]]
+name = "googleapis_common_protos-1.75.3-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/1a/7a/7d79170c6ce6f12e109df2b3879d6b934010cf4f99aea8de8b7e5408c174/googleapis_common_protos-1.75.3-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "a018d2bf098ca9fb6faa08d5bb780e2a2c2f73c566f069761331386c9596d3f2"
+
+[[packages]]
 name = "greenlet"
 version = "3.5.5"
 
@@ -541,6 +618,28 @@ url = "https://files.pythonhosted.org/packages/27/6e/80993e10a0482f630cef5286357
 sha256 = "8a02cb259042c79d1cd0450facc2fe6dc9d303ae7901afbe33bf8ea0b188cef6"
 
 [[packages]]
+name = "proto-plus"
+version = "1.28.4"
+
+[[packages.wheels]]
+name = "proto_plus-1.28.4-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/41/5d/0f04b85dafdc3250ced7f2592efc17dce7f40712e941e9632202481e600d/proto_plus-1.28.4-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "4b01341272f8a348db3f003b6143109f83ab43091019d5181b3fcdf500ab32aa"
+
+[[packages]]
+name = "protobuf"
+version = "7.36.1"
+
+[[packages.wheels]]
+name = "protobuf-7.36.1-cp310-abi3-manylinux2014_x86_64.whl"
+url = "https://files.pythonhosted.org/packages/22/df/c799fe7a05ef16ba853a59db01f3a2c5f7d0676469589ccc4874f76a2a88/protobuf-7.36.1-cp310-abi3-manylinux2014_x86_64.whl"
+
+[packages.wheels.hashes]
+sha256 = "97198b77e369a0abd8e262b8f6c7266c55ddb796a3a12c76d7b8881188ed83aa"
+
+[[packages]]
 name = "psycopg"
 version = "3.3.4"
 
@@ -583,6 +682,28 @@ url = "https://files.pythonhosted.org/packages/f6/95/b8ba862968712caa12a19666175
 
 [packages.wheels.hashes]
 sha256 = "ab862adbcb8c72547d1c57821f22cbbb71ab86509039c96f36e914e0336c8dd7"
+
+[[packages]]
+name = "pyasn1"
+version = "0.6.4"
+
+[[packages.wheels]]
+name = "pyasn1-0.6.4-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/9a/3b/6163796d69c3977d1e4287bea4a6979161cbbdd170ebb430511e8e1999ce/pyasn1-0.6.4-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b"
+
+[[packages]]
+name = "pyasn1-modules"
+version = "0.4.2"
+
+[[packages.wheels]]
+name = "pyasn1_modules-0.4.2-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/47/8d/d529b5d697919ba8c11ad626e835d4039be708a35b0d22de83a269a6682c/pyasn1_modules-0.4.2-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "29253a9207ce32b64c3ac6600edc75368f98473906e8fd1043bd6b5b1de2c14a"
 
 [[packages]]
 name = "pycparser"

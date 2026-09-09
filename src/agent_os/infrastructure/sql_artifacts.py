@@ -21,6 +21,7 @@ from sqlalchemy import (
     Table,
     and_,
     create_engine,
+    inspect,
     insert,
     select,
     text,
@@ -47,7 +48,9 @@ artifacts = Table(
     Column("digest", String(64), nullable=False),
     Column("byte_length", BigInteger, nullable=False),
     Column("media_type", String(256), nullable=False),
-    Column("content", LargeBinary, nullable=False),
+    Column("content", LargeBinary, nullable=True),
+    Column("storage_backend", String(32), nullable=False, default="inline"),
+    Column("object_name", String(512), nullable=True),
     Column("record", JSON, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
 )
@@ -104,6 +107,26 @@ class SQLArtifactStore(ArtifactStore):
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         if create_schema:
             artifact_metadata.create_all(self._engine)
+            self._upgrade_development_sqlite_schema()
+
+    def _upgrade_development_sqlite_schema(self) -> None:
+        """Keep existing local V2 databases usable after the external-store migration."""
+        if self._engine.dialect.name != "sqlite":
+            return
+        columns = {
+            str(column["name"])
+            for column in inspect(self._engine).get_columns("aos_v2_artifacts")
+        }
+        with self._engine.begin() as connection:
+            if "storage_backend" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE aos_v2_artifacts ADD COLUMN storage_backend "
+                    "VARCHAR(32) NOT NULL DEFAULT 'inline'"
+                )
+            if "object_name" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE aos_v2_artifacts ADD COLUMN object_name VARCHAR(512)"
+                )
 
     @contextmanager
     def _tenant_connection(self, tenant_id: str):
@@ -140,6 +163,27 @@ class SQLArtifactStore(ArtifactStore):
         media_type: str,
         idempotency_key: str,
     ) -> str:
+        prepared = self._prepare_put(
+            organization_id=organization_id,
+            content=content,
+            media_type=media_type,
+            idempotency_key=idempotency_key,
+        )
+        return self._persist_prepared(
+            prepared,
+            content=content,
+            storage_backend="inline",
+            object_name=None,
+        )
+
+    def _prepare_put(
+        self,
+        *,
+        organization_id: str,
+        content: bytes,
+        media_type: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
         if not isinstance(content, bytes):
             raise TypeError("artifact content must be bytes")
         media_type = media_type.strip().lower()
@@ -150,7 +194,7 @@ class SQLArtifactStore(ArtifactStore):
             raise ValueError("artifact media type is invalid")
         if len(content) > self._max_content_bytes:
             raise ValueError(
-                f"artifact exceeds the {self._max_content_bytes}-byte bootstrap store limit"
+                f"artifact exceeds the {self._max_content_bytes}-byte store limit"
             )
         fingerprint = _fingerprint(media_type, content)
         artifact_id = f"artifact-{fingerprint}"
@@ -158,14 +202,49 @@ class SQLArtifactStore(ArtifactStore):
         created_at = self._clock()
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
-        record = {
+        return {
+            "organization_id": organization_id,
+            "idempotency_key": idempotency_key,
+            "fingerprint": fingerprint,
             "artifact_id": artifact_id,
-            "tenant_id": organization_id,
             "digest": digest,
             "byte_length": len(content),
             "media_type": media_type,
-            "created_at": created_at.isoformat(),
+            "created_at": created_at,
+            "record": {
+                "artifact_id": artifact_id,
+                "tenant_id": organization_id,
+                "digest": digest,
+                "byte_length": len(content),
+                "media_type": media_type,
+                "created_at": created_at.isoformat(),
+            },
         }
+
+    def _find_write(
+        self, organization_id: str, idempotency_key: str,
+    ) -> Mapping[str, Any] | None:
+        with self._tenant_connection(organization_id) as connection:
+            return connection.execute(select(
+                artifact_writes.c.artifact_id,
+                artifact_writes.c.fingerprint,
+            ).where(and_(
+                artifact_writes.c.tenant_id == organization_id,
+                artifact_writes.c.idempotency_key == idempotency_key,
+            ))).mappings().one_or_none()
+
+    def _persist_prepared(
+        self,
+        prepared: Mapping[str, Any],
+        *,
+        content: bytes | None,
+        storage_backend: str,
+        object_name: str | None,
+    ) -> str:
+        organization_id = str(prepared["organization_id"])
+        idempotency_key = str(prepared["idempotency_key"])
+        fingerprint = str(prepared["fingerprint"])
+        artifact_id = str(prepared["artifact_id"])
         request_key = and_(
             artifact_writes.c.tenant_id == organization_id,
             artifact_writes.c.idempotency_key == idempotency_key,
@@ -183,28 +262,35 @@ class SQLArtifactStore(ArtifactStore):
                 self._insert_artifact(connection, {
                     "tenant_id": organization_id,
                     "artifact_id": artifact_id,
-                    "digest": digest,
-                    "byte_length": len(content),
-                    "media_type": media_type,
+                    "digest": prepared["digest"],
+                    "byte_length": prepared["byte_length"],
+                    "media_type": prepared["media_type"],
                     "content": content,
-                    "record": record,
-                    "created_at": created_at,
+                    "storage_backend": storage_backend,
+                    "object_name": object_name,
+                    "record": prepared["record"],
+                    "created_at": prepared["created_at"],
                 })
                 existing = connection.execute(select(
                     artifacts.c.digest,
                     artifacts.c.media_type,
+                    artifacts.c.storage_backend,
+                    artifacts.c.object_name,
                 ).where(and_(
                     artifacts.c.tenant_id == organization_id,
                     artifacts.c.artifact_id == artifact_id,
                 ))).mappings().one()
-                if existing["digest"] != digest or existing["media_type"] != media_type:
+                if (
+                    existing["digest"] != prepared["digest"]
+                    or existing["media_type"] != prepared["media_type"]
+                ):
                     raise ValueError("artifact content-address collision")
                 connection.execute(insert(artifact_writes).values(
                     tenant_id=organization_id,
                     idempotency_key=idempotency_key,
                     artifact_id=artifact_id,
                     fingerprint=fingerprint,
-                    created_at=created_at,
+                    created_at=prepared["created_at"],
                 ))
         except IntegrityError as exc:
             # A competing replica may commit the same request key first.
@@ -222,11 +308,31 @@ class SQLArtifactStore(ArtifactStore):
 
     def get(self, organization_id: str, artifact_id: str) -> bytes | None:
         with self._tenant_connection(organization_id) as connection:
-            value = connection.execute(select(artifacts.c.content).where(and_(
+            value = connection.execute(select(
+                artifacts.c.content,
+                artifacts.c.storage_backend,
+            ).where(and_(
                 artifacts.c.tenant_id == organization_id,
                 artifacts.c.artifact_id == artifact_id,
-            ))).scalar_one_or_none()
-        return None if value is None else bytes(value)
+            ))).mappings().one_or_none()
+        if value is None:
+            return None
+        if value["storage_backend"] != "inline" or value["content"] is None:
+            raise RuntimeError("artifact payload requires the configured external store")
+        return bytes(value["content"])
+
+    def _load_artifact(self, organization_id: str, artifact_id: str) -> Mapping[str, Any] | None:
+        with self._tenant_connection(organization_id) as connection:
+            value = connection.execute(select(
+                artifacts.c.content,
+                artifacts.c.storage_backend,
+                artifacts.c.object_name,
+                artifacts.c.record,
+            ).where(and_(
+                artifacts.c.tenant_id == organization_id,
+                artifacts.c.artifact_id == artifact_id,
+            ))).mappings().one_or_none()
+        return value
 
     def describe(self, organization_id: str, artifact_id: str) -> Mapping[str, Any] | None:
         with self._tenant_connection(organization_id) as connection:

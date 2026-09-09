@@ -140,6 +140,17 @@ variable "growth_model_budget_cents" {
   default = 250000
 }
 
+variable "artifact_max_content_bytes" {
+  description = "Per-artifact in-memory admission ceiling for this bootstrap adapter."
+  type        = number
+  default     = 67108864
+
+  validation {
+    condition     = var.artifact_max_content_bytes >= 1 && var.artifact_max_content_bytes <= 1073741824
+    error_message = "artifact_max_content_bytes must be between 1 byte and 1 GiB."
+  }
+}
+
 variable "model" {
   description = "Explicit PydanticAI provider:model selected for the worker."
   type        = string

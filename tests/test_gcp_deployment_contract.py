@@ -17,7 +17,7 @@ def test_migration_image_is_digest_pinned_non_root_complete_and_admin_isolated()
     dockerfile = text("deploy/Dockerfile.migrations-v2")
     assert "FROM postgres:16@sha256:" in dockerfile
     assert "USER 999:999" in dockerfile
-    for revision in range(86, 99):
+    for revision in range(86, 100):
         assert dockerfile.count(f"postgres/initdb/{revision}-") == 1
 
     script = text("deploy/migrate-v2.sh")
@@ -51,6 +51,9 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert "model_provider_key" not in api_secrets
     assert "migration_database_url" not in worker_secrets
     assert "migration_database_url" not in api_secrets
+    assert 'AOS_V2_ARTIFACT_BACKEND                      = "gcs"' in main
+    assert 'role   = "roles/storage.objectCreator"' in main
+    assert 'role   = "roles/storage.objectViewer"' in main
     subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/deploy.sh")], check=True)
 
 

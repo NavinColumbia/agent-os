@@ -19,6 +19,8 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
         "AOS_V2_STRIPE_WEBHOOK_SECRET", "AOS_V2_STRIPE_STARTER_PRICE_ID",
         "AOS_V2_STRIPE_GROWTH_PRICE_ID", "AOS_V2_STRIPE_STARTER_MODEL_BUDGET_CENTS",
         "AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS", "AOS_V2_STRIPE_API_VERSION",
+        "AOS_V2_ARTIFACT_BACKEND", "AOS_V2_ARTIFACT_BUCKET",
+        "AOS_V2_ARTIFACT_MAX_CONTENT_BYTES",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = ServerSettings.from_env()
@@ -32,6 +34,9 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
     assert settings.preview_ttl_seconds == 604800
     assert settings.tenant_monthly_model_budget_cents == 10000
     assert settings.billing_mode == "disabled"
+    assert settings.artifact_backend == "sql"
+    assert settings.artifact_bucket == ""
+    assert settings.artifact_max_content_bytes == 2 * 1024 * 1024
 
 
 def test_production_fails_closed_without_postgres_migrations_and_strong_secret(monkeypatch):
@@ -87,11 +92,15 @@ def test_production_fails_closed_without_postgres_migrations_and_strong_secret(m
     monkeypatch.setenv("AOS_V2_STRIPE_WEBHOOK_SECRET", "whsec_production_settings")
     monkeypatch.setenv("AOS_V2_STRIPE_STARTER_PRICE_ID", "price_starter")
     monkeypatch.setenv("AOS_V2_STRIPE_GROWTH_PRICE_ID", "price_growth")
+    with pytest.raises(ValueError, match="ARTIFACT_BUCKET"):
+        ServerSettings.from_env()
+    monkeypatch.setenv("AOS_V2_ARTIFACT_BUCKET", "example-agentos-artifacts")
     settings = ServerSettings.from_env()
     assert settings.public_base_url == "https://agent-os.example.test"
     assert settings.identity_mode == "oidc"
     assert settings.auth_secret == ""
     assert settings.billing_mode == "stripe"
+    assert settings.artifact_backend == "gcs"
 
     monkeypatch.setenv("AOS_V2_IDENTITY_MODE", "hmac")
     with pytest.raises(ValueError, match="production requires"):

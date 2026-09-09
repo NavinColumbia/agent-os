@@ -13,6 +13,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
         "AOS_V2_PUBLIC_BASE_URL", "AOS_V2_PREVIEW_TTL_SECONDS",
         "AOS_V2_IDENTITY_MODE", "AOS_V2_CAPABILITY_SECRET", "AOS_V2_OIDC_ISSUER",
         "AOS_V2_OIDC_AUDIENCE", "AOS_V2_OIDC_JWKS_URL",
+        "AOS_V2_OIDC_AUTHORIZATION_URL", "AOS_V2_OIDC_TOKEN_URL", "AOS_V2_OIDC_CLIENT_ID",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = ServerSettings.from_env()
@@ -36,6 +37,9 @@ def test_production_fails_closed_without_postgres_migrations_and_strong_secret(m
     monkeypatch.delenv("AOS_V2_OIDC_ISSUER", raising=False)
     monkeypatch.delenv("AOS_V2_OIDC_AUDIENCE", raising=False)
     monkeypatch.delenv("AOS_V2_OIDC_JWKS_URL", raising=False)
+    monkeypatch.delenv("AOS_V2_OIDC_AUTHORIZATION_URL", raising=False)
+    monkeypatch.delenv("AOS_V2_OIDC_TOKEN_URL", raising=False)
+    monkeypatch.delenv("AOS_V2_OIDC_CLIENT_ID", raising=False)
     with pytest.raises(ValueError, match="system database must be PostgreSQL"):
         ServerSettings.from_env()
 
@@ -53,6 +57,9 @@ def test_production_fails_closed_without_postgres_migrations_and_strong_secret(m
     monkeypatch.setenv("AOS_V2_OIDC_ISSUER", "https://identity.example.test")
     monkeypatch.setenv("AOS_V2_OIDC_AUDIENCE", "agent-os-api")
     monkeypatch.setenv("AOS_V2_OIDC_JWKS_URL", "https://identity.example.test/jwks.json")
+    monkeypatch.setenv("AOS_V2_OIDC_AUTHORIZATION_URL", "https://identity.example.test/authorize")
+    monkeypatch.setenv("AOS_V2_OIDC_TOKEN_URL", "https://identity.example.test/oauth/token")
+    monkeypatch.setenv("AOS_V2_OIDC_CLIENT_ID", "agent-os-browser")
     monkeypatch.setenv("AOS_V2_PUBLIC_BASE_URL", "http://agent-os.example.test")
     with pytest.raises(ValueError, match="must use HTTPS"):
         ServerSettings.from_env()

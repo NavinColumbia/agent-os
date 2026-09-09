@@ -5,6 +5,7 @@ import hashlib
 from typing import Any, Mapping
 
 from fastapi.testclient import TestClient
+import pytest
 
 from agent_os.api.app import create_app
 from agent_os.application.mission import mission_planning_run_id
@@ -36,6 +37,49 @@ def client() -> TestClient:
     return TestClient(create_app(engine=InMemoryWorkflowEngine(), identity=FakeIdentity()))
 
 
+def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
+    api = client()
+    root = api.get("/", follow_redirects=False)
+    assert root.status_code == 307
+    assert root.headers["location"] == "/app"
+    page = api.get("/app")
+    assert page.status_code == 200
+    assert "CEO Workspace" in page.text
+    assert "unsafe-inline" not in page.headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    assert api.get("/assets/ceo.css").status_code == 200
+    assert api.get("/assets/ceo.js").status_code == 200
+    assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
+    assert api.get("/v2/runs").status_code == 401
+
+
+def test_ceo_workspace_publishes_only_validated_public_oidc_pkce_configuration():
+    config = {
+        "identity_mode": "oidc",
+        "authorization_url": "https://identity.example.test/authorize",
+        "token_url": "https://tokens.example.test/oauth/token",
+        "client_id": "public-browser-client",
+        "scope": "openid profile email",
+        "audience": "agent-os-api",
+        "authorization_audience_parameter": "audience",
+        "redirect_uri": "https://app.example.test/app",
+    }
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+        client_identity_config=config,
+    ))
+    response = api.get("/v2/client-config")
+    assert response.json() == config
+    assert response.headers["cache-control"] == "no-store"
+    assert "https://tokens.example.test" in api.get("/app").headers["content-security-policy"]
+
+    with pytest.raises(ValueError, match="audience parameter"):
+        create_app(
+            engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+            client_identity_config={**config, "authorization_audience_parameter": "bad; connect-src *"},
+        )
+
+
 def test_directive_is_tenant_bound_idempotent_and_immediately_enters_research():
     api = client()
     headers = {"Authorization": "Bearer org-a", "Idempotency-Key": "request-123"}
@@ -51,6 +95,35 @@ def test_directive_is_tenant_bound_idempotent_and_immediately_enters_research():
     assert state.status_code == 200
     assert state.json()["phase"] == "research"
     assert state.json()["version"] == 1
+    assert state.json()["objective"] == "Build my application"
+
+
+def test_run_inventory_is_tenant_bound_bounded_and_keeps_objectives_compact():
+    api = client()
+    for tenant, suffix in (("org-a", "first"), ("org-b", "hidden"), ("org-a", "latest")):
+        response = api.post(
+            "/v2/runs",
+            headers={
+                "Authorization": f"Bearer {tenant}",
+                "Idempotency-Key": f"request-inventory-{suffix}",
+            },
+            json={"prompt": f"Build the {suffix} product", "title": suffix.title()},
+        )
+        assert response.status_code == 202
+
+    inventory = api.get("/v2/runs?limit=1", headers={"Authorization": "Bearer org-a"})
+    assert inventory.status_code == 200
+    assert inventory.json()["items"] == [{
+        "run_id": inventory.json()["items"][0]["run_id"],
+        "title": "Latest",
+        "objective_preview": "Build the latest product",
+        "phase": "research",
+        "status": "active",
+        "version": 1,
+        "verification_cycle": 0,
+        "artifact_revision": None,
+    }]
+    assert "hidden" not in str(inventory.json())
 
 
 def test_tenant_isolation_comes_from_identity_not_request_headers():

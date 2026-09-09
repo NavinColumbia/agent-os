@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Agent OS — CEO Workspace</title>
+  <link rel="stylesheet" href="/assets/ceo.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <div id="auth-gate" class="auth-gate">
+    <section class="auth-card" aria-labelledby="auth-title">
+      <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <p class="eyebrow">AGENT OS</p>
+      <h1 id="auth-title">Your company,<br>in one workspace.</h1>
+      <p class="muted">Set the objective. Your governed AI organization plans, executes, verifies, and reports back.</p>
+      <button id="oidc-login" class="primary wide hidden" type="button">Continue securely</button>
+      <form id="token-form" class="token-form hidden">
+        <label for="token-input">Local evaluation token</label>
+        <div class="token-row">
+          <input id="token-input" type="password" autocomplete="off" placeholder="aosv2.…" required>
+          <button class="primary" type="submit">Connect</button>
+        </div>
+        <p class="fineprint">The token stays in this tab's memory and is never written to browser storage.</p>
+      </form>
+      <p id="auth-status" class="status-line" role="status" aria-live="polite">Preparing secure access…</p>
+    </section>
+  </div>
+
+  <div id="workspace" class="workspace hidden">
+    <aside class="sidebar">
+      <a class="brand" href="#missions" aria-label="Agent OS home">
+        <div class="brand-mark compact" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div><strong>Agent OS</strong><small>CEO workspace</small></div>
+      </a>
+      <nav aria-label="Workspace">
+        <button class="nav-item active" data-view="missions" type="button"><span>◫</span>Missions</button>
+        <button class="nav-item" data-view="company" type="button"><span>⌘</span>Company</button>
+        <button class="nav-item" data-view="inbox" type="button"><span>◇</span>Inbox <b id="inbox-count" class="count hidden">0</b></button>
+        <button class="nav-item" data-view="previews" type="button"><span>↗</span>Releases</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="connection"><i></i><span>Control plane connected</span></div>
+        <button id="disconnect" class="quiet" type="button">Disconnect</button>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">COMMAND CENTER</p>
+          <h2 id="view-title">Missions</h2>
+        </div>
+        <div class="top-actions">
+          <span id="last-refresh" class="muted small">Not refreshed</span>
+          <button id="refresh" class="icon-button" type="button" aria-label="Refresh current view">↻</button>
+          <div class="avatar" aria-label="Signed in">CEO</div>
+        </div>
+      </header>
+
+      <div id="flash" class="flash hidden" role="status" aria-live="polite"></div>
+
+      <section id="missions-view" class="view">
+        <form id="directive-form" class="composer panel">
+          <div class="composer-copy">
+            <span class="pulse"></span>
+            <div>
+              <label for="directive">What should your company accomplish?</label>
+              <p>Describe the outcome, constraints, budget, and what “done” means. The team will shape the execution plan.</p>
+            </div>
+          </div>
+          <input id="directive-title" maxlength="200" placeholder="Mission name (optional)" aria-label="Mission name">
+          <textarea id="directive" maxlength="50000" rows="4" placeholder="Build and launch…" required></textarea>
+          <div class="composer-actions">
+            <span id="directive-count">0 / 50,000</span>
+            <button class="primary" type="submit"><span>Start mission</span><b>→</b></button>
+          </div>
+        </form>
+
+        <div id="mission-stats" class="stats" aria-label="Mission summary"></div>
+        <div class="section-heading"><div><p class="eyebrow">PORTFOLIO</p><h3>Recent missions</h3></div></div>
+        <div id="missions-list" class="mission-list"><div class="empty">Loading missions…</div></div>
+      </section>
+
+      <section id="company-view" class="view hidden">
+        <div id="company-summary" class="stats"></div>
+        <div class="section-heading"><div><p class="eyebrow">ORGANIZATION</p><h3>Standing team</h3></div></div>
+        <div id="company-content" class="panel content-panel"><div class="empty">Loading company…</div></div>
+      </section>
+
+      <section id="inbox-view" class="view hidden">
+        <div class="section-heading"><div><p class="eyebrow">ATTENTION</p><h3>Company inbox</h3></div></div>
+        <div id="inbox-content" class="stack"><div class="empty">Loading messages…</div></div>
+      </section>
+
+      <section id="previews-view" class="view hidden">
+        <div class="section-heading"><div><p class="eyebrow">DELIVERABLES</p><h3>Published previews</h3></div></div>
+        <div id="previews-content" class="card-grid"><div class="empty">Loading releases…</div></div>
+      </section>
+    </main>
+
+    <aside id="mission-drawer" class="drawer" aria-label="Mission details" aria-hidden="true">
+      <div class="drawer-head">
+        <div><p class="eyebrow">MISSION CONTROL</p><h3 id="drawer-title">Mission</h3></div>
+        <button id="drawer-close" class="icon-button" type="button" aria-label="Close mission details">×</button>
+      </div>
+      <div id="drawer-content" class="drawer-content"></div>
+    </aside>
+  </div>
+  <script src="/assets/ceo.js" defer></script>
+</body>
+</html>

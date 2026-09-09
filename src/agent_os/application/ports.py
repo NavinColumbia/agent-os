@@ -94,6 +94,13 @@ class WorkflowEngine(Protocol):
 
     def get_run(self, organization_id: str, run_id: str) -> LifecycleState | None: ...
 
+    def list_runs(
+        self,
+        organization_id: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[LifecycleState, ...]: ...
+
     def cancel_run(
         self,
         organization_id: str,

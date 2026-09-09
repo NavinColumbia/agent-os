@@ -74,6 +74,28 @@ def test_start_run_can_atomically_accept_the_initial_directive(engine):
     assert activity[0]["payload"]["outcome"] == "Build a human-governed Jira engineering team"
 
 
+def test_run_inventory_is_ordered_bounded_and_tenant_scoped(engine):
+    for tenant_id, run_id, title in (
+        ("org-1", "run-first", "First"),
+        ("org-2", "run-hidden", "Hidden"),
+        ("org-1", "run-latest", "Latest"),
+    ):
+        receipt = engine.start_run(
+            LifecycleState(run_id=run_id, organization_id=tenant_id),
+            Event(
+                f"scope-{run_id}", EventKind.SCOPE_ACCEPTED, 0,
+                {"title": title, "prompt": f"Build {title.lower()}"},
+            ),
+        )
+        engine.get_result(receipt.workflow_id)
+
+    visible = engine.list_runs("org-1", limit=1)
+    assert len(visible) == 1
+    assert visible[0].run_id == "run-latest"
+    assert visible[0].title == "Latest"
+    assert all(item.organization_id == "org-1" for item in engine.list_runs("org-1"))
+
+
 def test_dbos_adapter_fences_tenants_versions_and_conflicting_event_ids(engine):
     initial = LifecycleState(run_id="same-run", organization_id="org-a")
     receipt = engine.start_run(initial)

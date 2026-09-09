@@ -103,6 +103,8 @@ class LifecycleState:
     phase: LifecyclePhase = LifecyclePhase.INTAKE
     status: LifecycleStatus = LifecycleStatus.ACTIVE
     version: int = 0
+    title: str | None = None
+    objective: str | None = None
     wait: WaitState | None = None
     failure: Failure | None = None
     artifact_revision: str | None = None
@@ -114,6 +116,10 @@ class LifecycleState:
             raise ValueError("run_id and organization_id are required")
         if self.version < 0 or self.verification_cycle < 0:
             raise ValueError("version and verification_cycle cannot be negative")
+        if self.title is not None and (not self.title.strip() or len(self.title) > 200):
+            raise ValueError("lifecycle title must contain 1 to 200 characters")
+        if self.objective is not None and (not self.objective.strip() or len(self.objective) > 50_000):
+            raise ValueError("lifecycle objective must contain 1 to 50000 characters")
         if (self.status is LifecycleStatus.WAITING) != (self.wait is not None):
             raise ValueError("wait details exist if and only if status is waiting")
         if (self.status is LifecycleStatus.FAILED) != (self.failure is not None):
@@ -131,6 +137,8 @@ class LifecycleState:
             "phase": self.phase.value,
             "status": self.status.value,
             "version": self.version,
+            "title": self.title,
+            "objective": self.objective,
             "wait": None if self.wait is None else {
                 "kind": self.wait.kind.value,
                 "correlation_id": self.wait.correlation_id,
@@ -158,6 +166,8 @@ class LifecycleState:
             phase=LifecyclePhase(str(raw.get("phase", LifecyclePhase.INTAKE.value))),
             status=LifecycleStatus(str(raw.get("status", LifecycleStatus.ACTIVE.value))),
             version=int(raw.get("version", 0)),
+            title=raw.get("title"),
+            objective=raw.get("objective"),
             wait=None if wait_raw is None else WaitState(
                 kind=WaitKind(str(wait_raw["kind"])),
                 correlation_id=str(wait_raw["correlation_id"]),
@@ -425,6 +435,13 @@ def evolve(state: LifecycleState, event: Event) -> Transition:
     if forward is not None:
         phase, command = forward
         changes: dict[str, Any] = {"phase": phase}
+        if event.kind is EventKind.SCOPE_ACCEPTED:
+            prompt = event.payload.get("prompt")
+            title = event.payload.get("title")
+            if isinstance(prompt, str) and prompt.strip():
+                changes["objective"] = prompt.strip()
+            if isinstance(title, str) and title.strip():
+                changes["title"] = title.strip()
         if event.kind is EventKind.BUILD_COMPLETED:
             changes["artifact_revision"] = _required_text(event.payload, "artifact_revision")
         return _commit(

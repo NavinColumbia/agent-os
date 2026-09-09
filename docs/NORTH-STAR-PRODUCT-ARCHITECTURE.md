@@ -503,9 +503,12 @@ path without provider spend; the earlier live-provider mission proof separately 
 CEO cancellation now propagates into both planning and execution graphs, blocks late bootstrap/launch work, and
 is race-safe and idempotent rather than being only a top-level status change.
 Workers can discover due tenants through a narrow scheduling-only database role while retaining tenant-RLS claims
-and round-robin fairness. It still has overlapping legacy controllers, local-host assumptions, unfinished public
-infrastructure, no hosted identity signup/session/invite UI (although provider-neutral OIDC/JWKS access-token
-verification now fails closed in production), no managed-cloud sandbox/production-deploy/general-subworkflow
+and round-robin fairness. A packaged responsive CEO workspace now consumes the real tenant-scoped mission,
+management, company, notification, staffing-decision, cancellation, and preview APIs; hosted mode uses an external
+OIDC authorization-code/PKCE flow and keeps access tokens in page memory. It still has overlapping legacy
+controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
+signup/invite/organization onboarding (although provider-neutral OIDC/JWKS verification fails closed in production),
+no managed-cloud sandbox/production-deploy/general-subworkflow
 adapters, and no complete
 new-customer-browser-to-production-URL vertical.
 This is a real durable execution spine, not yet the finished platform.

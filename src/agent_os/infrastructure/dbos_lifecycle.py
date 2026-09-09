@@ -457,6 +457,22 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
             ))).scalar_one_or_none()
         return None if raw is None else LifecycleState.from_dict(raw)
 
+    def list_runs(
+        self,
+        organization_id: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[LifecycleState, ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("run list limit must be between 1 and 500")
+        with self._tenant_connection(organization_id) as connection:
+            raw = connection.execute(
+                select(runs.c.state).where(
+                    runs.c.organization_id == organization_id
+                ).order_by(runs.c.updated_at.desc(), runs.c.run_id.desc()).limit(limit)
+            ).scalars().all()
+        return tuple(LifecycleState.from_dict(item) for item in raw)
+
     def cancel_run(
         self,
         organization_id: str,

@@ -171,6 +171,15 @@ and maps configurable organization/role claims only after signature validation. 
 header or an access token from a browser cookie. `AOS_V2_CAPABILITY_SECRET` independently signs public preview
 capabilities and must not be reused as a local-token secret in production.
 
+`/app` now serves the packaged CEO workspace from the same origin as the control API. In OIDC mode its public
+configuration uses authorization code + PKCE and keeps the resulting bearer credential only in page memory; in
+local/BYOC mode it accepts the local evaluation token without persisting it in browser storage. The workspace can
+start and list tenant missions, inspect the lifecycle/mission/management projections, observe manager signals and
+materialized work, cancel a mission, select the team and manager for an approved AI staffing proposal, and view the
+standing company, notification inbox, and published previews. Its CSP permits API traffic to self and the single
+validated token origin, with no inline script/style execution or framing. `GET /v2/runs` is tenant-scoped and returns
+bounded summaries; the full directive is available only from the authenticated single-run view.
+
 With no static allowlist, staging/production workers use the narrow `agentos_worker` database role to discover
 only tenant IDs with due or abandoned queue work. That role receives column-level access to scheduling metadata,
 not customer command/action payloads. Actual claims and mutations still enter the existing `agentos_app` tenant
@@ -188,7 +197,8 @@ docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --bui
 ```
 
 It starts PostgreSQL, applies only the isolated V2 migrations (86–96), and then starts the API and worker from the
-exact same non-root image. Hosted OIDC access-token verification is implemented, but provider signup/session/invite
-UX, secrets management, production deploy/rollback, a hosted
+exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
+actual provider tenant plus its signup/invite/organization configuration, secrets management, production
+deploy/rollback, a hosted
 sandbox/build adapter, large-object storage/garbage collection, metering, and managed-cloud IaC are still launch
 blockers.

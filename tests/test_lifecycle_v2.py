@@ -79,8 +79,13 @@ def test_happy_path_is_small_monotonic_and_emits_one_command_per_boundary():
 
 def test_dynamic_mission_graph_can_project_directly_to_verified_completion():
     state = new_state()
-    state, commands = apply(state, EventKind.SCOPE_ACCEPTED, prompt="Build an application")
+    state, commands = apply(
+        state, EventKind.SCOPE_ACCEPTED,
+        prompt="Build an application", title="Customer portal",
+    )
     assert commands[0].kind is CommandKind.START_MISSION
+    assert state.objective == "Build an application"
+    assert state.title == "Customer portal"
 
     state, commands = apply(
         state,

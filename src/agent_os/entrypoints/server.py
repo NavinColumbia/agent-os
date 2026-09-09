@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 
@@ -35,6 +36,11 @@ class ServerSettings:
     oidc_algorithms: tuple[str, ...]
     oidc_leeway_seconds: int
     oidc_maximum_token_lifetime_seconds: int
+    oidc_authorization_url: str
+    oidc_token_url: str
+    oidc_client_id: str
+    oidc_scope: str
+    oidc_authorization_audience_parameter: str
     application_version: str
     public_base_url: str
     preview_ttl_seconds: int
@@ -78,6 +84,13 @@ class ServerSettings:
         oidc_maximum_token_lifetime_seconds = int(
             os.getenv("AOS_V2_OIDC_MAXIMUM_TOKEN_LIFETIME_SECONDS", "86400")
         )
+        oidc_authorization_url = os.getenv("AOS_V2_OIDC_AUTHORIZATION_URL", "").strip()
+        oidc_token_url = os.getenv("AOS_V2_OIDC_TOKEN_URL", "").strip()
+        oidc_client_id = os.getenv("AOS_V2_OIDC_CLIENT_ID", "").strip()
+        oidc_scope = os.getenv("AOS_V2_OIDC_SCOPE", "openid profile email").strip()
+        oidc_authorization_audience_parameter = os.getenv(
+            "AOS_V2_OIDC_AUTHORIZATION_AUDIENCE_PARAMETER", ""
+        ).strip()
         create_schema = os.getenv(
             "AOS_V2_CREATE_SCHEMA", "1" if environment in {"development", "test"} else "0"
         ).lower() in {"1", "true", "yes", "on"}
@@ -113,6 +126,25 @@ class ServerSettings:
                 leeway_seconds=oidc_leeway_seconds,
                 maximum_token_lifetime_seconds=oidc_maximum_token_lifetime_seconds,
             )
+            if environment == "production":
+                for label, value in (
+                    ("authorization URL", oidc_authorization_url),
+                    ("token URL", oidc_token_url),
+                ):
+                    parsed = urlparse(value)
+                    if (
+                        parsed.scheme != "https" or not parsed.netloc
+                        or parsed.username or parsed.password or parsed.fragment
+                    ):
+                        raise ValueError(
+                            f"production OIDC {label} must be HTTPS without credentials or a fragment"
+                        )
+                if not oidc_client_id or len(oidc_client_id) > 256:
+                    raise ValueError("production AOS_V2_OIDC_CLIENT_ID is required")
+                if not oidc_scope or len(oidc_scope) > 1_000:
+                    raise ValueError("production AOS_V2_OIDC_SCOPE is required")
+                if len(oidc_authorization_audience_parameter) > 64:
+                    raise ValueError("OIDC authorization audience parameter is too long")
         port = int(os.getenv("PORT", os.getenv("AOS_V2_PORT", "8080")))
         public_base_url = os.getenv(
             "AOS_V2_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}",
@@ -137,6 +169,11 @@ class ServerSettings:
             oidc_algorithms=oidc_algorithms,
             oidc_leeway_seconds=oidc_leeway_seconds,
             oidc_maximum_token_lifetime_seconds=oidc_maximum_token_lifetime_seconds,
+            oidc_authorization_url=oidc_authorization_url,
+            oidc_token_url=oidc_token_url,
+            oidc_client_id=oidc_client_id,
+            oidc_scope=oidc_scope,
+            oidc_authorization_audience_parameter=oidc_authorization_audience_parameter,
             application_version=os.getenv("AOS_V2_APPLICATION_VERSION", "v2-dev"),
             public_base_url=public_base_url,
             preview_ttl_seconds=preview_ttl_seconds,
@@ -159,6 +196,21 @@ def build_identity(settings: ServerSettings) -> Authenticator:
             maximum_token_lifetime_seconds=settings.oidc_maximum_token_lifetime_seconds,
         )
     return HMACTokenIdentity(settings.auth_secret)
+
+
+def browser_identity_config(settings: ServerSettings) -> dict[str, str]:
+    if settings.identity_mode != "oidc":
+        return {"identity_mode": "hmac"}
+    return {
+        "identity_mode": "oidc",
+        "authorization_url": settings.oidc_authorization_url,
+        "token_url": settings.oidc_token_url,
+        "client_id": settings.oidc_client_id,
+        "scope": settings.oidc_scope,
+        "audience": settings.oidc_audience,
+        "authorization_audience_parameter": settings.oidc_authorization_audience_parameter,
+        "redirect_uri": f"{settings.public_base_url}/app",
+    }
 
 
 def build_app(settings: ServerSettings | None = None) -> FastAPI:
@@ -209,6 +261,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             artifact_store=artifact_store,
             preview_deployments=preview_deployments,
             company_directory=company_directory,
+            client_identity_config=browser_identity_config(settings),
             shutdown=resources.close,
         )
     except Exception:

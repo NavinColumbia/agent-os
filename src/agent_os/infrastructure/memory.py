@@ -67,6 +67,22 @@ class InMemoryWorkflowEngine(WorkflowEngine):
             history = self._runs.get((organization_id, run_id))
             return None if history is None else history.state
 
+    def list_runs(
+        self,
+        organization_id: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[LifecycleState, ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("run list limit must be between 1 and 500")
+        with self._lock:
+            matching = [
+                history.state
+                for (tenant_id, _), history in reversed(self._runs.items())
+                if tenant_id == organization_id
+            ]
+        return tuple(matching[:limit])
+
     def cancel_run(
         self,
         organization_id: str,

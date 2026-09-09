@@ -5,10 +5,13 @@ import binascii
 import hashlib
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
+import re
 from typing import Any, Annotated, Mapping
+from urllib.parse import urlparse
 
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_os.api.auth import Authenticator, Principal
@@ -152,6 +155,42 @@ class HiringProposalDecisionRequest(BaseModel):
 _HUMAN_EVENTS = {EventKind.WAIT_RESOLVED, EventKind.CANCEL_REQUESTED}
 _INTERNAL_ROLES = {"agent", "operator", "system"}
 _MAX_API_ARTIFACT_BYTES = 2 * 1024 * 1024
+_WEB_ROOT = Path(__file__).with_name("web")
+_PUBLIC_IDENTITY_KEYS = {
+    "identity_mode", "authorization_url", "token_url", "client_id", "scope", "audience",
+    "authorization_audience_parameter", "redirect_uri",
+}
+
+
+def _browser_identity_config(raw: Mapping[str, str] | None) -> tuple[dict[str, str], str]:
+    values = dict(raw or {"identity_mode": "manual"})
+    if set(values) - _PUBLIC_IDENTITY_KEYS:
+        raise ValueError("browser identity configuration contains an unsupported field")
+    if any(not isinstance(value, str) or len(value) > 2_000 or any(
+        character in value for character in "\r\n\0"
+    ) for value in values.values()):
+        raise ValueError("browser identity configuration contains an invalid value")
+    mode = values.get("identity_mode", "manual")
+    if mode not in {"manual", "hmac", "oidc"}:
+        raise ValueError("browser identity mode must be manual, hmac, or oidc")
+    if mode != "oidc":
+        return {"identity_mode": mode}, ""
+    required = (
+        "authorization_url", "token_url", "client_id", "scope", "audience", "redirect_uri",
+    )
+    if any(not values.get(key) for key in required):
+        raise ValueError("OIDC browser identity configuration is incomplete")
+    for key in ("authorization_url", "token_url"):
+        parsed = urlparse(values[key])
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            raise ValueError(f"OIDC browser {key} must be an HTTPS URL")
+    parameter = values.get("authorization_audience_parameter", "")
+    if parameter and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", parameter) is None:
+        raise ValueError("OIDC authorization audience parameter is invalid")
+    parsed_token = urlparse(values["token_url"])
+    return {key: values.get(key, "") for key in _PUBLIC_IDENTITY_KEYS}, (
+        f"{parsed_token.scheme}://{parsed_token.netloc}"
+    )
 
 
 def _run_id(organization_id: str, idempotency_key: str) -> str:
@@ -219,6 +258,7 @@ def create_app(
     artifact_store: ArtifactStore | None = None,
     preview_deployments: PreviewDeploymentStore | None = None,
     company_directory: CompanyDirectory | None = None,
+    client_identity_config: Mapping[str, str] | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     @asynccontextmanager
@@ -237,6 +277,61 @@ def create_app(
         openapi_url="/v2/openapi.json",
         lifespan=lifespan,
     )
+    public_identity, token_origin_value = _browser_identity_config(client_identity_config)
+    token_origin = f" {token_origin_value}" if token_origin_value else ""
+    workspace_headers = {
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": (
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            f"connect-src 'self'{token_origin}; font-src 'self'; base-uri 'none'; "
+            "frame-ancestors 'none'; form-action 'none'; object-src 'none'"
+        ),
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+    }
+
+    @app.get("/", include_in_schema=False)
+    def workspace_root() -> RedirectResponse:
+        return RedirectResponse("/app", status_code=307, headers={"Cache-Control": "no-store"})
+
+    @app.get("/app", include_in_schema=False)
+    def ceo_workspace() -> FileResponse:
+        return FileResponse(
+            _WEB_ROOT / "ceo.html",
+            media_type="text/html",
+            headers={
+                **workspace_headers,
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+            },
+        )
+
+    @app.get("/assets/ceo.css", include_in_schema=False)
+    def ceo_styles() -> FileResponse:
+        return FileResponse(
+            _WEB_ROOT / "ceo.css", media_type="text/css",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/assets/ceo.js", include_in_schema=False)
+    def ceo_script() -> FileResponse:
+        return FileResponse(
+            _WEB_ROOT / "ceo.js", media_type="text/javascript",
+            headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/v2/client-config", include_in_schema=False)
+    def get_client_config() -> JSONResponse:
+        return JSONResponse(
+            public_identity,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": "default-src 'none'",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     def current_principal(
         authorization: Annotated[str | None, Header()] = None,
@@ -436,6 +531,27 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return _response(receipt, run_id)
+
+    @app.get("/v2/runs")
+    def list_runs(
+        principal: Annotated[Principal, Depends(current_principal)],
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> Mapping[str, Any]:
+        return {
+            "items": [{
+                "run_id": state_value.run_id,
+                "title": state_value.title,
+                "objective_preview": None if state_value.objective is None else (
+                    state_value.objective[:280]
+                    + ("…" if len(state_value.objective) > 280 else "")
+                ),
+                "phase": state_value.phase.value,
+                "status": state_value.status.value,
+                "version": state_value.version,
+                "verification_cycle": state_value.verification_cycle,
+                "artifact_revision": state_value.artifact_revision,
+            } for state_value in engine.list_runs(principal.organization_id, limit=limit)]
+        }
 
     @app.get("/v2/runs/{run_id}")
     def get_run(

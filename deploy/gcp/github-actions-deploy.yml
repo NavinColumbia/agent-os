@@ -24,6 +24,7 @@ jobs:
     env:
       TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
       TF_VAR_sandbox_project_id: ${{ vars.GCP_SANDBOX_PROJECT_ID }}
+      TF_VAR_app_project_id: ${{ vars.GCP_APP_PROJECT_ID }}
       TF_VAR_region: ${{ vars.GCP_REGION }}
       TF_VAR_environment: production
       TF_VAR_public_base_url: ${{ vars.AOS_V2_PUBLIC_BASE_URL }}
@@ -45,6 +46,7 @@ jobs:
       TF_VAR_model_provider_secret_environment: ${{ vars.AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT }}
       TF_VAR_alert_notification_channels: ${{ vars.AOS_ALERT_NOTIFICATION_CHANNELS || '[]' }}
       TF_VAR_activate_services: "true"
+      TF_VAR_app_builder_image: ${{ vars.AOS_V2_APP_BUILDER_IMAGE }}
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5

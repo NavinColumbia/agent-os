@@ -24,6 +24,16 @@ variable "sandbox_project_id" {
   }
 }
 
+variable "app_project_id" {
+  description = "Existing billed GCP project dedicated to generated customer application builds and serving."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.app_project_id))
+    error_message = "app_project_id must be a valid GCP project ID."
+  }
+}
+
 variable "environment" {
   type    = string
   default = "production"
@@ -70,6 +80,28 @@ variable "sandbox_image" {
   validation {
     condition     = !var.activate_services || can(regex("@sha256:[0-9a-f]{64}$", var.sandbox_image))
     error_message = "sandbox_image must be an immutable @sha256 digest when services are active."
+  }
+}
+
+variable "app_builder_image" {
+  description = "Trusted Cloud Build Docker builder image pinned by sha256 digest."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.activate_services || can(regex("@sha256:[0-9a-f]{64}$", var.app_builder_image))
+    error_message = "app_builder_image must be an immutable @sha256 digest when services are active."
+  }
+}
+
+variable "app_max_instances" {
+  description = "Per-generated-service maximum instance count for the first-customer cell."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.app_max_instances >= 1 && var.app_max_instances <= 100
+    error_message = "app_max_instances must be between 1 and 100."
   }
 }
 

@@ -506,6 +506,13 @@ pointers are never cached while revision assets are immutable-cacheable. IAM con
 create/read permission to release objects and create/read/update permission to route pointers, with no delete
 permission, while the router receives exact-object read only. The cell monitors and rolls back this router together
 with the API/worker serving revision.
+The first production backend adapter now stages a bounded, credential-scanned source archive in a separate
+generated-app project, reconciles crash retries against tagged Cloud Builds, accepts only the matching immutable
+image digest, and creates or updates an opaque Cloud Run service after exact Human-node approval. Dockerfile bases
+and the trusted builder are digest-pinned, the final container user is numeric/non-root, the runtime identity has no
+project roles or injected control-plane secrets, and each service has a hard instance ceiling. An independent health
+probe must pass before success evidence is committed; a failed replacement restores the prior ready revision's
+traffic and records failure evidence. This path is adapter/IaC tested but not yet exercised in a real GCP project.
 A fast deterministic integration contract now proves the entire authenticated CEO-prompt-to-fetchable-preview
 path without provider spend; a second contract proves CEO prompt -> agent-designed child team -> generated source
 bundle -> sandbox verification -> durable CEO approval -> immutable production-static promotion -> independently
@@ -537,9 +544,9 @@ generation, length, and digest. Production refuses the small inline SQL adapter.
 controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
 multi-user invite/organization onboarding (although provider-neutral OIDC/JWKS verification now supports a
 zero-touch personal-company path derived from the verified issuer/subject),
-no per-paying-tenant sandbox-project allocator, dynamic/backend production deployer, or general-subworkflow
-adapters (although the first secretless cross-project Cloud Run Job sandbox and human-gated static production
-publisher are now wired). The remaining browser-to-production proof is the managed-cloud activation path: apply
+no per-paying-tenant sandbox/generated-app project allocator or general-subworkflow adapters (although the first
+secretless cross-project Cloud Run Job sandbox, human-gated static publisher, and digest-pinned Cloud Run service
+deployer are now wired). The remaining browser-to-production proof is the managed-cloud activation path: apply
 the cell in a real account, connect identity/model/billing secrets and DNS, run the same vertical against managed
 PostgreSQL, GCS, Cloud Run Jobs, and the public router, then retain its health/rollback evidence.
 This is a real durable execution spine, not yet the finished platform.

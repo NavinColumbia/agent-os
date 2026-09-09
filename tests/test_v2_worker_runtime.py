@@ -229,6 +229,27 @@ def test_worker_settings_require_explicit_model_and_production_tenants(monkeypat
     assert settings.published_app_bucket == "example-published-apps"
     assert settings.apps_base_url == "https://apps.example.test"
 
+    monkeypatch.setenv("AOS_V2_APP_PROJECT_ID", "generated-apps")
+    with pytest.raises(ValueError, match="requires app project, region, source bucket"):
+        WorkerSettings.from_env()
+    monkeypatch.setenv("AOS_V2_APP_REGION", "us-central1")
+    monkeypatch.setenv("AOS_V2_APP_SOURCE_BUCKET", "generated-app-sources")
+    monkeypatch.setenv("AOS_V2_APP_REPOSITORY", "customer-apps")
+    monkeypatch.setenv(
+        "AOS_V2_APP_BUILD_SERVICE_ACCOUNT",
+        "builder@generated-apps.iam.gserviceaccount.com",
+    )
+    monkeypatch.setenv(
+        "AOS_V2_APP_RUNTIME_SERVICE_ACCOUNT",
+        "runtime@generated-apps.iam.gserviceaccount.com",
+    )
+    monkeypatch.setenv(
+        "AOS_V2_APP_BUILDER_IMAGE", "builder@sha256:" + "a" * 64,
+    )
+    settings = WorkerSettings.from_env()
+    assert settings.app_project_id == "generated-apps"
+    assert settings.app_max_instances == 10
+
     monkeypatch.setenv("AOS_V2_WORKER_ORGANIZATIONS", "tenant-a,tenant-b,tenant-a")
     settings = WorkerSettings.from_env()
     assert settings.organization_ids == ("tenant-a", "tenant-b")

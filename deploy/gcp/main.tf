@@ -36,6 +36,14 @@ check "production_inputs" {
   }
 
   assert {
+    condition = (
+      var.app_project_id != var.project_id &&
+      var.app_project_id != var.sandbox_project_id
+    )
+    error_message = "Generated applications need a third GCP project separate from control and QA sandbox planes."
+  }
+
+  assert {
     condition     = var.apps_base_url != var.public_base_url
     error_message = "Generated applications must use an origin separate from the control API."
   }
@@ -124,6 +132,14 @@ locals {
     AOS_V2_SANDBOX_TIMEOUT_SECONDS         = tostring(var.sandbox_timeout_seconds)
     AOS_V2_PUBLISHED_APP_BUCKET            = google_storage_bucket.published_apps.name
     AOS_V2_APPS_BASE_URL                   = var.apps_base_url
+    AOS_V2_APP_PROJECT_ID                  = var.app_project_id
+    AOS_V2_APP_REGION                      = var.region
+    AOS_V2_APP_SOURCE_BUCKET               = google_storage_bucket.app_sources.name
+    AOS_V2_APP_REPOSITORY                  = google_artifact_registry_repository.generated_apps.repository_id
+    AOS_V2_APP_BUILD_SERVICE_ACCOUNT       = google_service_account.app_builder.email
+    AOS_V2_APP_RUNTIME_SERVICE_ACCOUNT     = google_service_account.app_runtime.email
+    AOS_V2_APP_BUILDER_IMAGE               = var.app_builder_image
+    AOS_V2_APP_MAX_INSTANCES               = tostring(var.app_max_instances)
   })
 
   static_router_environment = {
@@ -681,5 +697,10 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
     google_storage_bucket_iam_member.published_app_route_writer,
     google_cloud_run_v2_job_iam_member.worker_sandbox_runner,
     google_service_account_iam_member.worker_self_signer,
+    google_project_iam_member.worker_app_build_controller,
+    google_project_iam_member.worker_app_service_controller,
+    google_storage_bucket_iam_member.worker_app_source,
+    google_service_account_iam_member.worker_app_builder_act_as,
+    google_service_account_iam_member.worker_app_runtime_act_as,
   ]
 }

@@ -42,6 +42,13 @@ _MAX_FILES = 1_000
 _MAX_BYTES = 10 * 1024 * 1024
 
 
+def contains_credential_like_material(content: bytes) -> bool:
+    """Conservative release-boundary scan shared by generated-app deployers."""
+
+    searchable = content.decode("utf-8", errors="ignore")
+    return any(pattern.search(searchable) for pattern in _SECRET_PATTERNS)
+
+
 class GCSStaticSiteDeployer(StaticSiteDeployer):
     """Publish immutable assets and atomically advance a stable route pointer."""
 
@@ -144,8 +151,7 @@ class GCSStaticSiteDeployer(StaticSiteDeployer):
             total += len(value)
             if total > self._maximum_bytes:
                 raise FatalCommandError("static-site bundle exceeds the byte limit")
-            searchable = value.decode("utf-8", errors="ignore")
-            if any(pattern.search(searchable) for pattern in _SECRET_PATTERNS):
+            if contains_credential_like_material(value):
                 raise FatalCommandError("static-site bundle contains credential-like material")
             files[path] = (value, executable)
         if "index.html" not in files:

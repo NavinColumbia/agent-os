@@ -574,6 +574,21 @@ class StaticSiteDeployer(Protocol):
 
 
 @runtime_checkable
+class ApplicationDeployer(Protocol):
+    """Build and promote one verified source bundle as an isolated web service."""
+
+    def deploy_service(
+        self,
+        *,
+        organization_id: str,
+        artifact_id: str,
+        app_slug: str,
+        health_path: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class PreviewDeploymentStore(Deployer, Protocol):
     """Static public deployment authority addressed by an unguessable capability."""
 

@@ -982,7 +982,9 @@ def create_app(
                         node.node_id: str(node.configuration.get("tool"))
                         for node in definition.nodes
                         if node.kind is NodeKind.TOOL
-                        and node.configuration.get("tool") in {"deploy.preview", "deploy.static"}
+                        and node.configuration.get("tool") in {
+                            "deploy.preview", "deploy.service", "deploy.static",
+                        }
                     }
                 for token in execution.tokens:
                     output = token.output
@@ -999,7 +1001,11 @@ def create_app(
                         "kind": (
                             "static_site"
                             if deployment_nodes[token.node_id] == "deploy.static"
-                            else "static_preview"
+                            else (
+                                "cloud_run_service"
+                                if deployment_nodes[token.node_id] == "deploy.service"
+                                else "static_preview"
+                            )
                         ),
                         "node_id": token.node_id,
                         "deployment_id": deployment_id,

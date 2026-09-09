@@ -21,3 +21,9 @@ provider "google" {
   project = var.sandbox_project_id
   region  = var.region
 }
+
+provider "google" {
+  alias   = "apps"
+  project = var.app_project_id
+  region  = var.region
+}

@@ -445,7 +445,15 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
                 "requested_count": 1,
                 "estimated_budget_cents": 0,
             }]}},
-        ),),
+        ), NodeToken(
+            "publish-token", "publish", TokenStatus.SUCCEEDED, 1,
+            evidence_ids=("artifact-service-receipt",),
+            output={
+                "deployment_id": "service-deployment-one",
+                "public_url": "https://customer-api.run.app",
+                "receipt_artifact_id": "artifact-service-receipt",
+            },
+        )),
     )
 
     class MissionGraphs:
@@ -461,9 +469,13 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
                 "mission-workflow", "org-a", "Mission", 1, "work",
                 (
                     WorkflowNode("work", NodeKind.AGENT, "Build the product", "engineer"),
+                    WorkflowNode(
+                        "publish", NodeKind.TOOL, "Publish the approved service",
+                        configuration={"tool": "deploy.service"},
+                    ),
                     WorkflowNode("done", NodeKind.TERMINAL, "Accept proof"),
                 ),
-                (WorkflowEdge("work", "done"),),
+                (WorkflowEdge("work", "publish"), WorkflowEdge("publish", "done")),
                 "agent:mission-architect",
             )
 
@@ -492,7 +504,13 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
     assert response.json()["planning_run_id"] == planning_run_id
     assert response.json()["execution_run_id"] == child_run_id
     assert response.json()["execution"]["status"] == "active"
-    assert response.json()["deliverables"] == []
+    assert response.json()["deliverables"] == [{
+        "kind": "cloud_run_service",
+        "node_id": "publish",
+        "deployment_id": "service-deployment-one",
+        "public_url": "https://customer-api.run.app",
+        "receipt_artifact_id": "artifact-service-receipt",
+    }]
     management = api.get(
         f"/v2/runs/{created['run_id']}/management",
         headers={"Authorization": "Bearer org-a"},

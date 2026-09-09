@@ -13,7 +13,8 @@ if [[ ! -x .venv/bin/python ]]; then
 fi
 
 required_variables=(
-    GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID AOS_V2_PUBLIC_BASE_URL AOS_V2_APPS_BASE_URL
+    GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID GCP_APP_PROJECT_ID
+    AOS_V2_PUBLIC_BASE_URL AOS_V2_APPS_BASE_URL AOS_V2_APP_BUILDER_IMAGE
     AOS_V2_OIDC_ISSUER AOS_V2_OIDC_AUDIENCE AOS_V2_OIDC_JWKS_URL
     AOS_V2_OIDC_AUTHORIZATION_URL AOS_V2_OIDC_TOKEN_URL AOS_V2_OIDC_CLIENT_ID
     AOS_V2_STRIPE_STARTER_PRICE_ID AOS_V2_STRIPE_GROWTH_PRICE_ID AOS_V2_MODEL
@@ -36,6 +37,7 @@ tofu_root=deploy/gcp
 
 export TF_VAR_project_id="$GCP_PROJECT_ID"
 export TF_VAR_sandbox_project_id="$GCP_SANDBOX_PROJECT_ID"
+export TF_VAR_app_project_id="$GCP_APP_PROJECT_ID"
 export TF_VAR_region="$gcp_region"
 export TF_VAR_environment="$deployment_environment"
 export TF_VAR_public_base_url="$AOS_V2_PUBLIC_BASE_URL"
@@ -56,8 +58,11 @@ export TF_VAR_model="$AOS_V2_MODEL"
 export TF_VAR_database_runtime_role="$AOS_V2_DATABASE_RUNTIME_ROLE"
 export TF_VAR_model_provider_secret_environment="${AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT:-OPENAI_API_KEY}"
 export TF_VAR_release_id="$release_id"
+export TF_VAR_app_builder_image="$AOS_V2_APP_BUILDER_IMAGE"
 
 gcloud projects describe "$GCP_PROJECT_ID" >/dev/null
+gcloud projects describe "$GCP_SANDBOX_PROJECT_ID" >/dev/null
+gcloud projects describe "$GCP_APP_PROJECT_ID" >/dev/null
 if ! gcloud storage buckets describe "gs://${state_bucket}" --project "$GCP_PROJECT_ID" >/dev/null 2>&1; then
     gcloud storage buckets create "gs://${state_bucket}" \
         --project "$GCP_PROJECT_ID" \

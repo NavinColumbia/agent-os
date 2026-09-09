@@ -72,7 +72,7 @@ def test_release_order_is_migrate_then_activate_and_images_require_digests():
     assert "state list | rg -q '^google_cloud_run_v2_service\\.api\\[0\\]$'" in deploy
     assert "-target='google_cloud_run_v2_job.migrate[0]'" in deploy
     assert '${api_url}/ready' in deploy
-    assert variables.count('@sha256:[0-9a-f]{64}$') == 3
+    assert variables.count('@sha256:[0-9a-f]{64}$') == 4
     assert 'sandbox_tag="${runtime_repository}/sandbox:${release_id}"' in deploy
     assert '-var="sandbox_image=${sandbox_image}"' in deploy
 
@@ -113,7 +113,7 @@ def test_rollback_is_digest_pinned_serving_only_and_health_checked():
     rollback = text("deploy/gcp/rollback.sh")
 
     assert 'current_migration_image=$(tofu -chdir="$tofu_root" output -raw migration_image)' in rollback
-    assert rollback.count('@sha256:[0-9a-f]{64}$') == 3
+    assert rollback.count('@sha256:[0-9a-f]{64}$') == 4
     assert "-target='google_cloud_run_v2_service.api[0]'" in rollback
     assert "-target='google_cloud_run_v2_worker_pool.worker[0]'" in rollback
     assert "google_cloud_run_v2_job.migrate" not in rollback
@@ -185,3 +185,41 @@ def test_rollback_keeps_public_app_router_on_the_same_known_good_revision():
 
     assert "-target='google_cloud_run_v2_service.static_router[0]'" in rollback
     assert '${apps_url}/health' in rollback
+
+
+def test_generated_backend_apps_have_a_third_least_privilege_scale_to_zero_plane():
+    apps = text("deploy/gcp/apps.tf")
+    main = text("deploy/gcp/main.tf")
+    versions = text("deploy/gcp/versions.tf")
+    variables = text("deploy/gcp/variables.tf")
+    deploy = text("deploy/gcp/deploy.sh")
+    workflow = text("deploy/gcp/github-actions-deploy.yml")
+
+    assert 'variable "app_project_id"' in variables
+    assert 'alias   = "apps"' in versions
+    assert 'var.app_project_id != var.project_id' in main
+    assert 'var.app_project_id != var.sandbox_project_id' in main
+    assert 'provider = google.apps' in apps
+    assert 'resource "google_storage_bucket" "app_sources"' in apps
+    assert 'matches_prefix = ["temporary/app-build-sources/"]' in apps
+    assert 'resource "google_artifact_registry_repository" "generated_apps"' in apps
+    assert 'resource "google_service_account" "app_builder"' in apps
+    assert 'resource "google_service_account" "app_runtime"' in apps
+    assert 'role    = "roles/logging.logWriter"' in apps
+    assert 'role       = "roles/artifactregistry.writer"' in apps
+    assert 'permissions = [' in apps
+    assert '"cloudbuild.builds.create"' in apps
+    assert '"cloudbuild.builds.get"' in apps
+    assert '"cloudbuild.builds.list"' in apps
+    assert '"serviceusage.services.use"' in apps
+    assert '"run.services.create"' in apps
+    assert '"run.services.get"' in apps
+    assert '"run.services.update"' in apps
+    assert '"run.services.delete"' not in apps
+    assert 'role               = "roles/iam.serviceAccountUser"' in apps
+    assert 'AOS_V2_APP_PROJECT_ID' in main
+    assert 'AOS_V2_APP_BUILDER_IMAGE' in main
+    assert 'GCP_APP_PROJECT_ID' in deploy
+    assert 'AOS_V2_APP_BUILDER_IMAGE' in deploy
+    assert 'TF_VAR_app_project_id: ${{ vars.GCP_APP_PROJECT_ID }}' in workflow
+    assert 'TF_VAR_app_builder_image: ${{ vars.AOS_V2_APP_BUILDER_IMAGE }}' in workflow

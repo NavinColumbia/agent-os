@@ -38,7 +38,9 @@ _MISSION_PLAN_MAX_NODES = 32
 _MISSION_PLAN_MAX_EDGES = 128
 _MISSION_PLAN_MAX_ITERATIONS_PER_NODE = 16
 _MISSION_PLAN_MAX_TOTAL_ITERATIONS = 128
-_MISSION_TOOL_ALLOWLIST = frozenset({"deploy.preview", "deploy.static", "sandbox.run"})
+_MISSION_TOOL_ALLOWLIST = frozenset({
+    "deploy.preview", "deploy.service", "deploy.static", "sandbox.run",
+})
 
 
 class PlannedNode(BaseModel):
@@ -189,6 +191,25 @@ def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
             "app_slug": "stable lowercase DNS label",
             "success_condition": "outgoing condition after production publication",
         },
+        "production_service_deployment_configuration": {
+            "tool": "deploy.service",
+            "source": {
+                "node_id": "successful earlier sandbox node",
+                "output_path": ["output_artifact_id"],
+            },
+            "approval": {
+                "node_id": "successful earlier human approval node",
+                "output_path": ["human_response", "approved"],
+            },
+            "app_slug": "stable lowercase DNS label",
+            "health_path": "/health",
+            "success_condition": "outgoing condition after production promotion",
+            "source_contract": (
+                "Produce an Agent OS source bundle containing a root Dockerfile. Every FROM image and the "
+                "trusted builder are digest-pinned, the final stage declares a numeric non-root USER, the "
+                "container listens on PORT 8080, and health_path returns a 2xx response. Do not embed secrets."
+            ),
+        },
         "limits": {
             "nodes": _MISSION_PLAN_MAX_NODES,
             "edges": _MISSION_PLAN_MAX_EDGES,
@@ -325,8 +346,10 @@ def materialize_mission_workflow(
             }
             if tool == "sandbox.run":
                 allowed_configuration.update({"command", "failure_condition"})
-            elif tool == "deploy.static":
+            elif tool in {"deploy.static", "deploy.service"}:
                 allowed_configuration.update({"approval", "app_slug"})
+                if tool == "deploy.service":
+                    allowed_configuration.add("health_path")
             unexpected = set(configuration) - allowed_configuration
             if unexpected:
                 raise FatalCommandError(
@@ -368,19 +391,32 @@ def materialize_mission_workflow(
                     )
                 ):
                     raise FatalCommandError("planned sandbox command must be bounded direct argv")
-            elif tool == "deploy.static":
+            elif tool in {"deploy.static", "deploy.service"}:
+                deployment_kind = "static deployment" if tool == "deploy.static" else "service deployment"
                 app_slug = configuration.get("app_slug")
                 if (
                     not isinstance(app_slug, str)
                     or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", app_slug)
                 ):
                     raise FatalCommandError(
-                        "planned static deployment app_slug must be a lowercase DNS label"
+                        f"planned {deployment_kind} app_slug must be a lowercase DNS label"
                     )
+                if tool == "deploy.service":
+                    health_path = configuration.get("health_path", "/health")
+                    if (
+                        not isinstance(health_path, str)
+                        or not re.fullmatch(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,255}", health_path)
+                        or "//" in health_path
+                        or ".." in health_path
+                    ):
+                        raise FatalCommandError(
+                            "planned service deployment health_path must be a bounded absolute path"
+                        )
+                    configuration["health_path"] = health_path
                 approval = configuration.get("approval")
                 if not isinstance(approval, Mapping):
                     raise FatalCommandError(
-                        "planned static deployment requires a prior human approval"
+                        f"planned {deployment_kind} requires a prior human approval"
                     )
                 approval_node_id = approval.get("node_id")
                 approval_output_path = approval.get("output_path")
@@ -390,7 +426,7 @@ def materialize_mission_workflow(
                     or approval_output_path != ["human_response", "approved"]
                 ):
                     raise FatalCommandError(
-                        "planned static deployment approval reference is invalid"
+                        f"planned {deployment_kind} approval reference is invalid"
                     )
                 tool_sources.append((proposed.node_id, approval_node_id))
                 production_approvals.append((proposed.node_id, approval_node_id))
@@ -491,7 +527,7 @@ def materialize_mission_workflow(
         approval_node = nodes_by_id.get(approval_node_id)
         if approval_node is None or approval_node.kind is not NodeKind.HUMAN:
             raise FatalCommandError(
-                f"planned static deployment {tool_node_id} approval must reference a human node"
+                f"planned production deployment {tool_node_id} approval must reference a human node"
             )
     return definition
 

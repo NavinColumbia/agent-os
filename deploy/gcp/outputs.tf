@@ -38,6 +38,18 @@ output "sandbox_image" {
   value = var.sandbox_image
 }
 
+output "app_builder_image" {
+  value = var.app_builder_image
+}
+
+output "generated_app_source_bucket" {
+  value = google_storage_bucket.app_sources.name
+}
+
+output "generated_app_repository" {
+  value = "${var.region}-docker.pkg.dev/${var.app_project_id}/${google_artifact_registry_repository.generated_apps.repository_id}"
+}
+
 output "sandbox_job" {
   value = try(google_cloud_run_v2_job.sandbox[0].name, null)
 }

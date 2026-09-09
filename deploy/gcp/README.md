@@ -4,7 +4,8 @@ This is the low-fixed-cost, first-customer deployment path. It creates a scale-t
 scale-to-zero generated-app router, one manually scaled Cloud Run worker pool, a one-shot migration Job, private
 Artifact Registry and Cloud Storage repositories,
 separate least-privilege service accounts, Secret Manager containers, and optional repository-ID-bound GitHub OIDC.
-It also creates a scale-to-zero, secretless Cloud Run sandbox Job in a second GCP project. It deliberately does
+It also creates a scale-to-zero, secretless Cloud Run sandbox Job in a second GCP project and a generated-service
+build/serving plane in a third GCP project. It deliberately does
 **not** create GKE, Cloud SQL, public artifact buckets, permanent sandbox capacity, or secret values in OpenTofu
 state.
 
@@ -13,6 +14,14 @@ create/get/update route pointers through prefix-conditioned custom roles, but ca
 service account can get exact objects but cannot list the bucket. Its public Cloud Run router receives no database,
 model, OIDC, Stripe, or control-plane secret. The control API and generated apps must use different HTTPS origins.
 `deploy.static` additionally requires durable `approved: true` evidence from a preceding Human workflow node.
+
+Verified backend applications use `deploy.service`. The worker stages a bounded, secret-scanned source archive,
+reconciles Cloud Builds by a deterministic tag after crashes, and accepts only the matching output image digest.
+The build uses an explicit least-privilege identity; the deployed service uses a different identity with no project
+roles, receives no control-plane secrets, scales from zero to a bounded maximum, and is promoted through Cloud Run's
+idempotent create-or-update API. Source Dockerfiles and the trusted build-step image must pin every base by digest.
+An independently reachable health check must pass before the release receipt is committed. Production promotion
+still requires exact durable human approval from the workflow.
 
 Generated source, build output, and QA evidence use the private artifact bucket through Application Default
 Credentials; no storage key is created. Artifact bytes are immutable generation-guarded GCS objects. Tenant-scoped
@@ -41,6 +50,7 @@ or OpenTofu state.
 ```bash
 export GCP_PROJECT_ID=your-project
 export GCP_SANDBOX_PROJECT_ID=your-separate-sandbox-project
+export GCP_APP_PROJECT_ID=your-separate-generated-app-project
 export GCP_REGION=us-central1
 export AOS_V2_PUBLIC_BASE_URL=https://your-domain.example
 export AOS_V2_APPS_BASE_URL=https://apps.your-domain.example
@@ -64,6 +74,7 @@ export AOS_V2_APPLICATION_DATABASE_URL='postgresql://runtime-user:password@host/
 export AOS_V2_MODEL=openai:gpt-5-mini
 export AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT=OPENAI_API_KEY
 export AOS_V2_MODEL_PROVIDER_KEY=replace
+export AOS_V2_APP_BUILDER_IMAGE='gcr.io/cloud-builders/docker@sha256:replace-with-reviewed-digest'
 
 # Optional, repeatable; create the email/Slack/PagerDuty channel in Monitoring first.
 export TF_VAR_alert_notification_channels='["projects/your-project/notificationChannels/123456"]'
@@ -76,7 +87,8 @@ then rolls the API/worker and checks `/ready`. An existing serving plane is neve
 bootstrap shape. Set `AOS_ROTATE_SECRETS=1` only for an intentional rotation; the tenant-derivation secret is
 permanently excluded.
 
-`GCP_SANDBOX_PROJECT_ID` must be an existing billed project different from the trusted control-plane project. The
+`GCP_SANDBOX_PROJECT_ID` and `GCP_APP_PROJECT_ID` must be existing billed projects, all three project IDs must be
+different, and each is a separate failure/security plane. The
 module enables only the APIs it needs there, creates a dedicated VPC/subnet, sends all Job egress through that VPC,
 allows HTTPS only to Google's restricted API ranges, and denies every other IPv4 destination. Private DNS maps
 `*.googleapis.com` to `restricted.googleapis.com`. The sandbox runtime service account receives no project role and
@@ -86,6 +98,11 @@ The Job uses a bounded in-memory workspace, a digest-pinned minimal image, a non
 argv, resource/time/log/output ceilings, and immutable result evidence. Temporary transfer objects expire under the
 bucket's 30-day cleanup rule. A future project-pool allocator will tighten the boundary from one separate untrusted
 execution project to Google's recommended one-project-per-paying-tenant model.
+
+The generated-app project contains only a seven-day source-staging bucket, a customer-image registry, the minimal
+build and zero-role runtime identities, and dynamically created Cloud Run services. The control worker can
+create/get/list builds and create/get/update services but cannot delete them. It can act as only the two generated-app
+identities; the build identity cannot deploy, and generated code cannot read its source bucket or push images.
 
 The active cell also creates one-minute HTTPS uptime checks against the customer-facing `/ready` endpoint and the
 separate generated-app `/health` endpoint from
@@ -99,8 +116,9 @@ After the first apply, set these GitHub repository/environment variables from th
 
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_DEPLOY_SERVICE_ACCOUNT`
-- `GCP_PROJECT_ID`, `GCP_SANDBOX_PROJECT_ID`, `GCP_REGION`, and `GCP_STATE_BUCKET`
+- `GCP_PROJECT_ID`, `GCP_SANDBOX_PROJECT_ID`, `GCP_APP_PROJECT_ID`, `GCP_REGION`, and `GCP_STATE_BUCKET`
 - all non-secret `AOS_V2_OIDC_*`, Stripe price, control/app public URLs, and model values used above
+- `AOS_V2_APP_BUILDER_IMAGE`, pinned to the reviewed Cloud Build Docker builder digest
 - `AOS_ALERT_NOTIFICATION_CHANNELS`, a JSON list of full Monitoring notification-channel resource names (or `[]`)
 
 Runtime credentials stay in GCP Secret Manager and are never copied into GitHub. The worker identity cannot read
@@ -139,6 +157,7 @@ nor executes the migration Job. Database revisions must therefore follow the doc
 destructive schema reversal is an incident-specific, reviewed recovery action rather than an automated rollback.
 
 The GCP plane does not make the current product fully launch-ready by itself. A real domain, OIDC organization
-tenant, Stripe products/webhook, managed PostgreSQL, model key, artifact garbage collector,
+tenant, Stripe products/webhook, managed PostgreSQL, model key, per-paying-tenant generated-app project allocator,
+artifact/image garbage collector,
 backup/restore drills, notification-channel delivery, and an external smoke test
 must still be configured or proven.

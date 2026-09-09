@@ -23,6 +23,7 @@ from agent_os.entrypoints.server import ServerSettings
 from agent_os.infrastructure.agent_command_executor import DurableAgentCommandExecutor
 from agent_os.infrastructure.artifact_tool_nodes import ArtifactToolNodeHandlers
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
+from agent_os.infrastructure.cloud_run_apps import CloudRunServiceDeployer
 from agent_os.infrastructure.cloud_run_sandbox import CloudRunJobSandboxRunner
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.deployment_tool_nodes import DeploymentToolNodeHandlers
@@ -100,6 +101,14 @@ class WorkerSettings:
     sandbox_revision: str
     published_app_bucket: str
     apps_base_url: str
+    app_project_id: str
+    app_region: str
+    app_source_bucket: str
+    app_repository: str
+    app_build_service_account: str
+    app_runtime_service_account: str
+    app_builder_image: str
+    app_max_instances: int
     tenant_discovery_limit: int
     management_check_seconds: int
     slow_work_seconds: int
@@ -175,6 +184,36 @@ class WorkerSettings:
             raise ValueError(
                 "production requires AOS_V2_PUBLISHED_APP_BUCKET and AOS_V2_APPS_BASE_URL"
             )
+        app_project_id = os.getenv("AOS_V2_APP_PROJECT_ID", "").strip()
+        app_region = os.getenv("AOS_V2_APP_REGION", "").strip()
+        app_source_bucket = os.getenv("AOS_V2_APP_SOURCE_BUCKET", "").strip()
+        app_repository = os.getenv("AOS_V2_APP_REPOSITORY", "").strip()
+        app_build_service_account = os.getenv(
+            "AOS_V2_APP_BUILD_SERVICE_ACCOUNT", "",
+        ).strip()
+        app_runtime_service_account = os.getenv(
+            "AOS_V2_APP_RUNTIME_SERVICE_ACCOUNT", "",
+        ).strip()
+        app_builder_image = os.getenv("AOS_V2_APP_BUILDER_IMAGE", "").strip()
+        app_configuration = (
+            app_project_id,
+            app_region,
+            app_source_bucket,
+            app_repository,
+            app_build_service_account,
+            app_runtime_service_account,
+            app_builder_image,
+        )
+        if any(app_configuration) and not all(app_configuration):
+            raise ValueError(
+                "production service deployment requires app project, region, source bucket, "
+                "repository, build/runtime service accounts, and digest-pinned builder image"
+            )
+        if app_project_id and sandbox_project_id and app_project_id == sandbox_project_id:
+            raise ValueError("generated applications and untrusted QA sandboxes require separate projects")
+        app_max_instances = _positive_int("AOS_V2_APP_MAX_INSTANCES", 10)
+        if app_max_instances > 100:
+            raise ValueError("AOS_V2_APP_MAX_INSTANCES cannot exceed 100")
         tenant_discovery_limit = _positive_int("AOS_V2_TENANT_DISCOVERY_LIMIT", 128)
         if tenant_discovery_limit > 1_000:
             raise ValueError("AOS_V2_TENANT_DISCOVERY_LIMIT cannot exceed 1000")
@@ -214,6 +253,14 @@ class WorkerSettings:
             sandbox_revision=sandbox_revision,
             published_app_bucket=published_app_bucket,
             apps_base_url=apps_base_url,
+            app_project_id=app_project_id,
+            app_region=app_region,
+            app_source_bucket=app_source_bucket,
+            app_repository=app_repository,
+            app_build_service_account=app_build_service_account,
+            app_runtime_service_account=app_runtime_service_account,
+            app_builder_image=app_builder_image,
+            app_max_instances=app_max_instances,
             tenant_discovery_limit=tenant_discovery_limit,
             management_check_seconds=management_check_seconds,
             slow_work_seconds=slow_work_seconds,
@@ -292,12 +339,25 @@ def run_worker(
                 public_base_url=settings.apps_base_url,
                 capability_secret=settings.server.capability_secret,
             )
+        service_deployer = None
+        if settings.app_project_id:
+            service_deployer = CloudRunServiceDeployer(
+                artifact_store,
+                project_id=settings.app_project_id,
+                region=settings.app_region,
+                source_bucket=settings.app_source_bucket,
+                repository=settings.app_repository,
+                build_service_account_email=settings.app_build_service_account,
+                runtime_service_account_email=settings.app_runtime_service_account,
+                builder_image=settings.app_builder_image,
+                maximum_instances=settings.app_max_instances,
+            )
         notification_effects = NotificationEffectHandlers(notification_store)
         artifact_tools = ArtifactToolNodeHandlers(artifact_store)
         named_tool_handlers = dict(artifact_tools.named_handlers())
         named_tool_handlers.update(
             DeploymentToolNodeHandlers(
-                preview_deployments, static_deployer,
+                preview_deployments, static_deployer, service_deployer,
             ).named_handlers()
         )
         named_tool_handlers.update(

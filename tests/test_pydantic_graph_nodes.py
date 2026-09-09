@@ -10,6 +10,20 @@ from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntim
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 
 
+class FakeUsageMeter:
+    def __init__(self):
+        self.reservations = []
+        self.settlements = []
+
+    def reserve_model_turn(self, **values):
+        self.reservations.append(values)
+        return values
+
+    def settle_model_turn(self, **values):
+        self.settlements.append(values)
+        return values
+
+
 def agent_graph() -> WorkflowDefinition:
     return WorkflowDefinition(
         "graph", "tenant-a", "Graph", 1, "agent",
@@ -38,7 +52,11 @@ def test_agent_node_uses_structured_output_and_only_declared_conditions():
         "reason": None,
         "retryable": False,
     }
-    runtime = PydanticGraphNodeRuntime(TestModel(custom_output_args=output), max_turn_budget_cents=1)
+    meter = FakeUsageMeter()
+    runtime = PydanticGraphNodeRuntime(
+        TestModel(custom_output_args=output), max_turn_budget_cents=1,
+        usage_meter=meter, model_name="test:model",
+    )
 
     result = runtime.execute_node(
         tenant_id="tenant-a", run_id="run-agent", definition=definition,
@@ -48,6 +66,9 @@ def test_agent_node_uses_structured_output_and_only_declared_conditions():
     assert result["disposition"] == "complete"
     assert result["satisfied_conditions"] == ["verified"]
     assert result["output"]["summary"] == "Verified the path."
+    assert meter.reservations[0]["category"] == "graph_agent"
+    assert meter.reservations[0]["source_id"] == action.action_id
+    assert meter.settlements[0]["usage"] == result["output"]["usage"]
 
 
 def test_agent_node_persists_bounded_management_proposals_in_durable_output():

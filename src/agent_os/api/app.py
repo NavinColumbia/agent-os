@@ -25,6 +25,7 @@ from agent_os.application.ports import (
     NotificationStore,
     OrganizationLedger,
     PreviewDeploymentStore,
+    UsageMeter,
     WorkflowEngine,
     WorkflowReceipt,
 )
@@ -258,6 +259,7 @@ def create_app(
     artifact_store: ArtifactStore | None = None,
     preview_deployments: PreviewDeploymentStore | None = None,
     company_directory: CompanyDirectory | None = None,
+    usage_meter: UsageMeter | None = None,
     client_identity_config: Mapping[str, str] | None = None,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
@@ -411,6 +413,7 @@ def create_app(
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+
             return event
 
         @app.post("/v2/company/agents/{agent_id}/retire")
@@ -436,6 +439,24 @@ def create_app(
                 raise HTTPException(status_code=404, detail="standing agent not found") from exc
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if usage_meter is not None:
+        @app.get("/v2/usage/summary")
+        def get_usage_summary(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            return usage_meter.usage_summary(principal.organization_id)
+
+        @app.get("/v2/usage/events")
+        def get_usage_events(
+            principal: Annotated[Principal, Depends(current_principal)],
+            limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="usage event detail requires owner authority")
+            return {"items": list(usage_meter.list_usage_events(
+                principal.organization_id, limit=limit,
+            ))}
 
     if preview_deployments is not None:
         if artifact_store is None:

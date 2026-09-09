@@ -18,6 +18,7 @@ from agent_os.domain.workflow_runtime import (
 )
 from agent_os.infrastructure.memory import InMemoryWorkflowEngine
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
+from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 
 
 class FakeIdentity:
@@ -212,6 +213,45 @@ def test_notification_inbox_uses_authenticated_tenant_and_role_scope():
     assert owner.json()["items"][0]["notification_id"] == "notice-org-a"
     assert store.calls[0] == ("org-a", "run-1", None, 25)
     assert store.calls[1] == ("org-a", None, "agent-a", 100)
+
+
+def test_usage_api_is_tenant_scoped_and_event_detail_requires_owner(tmp_path):
+    meter = SQLUsageMeter(
+        f"sqlite:///{tmp_path / 'api-usage.sqlite3'}", monthly_budget_cents=250,
+        create_schema=True,
+    )
+    try:
+        meter.reserve_model_turn(
+            tenant_id="org-a", source_id="turn-1", run_id="run-1",
+            category="graph_agent", model="provider:model", maximum_cost_cents=10,
+        )
+        meter.settle_model_turn(
+            tenant_id="org-a", source_id="turn-1",
+            usage={
+                "requests": 1, "tool_calls": 0, "input_tokens": 20,
+                "output_tokens": 10, "total_tokens": 30,
+                "provider_cost_usd_micros": 1_000,
+            },
+        )
+        api = TestClient(create_app(
+            engine=InMemoryWorkflowEngine(), identity=FakeIdentity(), usage_meter=meter,
+        ))
+        assert api.get(
+            "/v2/usage/summary", headers={"Authorization": "Bearer org-a"},
+        ).json()["total_tokens"] == 30
+        assert api.get(
+            "/v2/usage/summary", headers={"Authorization": "Bearer org-b"},
+        ).json()["total_tokens"] == 0
+        assert api.get(
+            "/v2/usage/events", headers={"Authorization": "Bearer viewer-a"},
+        ).status_code == 403
+        owner_events = api.get(
+            "/v2/usage/events", headers={"Authorization": "Bearer org-a"},
+        )
+        assert owner_events.status_code == 200
+        assert owner_events.json()["items"][0]["source_id"] == "turn-1"
+    finally:
+        meter.close()
 
 
 def test_standing_company_agents_are_managed_by_tenant_authority_and_survive_runs(tmp_path):

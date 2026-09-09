@@ -22,6 +22,7 @@ x-runtime-environment: &runtime-environment
   AOS_V2_OIDC_ALGORITHMS: ${AOS_V2_OIDC_ALGORITHMS:-RS256,ES256}
   AOS_V2_PUBLIC_BASE_URL: ${AOS_V2_PUBLIC_BASE_URL:-http://localhost:8080}
   AOS_V2_PREVIEW_TTL_SECONDS: ${AOS_V2_PREVIEW_TTL_SECONDS:-604800}
+  AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS: ${AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS:-10000}
 
 services:
   postgres:
@@ -61,6 +62,7 @@ services:
       - ../postgres/initdb/94-management-watch-v2.sql:/migrations/94-management-watch-v2.sql:ro
       - ../postgres/initdb/95-company-directory-v2.sql:/migrations/95-company-directory-v2.sql:ro
       - ../postgres/initdb/96-company-proposal-decisions-v2.sql:/migrations/96-company-proposal-decisions-v2.sql:ro
+      - ../postgres/initdb/97-usage-meter-v2.sql:/migrations/97-usage-meter-v2.sql:ro
     command:
       - sh
       - -ec
@@ -76,6 +78,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/94-management-watch-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/95-company-directory-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/96-company-proposal-decisions-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/97-usage-meter-v2.sql
     restart: "no"
 
   api:

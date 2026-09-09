@@ -505,7 +505,10 @@ is race-safe and idempotent rather than being only a top-level status change.
 Workers can discover due tenants through a narrow scheduling-only database role while retaining tenant-RLS claims
 and round-robin fairness. A packaged responsive CEO workspace now consumes the real tenant-scoped mission,
 management, company, notification, staffing-decision, cancellation, and preview APIs; hosted mode uses an external
-OIDC authorization-code/PKCE flow and keeps access tokens in page memory. It still has overlapping legacy
+OIDC authorization-code/PKCE flow and keeps access tokens in page memory. Model turns now reserve a serialized,
+tenant-scoped monthly budget before provider access and settle replay-safe token/request/cost evidence afterward;
+unknown provider prices retain the conservative reservation instead of being treated as free. It still has no
+payment collection, plan-entitlement, credit/invoice/tax, or Stripe-webhook implementation and has overlapping legacy
 controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
 signup/invite/organization onboarding (although provider-neutral OIDC/JWKS verification fails closed in production),
 no managed-cloud sandbox/production-deploy/general-subworkflow

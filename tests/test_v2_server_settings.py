@@ -14,6 +14,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
         "AOS_V2_IDENTITY_MODE", "AOS_V2_CAPABILITY_SECRET", "AOS_V2_OIDC_ISSUER",
         "AOS_V2_OIDC_AUDIENCE", "AOS_V2_OIDC_JWKS_URL",
         "AOS_V2_OIDC_AUTHORIZATION_URL", "AOS_V2_OIDC_TOKEN_URL", "AOS_V2_OIDC_CLIENT_ID",
+        "AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = ServerSettings.from_env()
@@ -25,6 +26,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
     assert settings.capability_secret == settings.auth_secret
     assert settings.public_base_url == "http://127.0.0.1:8080"
     assert settings.preview_ttl_seconds == 604800
+    assert settings.tenant_monthly_model_budget_cents == 10000
 
 
 def test_production_fails_closed_without_postgres_migrations_and_strong_secret(monkeypatch):

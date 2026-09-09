@@ -9,7 +9,7 @@ which consequential actions commit.
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.models import Model
 
-from agent_os.application.ports import AgentRuntime
+from agent_os.application.ports import AgentRuntime, UsageMeter
 from agent_os.infrastructure.proposed_artifacts import ProposedArtifact
 
 
@@ -135,6 +135,22 @@ Consequential proposals are reviewed by durable policy and approval layers after
 """.strip()
 
 
+def model_usage_record(usage: Any) -> dict[str, int | None]:
+    provider_cost_usd_micros = None
+    if usage.cost is not None:
+        provider_cost_usd_micros = int(
+            (usage.cost * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING)
+        )
+    return {
+        "requests": usage.requests,
+        "tool_calls": usage.tool_calls,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "provider_cost_usd_micros": provider_cost_usd_micros,
+    }
+
+
 class PydanticAgentRuntime(AgentRuntime):
     """Provider-portable structured role execution with hard per-turn limits."""
 
@@ -146,6 +162,8 @@ class PydanticAgentRuntime(AgentRuntime):
         request_limit: int = 12,
         output_tokens_limit: int = 8_000,
         request_timeout_seconds: float = 120,
+        usage_meter: UsageMeter | None = None,
+        model_name: str | None = None,
     ) -> None:
         if request_limit < 1 or output_tokens_limit < 1 or request_timeout_seconds <= 0:
             raise ValueError("agent runtime limits must be positive")
@@ -154,6 +172,10 @@ class PydanticAgentRuntime(AgentRuntime):
         self._request_limit = request_limit
         self._output_tokens_limit = output_tokens_limit
         self._request_timeout_seconds = request_timeout_seconds
+        self._usage_meter = usage_meter
+        self._model_name = (model_name or str(model)).strip()
+        if usage_meter is not None and not self._model_name:
+            raise ValueError("a metered agent runtime requires a model name")
 
     def run_agent(
         self,
@@ -180,6 +202,15 @@ class PydanticAgentRuntime(AgentRuntime):
             retries=2,
             name="agent-os-role",
         )
+        if self._usage_meter is not None:
+            self._usage_meter.reserve_model_turn(
+                tenant_id=organization_id,
+                source_id=idempotency_key,
+                run_id=run_id,
+                category="lifecycle_agent",
+                model=self._model_name,
+                maximum_cost_cents=max(1, budget_cents),
+            )
         result = agent.run_sync(
             prompt,
             run_id=idempotency_key,
@@ -199,15 +230,15 @@ class PydanticAgentRuntime(AgentRuntime):
                 output_tokens_limit=self._output_tokens_limit,
             ),
         )
-        usage = result.usage
+        usage = model_usage_record(result.usage)
+        if self._usage_meter is not None:
+            self._usage_meter.settle_model_turn(
+                tenant_id=organization_id,
+                source_id=idempotency_key,
+                usage=usage,
+            )
         return {
             "output": result.output.model_dump(mode="json"),
-            "usage": {
-                "requests": usage.requests,
-                "tool_calls": usage.tool_calls,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "total_tokens": usage.total_tokens,
-            },
+            "usage": usage,
             "idempotency_key": idempotency_key,
         }

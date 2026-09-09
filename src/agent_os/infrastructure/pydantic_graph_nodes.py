@@ -13,7 +13,7 @@ from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.models import Model
 
 from agent_os.application.command_worker import FatalCommandError
-from agent_os.application.ports import ArtifactStore, GraphNodeRuntime
+from agent_os.application.ports import ArtifactStore, GraphNodeRuntime, UsageMeter
 from agent_os.domain.organization import Organization
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowNode
 from agent_os.domain.workflow_runtime import TokenStatus, WorkflowAction, WorkflowRunState
@@ -26,6 +26,7 @@ from agent_os.infrastructure.pydantic_agents import (
     ProposedDecision,
     ProposedMessage,
     ProposedWork,
+    model_usage_record,
 )
 
 
@@ -105,6 +106,8 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         max_turn_budget_cents: int = 100,
         context_character_limit: int = 64_000,
         organization_loader: Callable[[str], Organization] | None = None,
+        usage_meter: UsageMeter | None = None,
+        model_name: str | None = None,
     ) -> None:
         if (
             request_limit < 1
@@ -124,6 +127,10 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         self._max_turn_budget_cents = max_turn_budget_cents
         self._context_character_limit = context_character_limit
         self._organization_loader = organization_loader
+        self._usage_meter = usage_meter
+        self._model_name = (model_name or str(model)).strip()
+        if usage_meter is not None and not self._model_name:
+            raise ValueError("a metered graph runtime requires a model name")
 
     @staticmethod
     def _node(definition: WorkflowDefinition, node_id: str) -> WorkflowNode:
@@ -276,6 +283,15 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             retries=2,
             name="agent-os-graph-node",
         )
+        if self._usage_meter is not None:
+            self._usage_meter.reserve_model_turn(
+                tenant_id=tenant_id,
+                source_id=idempotency_key,
+                run_id=run_id,
+                category="graph_agent",
+                model=self._model_name,
+                maximum_cost_cents=self._max_turn_budget_cents,
+            )
         result = agent.run_sync(
             f"Execute this node using the authoritative context below:\n{context_text}",
             run_id=idempotency_key,
@@ -293,6 +309,13 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             ),
         )
         output = result.output
+        usage = model_usage_record(result.usage)
+        if self._usage_meter is not None:
+            self._usage_meter.settle_model_turn(
+                tenant_id=tenant_id,
+                source_id=idempotency_key,
+                usage=usage,
+            )
         unknown = set(output.satisfied_conditions) - set(available_conditions)
         if unknown:
             raise FatalCommandError(f"graph agent selected unknown conditions: {sorted(unknown)}")
@@ -329,12 +352,6 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
                 "decisions": [item.model_dump(mode="json") for item in output.decisions],
                 "next_actions": list(output.next_actions),
             },
-            "usage": {
-                "requests": result.usage.requests,
-                "tool_calls": result.usage.tool_calls,
-                "input_tokens": result.usage.input_tokens,
-                "output_tokens": result.usage.output_tokens,
-                "total_tokens": result.usage.total_tokens,
-            },
+            "usage": usage,
         }
         return raw

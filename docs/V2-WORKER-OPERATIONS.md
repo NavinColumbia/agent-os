@@ -23,6 +23,15 @@ same action ID; recovery after a committed result does not execute the node twic
 is committed as a graph failure instead of leaving a permanently running token. Timer, arbitrary subworkflow, and
 production release actions stay fail-closed until an idempotent adapter is registered.
 
+Before any lifecycle or graph agent calls a model provider, the worker creates an idempotent tenant usage
+reservation keyed by the durable command/action ID. A per-tenant monthly ceiling serializes concurrent reservations,
+so replicas cannot race past it. Successful calls settle request/tool/token counts and provider cost in integer USD
+micros; when a provider/model does not report a trustworthy price, the reserved maximum remains charged rather than
+pretending the call was free. A crash/retry with the same source ID cannot double-count usage. Authenticated summary
+and owner-level event APIs are available at `GET /v2/usage/summary` and `GET /v2/usage/events`; the CEO workspace
+shows current committed model budget. This is cost-control and future billing evidence, not payment collection:
+plan entitlements, invoices, credits/tax, and Stripe webhook settlement remain separate milestones.
+
 New CEO directives now emit `start_mission`, not a second hard-coded research/build agent chain. That durable
 command starts a built-in planner graph. The mission architect must persist an identity-free JSON graph proposal;
 `workflow.launch` supplies tenant/creator/version identities, permits only registered node/tool kinds, caps the
@@ -162,6 +171,7 @@ Important controls:
 - `AOS_V2_MANAGEMENT_CHECK_SECONDS` (default `30`; durable review cadence)
 - `AOS_V2_SLOW_WORK_SECONDS` (default `300`; diagnostic threshold, never a kill timeout)
 - `AOS_V2_MANAGEMENT_ESCALATION_CHECKS` (default `3`; consecutive checks before CEO escalation)
+- `AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS` (default `10000`; reserved before provider calls)
 
 The control API supports two identity modes behind the same tenant-binding boundary. `hmac` is only the local/BYOC
 evaluation token flow; public production rejects it. Production requires `AOS_V2_IDENTITY_MODE=oidc` plus an HTTPS
@@ -196,7 +206,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–96), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–97), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
 actual provider tenant plus its signup/invite/organization configuration, secrets management, production
 deploy/rollback, a hosted

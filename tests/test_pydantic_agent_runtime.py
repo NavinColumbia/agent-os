@@ -7,6 +7,20 @@ from pydantic_ai.models.test import TestModel
 from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
 
 
+class FakeUsageMeter:
+    def __init__(self):
+        self.reservations = []
+        self.settlements = []
+
+    def reserve_model_turn(self, **values):
+        self.reservations.append(values)
+        return values
+
+    def settle_model_turn(self, **values):
+        self.settlements.append(values)
+        return values
+
+
 def test_agent_turn_can_delegate_hire_message_decide_and_raise_risk_without_network():
     output = {
         "summary": "Split the mission and escalated a regulatory dependency.",
@@ -51,7 +65,10 @@ def test_agent_turn_can_delegate_hire_message_decide_and_raise_risk_without_netw
         }],
         "next_actions": ["Launch both research tracks"],
     }
-    runtime = PydanticAgentRuntime(TestModel(custom_output_args=output))
+    meter = FakeUsageMeter()
+    runtime = PydanticAgentRuntime(
+        TestModel(custom_output_args=output), usage_meter=meter, model_name="test:model",
+    )
 
     result = runtime.run_agent(
         organization_id="tenant-1",
@@ -69,6 +86,10 @@ def test_agent_turn_can_delegate_hire_message_decide_and_raise_risk_without_netw
     assert turn["messages"][0]["correlation_id"] == "question-jurisdiction"
     assert turn["decisions"][0]["chosen_option"] == "paper"
     assert result["idempotency_key"] == "turn-1"
+    assert meter.reservations[0]["maximum_cost_cents"] == 1
+    assert meter.reservations[0]["source_id"] == "turn-1"
+    assert meter.settlements[0]["usage"]["total_tokens"] == result["usage"]["total_tokens"]
+    assert "provider_cost_usd_micros" in result["usage"]
 
 
 def test_agent_runtime_rejects_unbounded_or_zero_limits():

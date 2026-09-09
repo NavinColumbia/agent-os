@@ -83,7 +83,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .composer input { margin-bottom: .65rem; }
 .composer-actions { display: flex; align-items: center; justify-content: space-between; margin-top: .7rem; color: var(--muted); font-size: .7rem; }
 .composer-actions button { min-width: 142px; display: flex; justify-content: space-between; }
-.stats { display: grid; grid-template-columns: repeat(4,1fr); gap: .75rem; margin: 1.2rem 0 2.4rem; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit,minmax(145px,1fr)); gap: .75rem; margin: 1.2rem 0 2.4rem; }
 .stat { min-height: 106px; padding: 1.05rem; border: 1px solid var(--line); border-radius: 14px; background: rgba(18,23,25,.58); }
 .stat small { display: block; color: var(--muted); font-size: .7rem; }
 .stat strong { display: block; margin-top: .8rem; font-size: 1.65rem; font-weight: 650; letter-spacing: -.05em; }

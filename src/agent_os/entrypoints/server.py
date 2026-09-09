@@ -17,6 +17,7 @@ from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
+from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 
 
@@ -41,6 +42,7 @@ class ServerSettings:
     oidc_client_id: str
     oidc_scope: str
     oidc_authorization_audience_parameter: str
+    tenant_monthly_model_budget_cents: int
     application_version: str
     public_base_url: str
     preview_ttl_seconds: int
@@ -91,6 +93,13 @@ class ServerSettings:
         oidc_authorization_audience_parameter = os.getenv(
             "AOS_V2_OIDC_AUTHORIZATION_AUDIENCE_PARAMETER", ""
         ).strip()
+        tenant_monthly_model_budget_cents = int(
+            os.getenv("AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS", "10000")
+        )
+        if not 1 <= tenant_monthly_model_budget_cents <= 1_000_000_000:
+            raise ValueError(
+                "AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS must be between 1 and 1000000000"
+            )
         create_schema = os.getenv(
             "AOS_V2_CREATE_SCHEMA", "1" if environment in {"development", "test"} else "0"
         ).lower() in {"1", "true", "yes", "on"}
@@ -174,6 +183,7 @@ class ServerSettings:
             oidc_client_id=oidc_client_id,
             oidc_scope=oidc_scope,
             oidc_authorization_audience_parameter=oidc_authorization_audience_parameter,
+            tenant_monthly_model_budget_cents=tenant_monthly_model_budget_cents,
             application_version=os.getenv("AOS_V2_APPLICATION_VERSION", "v2-dev"),
             public_base_url=public_base_url,
             preview_ttl_seconds=preview_ttl_seconds,
@@ -244,6 +254,12 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(artifact_store.close)
+        usage_meter = SQLUsageMeter(
+            settings.application_database_url,
+            monthly_budget_cents=settings.tenant_monthly_model_budget_cents,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(usage_meter.close)
         preview_deployments = SQLStaticPreviewDeployer(
             settings.application_database_url,
             artifact_store,
@@ -261,6 +277,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             artifact_store=artifact_store,
             preview_deployments=preview_deployments,
             company_directory=company_directory,
+            usage_meter=usage_meter,
             client_identity_config=browser_identity_config(settings),
             shutdown=resources.close,
         )
@@ -273,5 +290,6 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.artifact_store = artifact_store
     app.state.preview_deployments = preview_deployments
     app.state.company_directory = company_directory
+    app.state.usage_meter = usage_meter
     app.state.settings = settings
     return app

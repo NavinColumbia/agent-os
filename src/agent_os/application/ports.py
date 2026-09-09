@@ -434,6 +434,39 @@ class NotificationStore(Protocol):
 
 
 @runtime_checkable
+class UsageMeter(Protocol):
+    """Durable tenant model-usage reservations and exact post-turn settlement."""
+
+    def reserve_model_turn(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        run_id: str,
+        category: str,
+        model: str,
+        maximum_cost_cents: int,
+    ) -> Mapping[str, Any]: ...
+
+    def settle_model_turn(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        usage: Mapping[str, Any],
+    ) -> Mapping[str, Any]: ...
+
+    def usage_summary(self, tenant_id: str) -> Mapping[str, Any]: ...
+
+    def list_usage_events(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+
+@runtime_checkable
 class AgentRuntime(Protocol):
     def run_agent(
         self,

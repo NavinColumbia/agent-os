@@ -127,7 +127,9 @@ function stat(name, value, tone = "") {
 }
 
 async function loadMissions() {
-  const payload = await api("/v2/runs?limit=100");
+  const [payload, usage] = await Promise.all([
+    api("/v2/runs?limit=100"), api("/v2/usage/summary").catch(() => null),
+  ]);
   const items = payload.items || [];
   const counts = {
     active: items.filter((item) => item.status === "active").length,
@@ -140,6 +142,7 @@ async function loadMissions() {
     stat("Active", counts.active, "good"), stat("Waiting", counts.waiting, "warn"),
     stat("Needs attention", counts.attention, counts.attention ? "warn" : ""),
     stat("Delivered", counts.delivered),
+    stat("Model budget committed", usage ? `$${(usage.committed_cents / 100).toFixed(2)}` : "—"),
   );
   const list = byId("missions-list");
   list.replaceChildren();

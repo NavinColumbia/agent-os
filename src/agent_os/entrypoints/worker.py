@@ -42,6 +42,7 @@ from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_ready_tenants import SQLReadyTenantSource
+from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 from agent_os.infrastructure.tool_node_router import GraphToolNodeRouter
 
 
@@ -197,11 +198,17 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(artifact_store.close)
+        usage_meter = SQLUsageMeter(
+            settings.server.application_database_url,
+            monthly_budget_cents=settings.server.tenant_monthly_model_budget_cents,
+            create_schema=settings.server.create_schema,
+        )
+        resources.callback(usage_meter.close)
         preview_deployments = SQLStaticPreviewDeployer(
             settings.server.application_database_url,
             artifact_store,
             public_base_url=settings.server.public_base_url,
-            capability_secret=settings.server.auth_secret,
+            capability_secret=settings.server.capability_secret,
             ttl_seconds=settings.server.preview_ttl_seconds,
             create_schema=settings.server.create_schema,
         )
@@ -234,6 +241,8 @@ def run_worker(
             request_limit=settings.request_limit,
             output_tokens_limit=settings.output_tokens_limit,
             request_timeout_seconds=settings.request_timeout_seconds,
+            usage_meter=usage_meter,
+            model_name=settings.model,
         )
         agent_executor = DurableAgentCommandExecutor(
             runtime=runtime,
@@ -271,6 +280,8 @@ def run_worker(
             request_timeout_seconds=settings.request_timeout_seconds,
             max_turn_budget_cents=settings.max_turn_budget_cents,
             organization_loader=company_directory.get_organization,
+            usage_meter=usage_meter,
+            model_name=settings.model,
         )
         graph_worker = DurableGraphActionWorker(
             outbox=graph_engine,

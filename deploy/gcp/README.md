@@ -4,6 +4,9 @@ This is the low-fixed-cost, first-customer deployment path. It creates a scale-t
 scale-to-zero generated-app router, one manually scaled Cloud Run worker pool, a one-shot migration Job, private
 Artifact Registry and Cloud Storage repositories,
 separate least-privilege service accounts, Secret Manager containers, and optional repository-ID-bound GitHub OIDC.
+The two customer-facing origins terminate TLS at one global external Application Load Balancer with a reserved IP,
+Google-managed certificate, HTTP-to-HTTPS redirect, full request logging, and separate serverless backends. Direct
+public access to both control-plane Cloud Run URLs is disabled so the edge cannot be bypassed.
 It also creates a scale-to-zero, secretless Cloud Run sandbox Job in a second GCP project and a generated-service
 build/serving plane in a third GCP project. It deliberately does
 **not** create GKE, Cloud SQL, public artifact buckets, permanent sandbox capacity, or secret values in OpenTofu
@@ -76,6 +79,9 @@ export AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT=OPENAI_API_KEY
 export AOS_V2_MODEL_PROVIDER_KEY=replace
 export AOS_V2_APP_BUILDER_IMAGE='gcr.io/cloud-builders/docker@sha256:replace-with-reviewed-digest'
 
+# Optional: an existing Cloud DNS zone name. Leave unset for any other DNS provider.
+export GCP_DNS_MANAGED_ZONE=your-cloud-dns-zone
+
 # Optional, repeatable; create the email/Slack/PagerDuty channel in Monitoring first.
 export TF_VAR_alert_notification_channels='["projects/your-project/notificationChannels/123456"]'
 ```
@@ -83,9 +89,17 @@ export TF_VAR_alert_notification_channels='["projects/your-project/notificationC
 Then run `deploy/gcp/deploy.sh`. On a new cell it creates/version-enables the remote state bucket and bootstraps
 foundation resources without a runtime. On both first and repeat releases it adds only missing secret versions,
 builds all three images in Cloud Build, resolves immutable digests, updates only the migration Job, executes migrations,
-then rolls the API/worker and checks `/ready`. An existing serving plane is never reconciled against the inactive
+then rolls the API/worker and verifies both public origins through DNS, valid TLS, `/ready`, and `/health`. An
+existing serving plane is never reconciled against the inactive
 bootstrap shape. Set `AOS_ROTATE_SECRETS=1` only for an intentional rotation; the tenant-derivation secret is
 permanently excluded.
+
+The bootstrap reserves the edge IP before building an application. With `GCP_DNS_MANAGED_ZONE`, the same bootstrap
+creates both A records automatically. With another DNS provider, the first run stops before secret injection or
+image spend and prints the two exact A records; add them and rerun the same command. The readiness gate then follows
+observable DNS, TLS, `/ready`, and `/health` state for up to an hour (configurable with
+`AOS_V2_EDGE_READY_TIMEOUT_SECONDS`) so normal managed-certificate propagation is not mistaken for an app failure.
+The global load balancer and reserved IP have non-zero fixed cost even while Cloud Run scales to zero.
 
 `GCP_SANDBOX_PROJECT_ID` and `GCP_APP_PROJECT_ID` must be existing billed projects, all three project IDs must be
 different, and each is a separate failure/security plane. The
@@ -117,6 +131,7 @@ After the first apply, set these GitHub repository/environment variables from th
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_DEPLOY_SERVICE_ACCOUNT`
 - `GCP_PROJECT_ID`, `GCP_SANDBOX_PROJECT_ID`, `GCP_APP_PROJECT_ID`, `GCP_REGION`, and `GCP_STATE_BUCKET`
+- `GCP_DNS_MANAGED_ZONE` when the two public hostnames are managed by Cloud DNS; otherwise leave it empty
 - all non-secret `AOS_V2_OIDC_*`, Stripe price, control/app public URLs, and model values used above
 - `AOS_V2_APP_BUILDER_IMAGE`, pinned to the reviewed Cloud Build Docker builder digest
 - `AOS_ALERT_NOTIFICATION_CHANNELS`, a JSON list of full Monitoring notification-channel resource names (or `[]`)

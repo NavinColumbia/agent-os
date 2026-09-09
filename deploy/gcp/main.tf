@@ -44,7 +44,7 @@ check "production_inputs" {
   }
 
   assert {
-    condition     = var.apps_base_url != var.public_base_url
+    condition     = lower(local.apps_host) != lower(local.public_host)
     error_message = "Generated applications must use an origin separate from the control API."
   }
 }
@@ -61,6 +61,8 @@ locals {
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
     "cloudresourcemanager.googleapis.com",
+    "compute.googleapis.com",
+    "dns.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
     "logging.googleapis.com",
@@ -441,11 +443,12 @@ resource "google_cloud_run_v2_job" "migrate" {
 resource "google_cloud_run_v2_service" "api" {
   count = var.activate_services ? 1 : 0
 
-  name                = "${local.prefix}-api"
-  location            = var.region
-  deletion_protection = var.deletion_protection
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  labels              = local.labels
+  name                 = "${local.prefix}-api"
+  location             = var.region
+  deletion_protection  = var.deletion_protection
+  ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+  default_uri_disabled = true
+  labels               = local.labels
 
   template {
     service_account                  = google_service_account.api.email
@@ -546,11 +549,12 @@ resource "google_cloud_run_v2_service_iam_member" "public_api" {
 resource "google_cloud_run_v2_service" "static_router" {
   count = var.activate_services ? 1 : 0
 
-  name                = "${local.prefix}-apps"
-  location            = var.region
-  deletion_protection = var.deletion_protection
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  labels              = local.labels
+  name                 = "${local.prefix}-apps"
+  location             = var.region
+  deletion_protection  = var.deletion_protection
+  ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+  default_uri_disabled = true
+  labels               = local.labels
 
   template {
     service_account                  = google_service_account.static_router.email

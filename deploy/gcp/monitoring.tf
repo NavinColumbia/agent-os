@@ -1,6 +1,6 @@
 locals {
-  public_host = trimprefix(var.public_base_url, "https://")
-  apps_host   = trimprefix(var.apps_base_url, "https://")
+  public_host = lower(trimprefix(var.public_base_url, "https://"))
+  apps_host   = lower(trimprefix(var.apps_base_url, "https://"))
 }
 
 resource "google_monitoring_uptime_check_config" "static_apps" {

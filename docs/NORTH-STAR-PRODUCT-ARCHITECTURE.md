@@ -506,6 +506,12 @@ pointers are never cached while revision assets are immutable-cacheable. IAM con
 create/read permission to release objects and create/read/update permission to route pointers, with no delete
 permission, while the router receives exact-object read only. The cell monitors and rolls back this router together
 with the API/worker serving revision.
+The control API and static-app origin now sit behind one global external Application Load Balancer with a reserved
+IPv4 address, host-routed serverless NEGs, managed TLS, HTTP-to-HTTPS redirect, and complete request logging. Both
+Cloud Run backends accept internet traffic only through the load balancer and have their default public URLs
+disabled. Cloud DNS records are optional and declarative; an external DNS provider instead receives two exact A
+records before any image build, and the release gate observes DNS, TLS, `/ready`, and `/health` convergence rather
+than treating certificate propagation as an application timeout.
 The first production backend adapter now stages a bounded, credential-scanned source archive in a separate
 generated-app project, reconciles crash retries against tagged Cloud Builds, accepts only the matching immutable
 image digest, and creates or updates an opaque Cloud Run service after exact Human-node approval. Dockerfile bases

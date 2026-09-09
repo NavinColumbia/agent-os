@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for command_name in gcloud tofu curl date rg; do
+for command_name in gcloud tofu date rg; do
     command -v "$command_name" >/dev/null || {
         echo "$command_name is required" >&2
         exit 2
     }
 done
+if [[ ! -x .venv/bin/python ]]; then
+    echo ".venv/bin/python is required; run this script from the repository root" >&2
+    exit 2
+fi
 
 required_variables=(
     GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID GCP_APP_PROJECT_ID
@@ -41,6 +45,7 @@ export TF_VAR_region="$gcp_region"
 export TF_VAR_environment="$deployment_environment"
 export TF_VAR_public_base_url="$AOS_V2_PUBLIC_BASE_URL"
 export TF_VAR_apps_base_url="$AOS_V2_APPS_BASE_URL"
+export TF_VAR_dns_managed_zone="${GCP_DNS_MANAGED_ZONE:-}"
 export TF_VAR_state_bucket_name="$state_bucket"
 export TF_VAR_github_repository_id="$github_repository_id"
 export TF_VAR_oidc_issuer="$AOS_V2_OIDC_ISSUER"
@@ -115,9 +120,10 @@ tofu -chdir="$tofu_root" apply -auto-approve -input=false \
 
 api_url=$(tofu -chdir="$tofu_root" output -raw api_url)
 apps_url=$(tofu -chdir="$tofu_root" output -raw static_apps_url)
-curl --fail --silent --show-error --retry 8 --retry-all-errors \
-    --retry-delay 3 "${api_url}/ready"
-curl --fail --silent --show-error --retry 8 --retry-all-errors \
-    --retry-delay 3 "${apps_url}/health"
+edge_ip=$(tofu -chdir="$tofu_root" output -raw public_edge_ipv4)
+.venv/bin/python deploy/gcp/edge_check.py \
+    --api-url "$api_url" --apps-url "$apps_url" --expected-ip "$edge_ip" \
+    --timeout-seconds "${AOS_V2_EDGE_READY_TIMEOUT_SECONDS:-600}" \
+    --interval-seconds "${AOS_V2_EDGE_READY_INTERVAL_SECONDS:-15}"
 echo
 echo "Agent OS serving plane rolled back to ${rollback_image}; API and app router are healthy"

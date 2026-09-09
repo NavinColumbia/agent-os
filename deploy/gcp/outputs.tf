@@ -19,11 +19,34 @@ output "migration_job" {
 }
 
 output "api_url" {
-  value = try(google_cloud_run_v2_service.api[0].uri, null)
+  value = var.activate_services ? var.public_base_url : null
 }
 
 output "static_apps_url" {
+  value = var.activate_services ? var.apps_base_url : null
+}
+
+output "cloud_run_api_uri" {
+  value = try(google_cloud_run_v2_service.api[0].uri, null)
+}
+
+output "cloud_run_static_router_uri" {
   value = try(google_cloud_run_v2_service.static_router[0].uri, null)
+}
+
+output "public_edge_ipv4" {
+  value = google_compute_global_address.public_edge.address
+}
+
+output "public_edge_certificate" {
+  value = try(google_compute_managed_ssl_certificate.public_edge[0].name, null)
+}
+
+output "required_external_dns_records" {
+  value = var.dns_managed_zone == "" ? {
+    (local.public_host) = google_compute_global_address.public_edge.address
+    (local.apps_host)   = google_compute_global_address.public_edge.address
+  } : {}
 }
 
 output "application_image" {

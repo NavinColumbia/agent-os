@@ -132,8 +132,8 @@ variable "public_base_url" {
   type        = string
 
   validation {
-    condition     = can(regex("^https://[A-Za-z0-9.-]+(?::[0-9]+)?$", var.public_base_url))
-    error_message = "public_base_url must be an HTTPS origin without a path."
+    condition     = can(regex("^https://[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$", var.public_base_url))
+    error_message = "public_base_url must be a public HTTPS DNS origin without a port or path."
   }
 }
 
@@ -142,8 +142,30 @@ variable "apps_base_url" {
   type        = string
 
   validation {
-    condition     = can(regex("^https://[A-Za-z0-9.-]+(?::[0-9]+)?$", var.apps_base_url))
-    error_message = "apps_base_url must be an HTTPS origin without a path."
+    condition     = can(regex("^https://[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$", var.apps_base_url))
+    error_message = "apps_base_url must be a public HTTPS DNS origin without a port or path."
+  }
+}
+
+variable "dns_managed_zone" {
+  description = "Optional existing Cloud DNS managed-zone name; empty emits the A record for external DNS."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.dns_managed_zone == "" || can(regex("^[a-z][a-z0-9-]{0,61}[a-z0-9]$", var.dns_managed_zone))
+    error_message = "dns_managed_zone must be empty or a valid Cloud DNS managed-zone name."
+  }
+}
+
+variable "dns_ttl_seconds" {
+  description = "TTL for automatically managed public A records."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.dns_ttl_seconds >= 30 && var.dns_ttl_seconds <= 86400
+    error_message = "dns_ttl_seconds must be between 30 and 86400."
   }
 }
 

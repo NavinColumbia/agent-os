@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for command_name in gcloud tofu git curl rg openssl; do
+for command_name in gcloud tofu git rg openssl; do
     command -v "$command_name" >/dev/null || {
         echo "$command_name is required" >&2
         exit 2
@@ -42,6 +42,7 @@ export TF_VAR_region="$gcp_region"
 export TF_VAR_environment="$deployment_environment"
 export TF_VAR_public_base_url="$AOS_V2_PUBLIC_BASE_URL"
 export TF_VAR_apps_base_url="$AOS_V2_APPS_BASE_URL"
+export TF_VAR_dns_managed_zone="${GCP_DNS_MANAGED_ZONE:-}"
 export TF_VAR_state_bucket_name="$state_bucket"
 export TF_VAR_github_repository_id="$github_repository_id"
 export TF_VAR_oidc_issuer="$AOS_V2_OIDC_ISSUER"
@@ -81,6 +82,31 @@ tofu -chdir="$tofu_root" init -reconfigure \
 # state. Later changes are applied migration-first below.
 if ! tofu -chdir="$tofu_root" state list | rg -q '^google_cloud_run_v2_service\.api\[0\]$'; then
     tofu -chdir="$tofu_root" apply -auto-approve -var="activate_services=false"
+fi
+
+# The public IP exists before serving resources so external-DNS users can
+# establish the required records without first exposing an unverified release.
+if ! tofu -chdir="$tofu_root" state list | rg -q '^google_compute_global_address\.public_edge$'; then
+    tofu -chdir="$tofu_root" apply -auto-approve -input=false \
+        -target='google_compute_global_address.public_edge' \
+        -var="activate_services=false"
+fi
+if [[ -n "${GCP_DNS_MANAGED_ZONE:-}" ]] && \
+   ! tofu -chdir="$tofu_root" state list | rg -q '^google_dns_record_set\.api\[0\]$'; then
+    tofu -chdir="$tofu_root" apply -auto-approve -input=false \
+        -target='google_dns_record_set.api[0]' \
+        -target='google_dns_record_set.apps[0]' \
+        -var="activate_services=false"
+fi
+edge_ip=$(tofu -chdir="$tofu_root" output -raw public_edge_ipv4)
+if [[ -z "${GCP_DNS_MANAGED_ZONE:-}" ]] && ! .venv/bin/python deploy/gcp/edge_check.py \
+    --api-url "$AOS_V2_PUBLIC_BASE_URL" \
+    --apps-url "$AOS_V2_APPS_BASE_URL" \
+    --expected-ip "$edge_ip" --dns-only --timeout-seconds 0; then
+    echo "Add these external DNS A records, wait for propagation, then rerun this same command:" >&2
+    echo "  ${AOS_V2_PUBLIC_BASE_URL#https://} -> ${edge_ip}" >&2
+    echo "  ${AOS_V2_APPS_BASE_URL#https://} -> ${edge_ip}" >&2
+    exit 3
 fi
 
 put_secret_version() {
@@ -156,10 +182,13 @@ tofu -chdir="$tofu_root" apply -auto-approve \
 
 api_url=$(tofu -chdir="$tofu_root" output -raw api_url)
 apps_url=$(tofu -chdir="$tofu_root" output -raw static_apps_url)
-curl --fail --silent --show-error --retry 8 --retry-all-errors \
-    --retry-delay 3 "${api_url}/ready"
-curl --fail --silent --show-error --retry 8 --retry-all-errors \
-    --retry-delay 3 "${apps_url}/health"
+.venv/bin/python deploy/gcp/edge_check.py \
+    --api-url "$api_url" --apps-url "$apps_url" --expected-ip "$edge_ip" \
+    --timeout-seconds "${AOS_V2_EDGE_READY_TIMEOUT_SECONDS:-3600}" \
+    --interval-seconds "${AOS_V2_EDGE_READY_INTERVAL_SECONDS:-15}"
 echo
 echo "Agent OS ${release_id} is healthy at ${api_url}; app router: ${apps_url}"
-echo "Configure DNS/OIDC/Stripe for ${AOS_V2_PUBLIC_BASE_URL} and app DNS for ${AOS_V2_APPS_BASE_URL} before customer traffic."
+if [[ -z "${GCP_DNS_MANAGED_ZONE:-}" ]]; then
+    echo "External DNS is verified at ${edge_ip}."
+fi
+echo "Configure OIDC and Stripe callbacks for ${AOS_V2_PUBLIC_BASE_URL} before customer traffic."

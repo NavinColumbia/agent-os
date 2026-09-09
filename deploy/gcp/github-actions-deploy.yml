@@ -29,6 +29,7 @@ jobs:
       TF_VAR_environment: production
       TF_VAR_public_base_url: ${{ vars.AOS_V2_PUBLIC_BASE_URL }}
       TF_VAR_apps_base_url: ${{ vars.AOS_V2_APPS_BASE_URL }}
+      TF_VAR_dns_managed_zone: ${{ vars.GCP_DNS_MANAGED_ZONE }}
       TF_VAR_state_bucket_name: ${{ vars.GCP_STATE_BUCKET }}
       TF_VAR_github_repository_id: ${{ github.repository_id }}
       TF_VAR_oidc_issuer: ${{ vars.AOS_V2_OIDC_ISSUER }}
@@ -118,8 +119,8 @@ jobs:
       - name: verify deployed readiness
         run: |
           api_url=$(tofu -chdir=deploy/gcp output -raw api_url)
-          curl --fail --silent --show-error --retry 8 --retry-all-errors \
-            --retry-delay 3 "${api_url}/ready"
           apps_url=$(tofu -chdir=deploy/gcp output -raw static_apps_url)
-          curl --fail --silent --show-error --retry 8 --retry-all-errors \
-            --retry-delay 3 "${apps_url}/health"
+          edge_ip=$(tofu -chdir=deploy/gcp output -raw public_edge_ipv4)
+          python deploy/gcp/edge_check.py \
+            --api-url "$api_url" --apps-url "$apps_url" --expected-ip "$edge_ip" \
+            --timeout-seconds 900 --interval-seconds 15

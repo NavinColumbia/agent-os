@@ -5,6 +5,7 @@ region          = "us-central1"
 environment     = "production"
 public_base_url = "https://agentos.example.com"
 apps_base_url   = "https://apps.agentos.example.com"
+dns_managed_zone = "" # Set to an existing Cloud DNS zone for automatic A records.
 state_bucket_name = "replace-with-gcp-project-id-agentos-tofu-state"
 
 oidc_issuer            = "https://replace-with-issuer.example.com"

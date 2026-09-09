@@ -71,7 +71,8 @@ def test_release_order_is_migrate_then_activate_and_images_require_digests():
     assert migration_position < activation_position
     assert "state list | rg -q '^google_cloud_run_v2_service\\.api\\[0\\]$'" in deploy
     assert "-target='google_cloud_run_v2_job.migrate[0]'" in deploy
-    assert '${api_url}/ready' in deploy
+    assert '--api-url "$api_url"' in deploy
+    assert '--apps-url "$apps_url"' in deploy
     assert variables.count('@sha256:[0-9a-f]{64}$') == 4
     assert 'sandbox_tag="${runtime_repository}/sandbox:${release_id}"' in deploy
     assert '-var="sandbox_image=${sandbox_image}"' in deploy
@@ -118,7 +119,8 @@ def test_rollback_is_digest_pinned_serving_only_and_health_checked():
     assert "-target='google_cloud_run_v2_worker_pool.worker[0]'" in rollback
     assert "google_cloud_run_v2_job.migrate" not in rollback
     assert "gcloud run jobs execute" not in rollback
-    assert '${api_url}/ready' in rollback
+    assert '--api-url "$api_url"' in rollback
+    assert '--apps-url "$apps_url"' in rollback
     subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/rollback.sh")], check=True)
 
 
@@ -157,7 +159,7 @@ def test_generated_apps_use_a_separate_secretless_origin_and_prefix_scoped_stora
     deploy = text("deploy/gcp/deploy.sh")
 
     assert 'variable "apps_base_url"' in variables
-    assert 'var.apps_base_url != var.public_base_url' in main
+    assert 'lower(local.apps_host) != lower(local.public_host)' in main
     assert 'resource "google_storage_bucket" "published_apps"' in main
     assert 'public_access_prevention    = "enforced"' in main
     assert 'resource "google_cloud_run_v2_service" "static_router"' in main
@@ -177,14 +179,14 @@ def test_generated_apps_use_a_separate_secretless_origin_and_prefix_scoped_stora
     assert 'resource "google_monitoring_uptime_check_config" "static_apps"' in monitoring
     assert 'path           = "/health"' in monitoring
     assert "AOS_V2_APPS_BASE_URL" in deploy
-    assert '${apps_url}/health' in deploy
+    assert '--apps-url "$apps_url"' in deploy
 
 
 def test_rollback_keeps_public_app_router_on_the_same_known_good_revision():
     rollback = text("deploy/gcp/rollback.sh")
 
     assert "-target='google_cloud_run_v2_service.static_router[0]'" in rollback
-    assert '${apps_url}/health' in rollback
+    assert '--apps-url "$apps_url"' in rollback
 
 
 def test_generated_backend_apps_have_a_third_least_privilege_scale_to_zero_plane():
@@ -223,3 +225,24 @@ def test_generated_backend_apps_have_a_third_least_privilege_scale_to_zero_plane
     assert 'AOS_V2_APP_BUILDER_IMAGE' in deploy
     assert 'TF_VAR_app_project_id: ${{ vars.GCP_APP_PROJECT_ID }}' in workflow
     assert 'TF_VAR_app_builder_image: ${{ vars.AOS_V2_APP_BUILDER_IMAGE }}' in workflow
+
+
+def test_public_domains_terminate_at_a_managed_tls_edge_without_run_app_bypass():
+    edge = text("deploy/gcp/edge.tf")
+    main = text("deploy/gcp/main.tf")
+    outputs = text("deploy/gcp/outputs.tf")
+    deploy = text("deploy/gcp/deploy.sh")
+
+    assert 'resource "google_compute_global_address" "public_edge"' in edge
+    assert edge.count('network_endpoint_type = "SERVERLESS"') == 2
+    assert edge.count('load_balancing_scheme = "EXTERNAL_MANAGED"') == 4
+    assert 'resource "google_compute_managed_ssl_certificate" "public_edge"' in edge
+    assert 'min_tls_version = "TLS_1_2"' in edge
+    assert 'https_redirect         = true' in edge
+    assert 'resource "google_dns_record_set" "api"' in edge
+    assert 'resource "google_dns_record_set" "apps"' in edge
+    assert main.count('ingress              = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"') == 2
+    assert main.count("default_uri_disabled = true") == 2
+    assert 'output "required_external_dns_records"' in outputs
+    assert "edge_check.py" in deploy
+    assert "--dns-only --timeout-seconds 0" in deploy

@@ -507,7 +507,11 @@ create/read permission to release objects and create/read/update permission to r
 permission, while the router receives exact-object read only. The cell monitors and rolls back this router together
 with the API/worker serving revision.
 A fast deterministic integration contract now proves the entire authenticated CEO-prompt-to-fetchable-preview
-path without provider spend; the earlier live-provider mission proof separately exercises real model grounding.
+path without provider spend; a second contract proves CEO prompt -> agent-designed child team -> generated source
+bundle -> sandbox verification -> durable CEO approval -> immutable production-static promotion -> independently
+fetchable public application. The tests replace the model, sandbox executor, and GCS transport with deterministic
+adapters while retaining the production lifecycle, graph, authority, artifact, API, deployment, and router code;
+the earlier live-provider mission proof separately exercises real model grounding.
 CEO cancellation now propagates into both planning and execution graphs, blocks late bootstrap/launch work, and
 is race-safe and idempotent rather than being only a top-level status change.
 Workers can discover due tenants through a narrow scheduling-only database role while retaining tenant-RLS claims
@@ -535,8 +539,9 @@ multi-user invite/organization onboarding (although provider-neutral OIDC/JWKS v
 zero-touch personal-company path derived from the verified issuer/subject),
 no per-paying-tenant sandbox-project allocator, dynamic/backend production deployer, or general-subworkflow
 adapters (although the first secretless cross-project Cloud Run Job sandbox and human-gated static production
-publisher are now wired), and no complete
-new-customer-browser-to-production-URL vertical.
+publisher are now wired). The remaining browser-to-production proof is the managed-cloud activation path: apply
+the cell in a real account, connect identity/model/billing secrets and DNS, run the same vertical against managed
+PostgreSQL, GCS, Cloud Run Jobs, and the public router, then retain its health/rollback evidence.
 This is a real durable execution spine, not yet the finished platform.
 
 Therefore:
@@ -544,7 +549,8 @@ Therefore:
 - **Do not throw away the domain behavior or test knowledge.**
 - **Do not call the legacy runtime the finished scalable spine.**
 - **Do not run another all-day legacy dogfood campaign as proof of the new architecture.**
-- **Do build one bounded V2 prompt-to-public-URL vertical, inject failures, and then route new runs to it.**
+- **Do activate the bounded V2 prompt-to-public-URL vertical in a managed cloud, inject failures there, and then
+  route new customer runs to it.**
 - **Do not claim revenue, customer readiness, million-user scale, or full company autonomy before those gates
   have direct evidence.**
 

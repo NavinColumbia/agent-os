@@ -26,6 +26,14 @@ output "migration_image" {
   value = var.migration_image
 }
 
+output "sandbox_image" {
+  value = var.sandbox_image
+}
+
+output "sandbox_job" {
+  value = try(google_cloud_run_v2_job.sandbox[0].name, null)
+}
+
 output "readiness_uptime_check" {
   value = try(google_monitoring_uptime_check_config.public_ready[0].name, null)
 }

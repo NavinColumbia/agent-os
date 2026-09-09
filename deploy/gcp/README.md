@@ -3,8 +3,9 @@
 This is the low-fixed-cost, first-customer deployment path. It creates a scale-to-zero Cloud Run API, one manually
 scaled Cloud Run worker pool, a one-shot migration Job, private Artifact Registry and Cloud Storage repositories,
 separate least-privilege service accounts, Secret Manager containers, and optional repository-ID-bound GitHub OIDC.
-It deliberately does **not** create GKE, Cloud SQL, public artifact buckets, permanent sandbox capacity, or secret
-values in OpenTofu state.
+It also creates a scale-to-zero, secretless Cloud Run sandbox Job in a second GCP project. It deliberately does
+**not** create GKE, Cloud SQL, public artifact buckets, permanent sandbox capacity, or secret values in OpenTofu
+state.
 
 Generated source, build output, and QA evidence use the private artifact bucket through Application Default
 Credentials; no storage key is created. Artifact bytes are immutable generation-guarded GCS objects. Tenant-scoped
@@ -32,6 +33,7 @@ or OpenTofu state.
 
 ```bash
 export GCP_PROJECT_ID=your-project
+export GCP_SANDBOX_PROJECT_ID=your-separate-sandbox-project
 export GCP_REGION=us-central1
 export AOS_V2_PUBLIC_BASE_URL=https://your-domain.example
 
@@ -61,10 +63,21 @@ export TF_VAR_alert_notification_channels='["projects/your-project/notificationC
 
 Then run `deploy/gcp/deploy.sh`. On a new cell it creates/version-enables the remote state bucket and bootstraps
 foundation resources without a runtime. On both first and repeat releases it adds only missing secret versions,
-builds both images in Cloud Build, resolves immutable digests, updates only the migration Job, executes migrations,
+builds all three images in Cloud Build, resolves immutable digests, updates only the migration Job, executes migrations,
 then rolls the API/worker and checks `/ready`. An existing serving plane is never reconciled against the inactive
 bootstrap shape. Set `AOS_ROTATE_SECRETS=1` only for an intentional rotation; the tenant-derivation secret is
 permanently excluded.
+
+`GCP_SANDBOX_PROJECT_ID` must be an existing billed project different from the trusted control-plane project. The
+module enables only the APIs it needs there, creates a dedicated VPC/subnet, sends all Job egress through that VPC,
+allows HTTPS only to Google's restricted API ranges, and denies every other IPv4 destination. Private DNS maps
+`*.googleapis.com` to `restricted.googleapis.com`. The sandbox runtime service account receives no project role and
+no database, model, Stripe, or application secret. The worker passes one input and one output object through
+short-lived V4 signed URLs; its self-signing permission cannot add storage authority it does not already possess.
+The Job uses a bounded in-memory workspace, a digest-pinned minimal image, a non-root tenant child process, direct
+argv, resource/time/log/output ceilings, and immutable result evidence. Temporary transfer objects expire under the
+bucket's 30-day cleanup rule. A future project-pool allocator will tighten the boundary from one separate untrusted
+execution project to Google's recommended one-project-per-paying-tenant model.
 
 The active cell also creates a one-minute HTTPS uptime check against the customer-facing `/ready` endpoint from
 USA, Europe, and Asia-Pacific, logs failed probes, and opens a critical alert after multiple regions fail for two
@@ -77,7 +90,7 @@ After the first apply, set these GitHub repository/environment variables from th
 
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_DEPLOY_SERVICE_ACCOUNT`
-- `GCP_PROJECT_ID`, `GCP_REGION`, and `GCP_STATE_BUCKET`
+- `GCP_PROJECT_ID`, `GCP_SANDBOX_PROJECT_ID`, `GCP_REGION`, and `GCP_STATE_BUCKET`
 - all non-secret `AOS_V2_OIDC_*`, Stripe price, public URL, and model values used above
 - `AOS_ALERT_NOTIFICATION_CHANNELS`, a JSON list of full Monitoring notification-channel resource names (or `[]`)
 
@@ -117,6 +130,6 @@ nor executes the migration Job. Database revisions must therefore follow the doc
 destructive schema reversal is an incident-specific, reviewed recovery action rather than an automated rollback.
 
 The GCP plane does not make the current product fully launch-ready by itself. A real domain, OIDC organization
-tenant, Stripe products/webhook, managed PostgreSQL, model key, hosted untrusted sandbox, artifact garbage collector,
+tenant, Stripe products/webhook, managed PostgreSQL, model key, artifact garbage collector,
 production generated-app deployer, backup/restore drills, notification-channel delivery, and an external smoke test
 must still be configured or proven.

@@ -13,7 +13,7 @@ if [[ ! -x .venv/bin/python ]]; then
 fi
 
 required_variables=(
-    GCP_PROJECT_ID AOS_V2_PUBLIC_BASE_URL
+    GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID AOS_V2_PUBLIC_BASE_URL
     AOS_V2_OIDC_ISSUER AOS_V2_OIDC_AUDIENCE AOS_V2_OIDC_JWKS_URL
     AOS_V2_OIDC_AUTHORIZATION_URL AOS_V2_OIDC_TOKEN_URL AOS_V2_OIDC_CLIENT_ID
     AOS_V2_STRIPE_STARTER_PRICE_ID AOS_V2_STRIPE_GROWTH_PRICE_ID AOS_V2_MODEL
@@ -35,6 +35,7 @@ release_id=${AOS_RELEASE_ID:-$(git rev-parse --verify HEAD)}
 tofu_root=deploy/gcp
 
 export TF_VAR_project_id="$GCP_PROJECT_ID"
+export TF_VAR_sandbox_project_id="$GCP_SANDBOX_PROJECT_ID"
 export TF_VAR_region="$gcp_region"
 export TF_VAR_environment="$deployment_environment"
 export TF_VAR_public_base_url="$AOS_V2_PUBLIC_BASE_URL"
@@ -119,12 +120,16 @@ gcloud builds submit . --project "$GCP_PROJECT_ID" --config deploy/gcp/cloudbuil
 
 application_tag="${runtime_repository}/agent-os:${release_id}"
 migration_tag="${runtime_repository}/migrations:${release_id}"
+sandbox_tag="${runtime_repository}/sandbox:${release_id}"
 application_digest=$(gcloud artifacts docker images describe "$application_tag" \
     --project "$GCP_PROJECT_ID" --format='value(image_summary.digest)')
 migration_digest=$(gcloud artifacts docker images describe "$migration_tag" \
     --project "$GCP_PROJECT_ID" --format='value(image_summary.digest)')
+sandbox_digest=$(gcloud artifacts docker images describe "$sandbox_tag" \
+    --project "$GCP_PROJECT_ID" --format='value(image_summary.digest)')
 application_image="${runtime_repository}/agent-os@${application_digest}"
 migration_image="${runtime_repository}/migrations@${migration_digest}"
+sandbox_image="${runtime_repository}/sandbox@${sandbox_digest}"
 
 # Create or update only the migration job first. Targeting prevents a repeat
 # release from rolling (or removing) the currently serving API/worker before
@@ -133,13 +138,15 @@ tofu -chdir="$tofu_root" apply -auto-approve \
     -target='google_cloud_run_v2_job.migrate[0]' \
     -var="activate_services=true" \
     -var="application_image=${application_image}" \
-    -var="migration_image=${migration_image}"
+    -var="migration_image=${migration_image}" \
+    -var="sandbox_image=${sandbox_image}"
 gcloud run jobs execute "agentos-${deployment_environment}-migrate" \
     --project "$GCP_PROJECT_ID" --region "$gcp_region" --wait
 tofu -chdir="$tofu_root" apply -auto-approve \
     -var="activate_services=true" \
     -var="application_image=${application_image}" \
-    -var="migration_image=${migration_image}"
+    -var="migration_image=${migration_image}" \
+    -var="sandbox_image=${sandbox_image}"
 
 api_url=$(tofu -chdir="$tofu_root" output -raw api_url)
 curl --fail --silent --show-error --retry 8 --retry-all-errors \

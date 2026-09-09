@@ -29,6 +29,11 @@ check "production_inputs" {
     condition     = var.github_repository_id == "" || var.state_bucket_name != ""
     error_message = "state_bucket_name is required when GitHub deployment identity is enabled."
   }
+
+  assert {
+    condition     = var.sandbox_project_id != var.project_id
+    error_message = "Untrusted sandboxes must run in a GCP project separate from the control plane."
+  }
 }
 
 locals {
@@ -97,14 +102,21 @@ locals {
   })
 
   worker_environment = merge(local.common_environment, {
-    AOS_V2_MODEL                         = var.model
-    AOS_V2_TENANT_DISCOVERY_LIMIT        = "128"
-    AOS_V2_MAX_TURN_COST_CENTS           = "100"
-    AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS = "120"
-    AOS_V2_MANAGEMENT_CHECK_SECONDS      = "30"
-    AOS_V2_SLOW_WORK_SECONDS             = "300"
-    AOS_V2_MANAGEMENT_ESCALATION_CHECKS  = "3"
-    AOS_V2_SANDBOX_BACKEND               = "disabled"
+    AOS_V2_MODEL                           = var.model
+    AOS_V2_TENANT_DISCOVERY_LIMIT          = "128"
+    AOS_V2_MAX_TURN_COST_CENTS             = "100"
+    AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS   = "120"
+    AOS_V2_MANAGEMENT_CHECK_SECONDS        = "30"
+    AOS_V2_SLOW_WORK_SECONDS               = "300"
+    AOS_V2_MANAGEMENT_ESCALATION_CHECKS    = "3"
+    AOS_V2_SANDBOX_BACKEND                 = "cloud-run-job"
+    AOS_V2_SANDBOX_PROJECT_ID              = var.sandbox_project_id
+    AOS_V2_SANDBOX_REGION                  = var.region
+    AOS_V2_SANDBOX_JOB_NAME                = "${local.prefix}-sandbox"
+    AOS_V2_SANDBOX_BUCKET                  = google_storage_bucket.artifacts.name
+    AOS_V2_SANDBOX_SIGNING_SERVICE_ACCOUNT = google_service_account.worker.email
+    AOS_V2_SANDBOX_REVISION                = var.sandbox_image
+    AOS_V2_SANDBOX_TIMEOUT_SECONDS         = tostring(var.sandbox_timeout_seconds)
   })
 
   api_secret_environment = {
@@ -492,5 +504,7 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
     google_artifact_registry_repository_iam_member.runtime_readers,
     google_storage_bucket_iam_member.artifact_readers,
     google_storage_bucket_iam_member.artifact_writers,
+    google_cloud_run_v2_job_iam_member.worker_sandbox_runner,
+    google_service_account_iam_member.worker_self_signer,
   ]
 }

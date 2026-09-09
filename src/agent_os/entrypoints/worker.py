@@ -22,6 +22,7 @@ from agent_os.entrypoints.server import ServerSettings
 from agent_os.infrastructure.agent_command_executor import DurableAgentCommandExecutor
 from agent_os.infrastructure.artifact_tool_nodes import ArtifactToolNodeHandlers
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
+from agent_os.infrastructure.cloud_run_sandbox import CloudRunJobSandboxRunner
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.deployment_tool_nodes import DeploymentToolNodeHandlers
 from agent_os.infrastructure.docker_sandbox import DEFAULT_PYTHON_IMAGE, DockerSandboxRunner
@@ -89,6 +90,12 @@ class WorkerSettings:
     sandbox_backend: str
     sandbox_image: str
     sandbox_timeout_seconds: int
+    sandbox_project_id: str
+    sandbox_region: str
+    sandbox_job_name: str
+    sandbox_bucket: str
+    sandbox_signing_service_account: str
+    sandbox_revision: str
     tenant_discovery_limit: int
     management_check_seconds: int
     slow_work_seconds: int
@@ -116,8 +123,30 @@ class WorkerSettings:
         if max_attempts_raw:
             retry_max_attempts = _positive_int("AOS_V2_RETRY_MAX_ATTEMPTS", 1)
         sandbox_backend = os.getenv("AOS_V2_SANDBOX_BACKEND", "disabled").strip().lower()
-        if sandbox_backend not in {"disabled", "docker"}:
-            raise ValueError("AOS_V2_SANDBOX_BACKEND must be disabled or docker")
+        if sandbox_backend not in {"disabled", "docker", "cloud-run-job"}:
+            raise ValueError(
+                "AOS_V2_SANDBOX_BACKEND must be disabled, docker, or cloud-run-job"
+            )
+        sandbox_project_id = os.getenv("AOS_V2_SANDBOX_PROJECT_ID", "").strip()
+        sandbox_region = os.getenv("AOS_V2_SANDBOX_REGION", "").strip()
+        sandbox_job_name = os.getenv("AOS_V2_SANDBOX_JOB_NAME", "").strip()
+        sandbox_bucket = os.getenv("AOS_V2_SANDBOX_BUCKET", "").strip()
+        sandbox_signing_service_account = os.getenv(
+            "AOS_V2_SANDBOX_SIGNING_SERVICE_ACCOUNT", "",
+        ).strip()
+        sandbox_revision = os.getenv("AOS_V2_SANDBOX_REVISION", "").strip()
+        if sandbox_backend == "cloud-run-job" and any(not value for value in (
+            sandbox_project_id,
+            sandbox_region,
+            sandbox_job_name,
+            sandbox_bucket,
+            sandbox_signing_service_account,
+            sandbox_revision,
+        )):
+            raise ValueError(
+                "cloud-run-job sandbox requires project, region, job, bucket, "
+                "signing service account, and revision settings"
+            )
         tenant_discovery_limit = _positive_int("AOS_V2_TENANT_DISCOVERY_LIMIT", 128)
         if tenant_discovery_limit > 1_000:
             raise ValueError("AOS_V2_TENANT_DISCOVERY_LIMIT cannot exceed 1000")
@@ -149,6 +178,12 @@ class WorkerSettings:
             sandbox_backend=sandbox_backend,
             sandbox_image=os.getenv("AOS_V2_SANDBOX_IMAGE", DEFAULT_PYTHON_IMAGE).strip(),
             sandbox_timeout_seconds=_positive_int("AOS_V2_SANDBOX_TIMEOUT_SECONDS", 300),
+            sandbox_project_id=sandbox_project_id,
+            sandbox_region=sandbox_region,
+            sandbox_job_name=sandbox_job_name,
+            sandbox_bucket=sandbox_bucket,
+            sandbox_signing_service_account=sandbox_signing_service_account,
+            sandbox_revision=sandbox_revision,
             tenant_discovery_limit=tenant_discovery_limit,
             management_check_seconds=management_check_seconds,
             slow_work_seconds=slow_work_seconds,
@@ -238,6 +273,18 @@ def run_worker(
                 artifact_store,
                 image=settings.sandbox_image,
                 docker_binary=docker_binary,
+                timeout_seconds=settings.sandbox_timeout_seconds,
+            )
+            named_tool_handlers.update(SandboxToolNodeHandlers(sandbox_runner).named_handlers())
+        elif settings.sandbox_backend == "cloud-run-job":
+            sandbox_runner = CloudRunJobSandboxRunner(
+                artifact_store,
+                project_id=settings.sandbox_project_id,
+                region=settings.sandbox_region,
+                job_name=settings.sandbox_job_name,
+                bucket_name=settings.sandbox_bucket,
+                signing_service_account_email=settings.sandbox_signing_service_account,
+                sandbox_revision=settings.sandbox_revision,
                 timeout_seconds=settings.sandbox_timeout_seconds,
             )
             named_tool_handlers.update(SandboxToolNodeHandlers(sandbox_runner).named_handlers())

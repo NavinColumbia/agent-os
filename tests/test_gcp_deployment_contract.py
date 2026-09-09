@@ -72,7 +72,9 @@ def test_release_order_is_migrate_then_activate_and_images_require_digests():
     assert "state list | rg -q '^google_cloud_run_v2_service\\.api\\[0\\]$'" in deploy
     assert "-target='google_cloud_run_v2_job.migrate[0]'" in deploy
     assert '${api_url}/ready' in deploy
-    assert variables.count('@sha256:[0-9a-f]{64}$') == 2
+    assert variables.count('@sha256:[0-9a-f]{64}$') == 3
+    assert 'sandbox_tag="${runtime_repository}/sandbox:${release_id}"' in deploy
+    assert '-var="sandbox_image=${sandbox_image}"' in deploy
 
     workflow_text = text("deploy/gcp/github-actions-deploy.yml")
     workflow = yaml.safe_load(workflow_text)
@@ -111,10 +113,38 @@ def test_rollback_is_digest_pinned_serving_only_and_health_checked():
     rollback = text("deploy/gcp/rollback.sh")
 
     assert 'current_migration_image=$(tofu -chdir="$tofu_root" output -raw migration_image)' in rollback
-    assert rollback.count('@sha256:[0-9a-f]{64}$') == 2
+    assert rollback.count('@sha256:[0-9a-f]{64}$') == 3
     assert "-target='google_cloud_run_v2_service.api[0]'" in rollback
     assert "-target='google_cloud_run_v2_worker_pool.worker[0]'" in rollback
     assert "google_cloud_run_v2_job.migrate" not in rollback
     assert "gcloud run jobs execute" not in rollback
     assert '${api_url}/ready' in rollback
     subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/rollback.sh")], check=True)
+
+
+def test_hosted_sandbox_is_cross_project_secretless_and_network_denied():
+    main = text("deploy/gcp/main.tf")
+    sandbox = text("deploy/gcp/sandbox.tf")
+    variables = text("deploy/gcp/variables.tf")
+    build = text("deploy/gcp/cloudbuild.yaml")
+
+    assert 'var.sandbox_project_id != var.project_id' in main
+    assert 'AOS_V2_SANDBOX_BACKEND                 = "cloud-run-job"' in main
+    worker = main.split('resource "google_cloud_run_v2_worker_pool" "worker"', 1)[1]
+    assert "google_cloud_run_v2_job_iam_member.worker_sandbox_runner" in worker
+    assert "google_service_account_iam_member.worker_self_signer" in worker
+    assert 'variable "sandbox_project_id"' in variables
+    assert 'provider = google.sandbox' in sandbox
+    assert 'service_account       = google_service_account.sandbox.email' in sandbox
+    assert 'role               = "roles/iam.serviceAccountTokenCreator"' in sandbox
+    assert 'role     = "roles/run.developer"' in sandbox
+    assert 'direction          = "EGRESS"' in sandbox
+    assert 'destination_ranges = ["0.0.0.0/0"]' in sandbox
+    assert 'protocol = "all"' in sandbox
+    assert 'destination_ranges = ["199.36.153.4/30", "34.126.0.0/18"]' in sandbox
+    assert 'rrdatas      = ["restricted.googleapis.com."]' in sandbox
+    assert 'size_limit = "16Mi"' in sandbox
+    assert "secret_key_ref" not in sandbox
+    assert "AOS_V2_MODEL" not in sandbox
+    assert "Dockerfile.sandbox-v2" in build
+    assert "${_REPOSITORY}/sandbox:${_RELEASE_ID}" in build

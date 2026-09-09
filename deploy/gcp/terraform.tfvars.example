@@ -1,4 +1,5 @@
 project_id      = "replace-with-gcp-project-id"
+sandbox_project_id = "replace-with-separate-sandbox-project-id"
 region          = "us-central1"
 environment     = "production"
 public_base_url = "https://agentos.example.com"

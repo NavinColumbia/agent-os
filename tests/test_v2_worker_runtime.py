@@ -228,8 +228,23 @@ def test_worker_settings_require_explicit_model_and_production_tenants(monkeypat
     assert settings.sandbox_backend == "disabled"
 
     monkeypatch.setenv("AOS_V2_SANDBOX_BACKEND", "host")
-    with pytest.raises(ValueError, match="must be disabled or docker"):
+    with pytest.raises(ValueError, match="must be disabled, docker, or cloud-run-job"):
         WorkerSettings.from_env()
+
+    monkeypatch.setenv("AOS_V2_SANDBOX_BACKEND", "cloud-run-job")
+    with pytest.raises(ValueError, match="requires project, region, job, bucket"):
+        WorkerSettings.from_env()
+
+    monkeypatch.setenv("AOS_V2_SANDBOX_PROJECT_ID", "sandbox-proj")
+    monkeypatch.setenv("AOS_V2_SANDBOX_REGION", "us-central1")
+    monkeypatch.setenv("AOS_V2_SANDBOX_JOB_NAME", "agentos-production-sandbox")
+    monkeypatch.setenv("AOS_V2_SANDBOX_BUCKET", "control-artifacts")
+    monkeypatch.setenv(
+        "AOS_V2_SANDBOX_SIGNING_SERVICE_ACCOUNT",
+        "worker@control-proj.iam.gserviceaccount.com",
+    )
+    monkeypatch.setenv("AOS_V2_SANDBOX_REVISION", "image@sha256:" + "a" * 64)
+    assert WorkerSettings.from_env().sandbox_backend == "cloud-run-job"
 
     monkeypatch.setenv("AOS_V2_SANDBOX_BACKEND", "disabled")
     monkeypatch.setenv("AOS_V2_MANAGEMENT_ESCALATION_CHECKS", "101")

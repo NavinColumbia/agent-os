@@ -23,6 +23,7 @@ jobs:
     environment: production
     env:
       TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_sandbox_project_id: ${{ vars.GCP_SANDBOX_PROJECT_ID }}
       TF_VAR_region: ${{ vars.GCP_REGION }}
       TF_VAR_environment: production
       TF_VAR_public_base_url: ${{ vars.AOS_V2_PUBLIC_BASE_URL }}
@@ -89,12 +90,15 @@ jobs:
             --substitutions="_REPOSITORY=${repository},_RELEASE_ID=${release_id},_BUILD_SERVICE_ACCOUNT=${builder}"
           application_tag="${repository}/agent-os:${release_id}"
           migration_tag="${repository}/migrations:${release_id}"
+          sandbox_tag="${repository}/sandbox:${release_id}"
           application_digest=$(gcloud artifacts docker images describe "$application_tag" --format='value(image_summary.digest)')
           migration_digest=$(gcloud artifacts docker images describe "$migration_tag" --format='value(image_summary.digest)')
+          sandbox_digest=$(gcloud artifacts docker images describe "$sandbox_tag" --format='value(image_summary.digest)')
           {
             echo "TF_VAR_release_id=${release_id}"
             echo "TF_VAR_application_image=${repository}/agent-os@${application_digest}"
             echo "TF_VAR_migration_image=${repository}/migrations@${migration_digest}"
+            echo "TF_VAR_sandbox_image=${repository}/sandbox@${sandbox_digest}"
           } >> "$GITHUB_ENV"
 
       - name: migrate before releasing application revisions

@@ -125,6 +125,16 @@ bytes, and captured logs. It uses `--pull never` and never falls back to host ex
 be pre-pulled. Do not mount the Docker socket into the API or general worker container; the hosted adapter remains
 a separate Cloud Run Job/GKE sandbox boundary.
 
+Hosted production uses `AOS_V2_SANDBOX_BACKEND=cloud-run-job`. Its adapter stages a deterministic input object,
+creates short-lived generation-bound GCS read/write capabilities, executes one overridden Cloud Run Job, resumes a
+previously recorded long-running operation after a worker crash, and persists the same immutable output/result
+evidence contract as the local adapter. The Job runs in a separate GCP project on a dedicated Direct VPC egress
+network: private DNS maps Google APIs to `restricted.googleapis.com`, HTTPS to those documented ranges is allowed,
+and all other IPv4 egress is denied. Its service account has no project roles and receives no application, model,
+database, billing, or tenant secret. A root controller exists only to own transfer capabilities and demote the
+direct-argv child to UID/GID 65532; the child gets a scrubbed environment and bounded in-memory workspace, file,
+process, time, log, and output limits. The Cloud Run execution is pay-per-use and scales to zero.
+
 For a dedicated local runner host:
 
 ```bash

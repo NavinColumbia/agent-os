@@ -13,6 +13,8 @@ dependencies = [
   "cryptography==49.0.0",
   "dbos==2.24.0",
   "fastapi==0.138.0",
+  "google-api-core==2.36.0",
+  "google-auth==2.57.1",
   "google-cloud-storage==3.13.1",
   "opentelemetry-api==1.44.0",
   "opentelemetry-sdk==1.44.0",

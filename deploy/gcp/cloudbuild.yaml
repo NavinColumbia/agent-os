@@ -12,13 +12,22 @@ steps:
       - --tag=${_REPOSITORY}/migrations:${_RELEASE_ID}
       - .
   - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=deploy/Dockerfile.sandbox-v2
+      - --tag=${_REPOSITORY}/sandbox:${_RELEASE_ID}
+      - .
+  - name: gcr.io/cloud-builders/docker
     args: [push, "${_REPOSITORY}/agent-os:${_RELEASE_ID}"]
   - name: gcr.io/cloud-builders/docker
     args: [push, "${_REPOSITORY}/migrations:${_RELEASE_ID}"]
+  - name: gcr.io/cloud-builders/docker
+    args: [push, "${_REPOSITORY}/sandbox:${_RELEASE_ID}"]
 
 images:
   - ${_REPOSITORY}/agent-os:${_RELEASE_ID}
   - ${_REPOSITORY}/migrations:${_RELEASE_ID}
+  - ${_REPOSITORY}/sandbox:${_RELEASE_ID}
 
 options:
   logging: CLOUD_LOGGING_ONLY

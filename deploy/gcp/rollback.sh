@@ -9,7 +9,7 @@ for command_name in gcloud tofu curl date rg; do
 done
 
 required_variables=(
-    GCP_PROJECT_ID AOS_V2_PUBLIC_BASE_URL
+    GCP_PROJECT_ID GCP_SANDBOX_PROJECT_ID AOS_V2_PUBLIC_BASE_URL
     AOS_V2_OIDC_ISSUER AOS_V2_OIDC_AUDIENCE AOS_V2_OIDC_JWKS_URL
     AOS_V2_OIDC_AUTHORIZATION_URL AOS_V2_OIDC_TOKEN_URL AOS_V2_OIDC_CLIENT_ID
     AOS_V2_STRIPE_STARTER_PRICE_ID AOS_V2_STRIPE_GROWTH_PRICE_ID AOS_V2_MODEL
@@ -34,6 +34,7 @@ github_repository_id=${GITHUB_REPOSITORY_ID:-1276674620}
 tofu_root=deploy/gcp
 
 export TF_VAR_project_id="$GCP_PROJECT_ID"
+export TF_VAR_sandbox_project_id="$GCP_SANDBOX_PROJECT_ID"
 export TF_VAR_region="$gcp_region"
 export TF_VAR_environment="$deployment_environment"
 export TF_VAR_public_base_url="$AOS_V2_PUBLIC_BASE_URL"
@@ -60,8 +61,13 @@ tofu -chdir="$tofu_root" init -reconfigure -input=false \
     -backend-config="prefix=${state_prefix}"
 
 current_migration_image=$(tofu -chdir="$tofu_root" output -raw migration_image)
+current_sandbox_image=$(tofu -chdir="$tofu_root" output -raw sandbox_image)
 if [[ ! "$current_migration_image" =~ @sha256:[0-9a-f]{64}$ ]]; then
     echo "current migration image in state is not digest-pinned; refusing rollback" >&2
+    exit 2
+fi
+if [[ ! "$current_sandbox_image" =~ @sha256:[0-9a-f]{64}$ ]]; then
+    echo "current sandbox image in state is not digest-pinned; refusing rollback" >&2
     exit 2
 fi
 
@@ -88,6 +94,7 @@ fi
 
 export TF_VAR_application_image="$rollback_image"
 export TF_VAR_migration_image="$current_migration_image"
+export TF_VAR_sandbox_image="$current_sandbox_image"
 export TF_VAR_release_id="$rollback_release_id"
 
 # Roll back serving revisions only. The migration job is not updated or run;

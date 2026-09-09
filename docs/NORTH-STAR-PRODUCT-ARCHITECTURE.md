@@ -520,8 +520,8 @@ generation, length, and digest. Production refuses the small inline SQL adapter.
 controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
 multi-user invite/organization onboarding (although provider-neutral OIDC/JWKS verification now supports a
 zero-touch personal-company path derived from the verified issuer/subject),
-no managed-cloud sandbox/production-deploy/general-subworkflow
-adapters, and no complete
+no per-paying-tenant sandbox-project allocator, production-deploy, or general-subworkflow
+adapters (although the first secretless cross-project Cloud Run Job sandbox is now wired), and no complete
 new-customer-browser-to-production-URL vertical.
 This is a real durable execution spine, not yet the finished platform.
 

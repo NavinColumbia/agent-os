@@ -14,6 +14,16 @@ variable "region" {
   default     = "us-central1"
 }
 
+variable "sandbox_project_id" {
+  description = "Existing billed GCP project dedicated to untrusted sandbox execution."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.sandbox_project_id))
+    error_message = "sandbox_project_id must be a valid GCP project ID."
+  }
+}
+
 variable "environment" {
   type    = string
   default = "production"
@@ -49,6 +59,28 @@ variable "migration_image" {
   validation {
     condition     = var.migration_image == "" || can(regex("@sha256:[0-9a-f]{64}$", var.migration_image))
     error_message = "migration_image must be empty or an immutable @sha256 digest."
+  }
+}
+
+variable "sandbox_image" {
+  description = "Secretless hosted-sandbox OCI image pinned by sha256 digest."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.activate_services || can(regex("@sha256:[0-9a-f]{64}$", var.sandbox_image))
+    error_message = "sandbox_image must be an immutable @sha256 digest when services are active."
+  }
+}
+
+variable "sandbox_timeout_seconds" {
+  description = "Maximum untrusted command duration; the job gets a bounded evidence-upload grace period."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.sandbox_timeout_seconds >= 1 && var.sandbox_timeout_seconds <= 3600
+    error_message = "sandbox_timeout_seconds must be between 1 and 3600."
   }
 }
 

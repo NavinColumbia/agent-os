@@ -27,6 +27,6 @@ BEGIN
 END $$;
 
 DROP INDEX IF EXISTS aos_v2_workflow_actions_pending_idx;
-CREATE INDEX aos_v2_workflow_actions_recoverable_idx
+CREATE INDEX IF NOT EXISTS aos_v2_workflow_actions_recoverable_idx
     ON aos_v2_workflow_actions (tenant_id, status, available_at, created_at, position)
     WHERE status IN ('pending', 'executing');

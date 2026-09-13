@@ -27,7 +27,17 @@ SELECT count(*) = 1 AS runtime_role_is_safe
    AND NOT rolbypassrls
 \gset
 \if :runtime_role_is_safe
+ALTER ROLE :"runtime_role" NOINHERIT;
 GRANT agentos_app, agentos_worker TO :"runtime_role";
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+GRANT USAGE ON SCHEMA public TO :"runtime_role";
+SELECT format(
+    'CREATE SCHEMA IF NOT EXISTS dbos AUTHORIZATION %I',
+    :'runtime_role'
+)
+\gexec
+SELECT format('ALTER SCHEMA dbos OWNER TO %I', :'runtime_role')
+\gexec
 \else
 \echo 'runtime database role is missing, cannot login, or bypasses RLS'
 \quit 3

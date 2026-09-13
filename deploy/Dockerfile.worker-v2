@@ -1,0 +1,22 @@
+FROM python:3.12-slim-trixie@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    AOS_ENVIRONMENT=staging
+
+RUN groupadd --system --gid 10001 agentos \
+    && useradd --system --uid 10001 --gid agentos --home-dir /nonexistent --shell /usr/sbin/nologin agentos \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends docker-cli=26.1.5+dfsg1-9+deb13u1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml pylock.toml README.md ./
+COPY src ./src
+RUN python -m pip install --no-cache-dir --upgrade pip==26.1.2 \
+    && python -m pip install --no-cache-dir -r pylock.toml \
+    && python -m pip install --no-cache-dir --no-deps .
+
+USER 10001:10001
+CMD ["agentos-v2", "worker"]

@@ -798,7 +798,10 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
 
     def health(self) -> Mapping[str, Any]:
         try:
-            with self._engine.connect() as connection:
+            # Exercise the same least-privilege role and tenant RLS path as a
+            # real request. Runtime logins are deliberately NOINHERIT and must
+            # never need unscoped table access merely to report readiness.
+            with self._tenant_connection("__agent_os_readiness__") as connection:
                 connection.execute(select(1)).scalar_one()
                 connection.execute(select(runs.c.run_id).limit(1)).first()
             return {"ok": True, "workflow_engine": "dbos", "database": "ready"}

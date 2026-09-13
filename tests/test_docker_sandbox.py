@@ -120,6 +120,26 @@ def test_docker_runner_requires_pinned_image_and_source_bundle_media_type(tmp_pa
     store.close()
 
 
+def test_docker_runner_uses_an_explicit_shared_workspace_root(tmp_path: Path):
+    store = SQLArtifactStore(f"sqlite:///{tmp_path / 'sandbox.sqlite3'}", create_schema=True)
+    workspace = tmp_path / "shared"
+    workspace.mkdir()
+    runner = DockerSandboxRunner(
+        store, docker_binary="/bin/true", workspace_root=workspace,
+    )
+    assert runner._workspace_root == workspace.resolve()
+
+    with pytest.raises(ValueError, match="must be absolute"):
+        DockerSandboxRunner(
+            store, docker_binary="/bin/true", workspace_root="relative/path",
+        )
+    with pytest.raises(ValueError, match="must exist"):
+        DockerSandboxRunner(
+            store, docker_binary="/bin/true", workspace_root=tmp_path / "missing",
+        )
+    store.close()
+
+
 def test_docker_infrastructure_failure_is_retryable_and_not_cached(monkeypatch, tmp_path: Path):
     store = SQLArtifactStore(f"sqlite:///{tmp_path / 'infra.sqlite3'}", create_schema=True)
     source_id = store.put(

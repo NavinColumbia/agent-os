@@ -178,6 +178,17 @@ url = "https://files.pythonhosted.org/packages/53/f6/788f89785cee5289c13c3220a26
 sha256 = "8e72b5fbc0c793214a6bb137cdb780ed08418153ce0afef56c7df2be8f3372ca"
 
 [[packages]]
+name = "distro"
+version = "1.9.0"
+
+[[packages.wheels]]
+name = "distro-1.9.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/12/b3/231ffd4ab1fc9d679809f356cebee130ac7daa00d6d6f3206dd4fd137e9e/distro-1.9.0-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2"
+
+[[packages]]
 name = "dnspython"
 version = "2.8.0"
 
@@ -310,6 +321,17 @@ url = "https://files.pythonhosted.org/packages/ce/a9/a780cc66f86335a6019f557a8aa
 sha256 = "14f87e04d613dfa218d6135e81b78272c3b904e2a7053b841481b38a7d901411"
 
 [[packages]]
+name = "google-genai"
+version = "2.22.0"
+
+[[packages.wheels]]
+name = "google_genai-2.22.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/de/96/0120d214958cb54f2b9c48da9f564a0e6eae269e9dd702415fb1d0551cc7/google_genai-2.22.0-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "c514001c45470cc0a942440ae1b8215445d12bfb6c373aac94637127e1f74ec6"
+
+[[packages]]
 name = "google-resumable-media"
 version = "2.10.2"
 
@@ -365,6 +387,17 @@ url = "https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995
 sha256 = "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86"
 
 [[packages]]
+name = "httpcore"
+version = "1.0.9"
+
+[[packages.wheels]]
+name = "httpcore-1.0.9-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55"
+
+[[packages]]
 name = "httpcore2"
 version = "2.12.0"
 
@@ -374,6 +407,17 @@ url = "https://files.pythonhosted.org/packages/d2/74/d370e55600d9bcfa0d9794b0166
 
 [packages.wheels.hashes]
 sha256 = "7e04258ce01013d7d615e5b910a3b27fac937d7a95038227e79652b4ba3b4ceb"
+
+[[packages]]
+name = "httpx"
+version = "0.28.1"
+
+[[packages.wheels]]
+name = "httpx-0.28.1-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad"
 
 [[packages]]
 name = "httpx2"
@@ -564,14 +608,14 @@ sha256 = "4b65538ae22f6fed0ce4874efd317463a7489796a0939fa66824dd542125a192"
 
 [[packages]]
 name = "openai"
-version = "3.8.0"
+version = "3.11.0"
 
 [[packages.wheels]]
-name = "openai-3.8.0-py3-none-any.whl"
-url = "https://files.pythonhosted.org/packages/24/a4/c7e89d3bfb8b7c7ffa38ec9fe527bccf4df723f752fb11bdb3da6c750b76/openai-3.8.0-py3-none-any.whl"
+name = "openai-3.11.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/c1/c4/d23c3f86e280e09a001dc9ad7330e882531baca2e598e42b0d7d1eb693c4/openai-3.11.0-py3-none-any.whl"
 
 [packages.wheels.hashes]
-sha256 = "514736aa1e4ef1033c1209ad53897392845ccd4f2c4fae6413b2cf5f91c2c926"
+sha256 = "2fc169442feafd535f4959605b42d47bc922216385a6d2473b0d47956691d9fd"
 
 [[packages]]
 name = "opentelemetry-api"
@@ -608,14 +652,14 @@ sha256 = "1cacde7b0ad306f84c5ef08c3dbe1bbaf20165bba6f8bff43b670e555a086bcb"
 
 [[packages]]
 name = "platformdirs"
-version = "4.11.7"
+version = "4.11.8"
 
 [[packages.wheels]]
-name = "platformdirs-4.11.7-py3-none-any.whl"
-url = "https://files.pythonhosted.org/packages/27/6e/80993e10a0482f630cef528635789233224f36b1ffd11592aa15d13ff9ce/platformdirs-4.11.7-py3-none-any.whl"
+name = "platformdirs-4.11.8-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/f4/e1/5b7b8bbb55084d1425bcb9bc823ff519e1b2be05f6ebb0089e2eacc38413/platformdirs-4.11.8-py3-none-any.whl"
 
 [packages.wheels.hashes]
-sha256 = "8a02cb259042c79d1cd0450facc2fe6dc9d303ae7901afbe33bf8ea0b188cef6"
+sha256 = "52f2f181bbfde907966932cc8312d967d02976422d66d537ea16092b8e291081"
 
 [[packages]]
 name = "proto-plus"
@@ -850,14 +894,14 @@ sha256 = "381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231"
 
 [[packages]]
 name = "regex"
-version = "2026.9.3"
+version = "2026.9.10"
 
 [[packages.wheels]]
-name = "regex-2026.9.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
-url = "https://files.pythonhosted.org/packages/4b/8b/9cc6d4123033f7cb82df6cd8ce19eb0fc18a964afe060a03c9b26757c9f3/regex-2026.9.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
+name = "regex-2026.9.10-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
+url = "https://files.pythonhosted.org/packages/cb/f5/dcdf5e0d898024005cfcce631e3e934d111dfbe177ca0b7f253ae8a735a2/regex-2026.9.10-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
 
 [packages.wheels.hashes]
-sha256 = "665207e41bacd435db001099eeab44103197c2c1a729d73ade74688a905ed4ce"
+sha256 = "2e67f8843f0e4b931f1fa860bf3bbe4134b714c0155cc5c7c0d7ea450230aae0"
 
 [[packages]]
 name = "requests"
@@ -970,6 +1014,17 @@ url = "https://files.pythonhosted.org/packages/c8/cb/6a6a47d5b464bd08695d254f3da
 sha256 = "a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c"
 
 [[packages]]
+name = "tenacity"
+version = "9.1.4"
+
+[[packages.wheels]]
+name = "tenacity-9.1.4-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55"
+
+[[packages]]
 name = "tiktoken"
 version = "0.14.0"
 
@@ -1059,11 +1114,11 @@ sha256 = "ba3d14c3ee7e41c6c654c46c9eb489d33213cdd30aa1696eab1374337c13f68f"
 
 [[packages]]
 name = "websockets"
-version = "17.1"
+version = "16.1.1"
 
 [[packages.wheels]]
-name = "websockets-17.1-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl"
-url = "https://files.pythonhosted.org/packages/fb/05/9f82d090c8d2d861604147ef6dfb938a90b039f9358d5193f1df62558593/websockets-17.1-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl"
+name = "websockets-16.1.1-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl"
+url = "https://files.pythonhosted.org/packages/fe/ed/f1831681fce0e3242346e5458486003c5f124ed69e5e0b847fd029db4973/websockets-16.1.1-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl"
 
 [packages.wheels.hashes]
-sha256 = "0c863507ada5805517ca6dff1c524dcd42942efe6304dacf06700878398d21a6"
+sha256 = "0f62863e8a00a6d33c3d6566ec0b89f23787b747ffe0c3bc71ec0e76b82c94b1"

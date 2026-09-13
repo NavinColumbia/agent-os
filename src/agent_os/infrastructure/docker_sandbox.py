@@ -137,6 +137,7 @@ class DockerSandboxRunner(SandboxRunner):
         max_output_bundle_bytes: int = 1024 * 1024,
         workspace_limit_bytes: int = 4 * 1024 * 1024,
         max_log_bytes: int = 64 * 1024,
+        workspace_root: str | Path | None = None,
     ) -> None:
         resolved = shutil.which(docker_binary)
         image_digest = image.rpartition("@sha256:")[2]
@@ -161,6 +162,18 @@ class DockerSandboxRunner(SandboxRunner):
         self._max_output_bundle_bytes = max_output_bundle_bytes
         self._workspace_limit_bytes = workspace_limit_bytes
         self._max_log_bytes = max_log_bytes
+        self._workspace_root = None
+        if workspace_root is not None:
+            configured_root = Path(workspace_root)
+            if not configured_root.is_absolute():
+                raise ValueError("sandbox workspace root must be absolute")
+            try:
+                configured_root = configured_root.resolve(strict=True)
+            except OSError as exc:
+                raise ValueError("sandbox workspace root must exist") from exc
+            if not configured_root.is_dir() or not os.access(configured_root, os.W_OK):
+                raise ValueError("sandbox workspace root must be a writable directory")
+            self._workspace_root = configured_root
         self._run_uid = os.getuid() if os.getuid() != 0 else 65532
         self._run_gid = os.getgid() if os.getuid() != 0 else 65532
 
@@ -350,7 +363,10 @@ class DockerSandboxRunner(SandboxRunner):
         stderr = bytearray()
         timed_out = False
         output_error: str | None = None
-        with tempfile.TemporaryDirectory(prefix="agent-os-sandbox-") as temporary:
+        with tempfile.TemporaryDirectory(
+            prefix="agent-os-sandbox-",
+            dir=None if self._workspace_root is None else str(self._workspace_root),
+        ) as temporary:
             source_workspace = Path(temporary) / "source"
             output_workspace = Path(temporary) / "output"
             source_workspace.mkdir(mode=0o755)

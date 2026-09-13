@@ -76,8 +76,8 @@ def issue_local_token(subject: str, organization: str, roles: tuple[str, ...], t
     """Issue a signed token for local/BYOC evaluation (not hosted signup)."""
 
     settings = ServerSettings.from_env()
-    if settings.environment not in {"development", "test"}:
-        raise click.ClickException("local tokens are disabled outside development/test")
+    if settings.environment not in {"development", "test", "staging"}:
+        raise click.ClickException("local tokens are disabled in production")
     token = HMACTokenIdentity(settings.auth_secret).issue(
         subject_id=subject,
         organization_id=organization,

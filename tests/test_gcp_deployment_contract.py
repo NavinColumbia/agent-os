@@ -25,7 +25,10 @@ def test_migration_image_is_digest_pinned_non_root_complete_and_admin_isolated()
     assert "AOS_V2_SYSTEM_DATABASE_URL" not in script
     assert "NOT rolsuper" in script
     assert "NOT rolbypassrls" in script
+    assert 'ALTER ROLE :"runtime_role" NOINHERIT' in script
     assert 'GRANT agentos_app, agentos_worker TO :"runtime_role"' in script
+    assert 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp"' in script
+    assert "CREATE SCHEMA IF NOT EXISTS dbos AUTHORIZATION" in script
     subprocess.run(["sh", "-n", str(ROOT / "deploy/migrate-v2.sh")], check=True)
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Literal, Mapping
+from typing import Any, Collection, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -41,6 +41,14 @@ _MISSION_PLAN_MAX_TOTAL_ITERATIONS = 128
 _MISSION_TOOL_ALLOWLIST = frozenset({
     "deploy.preview", "deploy.service", "deploy.static", "sandbox.run",
 })
+
+
+def _mission_tools(configured: Collection[str] | None) -> frozenset[str]:
+    tools = _MISSION_TOOL_ALLOWLIST if configured is None else frozenset(configured)
+    unsupported = tools - _MISSION_TOOL_ALLOWLIST
+    if unsupported:
+        raise ValueError(f"unsupported mission tools: {sorted(unsupported)}")
+    return tools
 
 
 class PlannedNode(BaseModel):
@@ -128,7 +136,10 @@ def _cancel_graph_run(
     raise FatalCommandError("mission graph cancellation exceeded its concurrency retry bound")
 
 
-def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
+def mission_bootstrap_definition(
+    tenant_id: str, *, available_tools: Collection[str] | None = None,
+) -> WorkflowDefinition:
+    tools = _mission_tools(available_tools)
     requirements = {
         "deliverable": (
             "Propose exactly one application/json artifact labeled mission-workflow. Use json_value, "
@@ -159,8 +170,8 @@ def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
                 "priority": 0,
             }],
         },
-        "available_tools": sorted(_MISSION_TOOL_ALLOWLIST),
-        "sandbox_tool_configuration": {
+        "available_tools": sorted(tools),
+        **({"sandbox_tool_configuration": {
             "tool": "sandbox.run",
             "source": {
                 "node_id": "successful earlier agent node",
@@ -169,16 +180,16 @@ def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
             "command": ["direct", "argument", "vector"],
             "success_condition": "outgoing condition for exit code zero",
             "failure_condition": "optional outgoing repair condition",
-        },
-        "preview_deployment_configuration": {
+        }} if "sandbox.run" in tools else {}),
+        **({"preview_deployment_configuration": {
             "tool": "deploy.preview",
             "source": {
                 "node_id": "successful earlier agent node",
                 "output_path": ["artifact_ids", "html-preview-artifact-label"],
             },
             "success_condition": "outgoing condition after publication",
-        },
-        "production_static_deployment_configuration": {
+        }} if "deploy.preview" in tools else {}),
+        **({"production_static_deployment_configuration": {
             "tool": "deploy.static",
             "source": {
                 "node_id": "successful earlier agent or sandbox node",
@@ -190,8 +201,8 @@ def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
             },
             "app_slug": "stable lowercase DNS label",
             "success_condition": "outgoing condition after production publication",
-        },
-        "production_service_deployment_configuration": {
+        }} if "deploy.static" in tools else {}),
+        **({"production_service_deployment_configuration": {
             "tool": "deploy.service",
             "source": {
                 "node_id": "successful earlier sandbox node",
@@ -209,7 +220,7 @@ def mission_bootstrap_definition(tenant_id: str) -> WorkflowDefinition:
                 "trusted builder are digest-pinned, the final stage declares a numeric non-root USER, the "
                 "container listens on PORT 8080, and health_path returns a 2xx response. Do not embed secrets."
             ),
-        },
+        }} if "deploy.service" in tools else {}),
         "limits": {
             "nodes": _MISSION_PLAN_MAX_NODES,
             "edges": _MISSION_PLAN_MAX_EDGES,
@@ -266,7 +277,9 @@ def materialize_mission_workflow(
     tenant_id: str,
     planning_run_id: str,
     artifact_id: str,
+    allowed_tools: Collection[str] | None = None,
 ) -> WorkflowDefinition:
+    tools = _mission_tools(allowed_tools)
     try:
         plan = MissionWorkflowPlan.model_validate(raw)
     except (TypeError, ValueError) as exc:
@@ -355,8 +368,8 @@ def materialize_mission_workflow(
                 raise FatalCommandError(
                     f"planned tool node has unsupported configuration: {sorted(unexpected)}"
                 )
-            if tool not in _MISSION_TOOL_ALLOWLIST:
-                raise FatalCommandError(f"planned workflow requested unregistered tool: {tool}")
+            if tool not in tools:
+                raise FatalCommandError(f"planned workflow requested unavailable tool: {tool}")
             source = configuration.get("source")
             if not isinstance(source, Mapping):
                 raise FatalCommandError("planned tool requires a prior-node source")
@@ -539,9 +552,11 @@ class MissionBootstrapHandler:
         self,
         graph_engine: GraphWorkflowEngine,
         lifecycle_engine: WorkflowEngine | None = None,
+        available_tools: Collection[str] | None = None,
     ) -> None:
         self._graph = graph_engine
         self._lifecycle = lifecycle_engine
+        self._available_tools = _mission_tools(available_tools)
 
     def execute(self, item: CommandEnvelope) -> Mapping[str, Any]:
         if self._lifecycle is not None:
@@ -550,7 +565,9 @@ class MissionBootstrapHandler:
                 raise FatalCommandError("mission lifecycle disappeared before planning")
             if lifecycle.status is LifecycleStatus.CANCELLED:
                 return {"planning_started": False, "reason": "lifecycle_cancelled"}
-        definition = mission_bootstrap_definition(item.organization_id)
+        definition = mission_bootstrap_definition(
+            item.organization_id, available_tools=self._available_tools,
+        )
         self._graph.register_workflow(definition)
         planning_run_id = mission_planning_run_id(item.run_id)
         context = {
@@ -582,10 +599,12 @@ class WorkflowLaunchToolNodeHandlers:
         graph_engine: GraphWorkflowEngine,
         artifact_store: ArtifactStore,
         lifecycle_engine: WorkflowEngine | None = None,
+        available_tools: Collection[str] | None = None,
     ) -> None:
         self._graph = graph_engine
         self._artifacts = artifact_store
         self._lifecycle = lifecycle_engine
+        self._available_tools = _mission_tools(available_tools)
 
     def _cancelled_lifecycle(self, tenant_id: str, state: WorkflowRunState) -> bool:
         if self._lifecycle is None:
@@ -643,6 +662,7 @@ class WorkflowLaunchToolNodeHandlers:
             tenant_id=tenant_id,
             planning_run_id=run_id,
             artifact_id=artifact_id,
+            allowed_tools=self._available_tools,
         )
         self._graph.register_workflow(child_definition)
         child_run_id = _child_run_id(run_id, child_definition.workflow_id)

@@ -259,6 +259,12 @@ actual provider tenant plus its multi-user invite/organization configuration, se
 configuration, artifact garbage collection, usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch
 blockers.
 
+For a stable, zero-fixed-cost external pilot from the existing WSL laptop, use
+[`deploy/LOCAL-PILOT.md`](../deploy/LOCAL-PILOT.md). That profile keeps the API loopback-only behind Tailscale
+Funnel, uses short-lived signed invitations, disables billing, supports Gemini's free tier, and executes generated
+tests in networkless resource-capped Docker containers. It is a customer-demonstration bridge, not a substitute for
+the isolated managed production cell.
+
 ## Managed GCP production-cell automation
 
 `deploy/gcp` now contains the first OpenTofu production cell and a credential-late deployment script. It creates a

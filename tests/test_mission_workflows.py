@@ -34,6 +34,7 @@ from agent_os.infrastructure.mission_workflows import (
     MissionGraphEffectHandlers,
     WorkflowLaunchToolNodeHandlers,
     materialize_mission_workflow,
+    mission_bootstrap_definition,
     mission_planning_run_id,
 )
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
@@ -88,12 +89,43 @@ def test_materialized_plan_is_tenant_owned_bounded_and_cannot_request_unknown_to
         "purpose": "Escape the authority layer.",
         "configuration": {"tool": "host.shell", "max_iterations": 1},
     }
-    with pytest.raises(FatalCommandError, match="unregistered tool"):
+    with pytest.raises(FatalCommandError, match="unavailable tool"):
         materialize_mission_workflow(
             bad,
             tenant_id="tenant-a",
             planning_run_id="plan-b",
             artifact_id="artifact-bad",
+        )
+
+
+def test_planner_advertises_and_enforces_only_runtime_available_tools():
+    definition = mission_bootstrap_definition(
+        "tenant-a", available_tools={"deploy.preview", "sandbox.run"},
+    )
+    planner = next(node for node in definition.nodes if node.node_id == "plan")
+    context = planner.configuration["agent_context"]
+    assert context["available_tools"] == ["deploy.preview", "sandbox.run"]
+    assert "preview_deployment_configuration" in context
+    assert "sandbox_tool_configuration" in context
+    assert "production_static_deployment_configuration" not in context
+    assert "production_service_deployment_configuration" not in context
+
+    plan = proposed_workflow()
+    plan["nodes"][0] = {
+        "node_id": "build",
+        "kind": "tool",
+        "purpose": "Attempt a cloud-only deployment.",
+        "configuration": {
+            "tool": "deploy.static",
+            "source": {"node_id": "done", "output_path": ["artifact_ids", "source"]},
+            "approval": {"node_id": "done", "output_path": ["human_response", "approved"]},
+            "app_slug": "blocked-app", "success_condition": "ready", "max_iterations": 1,
+        },
+    }
+    with pytest.raises(FatalCommandError, match="unavailable tool"):
+        materialize_mission_workflow(
+            plan, tenant_id="tenant-a", planning_run_id="plan-local",
+            artifact_id="artifact-local", allowed_tools={"deploy.preview", "sandbox.run"},
         )
 
 

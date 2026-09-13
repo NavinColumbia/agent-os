@@ -2,8 +2,8 @@ name: agent-os-v2
 
 x-runtime-environment: &runtime-environment
   AOS_ENVIRONMENT: staging
-  AOS_V2_SYSTEM_DATABASE_URL: postgresql://agentos:${AOS_V2_POSTGRES_PASSWORD}@postgres:5432/agentos
-  AOS_V2_APPLICATION_DATABASE_URL: postgresql://agentos:${AOS_V2_POSTGRES_PASSWORD}@postgres:5432/agentos
+  AOS_V2_SYSTEM_DATABASE_URL: postgresql://agentos_runtime:${AOS_V2_DATABASE_RUNTIME_PASSWORD}@postgres:5432/agentos
+  AOS_V2_APPLICATION_DATABASE_URL: postgresql://agentos_runtime:${AOS_V2_DATABASE_RUNTIME_PASSWORD}@postgres:5432/agentos
   AOS_V2_APPLICATION_VERSION: ${AOS_V2_APPLICATION_VERSION:-v2-local}
   AOS_V2_CREATE_SCHEMA: "0"
   AOS_V2_IDENTITY_MODE: ${AOS_V2_IDENTITY_MODE:-hmac}
@@ -26,7 +26,7 @@ x-runtime-environment: &runtime-environment
 
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:131dcf7ff6a900545df8e7e092c270aa8c6db2f2c818e408cb45ec21316b74e6
     environment:
       POSTGRES_USER: agentos
       POSTGRES_PASSWORD: ${AOS_V2_POSTGRES_PASSWORD:?set AOS_V2_POSTGRES_PASSWORD}
@@ -41,12 +41,13 @@ services:
     restart: unless-stopped
 
   migrate:
-    image: postgres:16
+    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
     environment:
       PGHOST: postgres
       PGUSER: agentos
       PGPASSWORD: ${AOS_V2_POSTGRES_PASSWORD:?set AOS_V2_POSTGRES_PASSWORD}
       PGDATABASE: agentos
+      AOS_V2_DATABASE_RUNTIME_PASSWORD: ${AOS_V2_DATABASE_RUNTIME_PASSWORD:?set a separate runtime database password}
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,6 +65,7 @@ services:
       - ../postgres/initdb/96-company-proposal-decisions-v2.sql:/migrations/96-company-proposal-decisions-v2.sql:ro
       - ../postgres/initdb/97-usage-meter-v2.sql:/migrations/97-usage-meter-v2.sql:ro
       - ../postgres/initdb/98-billing-v2.sql:/migrations/98-billing-v2.sql:ro
+      - ../postgres/initdb/99-external-artifacts-v2.sql:/migrations/99-external-artifacts-v2.sql:ro
     command:
       - sh
       - -ec
@@ -81,6 +83,24 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/96-company-proposal-decisions-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/97-usage-meter-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/98-billing-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/99-external-artifacts-v2.sql
+        psql -v ON_ERROR_STOP=1 \
+          -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
+        SELECT format(
+          'CREATE ROLE agentos_runtime LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT',
+          :'runtime_password'
+        )
+        WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentos_runtime')
+        \gexec
+        ALTER ROLE agentos_runtime WITH LOGIN PASSWORD :'runtime_password'
+          NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+        GRANT CONNECT ON DATABASE agentos TO agentos_runtime;
+        GRANT USAGE ON SCHEMA public TO agentos_runtime;
+        GRANT agentos_app, agentos_worker TO agentos_runtime;
+        CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+        CREATE SCHEMA IF NOT EXISTS dbos AUTHORIZATION agentos_runtime;
+        ALTER SCHEMA dbos OWNER TO agentos_runtime;
+        SQL
     restart: "no"
 
   api:
@@ -102,7 +122,7 @@ services:
       migrate:
         condition: service_completed_successfully
     ports:
-      - "${AOS_V2_PUBLIC_PORT:-8080}:8080"
+      - "127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080"
     healthcheck:
       test:
         - CMD
@@ -132,6 +152,8 @@ services:
       AOS_V2_MANAGEMENT_ESCALATION_CHECKS: ${AOS_V2_MANAGEMENT_ESCALATION_CHECKS:-3}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
     depends_on:
       migrate:
         condition: service_completed_successfully

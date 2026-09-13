@@ -1,0 +1,30 @@
+services:
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker-v2
+    user: "${AOS_PILOT_UID:?set AOS_PILOT_UID}:${AOS_PILOT_GID:?set AOS_PILOT_GID}"
+    group_add:
+      - "${AOS_PILOT_DOCKER_GID:?set AOS_PILOT_DOCKER_GID}"
+    environment:
+      AOS_V2_SANDBOX_BACKEND: docker
+      AOS_V2_SANDBOX_WORKSPACE_ROOT: ${AOS_V2_SANDBOX_WORKSPACE_ROOT:?set sandbox workspace root}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${AOS_V2_SANDBOX_WORKSPACE_ROOT:?set sandbox workspace root}:${AOS_V2_SANDBOX_WORKSPACE_ROOT:?set sandbox workspace root}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  api:
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

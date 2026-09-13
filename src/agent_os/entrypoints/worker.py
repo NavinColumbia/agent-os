@@ -93,6 +93,7 @@ class WorkerSettings:
     sandbox_backend: str
     sandbox_image: str
     sandbox_timeout_seconds: int
+    sandbox_workspace_root: str
     sandbox_project_id: str
     sandbox_region: str
     sandbox_job_name: str
@@ -140,6 +141,11 @@ class WorkerSettings:
             raise ValueError(
                 "AOS_V2_SANDBOX_BACKEND must be disabled, docker, or cloud-run-job"
             )
+        sandbox_workspace_root = os.getenv(
+            "AOS_V2_SANDBOX_WORKSPACE_ROOT", "",
+        ).strip()
+        if sandbox_workspace_root and not os.path.isabs(sandbox_workspace_root):
+            raise ValueError("AOS_V2_SANDBOX_WORKSPACE_ROOT must be absolute")
         sandbox_project_id = os.getenv("AOS_V2_SANDBOX_PROJECT_ID", "").strip()
         sandbox_region = os.getenv("AOS_V2_SANDBOX_REGION", "").strip()
         sandbox_job_name = os.getenv("AOS_V2_SANDBOX_JOB_NAME", "").strip()
@@ -245,6 +251,7 @@ class WorkerSettings:
             sandbox_backend=sandbox_backend,
             sandbox_image=os.getenv("AOS_V2_SANDBOX_IMAGE", DEFAULT_PYTHON_IMAGE).strip(),
             sandbox_timeout_seconds=_positive_int("AOS_V2_SANDBOX_TIMEOUT_SECONDS", 300),
+            sandbox_workspace_root=sandbox_workspace_root,
             sandbox_project_id=sandbox_project_id,
             sandbox_region=sandbox_region,
             sandbox_job_name=sandbox_job_name,
@@ -360,11 +367,6 @@ def run_worker(
                 preview_deployments, static_deployer, service_deployer,
             ).named_handlers()
         )
-        named_tool_handlers.update(
-            WorkflowLaunchToolNodeHandlers(
-                graph_engine, artifact_store, engine,
-            ).named_handlers()
-        )
         if settings.sandbox_backend == "docker":
             docker_binary = shutil.which("docker")
             if docker_binary is None:
@@ -374,6 +376,7 @@ def run_worker(
                 image=settings.sandbox_image,
                 docker_binary=docker_binary,
                 timeout_seconds=settings.sandbox_timeout_seconds,
+                workspace_root=settings.sandbox_workspace_root or None,
             )
             named_tool_handlers.update(SandboxToolNodeHandlers(sandbox_runner).named_handlers())
         elif settings.sandbox_backend == "cloud-run-job":
@@ -388,6 +391,15 @@ def run_worker(
                 timeout_seconds=settings.sandbox_timeout_seconds,
             )
             named_tool_handlers.update(SandboxToolNodeHandlers(sandbox_runner).named_handlers())
+        available_mission_tools = frozenset({
+            "deploy.preview", "deploy.static", "deploy.service", "sandbox.run",
+        }) & frozenset(named_tool_handlers)
+        named_tool_handlers.update(
+            WorkflowLaunchToolNodeHandlers(
+                graph_engine, artifact_store, engine,
+                available_tools=available_mission_tools,
+            ).named_handlers()
+        )
         tool_router = GraphToolNodeRouter(named_tool_handlers)
         runtime = PydanticAgentRuntime(
             settings.model,
@@ -406,7 +418,7 @@ def run_worker(
         )
         lifecycle_handlers = dict(notification_effects.lifecycle_handlers())
         lifecycle_handlers[CommandKind.START_MISSION] = MissionBootstrapHandler(
-            graph_engine, engine,
+            graph_engine, engine, available_tools=available_mission_tools,
         ).execute
         lifecycle_handlers[CommandKind.CANCEL_ACTIVE_OPERATION] = MissionCancellationHandler(
             graph_engine, artifact_store,

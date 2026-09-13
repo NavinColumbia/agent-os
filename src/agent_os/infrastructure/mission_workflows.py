@@ -5,9 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Collection, Literal, Mapping
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Any, Collection, Mapping
 
 from agent_os.application.command_worker import FatalCommandError
 from agent_os.application.lifecycle import CommandEnvelope
@@ -30,61 +28,35 @@ from agent_os.domain.workflow_runtime import (
     WorkflowTransitionRejected,
 )
 from agent_os.infrastructure.graph_output_refs import resolve_prior_output
+from agent_os.infrastructure.mission_programs import (
+    MissionProgramPlan,
+    MissionWorkflowPlan,
+    validate_program_graph,
+)
 
 
 MISSION_BOOTSTRAP_WORKFLOW_ID = "agent-os-mission-bootstrap"
 MISSION_PLAN_ARTIFACT_LABEL = "mission-workflow"
-_MISSION_PLAN_MAX_NODES = 32
-_MISSION_PLAN_MAX_EDGES = 128
+_MISSION_PLAN_MAX_NODES = 64
+_MISSION_PLAN_MAX_EDGES = 256
 _MISSION_PLAN_MAX_ITERATIONS_PER_NODE = 16
 _MISSION_PLAN_MAX_TOTAL_ITERATIONS = 128
+_MISSION_INTERNAL_TOOLS = frozenset({"workflow.revise"})
 _MISSION_TOOL_ALLOWLIST = frozenset({
-    "deploy.preview", "deploy.service", "deploy.static", "sandbox.run",
+    "deploy.preview", "deploy.service", "deploy.static", "sandbox.run", "workflow.revise",
 })
 
 
 def _mission_tools(configured: Collection[str] | None) -> frozenset[str]:
-    tools = _MISSION_TOOL_ALLOWLIST if configured is None else frozenset(configured)
+    tools = (
+        _MISSION_TOOL_ALLOWLIST
+        if configured is None
+        else frozenset(configured) | _MISSION_INTERNAL_TOOLS
+    )
     unsupported = tools - _MISSION_TOOL_ALLOWLIST
     if unsupported:
         raise ValueError(f"unsupported mission tools: {sorted(unsupported)}")
     return tools
-
-
-class PlannedNode(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    node_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
-    kind: Literal["agent", "decision", "human", "tool", "terminal"]
-    purpose: str = Field(min_length=1, max_length=4_000)
-    owner_role: str | None = Field(default=None, max_length=256)
-    configuration: dict[str, Any] = Field(default_factory=dict, max_length=64)
-
-    @model_validator(mode="after")
-    def agent_has_owner(self) -> "PlannedNode":
-        if self.kind == "agent" and not self.owner_role:
-            raise ValueError("planned agent nodes require owner_role")
-        return self
-
-
-class PlannedEdge(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    source: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
-    target: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
-    condition: str = Field(default="always", min_length=1, max_length=128)
-    priority: int = Field(default=0, ge=-10_000, le=10_000)
-
-
-class MissionWorkflowPlan(BaseModel):
-    """Identity-free model proposal; authority supplies tenant, version, and creator."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(min_length=1, max_length=256)
-    entry_node_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
-    nodes: list[PlannedNode] = Field(min_length=2, max_length=_MISSION_PLAN_MAX_NODES)
-    edges: list[PlannedEdge] = Field(min_length=1, max_length=_MISSION_PLAN_MAX_EDGES)
 
 
 def _workflow_id(tenant_id: str, planning_run_id: str, artifact_id: str) -> str:
@@ -143,33 +115,20 @@ def mission_bootstrap_definition(
     requirements = {
         "deliverable": (
             "Propose exactly one application/json artifact labeled mission-workflow. Use json_value, "
-            "not a JSON-escaped content string. The value must match the supplied schema. Design the "
-            "smallest sufficient non-linear team workflow for the CEO directive; include evidence gates, "
-            "repair paths, and correlated human nodes only where judgment or authority is truly needed."
+            "not a JSON-escaped content string. Its value is a complete mission program, not merely a task "
+            "graph, and must match the supplied JSON schema. Assess feasibility honestly with ranges and "
+            "assumptions; ask only material questions; scope each question to the workstreams it blocks so "
+            "independent work proceeds; design accountable human/agent/service roles; inventory every "
+            "resource and capability and give missing ones an acquisition/expansion path; map execution, "
+            "evidence-based verification and repair; and include a recurring replan decision with both "
+            "continue and replan paths. Never claim an unverified capability is available. External spend, "
+            "hiring, credentials, legal authority, production release, and irreversible decisions remain "
+            "human-governed. A material-replan path must enter workflow.revise and source a newly proposed "
+            "complete mission-program JSON artifact from its replan agent; that atomic authority replaces "
+            "obsolete live work in the same run. Design the smallest sufficient non-linear program for the "
+            "CEO directive."
         ),
-        "plan_schema": {
-            "name": "string",
-            "entry_node_id": "node id",
-            "nodes": [{
-                "node_id": "lowercase stable id",
-                "kind": "agent | decision | human | tool | terminal",
-                "purpose": "specific accountable outcome",
-                "owner_role": "required for agent nodes",
-                "configuration": {
-                    "max_iterations": "integer 1..16",
-                    "agent_context": "optional bounded instructions for that node",
-                    "recipient_ids": "human nodes: intended participant IDs",
-                    "response_condition": "human nodes: affirmative/normal outgoing condition",
-                    "rejection_condition": "approval nodes: outgoing condition when approved is false",
-                },
-            }],
-            "edges": [{
-                "source": "node id",
-                "target": "node id",
-                "condition": "always or a condition the source node will satisfy",
-                "priority": 0,
-            }],
-        },
+        "plan_schema": MissionProgramPlan.model_json_schema(),
         "available_tools": sorted(tools),
         **({"sandbox_tool_configuration": {
             "tool": "sandbox.run",
@@ -278,10 +237,21 @@ def materialize_mission_workflow(
     planning_run_id: str,
     artifact_id: str,
     allowed_tools: Collection[str] | None = None,
+    workflow_id: str | None = None,
+    workflow_version: int = 1,
+    supersedes_version: int | None = None,
 ) -> WorkflowDefinition:
     tools = _mission_tools(allowed_tools)
     try:
-        plan = MissionWorkflowPlan.model_validate(raw)
+        if raw.get("format") is not None:
+            program = MissionProgramPlan.model_validate(raw)
+            validate_program_graph(program, available_tools=tools)
+            plan = program.workflow
+        else:
+            # Compatibility for explicitly registered pre-program graphs.  The
+            # autonomous bootstrap path below calls materialize_mission_program
+            # and therefore cannot bypass the full command contract.
+            plan = MissionWorkflowPlan.model_validate(raw)
     except (TypeError, ValueError) as exc:
         raise FatalCommandError(f"mission workflow proposal is invalid: {exc}") from exc
 
@@ -467,19 +437,20 @@ def materialize_mission_workflow(
     if total_iterations > _MISSION_PLAN_MAX_TOTAL_ITERATIONS:
         raise FatalCommandError("planned workflow exceeds its total iteration budget")
 
-    workflow_id = _workflow_id(tenant_id, planning_run_id, artifact_id)
+    workflow_identity = workflow_id or _workflow_id(tenant_id, planning_run_id, artifact_id)
     try:
         definition = WorkflowDefinition(
-            workflow_id=workflow_id,
+            workflow_id=workflow_identity,
             tenant_id=tenant_id,
             name=plan.name,
-            version=1,
+            version=workflow_version,
             entry_node_id=plan.entry_node_id,
             nodes=tuple(nodes),
             edges=tuple(WorkflowEdge(
                 edge.source, edge.target, edge.condition, edge.priority,
             ) for edge in plan.edges),
             created_by="agent:mission-architect",
+            supersedes_version=supersedes_version,
         )
     except (TypeError, ValueError) as exc:
         raise FatalCommandError(f"mission workflow structure is invalid: {exc}") from exc
@@ -543,6 +514,43 @@ def materialize_mission_workflow(
                 f"planned production deployment {tool_node_id} approval must reference a human node"
             )
     return definition
+
+
+def materialize_mission_program(
+    raw: Mapping[str, Any],
+    *,
+    tenant_id: str,
+    planning_run_id: str,
+    artifact_id: str,
+    allowed_tools: Collection[str] | None = None,
+    workflow_id: str | None = None,
+    workflow_version: int = 1,
+    supersedes_version: int | None = None,
+    authorized_budget_cents: int | None = None,
+) -> tuple[MissionProgramPlan, WorkflowDefinition]:
+    """Validate the complete north-star contract and materialize its graph."""
+
+    try:
+        program = MissionProgramPlan.model_validate(raw)
+        validate_program_graph(program, available_tools=_mission_tools(allowed_tools))
+    except (TypeError, ValueError) as exc:
+        raise FatalCommandError(f"mission program proposal is invalid: {exc}") from exc
+    if (
+        authorized_budget_cents is not None
+        and program.authorized_budget_cents > authorized_budget_cents
+    ):
+        raise FatalCommandError("mission program exceeds the CEO-authorized budget")
+    definition = materialize_mission_workflow(
+        raw,
+        tenant_id=tenant_id,
+        planning_run_id=planning_run_id,
+        artifact_id=artifact_id,
+        allowed_tools=allowed_tools,
+        workflow_id=workflow_id,
+        workflow_version=workflow_version,
+        supersedes_version=supersedes_version,
+    )
+    return program, definition
 
 
 class MissionBootstrapHandler:
@@ -616,7 +624,22 @@ class WorkflowLaunchToolNodeHandlers:
         return lifecycle.status is LifecycleStatus.CANCELLED
 
     def named_handlers(self):
-        return {"workflow.launch": self.execute}
+        return {"workflow.launch": self.execute, "workflow.revise": self.revise}
+
+    def _program_artifact(self, tenant_id: str, artifact_id: str) -> Mapping[str, Any]:
+        record = self._artifacts.describe(tenant_id, artifact_id)
+        content = self._artifacts.get(tenant_id, artifact_id)
+        if record is None or content is None:
+            raise FatalCommandError("mission program artifact does not exist in this tenant")
+        if record.get("media_type") != "application/json":
+            raise FatalCommandError("mission program artifact must use application/json")
+        try:
+            raw = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise FatalCommandError("mission program artifact is invalid JSON") from exc
+        if not isinstance(raw, Mapping):
+            raise FatalCommandError("mission program artifact must contain one object")
+        return raw
 
     def execute(
         self,
@@ -644,25 +667,18 @@ class WorkflowLaunchToolNodeHandlers:
         )
         if not isinstance(artifact_id, str) or not artifact_id:
             raise FatalCommandError("workflow launch source is not an artifact ID")
-        record = self._artifacts.describe(tenant_id, artifact_id)
-        content = self._artifacts.get(tenant_id, artifact_id)
-        if record is None or content is None:
-            raise FatalCommandError("mission workflow artifact does not exist in this tenant")
-        if record.get("media_type") != "application/json":
-            raise FatalCommandError("mission workflow artifact must use application/json")
-        try:
-            raw = json.loads(content)
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-            raise FatalCommandError("mission workflow artifact is invalid JSON") from exc
-        if not isinstance(raw, Mapping):
-            raise FatalCommandError("mission workflow artifact must contain one object")
+        raw = self._program_artifact(tenant_id, artifact_id)
 
-        child_definition = materialize_mission_workflow(
+        raw_budget = state.context.get("budget_limit_cents", 0)
+        if isinstance(raw_budget, bool) or not isinstance(raw_budget, int):
+            raise FatalCommandError("CEO-authorized mission budget is invalid")
+        program, child_definition = materialize_mission_program(
             raw,
             tenant_id=tenant_id,
             planning_run_id=run_id,
             artifact_id=artifact_id,
             allowed_tools=self._available_tools,
+            authorized_budget_cents=raw_budget,
         )
         self._graph.register_workflow(child_definition)
         child_run_id = _child_run_id(run_id, child_definition.workflow_id)
@@ -673,6 +689,8 @@ class WorkflowLaunchToolNodeHandlers:
             "mission_execution": True,
             "planning_run_id": run_id,
             "workflow_plan_artifact_id": artifact_id,
+            "mission_program": program.model_dump(mode="json", exclude={"workflow"}),
+            "mission_program_revision": program.revision,
         })
         self._graph.start_graph_run(
             tenant_id,
@@ -703,6 +721,8 @@ class WorkflowLaunchToolNodeHandlers:
             "tenant_id": tenant_id,
             "planning_run_id": run_id,
             "workflow_plan_artifact_id": artifact_id,
+            "mission_program_format": program.format,
+            "mission_program_revision": program.revision,
             "workflow_id": child_definition.workflow_id,
             "workflow_version": child_definition.version,
             "child_run_id": child_run_id,
@@ -723,6 +743,85 @@ class WorkflowLaunchToolNodeHandlers:
             "output": {
                 **launch_record,
                 "launch_artifact_id": launch_artifact_id,
+                "admitted_program": program.model_dump(mode="json", exclude={"workflow"}),
+            },
+        }
+
+    def revise(
+        self,
+        tenant_id: str,
+        run_id: str,
+        definition: WorkflowDefinition,
+        state: WorkflowRunState,
+        action: WorkflowAction,
+        node: WorkflowNode,
+    ) -> Mapping[str, Any]:
+        del definition
+        if node.kind is not NodeKind.TOOL or node.configuration.get("tool") != "workflow.revise":
+            raise FatalCommandError("workflow revision handler received the wrong tool node")
+        if state.context.get("mission_execution") is not True:
+            raise FatalCommandError("only an admitted mission execution may revise its workflow")
+        artifact_id = resolve_prior_output(
+            state, node.configuration.get("source"), subject="workflow revision",
+        )
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise FatalCommandError("workflow revision source is not an artifact ID")
+        raw = self._program_artifact(tenant_id, artifact_id)
+        current_revision = state.context.get("mission_program_revision", 1)
+        current_program = state.context.get("mission_program", {})
+        if isinstance(current_revision, bool) or not isinstance(current_revision, int):
+            raise FatalCommandError("current mission program revision is invalid")
+        if not isinstance(current_program, Mapping):
+            raise FatalCommandError("current mission program is missing")
+        replanning = current_program.get("replanning", {})
+        max_revisions = replanning.get("max_revisions", 16) if isinstance(replanning, Mapping) else 16
+        if isinstance(max_revisions, bool) or not isinstance(max_revisions, int):
+            raise FatalCommandError("mission program revision bound is invalid")
+        if current_revision >= max_revisions:
+            raise FatalCommandError("mission program reached its admitted revision bound")
+
+        program, replacement = materialize_mission_program(
+            raw,
+            tenant_id=tenant_id,
+            planning_run_id=str(state.context.get("planning_run_id") or run_id),
+            artifact_id=artifact_id,
+            allowed_tools=self._available_tools,
+            workflow_id=state.workflow_id,
+            workflow_version=state.workflow_version + 1,
+            supersedes_version=state.workflow_version,
+            authorized_budget_cents=int(current_program.get("authorized_budget_cents", 0)),
+        )
+        if program.revision != current_revision + 1:
+            raise FatalCommandError("replacement mission program must advance exactly one revision")
+        if program.replanning.max_revisions > max_revisions:
+            raise FatalCommandError("replacement program cannot expand its admitted revision authority")
+        if program.authorized_budget_cents > int(current_program.get("authorized_budget_cents", 0)):
+            raise FatalCommandError("replacement program cannot expand its admitted budget authority")
+        self._graph.register_workflow(replacement)
+        event_id = "mission-revision-" + hashlib.sha256(action.action_id.encode()).hexdigest()
+        receipt = self._graph.submit_graph_event(
+            tenant_id,
+            run_id,
+            WorkflowEvent(
+                event_id,
+                WorkflowEventKind.RUN_REVISED,
+                state.version,
+                {
+                    "replacement_workflow": replacement.to_dict(),
+                    "mission_program": program.model_dump(mode="json", exclude={"workflow"}),
+                    "evidence_ids": [artifact_id],
+                    "reason": node.purpose,
+                },
+            ),
+        )
+        return {
+            "disposition": "complete",
+            "satisfied_conditions": [str(node.configuration.get("success_condition") or "revised")],
+            "evidence_ids": [artifact_id],
+            "output": {
+                "mission_program_revision": program.revision,
+                "workflow_version": replacement.version,
+                "state_version": receipt.state.version,
             },
         }
 

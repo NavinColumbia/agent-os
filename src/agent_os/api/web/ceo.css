@@ -137,6 +137,8 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .detail-grid strong { margin-top: .25rem; font-size: .78rem; }
 .progress-track { height: 7px; margin: .9rem 0 .4rem; border-radius: 99px; background: #0b0e10; overflow: hidden; }
 .progress-track span { display: block; height: 100%; background: var(--lime); border-radius: inherit; }
+.program-rationale { color: #cbd1ce; font-size: .75rem; line-height: 1.55; }
+.good-note { display: block; margin-top: .75rem; color: var(--lime); font-size: .68rem; }
 .work-row { padding: .8rem 0; border-top: 1px solid var(--line); }
 .work-row:first-of-type { border-top: 0; }
 .work-row p { margin: .3rem 0; color: #cbd1ce; font-size: .74rem; line-height: 1.5; }

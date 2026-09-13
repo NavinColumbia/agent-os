@@ -42,23 +42,42 @@ hard provider-spend ceiling, not permission for silent overage.
 Stripe secrets are API-only configuration and are deliberately absent from the worker container.
 
 New CEO directives now emit `start_mission`, not a second hard-coded research/build agent chain. That durable
-command starts a built-in planner graph. The mission architect must persist an identity-free JSON graph proposal;
-`workflow.launch` supplies tenant/creator/version identities, permits only registered node/tool kinds, caps the
-plan at 32 nodes and 128 edges, limits per-node and total iterations, rejects any node without a terminal path,
-registers the immutable definition, and launches its correlated child run. `GET /v2/runs/{run_id}/mission`
-projects the lifecycle, planning graph, and detailed execution graph together. A terminal child outcome is
-idempotently projected back to the coarse CEO lifecycle, while the six phases remain a UI/status projection rather
-than the orchestration engine.
+command starts a built-in planner graph. The mission architect must persist a complete, identity-free mission
+program—not merely a task graph. The deterministic admission contract requires an honest feasibility verdict,
+ordered time/cost ranges and assumptions; scoped material clarifications; accountable human/agent/service roles;
+resource and capability inventories with acquisition/expansion nodes; mapped workstreams; evidence claims and
+repair routes; and a recurring replan decision. A claimed available capability cannot cite a runtime tool that is
+not actually registered. Each directive carries an explicit CEO-authorized external-spend ceiling (zero by
+default); admission rejects a larger program budget, and a later revision cannot expand either budget or revision
+authority. A forecast above current authority must remain visible as an owned budget-acquisition gap rather than
+an invented permission to spend. `workflow.launch` supplies tenant/creator/version identities, permits only registered
+node/tool kinds, caps the plan at 64 nodes and 256 edges, limits per-node and total iterations, rejects ungoverned
+nodes or any node without a terminal path, and launches its correlated child run. `GET /v2/runs/{run_id}/mission`
+projects the admitted program alongside the lifecycle, planning graph, detailed execution graph, and releases.
+A terminal child outcome is idempotently projected back to the coarse CEO lifecycle, while the six phases remain
+a UI/status projection rather than the orchestration engine.
 
-`GET /v2/runs/{run_id}/management` is the first CEO/manager read model over that execution truth. It projects
+A material replan cannot mutate token output and pretend the plan changed. The admitted graph must route that
+condition through the internal `workflow.revise` authority and provide a new complete mission-program artifact.
+The authority validates the whole replacement, registers exactly version N+1 with an explicit supersedes fence,
+atomically archives obsolete live/waiting tokens, advances program and workflow revisions, and schedules the new
+entry token on the same run ID. History and evidence remain intact, raw API revision events are rejected, revision
+authority is bounded by the prior program, and lifecycle cancellation still targets the same mission run.
+
+`GET /v2/runs/{run_id}/management` is the CEO/manager read model over that execution truth. It projects
 mission-scoped roles, accountable owners and managers, materialized work, attempts, evidence, human waits,
 risks, decisions, delegation/staffing proposals, and recommended management actions. It reads bounded action
 timing and lease records under tenant RLS. In particular, it distinguishes a slow action whose renewable lease
 is healthy from an expired recoverable lease, scheduled retry, delayed dispatch, contradictory state, and
 terminal business failure. A review interval therefore creates a diagnostic signal; it never abandons healthy
-work or pretends the whole adaptive graph is a fixed-size percentage plan. Agent nodes persist their bounded
-management proposals in workflow state, but external messages and staffing requests remain labelled proposals
-until a governed effect/approval executor applies them.
+work or pretends the whole adaptive graph is a fixed-size percentage plan. It also projects the admitted
+feasibility, program revision, unresolved questions, specifically blocked workstreams, outstanding resources and
+capabilities, and whether independent work is continuing. The CEO drawer renders those facts and upfront ranges.
+Agent communications, risks, decisions, delegations, and staffing requests first commit in workflow state, then a
+separate crash-recoverable outbox effect records them in the lifecycle-scoped organization ledger without repeating
+the model call. The same ledger receives the complete `program_admitted` record, so management communications and
+the charter they refer to share one immutable mission history. Consequential actions remain proposals until their
+governed approval/effect executor applies them.
 
 Every graph run also creates a durable management watch. The fair tenant worker claims due watches under an
 owner-fenced lease, runs the same authority-derived diagnosis, and schedules the next check without keeping a

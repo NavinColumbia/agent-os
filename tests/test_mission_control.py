@@ -145,3 +145,53 @@ def test_expired_lease_is_recovering_work_not_a_business_timeout():
     assert projected["work_items"][0]["health"] == "recovering"
     assert "reclamation" in projected["management_signals"][0]["recommended_action"]
     assert projected["status"] == "active"
+
+
+def test_readiness_exposes_scoped_human_and_capability_gaps_without_claiming_global_block():
+    planning = WorkflowRunState(
+        "planning", "tenant-a", "planner", 1, 1, WorkflowRunStatus.SUCCEEDED,
+        (NodeToken("planner-done", "done", TokenStatus.SUCCEEDED, 1, evidence_ids=("plan",)),),
+    )
+    execution = WorkflowRunState(
+        "execution", "tenant-a", "mission", 1, 3, WorkflowRunStatus.ACTIVE,
+        (
+            NodeToken("lead-work", "lead", TokenStatus.READY, 1),
+            NodeToken(
+                "human-work", "approval", TokenStatus.WAITING, 1,
+                wait_correlation_id="answer", wait_reason="Choose launch boundary",
+            ),
+        ),
+        context={"mission_program": {
+            "format": "agent-os.mission-program.v1", "revision": 2,
+            "feasibility": {"verdict": "viable_with_conditions"},
+            "clarifications": [{
+                "question_id": "launch-boundary", "status": "open",
+                "human_node_id": "approval", "blocking_workstream_ids": ["release"],
+            }],
+            "resources": [{
+                "resource_id": "release-authority", "status": "missing",
+                "acquisition_node_ids": ["approval"],
+            }],
+            "capabilities": [{
+                "capability_id": "implementation", "status": "missing",
+                "expansion_node_ids": ["lead"],
+            }],
+        }},
+    )
+
+    projected = project_mission_control(
+        lifecycle_run_id="lifecycle", planning_state=planning,
+        execution_state=execution, definition=definition(),
+    )
+
+    assert projected["readiness"] == {
+        "program_format": "agent-os.mission-program.v1",
+        "revision": 2,
+        "status": "acquiring_resources_and_capabilities",
+        "feasibility_verdict": "viable_with_conditions",
+        "unresolved_question_ids": ["launch-boundary"],
+        "blocked_workstream_ids": ["release"],
+        "outstanding_resource_ids": ["release-authority"],
+        "outstanding_capability_ids": ["implementation"],
+        "independent_work_continues": True,
+    }

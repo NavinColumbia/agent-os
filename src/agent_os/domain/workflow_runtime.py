@@ -36,6 +36,8 @@ class TokenStatus(str, Enum):
 
 class WorkflowActionKind(str, Enum):
     EXECUTE_NODE = "execute_node"
+    RECORD_PROGRAM = "record_program"
+    RECORD_ORGANIZATION = "record_organization"
     NOTIFY_HUMAN = "notify_human"
     RUN_SUCCEEDED = "run_succeeded"
     RUN_FAILED = "run_failed"
@@ -211,6 +213,7 @@ class WorkflowEventKind(str, Enum):
     NODE_WAITED = "node_waited"
     WAIT_RESUMED = "wait_resumed"
     NODE_FAILED = "node_failed"
+    RUN_REVISED = "run_revised"
     RUN_CANCELLED = "run_cancelled"
 
 
@@ -451,6 +454,45 @@ def complete_node(
     actions: list[WorkflowAction] = []
     terminal_ids = state.terminal_token_ids
 
+    organization_actions = completed.output.get("organization_actions")
+    admitted_program = completed.output.get("admitted_program")
+    if isinstance(admitted_program, Mapping):
+        actions.append(_action(
+            state.run_id,
+            version,
+            len(actions),
+            WorkflowActionKind.RECORD_PROGRAM,
+            completed,
+            {
+                "organization_run_id": str(
+                    state.context.get("lifecycle_run_id") or state.run_id
+                ),
+                "actor_role": node.owner_role or "mission-architect",
+                "program": dict(admitted_program),
+                "program_artifact_id": completed.output.get("workflow_plan_artifact_id"),
+            },
+        ))
+    if (
+        isinstance(organization_actions, Mapping)
+        and any(bool(value) for value in organization_actions.values())
+    ):
+        actions.append(_action(
+            state.run_id,
+            version,
+            len(actions),
+            WorkflowActionKind.RECORD_ORGANIZATION,
+            completed,
+            {
+                "organization_run_id": str(
+                    state.context.get("lifecycle_run_id") or state.run_id
+                ),
+                "actor_role": node.owner_role or "mission-manager",
+                "summary": str(completed.output.get("summary") or node.purpose),
+                "evidence_ids": list(evidence_ids),
+                "organization_actions": dict(organization_actions),
+            },
+        ))
+
     if node.kind is NodeKind.TERMINAL:
         terminal_ids = (*terminal_ids, token.token_id)
     elif not outgoing:
@@ -579,6 +621,92 @@ def cancel_workflow(
     ))
 
 
+def revise_workflow(
+    state: WorkflowRunState,
+    replacement: WorkflowDefinition,
+    *,
+    expected_version: int,
+    program: Mapping[str, Any],
+    evidence_ids: tuple[str, ...],
+    reason: str,
+) -> WorkflowMutation:
+    """Atomically supersede the live graph while retaining its durable history."""
+
+    _ensure_mutable(state, expected_version)
+    if replacement.tenant_id != state.tenant_id or replacement.workflow_id != state.workflow_id:
+        raise WorkflowTransitionRejected("workflow revision must retain tenant and workflow identity")
+    if replacement.version != state.workflow_version + 1:
+        raise WorkflowTransitionRejected("workflow revision must advance exactly one definition version")
+    if replacement.supersedes_version != state.workflow_version:
+        raise WorkflowTransitionRejected("workflow revision must declare the version it supersedes")
+    if not reason.strip() or not evidence_ids:
+        raise WorkflowTransitionRejected("workflow revision requires a reason and durable evidence")
+    revision = program.get("revision")
+    current_revision = state.context.get("mission_program_revision", 1)
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or isinstance(current_revision, bool)
+        or not isinstance(current_revision, int)
+        or revision != current_revision + 1
+    ):
+        raise WorkflowTransitionRejected("mission program revision must advance exactly one version")
+
+    archived = tuple(
+        replace(token, status=TokenStatus.CANCELLED,
+                wait_correlation_id=None, wait_reason=None)
+        if token.status in _LIVE else token
+        for token in state.tokens
+    )
+    version = state.version + 1
+    entry = NodeToken(
+        token_id=_id(
+            "agent-os", "workflow-token", "v1", state.run_id,
+            "revision", replacement.version, replacement.entry_node_id,
+        ),
+        node_id=replacement.entry_node_id,
+        status=TokenStatus.READY,
+        iteration=1,
+        evidence_ids=(),
+        output={
+            "revision_reason": reason,
+            "revision_evidence_ids": list(evidence_ids),
+        },
+    )
+    next_state = replace(
+        state,
+        workflow_version=replacement.version,
+        version=version,
+        status=WorkflowRunStatus.ACTIVE,
+        tokens=(*archived, entry),
+        context={
+            **dict(state.context),
+            "mission_program": dict(program),
+            "mission_program_revision": revision,
+            "prior_workflow_version": state.workflow_version,
+            "revision_reason": reason,
+            "revision_evidence_ids": list(evidence_ids),
+        },
+        terminal_token_ids=(),
+        failure=None,
+    )
+    return WorkflowMutation(next_state, (
+        _action(state.run_id, version, 0, WorkflowActionKind.RECORD_PROGRAM, entry, {
+            "organization_run_id": str(
+                state.context.get("lifecycle_run_id") or state.run_id
+            ),
+            "actor_role": "mission-manager",
+            "program": dict(program),
+            "program_artifact_id": evidence_ids[0],
+        }),
+        _action(state.run_id, version, 1, WorkflowActionKind.EXECUTE_NODE, entry, {
+            "workflow_revised": True,
+            "prior_workflow_version": state.workflow_version,
+            "mission_program_revision": revision,
+        }),
+    ))
+
+
 def evolve_workflow(
     definition: WorkflowDefinition,
     state: WorkflowRunState,
@@ -630,6 +758,23 @@ def evolve_workflow(
             expected_version=event.expected_version,
             reason=str(payload.get("reason") or ""),
             retryable=bool(payload.get("retryable", False)),
+        )
+    if event.kind is WorkflowEventKind.RUN_REVISED:
+        replacement_raw = payload.get("replacement_workflow")
+        program = payload.get("mission_program")
+        if not isinstance(replacement_raw, Mapping) or not isinstance(program, Mapping):
+            raise WorkflowTransitionRejected("workflow revision payload is malformed")
+        try:
+            replacement = WorkflowDefinition.from_dict(replacement_raw)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkflowTransitionRejected("replacement workflow definition is invalid") from exc
+        return revise_workflow(
+            state,
+            replacement,
+            expected_version=event.expected_version,
+            program=program,
+            evidence_ids=tuple(str(item) for item in payload.get("evidence_ids", ()) if str(item)),
+            reason=str(payload.get("reason") or ""),
         )
     if event.kind is WorkflowEventKind.RUN_CANCELLED:
         return cancel_workflow(

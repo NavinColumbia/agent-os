@@ -24,6 +24,7 @@ from agent_os.infrastructure.docker_sandbox import (
     SOURCE_BUNDLE_MEDIA_TYPE,
 )
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
+from agent_os.infrastructure.graph_organization_effects import GraphOrganizationEffectHandler
 from agent_os.infrastructure.gcs_static_sites import GCSStaticSiteDeployer
 from agent_os.infrastructure.mission_workflows import (
     MissionBootstrapHandler,
@@ -236,6 +237,14 @@ def test_one_ceo_prompt_reaches_human_approved_fetchable_production_static_app(
                     },
                 },
                 {
+                    "node_id": "revise-program", "kind": "tool",
+                    "purpose": "Atomically admit a repaired mission program.",
+                    "configuration": {"tool": "workflow.revise",
+                        "source": {"node_id": "build",
+                                   "output_path": ["artifact_ids", "mission-program-revision"]},
+                        "success_condition": "revised", "max_iterations": 1},
+                },
+                {
                     "node_id": "repair", "kind": "terminal",
                     "purpose": "Stop publication and retain verification evidence.",
                     "configuration": {"max_iterations": 1},
@@ -253,6 +262,8 @@ def test_one_ceo_prompt_reaches_human_approved_fetchable_production_static_app(
             ],
             "edges": [
                 {"source": "build", "target": "verify", "condition": "built"},
+                {"source": "build", "target": "revise-program", "condition": "repair"},
+                {"source": "revise-program", "target": "build", "condition": "revised"},
                 {"source": "verify", "target": "approve", "condition": "verified"},
                 {"source": "verify", "target": "repair", "condition": "repair"},
                 {"source": "approve", "target": "publish", "condition": "approved"},
@@ -260,13 +271,86 @@ def test_one_ceo_prompt_reaches_human_approved_fetchable_production_static_app(
                 {"source": "publish", "target": "done", "condition": "published"},
             ],
         }
+        proposed_program = {
+            "format": "agent-os.mission-program.v1", "revision": 1,
+            "objective": "Build, verify, and publish a production status dashboard.",
+            "authorized_budget_cents": 0,
+            "success_measures": [{"measure_id": "production-ready",
+                "description": "The approved, tested dashboard is publicly fetchable."}],
+            "feasibility": {
+                "verdict": "viable_with_conditions",
+                "rationale": "Configured build, sandbox, and publication capabilities are sufficient after approval.",
+                "delivery_estimate": {"optimistic": 1, "likely": 3, "pessimistic": 8,
+                    "unit": "hours", "basis": "Build, isolated verification, approval, publication.",
+                    "confidence": 0.8},
+                "cost_estimate": {"optimistic": 0, "likely": 0, "pessimistic": 100,
+                    "unit": "usd_cents", "basis": "Bounded proof using configured infrastructure.",
+                    "confidence": 0.8},
+                "assumptions": ["The CEO may approve the verified revision."],
+                "risks": ["Production publication must never bypass human authority."],
+            },
+            "clarifications": [],
+            "roles": [
+                {"role_id": "frontend-engineer", "title": "Frontend Engineer",
+                 "participant_kind": "agent", "responsibilities": ["Build and repair source"]},
+                {"role_id": "release-manager", "title": "Release Manager",
+                 "participant_kind": "agent", "responsibilities": ["Govern verification and release"],
+                 "manager_role_id": "frontend-engineer"},
+            ],
+            "resources": [{"resource_id": "production-approval", "kind": "authority",
+                "purpose": "Explicit authority to publish this verified revision", "status": "missing",
+                "owner_role_id": "release-manager", "acquisition_mode": "request_human",
+                "acquisition_node_ids": ["approve"], "needs_human_approval": True}],
+            "capabilities": [
+                {"capability_id": "app-build", "purpose": "Build production source",
+                 "status": "missing", "owner_role_id": "frontend-engineer",
+                 "expansion_mode": "build_capability", "expansion_node_ids": ["build"],
+                 "acceptance_checks": ["Source bundle contains automated tests."]},
+                {"capability_id": "sandbox-verification", "purpose": "Run isolated tests",
+                 "status": "available_unverified", "owner_role_id": "release-manager",
+                 "expansion_mode": "verify", "expansion_node_ids": ["verify"],
+                 "required_tool_ids": ["sandbox.run"],
+                 "acceptance_checks": ["Sandbox exits successfully."]},
+                {"capability_id": "static-production", "purpose": "Publish immutable static output",
+                 "status": "available_unverified", "owner_role_id": "release-manager",
+                 "expansion_mode": "verify", "expansion_node_ids": ["publish"],
+                 "required_tool_ids": ["deploy.static"],
+                 "acceptance_checks": ["Public immutable URL is fetchable."]},
+            ],
+            "workstreams": [
+                {"workstream_id": "implementation", "objective": "Build and test the dashboard",
+                 "accountable_role_id": "frontend-engineer",
+                 "workflow_node_ids": ["build", "verify", "revise-program"],
+                 "required_capability_ids": ["app-build", "sandbox-verification"],
+                 "acceptance_criteria": ["Isolated tests pass."]},
+                {"workstream_id": "release", "objective": "Publish only an approved revision",
+                 "accountable_role_id": "release-manager", "workflow_node_ids": ["publish"],
+                 "depends_on_workstream_ids": ["implementation"],
+                 "required_resource_ids": ["production-approval"],
+                 "required_capability_ids": ["static-production"],
+                 "acceptance_criteria": ["Approval and deployment receipts exist."]},
+            ],
+            "verification": [{"claim_id": "production-ready",
+                "claim": "The published dashboard is the tested and approved revision.",
+                "success_measure_ids": ["production-ready"],
+                "reviewer_role_id": "release-manager", "verification_node_ids": ["verify", "publish"],
+                "required_evidence": ["Test result", "approval", "deployment receipt"],
+                "failure_routes_to_node_id": "build"}],
+            "replanning": {"owner_role_id": "frontend-engineer",
+                "review_cadence": "At every build attempt",
+                "triggers": ["Tests fail", "requirements change", "release evidence is incomplete"],
+                "replan_node_ids": ["build"], "continue_condition": "built",
+                "replan_condition": "repair", "material_change_requires_new_revision": True,
+                "notify_role_ids": ["frontend-engineer", "release-manager"]},
+            "workflow": proposed_plan,
+        }
         planner_output = {
             "summary": "Designed a bounded build, verify, human approval, and publish team.",
             "disposition": "complete",
             "satisfied_conditions": ["planned"],
             "artifacts": [{
                 "label": "mission-workflow", "media_type": "application/json",
-                "json_value": proposed_plan,
+                "json_value": proposed_program,
             }],
         }
         launch_tools = WorkflowLaunchToolNodeHandlers(graph, artifacts)
@@ -343,11 +427,11 @@ def test_one_ceo_prompt_reaches_human_approved_fetchable_production_static_app(
                     artifact_store=artifacts,
                     max_turn_budget_cents=1,
                 ),
-                effect_handlers=MissionGraphEffectHandlers(
+                effect_handlers={**MissionGraphEffectHandlers(
                     lifecycle_engine=lifecycle,
                     graph_engine=graph,
                     notification_handlers=notification_effects.graph_handlers(),
-                ).graph_handlers(),
+                ).graph_handlers(), **GraphOrganizationEffectHandler(lifecycle).handlers()},
             ),
             worker_id="production-static-mission", lease_seconds=3,
         )
@@ -400,6 +484,7 @@ def test_one_ceo_prompt_reaches_human_approved_fetchable_production_static_app(
             headers={"Authorization": f"Bearer {owner_token}"},
         ).json()
         assert mission["execution"]["status"] == "succeeded"
+        assert mission["program"]["resources"][0]["resource_id"] == "production-approval"
         assert mission["deliverables"] == [{
             "kind": "static_site",
             "node_id": "publish",

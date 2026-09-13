@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,8 @@ from agent_os.domain.workflow_runtime import (
     TokenStatus,
     WorkflowAction,
     WorkflowActionKind,
+    WorkflowEvent,
+    WorkflowEventKind,
     WorkflowRunState,
     WorkflowRunStatus,
 )
@@ -33,6 +37,7 @@ from agent_os.infrastructure.mission_workflows import (
     MissionCancellationHandler,
     MissionGraphEffectHandlers,
     WorkflowLaunchToolNodeHandlers,
+    materialize_mission_program,
     materialize_mission_workflow,
     mission_bootstrap_definition,
     mission_planning_run_id,
@@ -59,13 +64,100 @@ def proposed_workflow() -> dict:
                 },
             },
             {
+                "node_id": "replan",
+                "kind": "decision",
+                "purpose": "Check new evidence and revise the plan when material facts changed.",
+                "owner_role": "mission-manager",
+                "configuration": {"max_iterations": 2},
+            },
+            {
+                "node_id": "revise-program", "kind": "tool",
+                "purpose": "Atomically admit the next mission program revision.",
+                "configuration": {
+                    "tool": "workflow.revise",
+                    "source": {"node_id": "replan",
+                               "output_path": ["artifact_ids", "mission-program-revision"]},
+                    "success_condition": "revised", "max_iterations": 2,
+                },
+            },
+            {
                 "node_id": "done",
                 "kind": "terminal",
                 "purpose": "Accept the implementation evidence.",
                 "configuration": {"max_iterations": 1},
             },
         ],
-        "edges": [{"source": "build", "target": "done", "condition": "ready"}],
+        "edges": [
+            {"source": "build", "target": "replan", "condition": "ready"},
+            {"source": "replan", "target": "done", "condition": "stable"},
+            {"source": "replan", "target": "revise-program", "condition": "changed"},
+            {"source": "revise-program", "target": "build", "condition": "revised"},
+        ],
+    }
+
+
+def proposed_program() -> dict:
+    return {
+        "format": "agent-os.mission-program.v1",
+        "revision": 1,
+        "objective": "Build a tested application.",
+        "authorized_budget_cents": 0,
+        "success_measures": [{"measure_id": "implementation-ready",
+                              "description": "A tested implementation artifact is accepted."}],
+        "feasibility": {
+            "verdict": "viable",
+            "rationale": "The bounded application can be implemented with configured capabilities.",
+            "delivery_estimate": {
+                "optimistic": 1, "likely": 2, "pessimistic": 5, "unit": "days",
+                "basis": "One implementation and review loop.", "confidence": 0.7,
+            },
+            "cost_estimate": {
+                "optimistic": 0, "likely": 0, "pessimistic": 100,
+                "unit": "usd_cents", "basis": "Local runtime with a bounded model turn.",
+                "confidence": 0.7,
+            },
+            "assumptions": ["The directive is within the configured application sandbox."],
+        },
+        "clarifications": [],
+        "roles": [
+            {"role_id": "mission-manager", "title": "Mission Manager",
+             "participant_kind": "agent", "responsibilities": ["Replan from evidence"]},
+            {"role_id": "engineer", "title": "Engineer", "participant_kind": "agent",
+             "responsibilities": ["Build tested application"],
+             "manager_role_id": "mission-manager"},
+        ],
+        "resources": [],
+        "capabilities": [{
+            "capability_id": "application-delivery", "purpose": "Build the requested application",
+            "status": "missing", "owner_role_id": "engineer",
+            "expansion_mode": "build_capability", "expansion_node_ids": ["build"],
+            "acceptance_checks": ["Implementation evidence exists."],
+        }],
+        "workstreams": [
+            {"workstream_id": "delivery", "objective": "Build and verify the application",
+             "accountable_role_id": "engineer", "workflow_node_ids": ["build"],
+             "required_capability_ids": ["application-delivery"],
+             "acceptance_criteria": ["Implementation artifact is tested."]},
+            {"workstream_id": "command", "objective": "Review evidence and replan",
+             "accountable_role_id": "mission-manager",
+             "workflow_node_ids": ["replan", "revise-program"],
+             "acceptance_criteria": ["Material changes cause replanning."]},
+        ],
+        "verification": [{
+            "claim_id": "implementation-ready", "claim": "Implementation meets the directive.",
+            "success_measure_ids": ["implementation-ready"],
+            "reviewer_role_id": "mission-manager", "verification_node_ids": ["replan"],
+            "required_evidence": ["Implementation artifact"],
+            "failure_routes_to_node_id": "build",
+        }],
+        "replanning": {
+            "owner_role_id": "mission-manager", "review_cadence": "After each delivery attempt",
+            "triggers": ["Verification fails", "requirements change"],
+            "replan_node_ids": ["replan"], "continue_condition": "stable",
+            "replan_condition": "changed", "material_change_requires_new_revision": True,
+            "notify_role_ids": ["mission-manager"],
+        },
+        "workflow": proposed_workflow(),
     }
 
 
@@ -104,7 +196,7 @@ def test_planner_advertises_and_enforces_only_runtime_available_tools():
     )
     planner = next(node for node in definition.nodes if node.node_id == "plan")
     context = planner.configuration["agent_context"]
-    assert context["available_tools"] == ["deploy.preview", "sandbox.run"]
+    assert context["available_tools"] == ["deploy.preview", "sandbox.run", "workflow.revise"]
     assert "preview_deployment_configuration" in context
     assert "sandbox_tool_configuration" in context
     assert "production_static_deployment_configuration" not in context
@@ -187,6 +279,7 @@ def test_production_publication_plan_requires_a_preceding_human_approval():
 
 def test_plan_rejects_a_reachable_trap_with_no_terminal_path():
     bad = proposed_workflow()
+    bad["nodes"] = [node for node in bad["nodes"] if node["node_id"] != "revise-program"]
     bad["nodes"].append({
         "node_id": "loop",
         "kind": "decision",
@@ -194,8 +287,9 @@ def test_plan_rejects_a_reachable_trap_with_no_terminal_path():
         "configuration": {"max_iterations": 2},
     })
     bad["edges"] = [
-        {"source": "build", "target": "loop", "condition": "ready"},
-        {"source": "build", "target": "done", "condition": "skip"},
+        {"source": "build", "target": "replan", "condition": "ready"},
+        {"source": "replan", "target": "loop", "condition": "stable"},
+        {"source": "replan", "target": "done", "condition": "skip"},
         {"source": "loop", "target": "loop", "condition": "again"},
     ]
     with pytest.raises(FatalCommandError, match="no terminal path"):
@@ -242,7 +336,7 @@ def test_start_mission_plans_validates_and_launches_a_child_graph(tmp_path: Path
             "artifacts": [{
                 "label": "mission-workflow",
                 "media_type": "application/json",
-                "json_value": proposed_workflow(),
+                "json_value": proposed_program(),
             }],
             "output": {},
             "recipient_ids": [],
@@ -343,6 +437,102 @@ def test_cancelled_lifecycle_cannot_start_a_late_planning_graph(tmp_path: Path):
             "tenant-a", mission_planning_run_id("late-run"),
         ) is None
     finally:
+        graph.close()
+
+
+def test_material_replan_supersedes_the_graph_in_place_without_restarting_the_mission(
+    tmp_path: Path,
+):
+    graph = SQLGraphWorkflowEngine(
+        f"sqlite:///{tmp_path / 'revision-graph.sqlite3'}", create_schema=True,
+    )
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'revision-artifacts.sqlite3'}", create_schema=True,
+    )
+    try:
+        original = proposed_program()
+        _, definition = materialize_mission_program(
+            original, tenant_id="tenant-a", planning_run_id="planning",
+            artifact_id="program-one",
+        )
+        graph.register_workflow(definition)
+        admitted = {key: value for key, value in original.items() if key != "workflow"}
+        graph.start_graph_run(
+            "tenant-a", definition.workflow_id, 1, run_id="same-mission-run",
+            request_id="start-revisable-mission", context={
+                "mission_execution": True, "planning_run_id": "planning",
+                "mission_program": admitted, "mission_program_revision": 1,
+            },
+        )
+
+        state = graph.get_graph_run("tenant-a", "same-mission-run")
+        build = state.tokens[0]
+        state = graph.submit_graph_event("tenant-a", state.run_id, WorkflowEvent(
+            "begin-build", WorkflowEventKind.NODE_BEGAN, state.version,
+            {"token_id": build.token_id},
+        )).state
+        state = graph.submit_graph_event("tenant-a", state.run_id, WorkflowEvent(
+            "complete-build", WorkflowEventKind.NODE_COMPLETED, state.version,
+            {"token_id": build.token_id, "satisfied_conditions": ["ready"],
+             "evidence_ids": ["artifact-build"], "output": {}},
+        )).state
+        replan = next(token for token in state.tokens if token.node_id == "replan")
+        state = graph.submit_graph_event("tenant-a", state.run_id, WorkflowEvent(
+            "begin-replan", WorkflowEventKind.NODE_BEGAN, state.version,
+            {"token_id": replan.token_id},
+        )).state
+
+        replacement = copy.deepcopy(original)
+        replacement["revision"] = 2
+        replacement["workflow"]["name"] = "Revised implementation after new evidence"
+        replacement_id = artifacts.put(
+            organization_id="tenant-a",
+            content=json.dumps(replacement).encode(), media_type="application/json",
+            idempotency_key="program-revision-two",
+        )
+        state = graph.submit_graph_event("tenant-a", state.run_id, WorkflowEvent(
+            "complete-replan", WorkflowEventKind.NODE_COMPLETED, state.version,
+            {"token_id": replan.token_id, "satisfied_conditions": ["changed"],
+             "evidence_ids": [replacement_id],
+             "output": {"artifact_ids": {"mission-program-revision": replacement_id}}},
+        )).state
+        revise_token = next(
+            token for token in state.tokens
+            if token.node_id == "revise-program" and token.status is TokenStatus.READY
+        )
+        state = graph.submit_graph_event("tenant-a", state.run_id, WorkflowEvent(
+            "begin-revision", WorkflowEventKind.NODE_BEGAN, state.version,
+            {"token_id": revise_token.token_id},
+        )).state
+        action = WorkflowAction(
+            "atomic-revision-action", WorkflowActionKind.EXECUTE_NODE,
+            revise_token.token_id, revise_token.node_id,
+        )
+        revision_node = next(
+            node for node in definition.nodes if node.node_id == "revise-program"
+        )
+
+        WorkflowLaunchToolNodeHandlers(graph, artifacts).revise(
+            "tenant-a", state.run_id, definition, state, action, revision_node,
+        )
+
+        revised = graph.get_graph_run("tenant-a", "same-mission-run")
+        assert revised.run_id == "same-mission-run"
+        assert revised.workflow_id == definition.workflow_id
+        assert revised.workflow_version == 2
+        assert revised.context["mission_program_revision"] == 2
+        assert revised.context["prior_workflow_version"] == 1
+        assert revised.token(revise_token.token_id).status is TokenStatus.CANCELLED
+        assert any(
+            token.node_id == replacement["workflow"]["entry_node_id"]
+            and token.status is TokenStatus.READY
+            for token in revised.tokens
+        )
+        stored = graph.get_workflow_definition("tenant-a", definition.workflow_id, 2)
+        assert stored.name == "Revised implementation after new evidence"
+        assert stored.supersedes_version == 1
+    finally:
+        artifacts.close()
         graph.close()
 
 

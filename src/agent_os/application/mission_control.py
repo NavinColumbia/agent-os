@@ -200,6 +200,83 @@ def _organization_actions(
     return collected
 
 
+def _program_readiness(state: WorkflowRunState) -> Mapping[str, Any] | None:
+    """Project live readiness from the immutable admitted program and token facts."""
+
+    program = state.context.get("mission_program")
+    if not isinstance(program, Mapping):
+        return None
+    successful_nodes = {
+        token.node_id for token in state.tokens if token.status is TokenStatus.SUCCEEDED
+    }
+    unresolved_questions: list[str] = []
+    blocked_workstreams: set[str] = set()
+    raw_questions = program.get("clarifications", ())
+    if isinstance(raw_questions, Sequence) and not isinstance(raw_questions, (str, bytes)):
+        for raw in raw_questions:
+            if not isinstance(raw, Mapping) or raw.get("status") != "open":
+                continue
+            node_id = raw.get("human_node_id")
+            if isinstance(node_id, str) and node_id in successful_nodes:
+                continue
+            question_id = raw.get("question_id")
+            if isinstance(question_id, str):
+                unresolved_questions.append(question_id)
+            blockers = raw.get("blocking_workstream_ids", ())
+            if isinstance(blockers, Sequence) and not isinstance(blockers, (str, bytes)):
+                blocked_workstreams.update(str(item) for item in blockers if str(item))
+
+    def unresolved_plans(key: str, id_key: str, node_key: str) -> list[str]:
+        unresolved: list[str] = []
+        raw_plans = program.get(key, ())
+        if not isinstance(raw_plans, Sequence) or isinstance(raw_plans, (str, bytes)):
+            return unresolved
+        for raw in raw_plans:
+            if not isinstance(raw, Mapping) or raw.get("status") == "verified":
+                continue
+            node_ids = raw.get(node_key, ())
+            if (
+                not isinstance(node_ids, Sequence)
+                or isinstance(node_ids, (str, bytes))
+                or not node_ids
+                or not all(str(item) in successful_nodes for item in node_ids)
+            ):
+                identifier = raw.get(id_key)
+                if isinstance(identifier, str):
+                    unresolved.append(identifier)
+        return unresolved
+
+    resources = unresolved_plans("resources", "resource_id", "acquisition_node_ids")
+    capabilities = unresolved_plans("capabilities", "capability_id", "expansion_node_ids")
+    if state.status.value == "succeeded":
+        status = "verified"
+    elif unresolved_questions and not state.ready():
+        status = "awaiting_human"
+    elif resources or capabilities:
+        status = "acquiring_resources_and_capabilities"
+    else:
+        status = "executing_and_verifying"
+    return {
+        "program_format": program.get("format"),
+        "revision": program.get("revision"),
+        "status": status,
+        "feasibility_verdict": (
+            program.get("feasibility", {}).get("verdict")
+            if isinstance(program.get("feasibility"), Mapping) else None
+        ),
+        "unresolved_question_ids": sorted(unresolved_questions),
+        "blocked_workstream_ids": sorted(blocked_workstreams),
+        "outstanding_resource_ids": sorted(resources),
+        "outstanding_capability_ids": sorted(capabilities),
+        "independent_work_continues": bool(
+            unresolved_questions and any(
+                token.status in {TokenStatus.READY, TokenStatus.RUNNING}
+                for token in state.tokens
+            )
+        ),
+    }
+
+
 def project_mission_control(
     *,
     lifecycle_run_id: str,
@@ -368,6 +445,8 @@ def project_mission_control(
             "failed": failed,
             "note": "Ratio covers materialized work only; adaptive branches may create more work.",
         },
+        "program": state.context.get("mission_program"),
+        "readiness": _program_readiness(state),
         "last_graph_progress_at": None if observation is None else _iso(observation.get("updated_at")),
         "team": team,
         "work_items": work_items,

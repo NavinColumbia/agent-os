@@ -47,6 +47,7 @@ class DirectiveRequest(BaseModel):
 
     prompt: str = Field(min_length=1, max_length=50_000)
     title: str | None = Field(default=None, max_length=200)
+    budget_limit_cents: int = Field(default=0, ge=0, le=100_000_000_000)
 
 
 class EventRequest(BaseModel):
@@ -624,6 +625,7 @@ def create_app(
                 "prompt": body.prompt,
                 "title": body.title,
                 "requested_by": principal.subject_id,
+                "budget_limit_cents": body.budget_limit_cents,
             },
         )
         try:
@@ -1021,6 +1023,7 @@ def create_app(
                 "planning": None if planning is None else planning.to_dict(),
                 "execution_run_id": execution_run_id,
                 "execution": None if execution is None else execution.to_dict(),
+                "program": None if execution is None else execution.context.get("mission_program"),
                 "deliverables": deliverables,
             }
 
@@ -1104,6 +1107,16 @@ def create_app(
             if state_value is None:
                 raise HTTPException(status_code=404, detail="graph run not found")
             owner_authority = bool(principal.roles & {"owner", "operator", "system"})
+            if body.kind is WorkflowEventKind.RUN_REVISED:
+                # Revision is a compound authority: validate a complete mission
+                # program, register its immutable definition, then atomically
+                # advance the run.  The in-process workflow.revise handler owns
+                # that sequence; accepting raw revision events here could point
+                # a run at an unregistered or policy-bypassing definition.
+                raise HTTPException(
+                    status_code=403,
+                    detail="workflow revisions require the internal program-revision authority",
+                )
             if body.kind is WorkflowEventKind.RUN_CANCELLED and not owner_authority:
                 raise HTTPException(status_code=403, detail="graph cancellation requires owner authority")
             if body.kind is WorkflowEventKind.WAIT_RESUMED:

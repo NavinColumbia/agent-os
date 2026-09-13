@@ -21,6 +21,7 @@ from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.deployment_tool_nodes import DeploymentToolNodeHandlers
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
+from agent_os.infrastructure.graph_organization_effects import GraphOrganizationEffectHandler
 from agent_os.infrastructure.mission_workflows import (
     MissionBootstrapHandler,
     MissionGraphEffectHandlers,
@@ -126,6 +127,14 @@ def test_authenticated_ceo_prompt_reaches_a_fetchable_public_preview(tmp_path: P
                     },
                 },
                 {
+                    "node_id": "revise-program", "kind": "tool",
+                    "purpose": "Atomically admit a repaired mission program.",
+                    "configuration": {"tool": "workflow.revise",
+                        "source": {"node_id": "build",
+                                   "output_path": ["artifact_ids", "mission-program-revision"]},
+                        "success_condition": "revised", "max_iterations": 1},
+                },
+                {
                     "node_id": "done",
                     "kind": "terminal",
                     "purpose": "Accept the durable build and deployment evidence.",
@@ -134,8 +143,63 @@ def test_authenticated_ceo_prompt_reaches_a_fetchable_public_preview(tmp_path: P
             ],
             "edges": [
                 {"source": "build", "target": "publish", "condition": "built"},
+                {"source": "build", "target": "revise-program", "condition": "repair"},
+                {"source": "revise-program", "target": "build", "condition": "revised"},
                 {"source": "publish", "target": "done", "condition": "published"},
             ],
+        }
+        proposed_program = {
+            "format": "agent-os.mission-program.v1", "revision": 1,
+            "objective": "Build and publish a tiny interactive status dashboard.",
+            "authorized_budget_cents": 0,
+            "success_measures": [{"measure_id": "preview-ready",
+                "description": "The dashboard is publicly fetchable and interactive."}],
+            "feasibility": {
+                "verdict": "viable",
+                "rationale": "The configured preview publisher can serve a bounded static app.",
+                "delivery_estimate": {"optimistic": 1, "likely": 2, "pessimistic": 4,
+                    "unit": "hours", "basis": "One static build and preview publication.",
+                    "confidence": 0.8},
+                "cost_estimate": {"optimistic": 0, "likely": 0, "pessimistic": 100,
+                    "unit": "usd_cents", "basis": "Local deterministic preview storage.",
+                    "confidence": 0.9},
+                "assumptions": ["A static preview satisfies this proof."],
+            },
+            "clarifications": [],
+            "roles": [{"role_id": "frontend-engineer", "title": "Frontend Engineer",
+                "participant_kind": "agent",
+                "responsibilities": ["Build, review, and repair the preview"]}],
+            "resources": [],
+            "capabilities": [
+                {"capability_id": "static-build", "purpose": "Build the dashboard",
+                 "status": "missing", "owner_role_id": "frontend-engineer",
+                 "expansion_mode": "build_capability", "expansion_node_ids": ["build"],
+                 "acceptance_checks": ["HTML is complete and interactive."]},
+                {"capability_id": "preview-publish", "purpose": "Publish a fetchable preview",
+                 "status": "available_unverified", "owner_role_id": "frontend-engineer",
+                 "expansion_mode": "verify", "expansion_node_ids": ["publish"],
+                 "required_tool_ids": ["deploy.preview"],
+                 "acceptance_checks": ["Published URL returns the exact artifact."]},
+            ],
+            "workstreams": [{"workstream_id": "delivery",
+                "objective": "Build, inspect, repair, and publish the dashboard",
+                "accountable_role_id": "frontend-engineer",
+                "workflow_node_ids": ["build", "publish", "revise-program"],
+                "required_capability_ids": ["static-build", "preview-publish"],
+                "acceptance_criteria": ["Public preview is fetchable."]}],
+            "verification": [{"claim_id": "preview-ready",
+                "claim": "The requested dashboard is publicly fetchable.",
+                "success_measure_ids": ["preview-ready"],
+                "reviewer_role_id": "frontend-engineer", "verification_node_ids": ["publish"],
+                "required_evidence": ["Immutable artifact and deployment receipt"],
+                "failure_routes_to_node_id": "build"}],
+            "replanning": {"owner_role_id": "frontend-engineer",
+                "review_cadence": "At each build result",
+                "triggers": ["Build evidence is incomplete", "requirements change"],
+                "replan_node_ids": ["build"], "continue_condition": "built",
+                "replan_condition": "repair", "material_change_requires_new_revision": True,
+                "notify_role_ids": ["frontend-engineer"]},
+            "workflow": proposed_plan,
         }
         planner_output = {
             "summary": "Designed the smallest sufficient build-and-publish team.",
@@ -144,7 +208,7 @@ def test_authenticated_ceo_prompt_reaches_a_fetchable_public_preview(tmp_path: P
             "artifacts": [{
                 "label": "mission-workflow",
                 "media_type": "application/json",
-                "json_value": proposed_plan,
+                "json_value": proposed_program,
             }],
         }
         launch_tools = WorkflowLaunchToolNodeHandlers(graph, artifacts)
@@ -194,11 +258,11 @@ def test_authenticated_ceo_prompt_reaches_a_fetchable_public_preview(tmp_path: P
             executor=DurableGraphActionExecutor(
                 engine=graph,
                 node_runtime=mission_runtime,
-                effect_handlers=MissionGraphEffectHandlers(
+                effect_handlers={**MissionGraphEffectHandlers(
                     lifecycle_engine=lifecycle,
                     graph_engine=graph,
                     notification_handlers={},
-                ).graph_handlers(),
+                ).graph_handlers(), **GraphOrganizationEffectHandler(lifecycle).handlers()},
             ),
             worker_id="prompt-preview-mission",
             lease_seconds=3,
@@ -231,8 +295,14 @@ def test_authenticated_ceo_prompt_reaches_a_fetchable_public_preview(tmp_path: P
             headers={"Authorization": f"Bearer {owner_token}"},
         )
         rendered = api.get(urlparse(public_url).path)
+        activity = api.get(
+            f"/v2/runs/{run_id}/activity",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        ).json()
         assert mission_status.status_code == 200
         assert mission_status.json()["execution"]["status"] == "succeeded"
+        assert mission_status.json()["program"]["feasibility"]["verdict"] == "viable"
+        assert any(event["kind"] == "program_admitted" for event in activity["items"])
         assert mission_status.json()["deliverables"] == [{
             "kind": "static_preview",
             "node_id": "publish",

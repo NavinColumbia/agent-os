@@ -29,6 +29,7 @@ from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.deployment_tool_nodes import DeploymentToolNodeHandlers
 from agent_os.infrastructure.docker_sandbox import DEFAULT_PYTHON_IMAGE, DockerSandboxRunner
 from agent_os.infrastructure.graph_action_executor import DurableGraphActionExecutor
+from agent_os.infrastructure.graph_organization_effects import GraphOrganizationEffectHandler
 from agent_os.infrastructure.gcs_artifacts import build_artifact_store
 from agent_os.infrastructure.gcs_static_sites import GCSStaticSiteDeployer
 from agent_os.infrastructure.mission_workflows import (
@@ -448,16 +449,20 @@ def run_worker(
             usage_meter=usage_meter,
             model_name=settings.model,
         )
+        graph_effect_handlers = MissionGraphEffectHandlers(
+            lifecycle_engine=engine,
+            graph_engine=graph_engine,
+            notification_handlers=notification_effects.graph_handlers(),
+        ).graph_handlers()
+        graph_effect_handlers.update(
+            GraphOrganizationEffectHandler(engine, company_directory).handlers()
+        )
         graph_worker = DurableGraphActionWorker(
             outbox=graph_engine,
             executor=DurableGraphActionExecutor(
                 engine=graph_engine,
                 node_runtime=graph_runtime,
-                effect_handlers=MissionGraphEffectHandlers(
-                    lifecycle_engine=engine,
-                    graph_engine=graph_engine,
-                    notification_handlers=notification_effects.graph_handlers(),
-                ).graph_handlers(),
+                effect_handlers=graph_effect_handlers,
             ),
             worker_id=settings.worker_id,
             lease_seconds=settings.lease_seconds,

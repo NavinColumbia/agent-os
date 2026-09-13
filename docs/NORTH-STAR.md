@@ -15,6 +15,18 @@ outcome. Agent OS must make uncertainty, prerequisites, legal boundaries, risk, 
 explicit while continuously improving the odds of success. It must never fake completion or quietly reduce a
 large mission to a toy implementation.
 
+Every admitted objective must remain inside one durable, inspectable command loop:
+
+`objective → feasibility and ranges → material clarification → organization design → resource acquisition →
+capability expansion → parallel execution → evidence-based verification → continuous revision and replanning`
+
+This sequence is an acceptance contract, not a fixed waterfall. A question blocks only the workstreams that
+depend on its answer; safe independent research and preparation continue. Missing credentials, people, data,
+authority, infrastructure, or domain capability become owned acquisition work with a recipient and evidence
+gate, not vague reasons to stop. When evidence invalidates an assumption, the program creates a durable new
+revision, supersedes obsolete live work, preserves history, and resumes the same mission rather than silently
+changing scope or restarting from scratch.
+
 The experience must be *indistinguishable* from being the real CEO of several multi-billion-dollar
 companies with tens of thousands of employees:
 

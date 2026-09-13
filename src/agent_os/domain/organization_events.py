@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 
 class OrganizationEventKind(str, Enum):
+    PROGRAM_ADMITTED = "program_admitted"
     MISSION_CHARTERED = "mission_chartered"
     RESOURCE_INVENTORY_UPDATED = "resource_inventory_updated"
     PREREQUISITE_IDENTIFIED = "prerequisite_identified"

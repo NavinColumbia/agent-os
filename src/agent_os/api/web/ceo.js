@@ -383,6 +383,50 @@ async function loadMissionDetail(item, silent = false) {
     }
     content.append(overview);
 
+    const program = managementResult?.program || missionResult?.program;
+    const readiness = managementResult?.readiness;
+    if (program) {
+      const command = detailSection("Program command");
+      const commandGrid = el("div", "detail-grid");
+      for (const [name, value] of [
+        ["Feasibility", label(program.feasibility?.verdict)],
+        ["Readiness", label(readiness?.status || "admitted")],
+        ["Program revision", readiness?.revision || program.revision || 1],
+      ]) {
+        const cell = el("div");
+        cell.append(el("small", "", name), el("strong", "", value));
+        commandGrid.append(cell);
+      }
+      command.append(commandGrid);
+      if (program.feasibility?.rationale) {
+        command.append(el("p", "program-rationale", program.feasibility.rationale));
+      }
+      const delivery = program.feasibility?.delivery_estimate;
+      const cost = program.feasibility?.cost_estimate;
+      if (delivery || cost) {
+        const estimates = el("div", "work-row");
+        if (delivery) estimates.append(el("p", "", `Delivery range: ${delivery.optimistic}–${delivery.pessimistic} ${delivery.unit}; likely ${delivery.likely}.`));
+        if (cost) estimates.append(el("p", "", `Cost range: $${(Number(cost.optimistic || 0) / 100).toFixed(2)}–$${(Number(cost.pessimistic || 0) / 100).toFixed(2)}; likely $${(Number(cost.likely || 0) / 100).toFixed(2)}.`));
+        command.append(estimates);
+      }
+      const gaps = [
+        ["Questions", readiness?.unresolved_question_ids || []],
+        ["Blocked workstreams", readiness?.blocked_workstream_ids || []],
+        ["Resources being acquired", readiness?.outstanding_resource_ids || []],
+        ["Capabilities being expanded", readiness?.outstanding_capability_ids || []],
+      ];
+      for (const [name, values] of gaps) {
+        if (!values.length) continue;
+        const row = el("div", "work-row");
+        row.append(el("small", "", name), el("p", "", values.map(label).join(" · ")));
+        command.append(row);
+      }
+      if (readiness?.independent_work_continues) {
+        command.append(el("small", "good-note", "Independent work is continuing while human input is pending."));
+      }
+      content.append(command);
+    }
+
     if (managementResult?.management_signals?.length) {
       const signals = detailSection("Manager signals");
       for (const signal of managementResult.management_signals) {
@@ -519,9 +563,13 @@ byId("directive-form").addEventListener("submit", async (event) => {
   try {
     const result = await api("/v2/runs", {
       method: "POST", headers: { "Idempotency-Key": `ceo-${crypto.randomUUID()}` },
-      body: JSON.stringify({ prompt: byId("directive").value.trim(), title: byId("directive-title").value.trim() || null }),
+      body: JSON.stringify({
+        prompt: byId("directive").value.trim(),
+        title: byId("directive-title").value.trim() || null,
+        budget_limit_cents: Math.round(Number(byId("directive-budget").value || 0) * 100),
+      }),
     });
-    byId("directive").value = ""; byId("directive-title").value = ""; byId("directive-count").textContent = "0 / 50,000";
+    byId("directive").value = ""; byId("directive-title").value = ""; byId("directive-budget").value = "0"; byId("directive-count").textContent = "0 / 50,000";
     setFlash("Mission accepted. Your team is planning it now."); await loadMissions();
     openMission({ run_id: result.run_id, title: "New mission" });
   } catch (error) { setFlash(error.message, "error"); }

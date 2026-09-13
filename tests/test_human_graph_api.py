@@ -128,6 +128,17 @@ def test_ceo_inbox_resolves_only_current_authorized_human_wait_and_replay_is_saf
             json=oversized,
         ).status_code == 413
 
+        raw_revision = api.post(
+            "/v2/graph-runs/release-run/events",
+            headers={"Authorization": "Bearer owner"},
+            json={
+                "event_id": "bypass-program-authority", "kind": "run_revised",
+                "expected_version": 2, "payload": {},
+            },
+        )
+        assert raw_revision.status_code == 403
+        assert "program-revision authority" in raw_revision.json()["detail"]
+
         accepted = api.post(
             "/v2/graph-runs/release-run/events",
             headers={"Authorization": "Bearer owner"},

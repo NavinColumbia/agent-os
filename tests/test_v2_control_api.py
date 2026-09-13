@@ -46,10 +46,14 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     page = api.get("/app")
     assert page.status_code == 200
     assert "CEO Workspace" in page.text
+    assert "Maximum external spend" in page.text
     assert "unsafe-inline" not in page.headers["content-security-policy"]
     assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
     assert api.get("/assets/ceo.css").status_code == 200
-    assert api.get("/assets/ceo.js").status_code == 200
+    script = api.get("/assets/ceo.js")
+    assert script.status_code == 200
+    assert "Program command" in script.text
+    assert "Independent work is continuing" in script.text
     assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
     assert api.get("/v2/runs").status_code == 401
 
@@ -97,6 +101,24 @@ def test_directive_is_tenant_bound_idempotent_and_immediately_enters_research():
     assert state.json()["phase"] == "research"
     assert state.json()["version"] == 1
     assert state.json()["objective"] == "Build my application"
+
+
+def test_directive_budget_authority_is_bounded_at_the_api_boundary():
+    api = client()
+    headers = {"Authorization": "Bearer org-a", "Idempotency-Key": "request-budget"}
+
+    accepted = api.post(
+        "/v2/runs", headers=headers,
+        json={"prompt": "Build within this ceiling", "budget_limit_cents": 25_000},
+    )
+    rejected = api.post(
+        "/v2/runs",
+        headers={**headers, "Idempotency-Key": "request-budget-invalid"},
+        json={"prompt": "Invent spending authority", "budget_limit_cents": -1},
+    )
+
+    assert accepted.status_code == 202
+    assert rejected.status_code == 422
 
 
 def test_run_inventory_is_tenant_bound_bounded_and_keeps_objectives_compact():

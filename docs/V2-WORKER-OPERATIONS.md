@@ -304,10 +304,10 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–99zz), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–99zzz), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
-actual provider tenant plus its multi-user invite/organization configuration, secrets management, production
-configuration, artifact garbage collection, usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch
+actual provider tenant, secrets management, production configuration, artifact garbage collection,
+usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch
 blockers.
 
 For a stable, zero-fixed-cost external pilot from the existing WSL laptop, use
@@ -346,5 +346,11 @@ configured organization claim is assigned a stable tenant derived by HMAC from t
 subject. The derivation key never reaches the worker or browser, provider roles are ignored on this fallback path,
 and the subject receives owner authority only inside that isolated personal company. Tokens that do carry an
 organization still require the explicit roles claim. The managed GCP cell generates and deletion-protects this key
-and excludes it from bulk rotation because rotating it would change personal tenant identities. Multi-user company
-selection, invitations, membership revocation, and provider configuration remain launch work.
+and excludes it from bulk rotation because rotating it would change personal tenant identities.
+
+Multi-user access is provider-neutral. Owners create bounded, single-use signed invitations; PostgreSQL retains only
+the token digest, expiry, roles, claim identity, and revocation history. An authenticated subject can select an
+invited company with `X-Agent-OS-Organization`; every request re-checks the active membership before applying that
+tenant's RLS scope. The CEO workspace exposes organization selection, invitation claim/creation, member inventory,
+and revocation. Subject-scoped RLS permits a user to discover only their own memberships, while mutations remain
+tenant-scoped. Per-tenant model-provider configuration remains launch work.

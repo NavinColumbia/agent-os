@@ -29,9 +29,11 @@ def test_runtime_image_installs_locked_dependencies_before_local_package():
     assert "python:3.12-slim-trixie@sha256:" in dockerfile
 
 
-def test_migration_image_uses_numeric_order_after_three_digit_versions():
+def test_migration_image_orders_numeric_revisions_and_compatibility_suffixes():
     script = (ROOT / "deploy" / "migrate-v2.sh").read_text()
-    assert "sort -V" in script
+    assert "suffix_length" in script
+    assert "-k1,1n -k2,2n" in script
+    assert "sort -V" not in script
     assert "for migration in /migrations/*.sql" not in script
 
 
@@ -73,6 +75,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "99-external-artifacts-v2.sql" in compose
     assert "99z-external-onboarding-v2.sql" in compose
     assert "99zz-connectors-v2.sql" in compose
+    assert "99zzz-memberships-v2.sql" in compose
     assert '127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080' in compose
     assert "GEMINI_API_KEY" in compose
     assert "AOS_V2_DATABASE_RUNTIME_PASSWORD" in compose

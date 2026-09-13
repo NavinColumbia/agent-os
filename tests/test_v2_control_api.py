@@ -19,6 +19,7 @@ from agent_os.domain.workflow_runtime import (
 from agent_os.infrastructure.memory import InMemoryWorkflowEngine
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
+from agent_os.infrastructure.sql_memberships import SQLMembershipStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 
 
@@ -32,11 +33,107 @@ class FakeIdentity:
             return {"sub": "agent-a", "org": "org-a", "roles": ["agent"]}
         if authorization == "Bearer viewer-a":
             return {"sub": "viewer-a", "org": "org-a", "roles": ["viewer"]}
+        if authorization == "Bearer guest-b":
+            return {"sub": "guest-b", "org": "org-b", "roles": ["viewer"]}
         raise ValueError("authentication required")
 
 
 def client() -> TestClient:
     return TestClient(create_app(engine=InMemoryWorkflowEngine(), identity=FakeIdentity()))
+
+
+def test_identity_bound_team_invitations_select_and_revoke_tenant_access(tmp_path):
+    memberships = SQLMembershipStore(
+        f"sqlite:///{tmp_path / 'api-memberships.sqlite3'}",
+        signing_secret="membership-api-secret-that-is-long-enough",
+        create_schema=True,
+    )
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+        membership_store=memberships, shutdown=memberships.close,
+    ))
+    owner = {"Authorization": "Bearer org-a", "Idempotency-Key": "invite-human-b"}
+    with api:
+        invitation = api.post(
+            "/v2/invitations", headers=owner,
+            json={"roles": ["viewer"], "expires_in_seconds": 3600},
+        )
+        assert invitation.status_code == 201
+        assert invitation.json()["organization_id"] == "org-a"
+        assert "claim_token" in invitation.json()
+
+        claim = api.post(
+            "/v2/invitations/claim",
+            headers={"Authorization": "Bearer org-b"},
+            json={"token": invitation.json()["claim_token"]},
+        )
+        assert claim.status_code == 200
+        assert claim.json()["roles"] == ["viewer"]
+
+        organizations = api.get(
+            "/v2/organizations", headers={"Authorization": "Bearer org-b"},
+        ).json()
+        assert [item["organization_id"] for item in organizations["items"]] == ["org-a", "org-b"]
+
+        selected = {
+            "Authorization": "Bearer org-b",
+            "X-Agent-OS-Organization": "org-a",
+        }
+        assert api.get("/v2/runs", headers=selected).status_code == 200
+        assert api.post(
+            "/v2/invitations",
+            headers={**selected, "Idempotency-Key": "viewer-cannot-invite"},
+            json={"roles": ["viewer"]},
+        ).status_code == 403
+        assert api.get("/v2/memberships", headers=selected).status_code == 403
+
+        members = api.get(
+            "/v2/memberships", headers={"Authorization": "Bearer org-a"},
+        )
+        assert members.status_code == 200
+        assert members.json()["items"][0]["subject_id"] == "human-b"
+
+        revoked = api.request(
+            "DELETE", "/v2/memberships/human-b",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "revoke-human-b"},
+            json={"reason": "Project access ended"},
+        )
+        assert revoked.status_code == 200
+        assert revoked.json()["active"] is False
+        assert api.get("/v2/runs", headers=selected).status_code == 403
+
+
+def test_invitation_capability_cannot_be_tampered_or_claimed_by_two_subjects(tmp_path):
+    memberships = SQLMembershipStore(
+        f"sqlite:///{tmp_path / 'api-membership-capability.sqlite3'}",
+        signing_secret="membership-api-secret-that-is-long-enough",
+        create_schema=True,
+    )
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+        membership_store=memberships, shutdown=memberships.close,
+    ))
+    with api:
+        invitation = api.post(
+            "/v2/invitations",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "single-claim"},
+            json={"roles": ["operator"]},
+        ).json()
+        token = invitation["claim_token"]
+        tampered = api.post(
+            "/v2/invitations/claim", headers={"Authorization": "Bearer org-b"},
+            json={"token": token[:-1] + ("a" if token[-1] != "a" else "b")},
+        )
+        assert tampered.status_code == 409
+        assert api.post(
+            "/v2/invitations/claim", headers={"Authorization": "Bearer org-b"},
+            json={"token": token},
+        ).status_code == 200
+        second = api.post(
+            "/v2/invitations/claim", headers={"Authorization": "Bearer guest-b"},
+            json={"token": token},
+        )
+        assert second.status_code == 409
 
 
 def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():

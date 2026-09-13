@@ -1,6 +1,6 @@
 "use strict";
 
-const state = { token: "", config: null, view: "missions", selectedRun: null, timer: null };
+const state = { token: "", organization: "", config: null, view: "missions", selectedRun: null, timer: null };
 const byId = (id) => document.getElementById(id);
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -21,6 +21,7 @@ function setFlash(message, kind = "") {
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("Authorization", `Bearer ${state.token}`);
+  if (state.organization) headers.set("X-Agent-OS-Organization", state.organization);
   if (options.body) headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...options, headers, cache: "no-store" });
   if (response.status === 401) {
@@ -93,7 +94,9 @@ async function finishOidc() {
 
 async function connect(token) {
   state.token = token;
+  state.organization = sessionStorage.getItem("aos.organization") || "";
   try {
+    await loadOrganizations();
     await api("/v2/company/organization");
     byId("auth-gate").classList.add("hidden");
     byId("workspace").classList.remove("hidden");
@@ -116,6 +119,8 @@ async function connect(token) {
 
 function disconnect(message = "Disconnected. No credential was stored.") {
   state.token = "";
+  state.organization = "";
+  sessionStorage.removeItem("aos.organization");
   window.clearInterval(state.timer);
   state.timer = null;
   closeDrawer();
@@ -124,6 +129,23 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   byId("token-input").value = "";
   byId("auth-status").textContent = message;
   byId("auth-status").className = "status-line";
+}
+
+async function loadOrganizations(preferred = state.organization) {
+  const payload = await api("/v2/organizations");
+  const items = payload.items || [];
+  const available = new Set(items.map((item) => item.organization_id));
+  state.organization = available.has(preferred) ? preferred : payload.default_organization_id;
+  sessionStorage.setItem("aos.organization", state.organization);
+  const picker = byId("organization-select");
+  picker.replaceChildren();
+  for (const item of items) {
+    const option = el("option", "", `${item.organization_id} · ${(item.roles || []).join(", ")}`);
+    option.value = item.organization_id;
+    option.selected = item.organization_id === state.organization;
+    picker.append(option);
+  }
+  return payload;
 }
 
 function stat(name, value, tone = "") {
@@ -171,7 +193,9 @@ async function loadMissions() {
 }
 
 async function loadCompany() {
-  const org = await api("/v2/company/organization");
+  const [org, memberships] = await Promise.all([
+    api("/v2/company/organization"), api("/v2/memberships").catch(() => null),
+  ]);
   const activeAgents = (org.agents || []).filter((item) => item.status === "active");
   byId("company-summary").replaceChildren(
     stat("AI agents", activeAgents.length, "good"), stat("Human teammates", (org.humans || []).length),
@@ -179,6 +203,7 @@ async function loadCompany() {
   );
   const content = byId("company-content");
   content.replaceChildren();
+  content.append(accessPanel(memberships));
   for (const team of org.teams || []) {
     const block = el("section", "team-block");
     block.append(el("h4", "", team.name));
@@ -197,6 +222,85 @@ async function loadCompany() {
     block.append(people);
     content.append(block);
   }
+}
+
+function accessPanel(memberships) {
+  const block = el("section", "team-block access-panel");
+  block.append(el("h4", "", "Company access"));
+  const join = el("div", "access-form");
+  const token = document.createElement("input");
+  token.type = "password"; token.maxLength = 2000; token.placeholder = "Paste an invitation token";
+  token.setAttribute("aria-label", "Invitation token");
+  const claim = el("button", "quiet", "Join organization"); claim.type = "button";
+  claim.addEventListener("click", async () => {
+    if (!token.value.trim()) return setFlash("Paste an invitation token first.", "error");
+    claim.disabled = true;
+    try {
+      const result = await api("/v2/invitations/claim", {
+        method: "POST", body: JSON.stringify({token: token.value.trim()}),
+      });
+      token.value = "";
+      await loadOrganizations(result.organization_id);
+      setFlash("Organization access activated.");
+      await refreshView();
+    } catch (error) { setFlash(error.message, "error"); }
+    finally { claim.disabled = false; }
+  });
+  join.append(token, claim); block.append(join);
+  if (!memberships) {
+    block.append(el("small", "muted", "Your current role can use the company but cannot manage access."));
+    return block;
+  }
+  const invite = el("div", "access-form");
+  const role = document.createElement("select");
+  for (const value of ["viewer", "operator", "owner"]) {
+    const option = el("option", "", value); option.value = value; role.append(option);
+  }
+  role.setAttribute("aria-label", "Invitation role");
+  const create = el("button", "primary", "Create invitation"); create.type = "button";
+  create.addEventListener("click", async () => {
+    create.disabled = true;
+    try {
+      const result = await api("/v2/invitations", {
+        method: "POST", headers: {"Idempotency-Key": `invite-${crypto.randomUUID()}`},
+        body: JSON.stringify({roles: [role.value], expires_in_seconds: 86400}),
+      });
+      const output = document.createElement("textarea");
+      output.readOnly = true; output.rows = 3; output.value = result.claim_token;
+      output.setAttribute("aria-label", "New invitation token");
+      block.append(el("small", "muted", "Share this single-use token securely. It expires in 24 hours."), output);
+      output.select();
+      setFlash("Invitation created.");
+    } catch (error) { setFlash(error.message, "error"); }
+    finally { create.disabled = false; }
+  });
+  invite.append(role, create); block.append(invite);
+  const people = el("div", "people");
+  for (const member of memberships.items || []) {
+    const card = el("div", "person");
+    card.append(
+      el("strong", "", member.subject_id),
+      el("small", "", `${(member.roles || []).join(", ")} · ${member.active ? "active" : "revoked"}`),
+    );
+    if (member.active) {
+      const revoke = el("button", "danger", "Revoke"); revoke.type = "button";
+      revoke.addEventListener("click", async () => {
+        if (!window.confirm(`Revoke ${member.subject_id}'s access?`)) return;
+        try {
+          await api(`/v2/memberships/${encodeURIComponent(member.subject_id)}`, {
+            method: "DELETE", headers: {"Idempotency-Key": `revoke-${crypto.randomUUID()}`},
+            body: JSON.stringify({reason: "Revoked in the CEO workspace"}),
+          });
+          setFlash("Membership revoked."); await loadCompany();
+        } catch (error) { setFlash(error.message, "error"); }
+      });
+      card.append(revoke);
+    }
+    people.append(card);
+  }
+  if (!(memberships.items || []).length) people.append(el("div", "empty", "No invited members yet."));
+  block.append(people);
+  return block;
 }
 
 async function loadInbox() {
@@ -555,6 +659,13 @@ byId("oidc-login").addEventListener("click", beginOidc);
 byId("token-form").addEventListener("submit", (event) => { event.preventDefault(); connect(byId("token-input").value.trim()); });
 byId("disconnect").addEventListener("click", () => disconnect());
 byId("refresh").addEventListener("click", () => refreshView());
+byId("organization-select").addEventListener("change", async (event) => {
+  state.organization = event.target.value;
+  sessionStorage.setItem("aos.organization", state.organization);
+  closeDrawer();
+  setFlash("Organization changed.");
+  await refreshView();
+});
 byId("drawer-close").addEventListener("click", closeDrawer);
 byId("directive").addEventListener("input", (event) => { byId("directive-count").textContent = `${event.target.value.length.toLocaleString()} / 50,000`; });
 byId("directive-form").addEventListener("submit", async (event) => {

@@ -11,7 +11,23 @@ case "$AOS_V2_DATABASE_RUNTIME_ROLE" in
         ;;
 esac
 
-find /migrations -maxdepth 1 -type f -name '*.sql' -print | sort -V |
+# Order first by the numeric revision and then by the length of the intentional
+# compatibility suffix (99, 99z, 99zz, ...). Version sorting reverses those suffixes,
+# while plain lexical order would place revision 100 before 86.
+find /migrations -maxdepth 1 -type f -name '*.sql' -print |
+awk '
+{
+    count = split($0, parts, "/")
+    base = parts[count]
+    match(base, /^[0-9]+/)
+    revision = substr(base, RSTART, RLENGTH) + 0
+    stem = base
+    sub(/-.*/, "", stem)
+    suffix_length = length(stem) - RLENGTH
+    printf "%012d\t%04d\t%s\n", revision, suffix_length, $0
+}' |
+sort -t '	' -k1,1n -k2,2n -k3,3 |
+cut -f3- |
 while IFS= read -r migration; do
     psql "$AOS_V2_MIGRATION_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"
 done

@@ -68,6 +68,7 @@ services:
       - ../postgres/initdb/99-external-artifacts-v2.sql:/migrations/99-external-artifacts-v2.sql:ro
       - ../postgres/initdb/99z-external-onboarding-v2.sql:/migrations/99z-external-onboarding-v2.sql:ro
       - ../postgres/initdb/99zz-connectors-v2.sql:/migrations/99zz-connectors-v2.sql:ro
+      - ../postgres/initdb/99zzz-memberships-v2.sql:/migrations/99zzz-memberships-v2.sql:ro
     command:
       - sh
       - -ec
@@ -88,6 +89,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/99-external-artifacts-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/99z-external-onboarding-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/99zz-connectors-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/99zzz-memberships-v2.sql
         psql -v ON_ERROR_STOP=1 \
           -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
         SELECT format(

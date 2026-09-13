@@ -260,6 +260,28 @@ class CompanyDirectory(Protocol):
         self, tenant_id: str,
     ) -> tuple[Mapping[str, Any], ...]: ...
 
+    def confirm_external_onboarding(
+        self,
+        *,
+        tenant_id: str,
+        onboarding_id: str,
+        display_name: str,
+        identity_subject: str | None,
+        response_sla_seconds: int,
+        quality_criteria: tuple[str, ...],
+        attestations: tuple[str, ...],
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def list_company_events(
+        self,
+        tenant_id: str,
+        *,
+        after_version: int = 0,
+        limit: int = 500,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
 
 @runtime_checkable
 class ConnectorRegistry(Protocol):
@@ -292,28 +314,43 @@ class ConnectorRegistry(Protocol):
         idempotency_key: str,
     ) -> Mapping[str, Any] | None: ...
 
-    def confirm_external_onboarding(
+
+@runtime_checkable
+class MembershipStore(Protocol):
+    """Identity-bound tenant membership and short-lived invitation authority."""
+
+    def roles_for(self, tenant_id: str, subject_id: str) -> frozenset[str] | None: ...
+
+    def organizations_for(self, subject_id: str) -> tuple[Mapping[str, Any], ...]: ...
+
+    def list_members(self, tenant_id: str) -> tuple[Mapping[str, Any], ...]: ...
+
+    def create_invitation(
         self,
         *,
         tenant_id: str,
-        onboarding_id: str,
-        display_name: str,
-        identity_subject: str | None,
-        response_sla_seconds: int,
-        quality_criteria: tuple[str, ...],
-        attestations: tuple[str, ...],
+        roles: tuple[str, ...],
         actor_id: str,
+        expires_in_seconds: int,
         idempotency_key: str,
     ) -> Mapping[str, Any]: ...
 
-    def list_company_events(
+    def claim_invitation(
         self,
-        tenant_id: str,
         *,
-        after_version: int = 0,
-        limit: int = 500,
-    ) -> tuple[Mapping[str, Any], ...]: ...
+        token: str,
+        subject_id: str,
+    ) -> Mapping[str, Any]: ...
 
+    def revoke_member(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
 
 @runtime_checkable
 class GraphWorkflowEngine(Protocol):

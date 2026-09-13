@@ -26,6 +26,7 @@ from agent_os.application.ports import (
     ConnectorRegistry,
     GraphWorkflowEngine,
     GraphRunInspector,
+    MembershipStore,
     NotificationStore,
     OrganizationLedger,
     PreviewDeploymentStore,
@@ -265,6 +266,25 @@ class ConnectorDisableRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2_000)
 
 
+class InvitationCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    roles: list[str] = Field(min_length=1, max_length=3)
+    expires_in_seconds: int = Field(default=86_400, ge=300, le=2_592_000)
+
+
+class InvitationClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=32, max_length=2_000)
+
+
+class MembershipRevokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2_000)
+
+
 class BillingCheckoutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -385,6 +405,7 @@ def create_app(
     preview_deployments: PreviewDeploymentStore | None = None,
     company_directory: CompanyDirectory | None = None,
     connector_registry: ConnectorRegistry | None = None,
+    membership_store: MembershipStore | None = None,
     usage_meter: UsageMeter | None = None,
     billing_service: BillingService | None = None,
     client_identity_config: Mapping[str, str] | None = None,
@@ -462,7 +483,7 @@ def create_app(
             },
         )
 
-    def current_principal(
+    def base_principal(
         authorization: Annotated[str | None, Header()] = None,
         aos_session: Annotated[str | None, Cookie()] = None,
     ) -> Principal:
@@ -474,6 +495,22 @@ def create_app(
                 detail=str(exc),
                 headers={"WWW-Authenticate": "Bearer"},
             ) from exc
+
+    def current_principal(
+        principal: Annotated[Principal, Depends(base_principal)],
+        selected_organization: Annotated[
+            str | None, Header(alias="X-Agent-OS-Organization", max_length=255)
+        ] = None,
+    ) -> Principal:
+        organization_id = (selected_organization or "").strip()
+        if not organization_id or organization_id == principal.organization_id:
+            return principal
+        if membership_store is None:
+            raise HTTPException(status_code=403, detail="organization selection is unavailable")
+        roles = membership_store.roles_for(organization_id, principal.subject_id)
+        if not roles:
+            raise HTTPException(status_code=403, detail="active organization membership is required")
+        return Principal(principal.subject_id, organization_id, roles)
 
     @app.exception_handler(TransitionRejected)
     def transition_rejected(_: Request, exc: TransitionRejected) -> JSONResponse:
@@ -491,6 +528,101 @@ def create_app(
     def ready() -> JSONResponse:
         report = dict(engine.health())
         return JSONResponse(status_code=200 if report.get("ok") else 503, content=report)
+
+    if membership_store is not None:
+        @app.get("/v2/organizations")
+        def list_organizations(
+            principal: Annotated[Principal, Depends(base_principal)],
+        ) -> Mapping[str, Any]:
+            memberships_by_id = {
+                str(item["organization_id"]): dict(item)
+                for item in membership_store.organizations_for(principal.subject_id)
+            }
+            base = memberships_by_id.get(principal.organization_id)
+            if base is None:
+                memberships_by_id[principal.organization_id] = {
+                    "organization_id": principal.organization_id,
+                    "roles": sorted(principal.roles),
+                    "source": "identity_provider",
+                    "joined_at": None,
+                }
+            else:
+                base["roles"] = sorted(set(base.get("roles", ())) | set(principal.roles))
+                base["source"] = "identity_provider_and_membership"
+            return {
+                "subject_id": principal.subject_id,
+                "default_organization_id": principal.organization_id,
+                "items": [memberships_by_id[key] for key in sorted(memberships_by_id)],
+            }
+
+        @app.post("/v2/invitations", status_code=201)
+        def create_invitation(
+            body: InvitationCreateRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "system"}):
+                raise HTTPException(status_code=403, detail="invitations require owner authority")
+            try:
+                return membership_store.create_invitation(
+                    tenant_id=principal.organization_id,
+                    roles=tuple(body.roles),
+                    actor_id=principal.subject_id,
+                    expires_in_seconds=body.expires_in_seconds,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @app.post("/v2/invitations/claim")
+        def claim_invitation(
+            body: InvitationClaimRequest,
+            principal: Annotated[Principal, Depends(base_principal)],
+        ) -> Mapping[str, Any]:
+            try:
+                return membership_store.claim_invitation(
+                    token=body.token,
+                    subject_id=principal.subject_id,
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.get("/v2/memberships")
+        def list_memberships(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="membership inventory requires operator authority")
+            return {"items": list(membership_store.list_members(principal.organization_id))}
+
+        @app.delete("/v2/memberships/{subject_id}")
+        def revoke_membership(
+            subject_id: str,
+            body: MembershipRevokeRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "system"}):
+                raise HTTPException(status_code=403, detail="membership revocation requires owner authority")
+            try:
+                result = membership_store.revoke_member(
+                    tenant_id=principal.organization_id,
+                    subject_id=subject_id,
+                    actor_id=principal.subject_id,
+                    reason=body.reason,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(status_code=404, detail="membership does not exist")
+            return result
 
     if billing_service is not None:
         @app.post("/v2/billing/webhooks/stripe", include_in_schema=False)

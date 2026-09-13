@@ -260,6 +260,38 @@ class CompanyDirectory(Protocol):
         self, tenant_id: str,
     ) -> tuple[Mapping[str, Any], ...]: ...
 
+
+@runtime_checkable
+class ConnectorRegistry(Protocol):
+    """Tenant-owned external capability definitions; secrets stay out of this port."""
+
+    def register_connector(
+        self,
+        *,
+        tenant_id: str,
+        definition: Mapping[str, Any],
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def get_connector(
+        self, tenant_id: str, connector_id: str,
+    ) -> Mapping[str, Any] | None: ...
+
+    def list_connectors(
+        self, tenant_id: str,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def disable_connector(
+        self,
+        *,
+        tenant_id: str,
+        connector_id: str,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
+
     def confirm_external_onboarding(
         self,
         *,

@@ -142,6 +142,8 @@ locals {
     AOS_V2_APP_RUNTIME_SERVICE_ACCOUNT     = google_service_account.app_runtime.email
     AOS_V2_APP_BUILDER_IMAGE               = var.app_builder_image
     AOS_V2_APP_MAX_INSTANCES               = tostring(var.app_max_instances)
+    AOS_V2_CONNECTOR_SECRET_BACKEND         = "gcp"
+    AOS_V2_CONNECTOR_SECRET_PROJECT_ID      = var.project_id
   })
 
   static_router_environment = {

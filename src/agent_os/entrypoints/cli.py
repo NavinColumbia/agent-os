@@ -14,6 +14,10 @@ from agent_os.entrypoints.static_site_router import (
     build_static_site_router,
 )
 from agent_os.entrypoints.worker import WorkerSettings, install_shutdown_handlers, run_worker
+from agent_os.infrastructure.http_connector_tools import (
+    FileConnectorSecretResolver,
+    GCPConnectorSecretResolver,
+)
 
 
 @click.group()
@@ -85,3 +89,22 @@ def issue_local_token(subject: str, organization: str, roles: tuple[str, ...], t
         ttl_seconds=ttl_seconds,
     )
     click.echo(json.dumps({"token": token, "organization_id": organization, "roles": roles}))
+
+
+@main.command("connector-secret-name")
+@click.option("--organization", required=True)
+@click.option("--credential-ref", required=True)
+@click.option("--backend", type=click.Choice(("file", "gcp")), default="file", show_default=True)
+def connector_secret_name(organization: str, credential_ref: str, backend: str) -> None:
+    """Print the secret locator for a connector credential, never its value."""
+
+    if not organization.strip() or not credential_ref.strip():
+        raise click.ClickException("organization and credential-ref are required")
+    if backend == "gcp":
+        locator = GCPConnectorSecretResolver.secret_name(organization, credential_ref)
+    else:
+        locator = (
+            FileConnectorSecretResolver.tenant_directory(organization)
+            + "/" + credential_ref
+        )
+    click.echo(json.dumps({"backend": backend, "locator": locator}))

@@ -23,6 +23,7 @@ from agent_os.application.mission_control import project_mission_control
 from agent_os.application.ports import (
     ArtifactStore,
     CompanyDirectory,
+    ConnectorRegistry,
     GraphWorkflowEngine,
     GraphRunInspector,
     NotificationStore,
@@ -242,6 +243,28 @@ class ExternalOnboardingConfirmationRequest(BaseModel):
     attestations: list[str] = Field(min_length=3, max_length=16)
 
 
+class ConnectorRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connector_id: str = Field(min_length=2, max_length=64)
+    display_name: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(min_length=1, max_length=2_000)
+    allowed_path_prefixes: list[str] = Field(min_length=1, max_length=32)
+    allowed_methods: list[str] = Field(default_factory=lambda: ["GET"], max_length=6)
+    auth_kind: str = Field(default="none", pattern=r"^(none|bearer|header)$")
+    credential_ref: str | None = Field(default=None, max_length=128)
+    auth_header: str | None = Field(default=None, max_length=128)
+    idempotency_header: str | None = Field(default=None, max_length=128)
+    timeout_seconds: int = Field(default=30, ge=1, le=120)
+    max_response_bytes: int = Field(default=2 * 1024 * 1024, ge=1, le=8 * 1024 * 1024)
+
+
+class ConnectorDisableRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2_000)
+
+
 class BillingCheckoutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -361,6 +384,7 @@ def create_app(
     artifact_store: ArtifactStore | None = None,
     preview_deployments: PreviewDeploymentStore | None = None,
     company_directory: CompanyDirectory | None = None,
+    connector_registry: ConnectorRegistry | None = None,
     usage_meter: UsageMeter | None = None,
     billing_service: BillingService | None = None,
     client_identity_config: Mapping[str, str] | None = None,
@@ -650,6 +674,60 @@ def create_app(
                 raise HTTPException(status_code=404, detail="standing agent not found") from exc
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if connector_registry is not None:
+        @app.get("/v2/connectors")
+        def list_connectors(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            return {"items": list(connector_registry.list_connectors(
+                principal.organization_id,
+            ))}
+
+        @app.post("/v2/connectors", status_code=201)
+        def register_connector(
+            body: ConnectorRegistrationRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="connector creation requires owner authority")
+            try:
+                return connector_registry.register_connector(
+                    tenant_id=principal.organization_id,
+                    definition=body.model_dump(),
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.delete("/v2/connectors/{connector_id}")
+        def disable_connector(
+            connector_id: str,
+            body: ConnectorDisableRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="connector removal requires owner authority")
+            try:
+                result = connector_registry.disable_connector(
+                    tenant_id=principal.organization_id,
+                    connector_id=connector_id,
+                    actor_id=principal.subject_id,
+                    reason=body.reason,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(status_code=404, detail="connector not found")
+            return result
 
     if usage_meter is not None:
         @app.get("/v2/usage/summary")

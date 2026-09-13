@@ -16,6 +16,7 @@ from agent_os.application.billing import BillingCatalog, BillingPlan, BillingSer
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.gcs_artifacts import build_artifact_store
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
+from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_billing import SQLBillingStore
@@ -349,6 +350,11 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(company_directory.close)
+        connector_registry = SQLConnectorRegistry(
+            settings.application_database_url,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(connector_registry.close)
         notification_store = SQLNotificationStore(
             settings.application_database_url,
             create_schema=settings.create_schema,
@@ -422,6 +428,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             artifact_store=artifact_store,
             preview_deployments=preview_deployments,
             company_directory=company_directory,
+            connector_registry=connector_registry,
             usage_meter=usage_meter,
             billing_service=billing_service,
             client_identity_config=browser_identity_config(settings),
@@ -436,6 +443,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.artifact_store = artifact_store
     app.state.preview_deployments = preview_deployments
     app.state.company_directory = company_directory
+    app.state.connector_registry = connector_registry
     app.state.usage_meter = usage_meter
     app.state.billing_store = billing_store
     app.state.billing_service = billing_service

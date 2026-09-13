@@ -118,9 +118,23 @@ because the requested spend is zero.
 
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
-email, Slack, SMS, and push remain separate adapters. `schedule_retry` and arbitrary external tool execution still
-require explicitly registered executors; until those adapters exist, the router marks the effect failed with a
-durable explanation rather than reporting an operation that did not happen.
+email, Slack, SMS, and push remain separate adapters. `schedule_retry` and any protocol-specific effect outside the
+registered HTTP/deployment/sandbox adapters still require an explicit executor; until one exists, the router marks
+the effect failed with a durable explanation rather than reporting an operation that did not happen.
+
+`connector.invoke` is the governed general HTTP capability adapter. An owner registers an immutable tenant-scoped
+HTTPS origin, path prefixes, methods, response/time bounds, authentication mode, opaque credential reference, and
+(for writes) upstream idempotency header at `POST /v2/connectors`; definitions and disable operations are isolated
+by PostgreSQL RLS. The planner receives only the non-secret active catalog. Runtime joins the fixed origin to a
+bounded path/query, refuses redirects and non-public DNS answers, pins TLS to an address it already validated,
+caps request/response bytes and call time, and persists the response plus a secret-free receipt as immutable
+evidence. POST/PUT/PATCH/DELETE additionally require a completed Human node and send the durable graph action ID as
+the upstream idempotency key. Provider 408/425/429/5xx and network failures use the existing durable lease/backoff
+loop; a whole mission is never killed by a wall-clock story timeout. Local secrets are tenant-digest-namespaced,
+read-only files with symlink refusal. Hosted secrets use a deterministic tenant/ref-derived Secret Manager name and
+workload identity, permitting per-secret IAM without storing raw keys in connector definitions, SQL, logs, prompts,
+or receipts. This adapter covers conventional JSON/HTTP APIs; protocol-specific OAuth consent and webhook ingestion
+remain explicit adapters because treating those security ceremonies as a generic HTTP call would be unsafe.
 
 General mission decomposition is recursive rather than a fixed six-step chain. An admitted workflow may use a
 `subworkflow` node whose source is another complete, immutable mission-program artifact. The runtime revalidates
@@ -246,6 +260,9 @@ Important controls:
 - `AOS_V2_MANAGEMENT_CHECK_SECONDS` (default `30`; durable review cadence)
 - `AOS_V2_SLOW_WORK_SECONDS` (default `300`; diagnostic threshold, never a kill timeout)
 - `AOS_V2_MANAGEMENT_ESCALATION_CHECKS` (default `3`; consecutive checks before CEO escalation)
+- `AOS_V2_CONNECTOR_SECRET_BACKEND` (`file` locally, `gcp` in hosted production)
+- `AOS_V2_CONNECTOR_SECRET_DIR` (local/BYOC read-only credential root)
+- `AOS_V2_CONNECTOR_SECRET_PROJECT_ID` (Secret Manager project when the backend is `gcp`)
 - `AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS` (default `10000`; reserved before provider calls)
 - `AOS_V2_BILLING_MODE` (`disabled` locally; public production requires `stripe`)
 - `AOS_V2_STRIPE_SECRET_KEY` (production requires an `sk_live_` key)
@@ -287,7 +304,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–99), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–99zz), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
 actual provider tenant plus its multi-user invite/organization configuration, secrets management, production
 configuration, artifact garbage collection, usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch

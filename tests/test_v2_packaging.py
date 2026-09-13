@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tomllib
 from pathlib import Path
 
@@ -39,6 +40,20 @@ def test_packaged_cli_exposes_api_and_worker_processes():
     assert result.exit_code == 0
     assert "serve" in result.output
     assert "worker" in result.output
+    assert "connector-secret-name" in result.output
+
+
+def test_connector_secret_locator_cli_is_deterministic_and_secret_free():
+    result = CliRunner().invoke(main, [
+        "connector-secret-name", "--organization", "tenant-a",
+        "--credential-ref", "jira-token", "--backend", "gcp",
+    ])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["backend"] == "gcp"
+    assert payload["locator"].startswith("agentos-connector-")
+    assert "tenant-a" not in payload["locator"]
+    assert "jira-token" not in payload["locator"]
 
 
 def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
@@ -57,6 +72,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "96-company-proposal-decisions-v2.sql" in compose
     assert "99-external-artifacts-v2.sql" in compose
     assert "99z-external-onboarding-v2.sql" in compose
+    assert "99zz-connectors-v2.sql" in compose
     assert '127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080' in compose
     assert "GEMINI_API_KEY" in compose
     assert "AOS_V2_DATABASE_RUNTIME_PASSWORD" in compose
@@ -70,6 +86,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "AOS_V2_SANDBOX_BACKEND=disabled" in env_example
     assert "AOS_V2_PUBLIC_BASE_URL=http://localhost:8080" in env_example
     assert "AOS_V2_PREVIEW_TTL_SECONDS=604800" in env_example
+    assert "AOS_V2_CONNECTOR_SECRET_HOST_DIR=./connector-secrets" in env_example
     assert "@sha256:" in env_example
 
 

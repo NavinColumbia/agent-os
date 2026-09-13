@@ -67,6 +67,7 @@ services:
       - ../postgres/initdb/98-billing-v2.sql:/migrations/98-billing-v2.sql:ro
       - ../postgres/initdb/99-external-artifacts-v2.sql:/migrations/99-external-artifacts-v2.sql:ro
       - ../postgres/initdb/99z-external-onboarding-v2.sql:/migrations/99z-external-onboarding-v2.sql:ro
+      - ../postgres/initdb/99zz-connectors-v2.sql:/migrations/99zz-connectors-v2.sql:ro
     command:
       - sh
       - -ec
@@ -86,6 +87,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/98-billing-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/99-external-artifacts-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/99z-external-onboarding-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/99zz-connectors-v2.sql
         psql -v ON_ERROR_STOP=1 \
           -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
         SELECT format(
@@ -152,6 +154,8 @@ services:
       AOS_V2_MANAGEMENT_CHECK_SECONDS: ${AOS_V2_MANAGEMENT_CHECK_SECONDS:-30}
       AOS_V2_SLOW_WORK_SECONDS: ${AOS_V2_SLOW_WORK_SECONDS:-300}
       AOS_V2_MANAGEMENT_ESCALATION_CHECKS: ${AOS_V2_MANAGEMENT_ESCALATION_CHECKS:-3}
+      AOS_V2_CONNECTOR_SECRET_BACKEND: file
+      AOS_V2_CONNECTOR_SECRET_DIR: /run/secrets/agent-os-connectors
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
@@ -159,6 +163,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    volumes:
+      - ${AOS_V2_CONNECTOR_SECRET_HOST_DIR:-./connector-secrets}:/run/secrets/agent-os-connectors:ro
     restart: unless-stopped
     # One provider request is bounded, but a complete agent turn may contain
     # retries/tool cleanup. Give SIGTERM enough time to stop without lease theft.

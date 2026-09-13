@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Collection, Mapping
+from typing import Any, Callable, Collection, Mapping
 
 from agent_os.application.command_worker import FatalCommandError, RetryableCommandError
 from agent_os.application.lifecycle import CommandEnvelope
@@ -44,7 +44,8 @@ _MISSION_PLAN_MAX_TOTAL_ITERATIONS = 128
 _MISSION_MAX_DEPTH = 8
 _MISSION_INTERNAL_TOOLS = frozenset({"workflow.revise"})
 _MISSION_TOOL_ALLOWLIST = frozenset({
-    "deploy.preview", "deploy.service", "deploy.static", "sandbox.run", "workflow.revise",
+    "connector.invoke", "deploy.preview", "deploy.service", "deploy.static",
+    "sandbox.run", "workflow.revise",
 })
 
 
@@ -157,6 +158,19 @@ def mission_bootstrap_definition(
             },
             "success_condition": "outgoing condition after publication",
         }} if "deploy.preview" in tools else {}),
+        **({"http_connector_configuration": {
+            "tool": "connector.invoke",
+            "connector_id": "one ID from authoritative configured_connectors",
+            "method": "one owner-allowed method",
+            "path": "a path within the connector's allowed prefixes",
+            "query": {"bounded": "non-secret primitive values"},
+            "source": {
+                "node_id": "optional successful source node for write bodies",
+                "output_path": ["artifact_ids", "request-body-label"],
+            },
+            "approval_node_id": "required successful human node for every write method",
+            "success_condition": "outgoing condition for a 2xx response",
+        }} if "connector.invoke" in tools else {}),
         **({"production_static_deployment_configuration": {
             "tool": "deploy.static",
             "source": {
@@ -391,6 +405,10 @@ def materialize_mission_workflow(
             }
             if tool == "sandbox.run":
                 allowed_configuration.update({"command", "failure_condition"})
+            elif tool == "connector.invoke":
+                allowed_configuration.update({
+                    "connector_id", "method", "path", "query", "approval_node_id",
+                })
             elif tool in {"deploy.static", "deploy.service"}:
                 allowed_configuration.update({"approval", "app_slug"})
                 if tool == "deploy.service":
@@ -403,25 +421,29 @@ def materialize_mission_workflow(
             if tool not in tools:
                 raise FatalCommandError(f"planned workflow requested unavailable tool: {tool}")
             source = configuration.get("source")
-            if not isinstance(source, Mapping):
+            if source is None and tool != "connector.invoke":
                 raise FatalCommandError("planned tool requires a prior-node source")
-            source_node_id = source.get("node_id")
-            output_path = source.get("output_path")
-            if (
-                not isinstance(source_node_id, str)
-                or not source_node_id
-                or not isinstance(output_path, (list, tuple))
-                or not output_path
-                or len(output_path) > 16
-                or any(
-                    isinstance(part, bool)
-                    or not isinstance(part, (str, int))
-                    or (isinstance(part, str) and not part)
-                    or (isinstance(part, int) and part < 0)
-                    for part in output_path
-                )
-            ):
-                raise FatalCommandError("planned tool source reference is invalid")
+            source_node_id = None
+            if source is not None:
+                if not isinstance(source, Mapping):
+                    raise FatalCommandError("planned tool source reference is invalid")
+                source_node_id = source.get("node_id")
+                output_path = source.get("output_path")
+                if (
+                    not isinstance(source_node_id, str)
+                    or not source_node_id
+                    or not isinstance(output_path, (list, tuple))
+                    or not output_path
+                    or len(output_path) > 16
+                    or any(
+                        isinstance(part, bool)
+                        or not isinstance(part, (str, int))
+                        or (isinstance(part, str) and not part)
+                        or (isinstance(part, int) and part < 0)
+                        for part in output_path
+                    )
+                ):
+                    raise FatalCommandError("planned tool source reference is invalid")
             if tool == "sandbox.run":
                 command = configuration.get("command")
                 if (
@@ -436,6 +458,29 @@ def materialize_mission_workflow(
                     )
                 ):
                     raise FatalCommandError("planned sandbox command must be bounded direct argv")
+            elif tool == "connector.invoke":
+                connector_id = configuration.get("connector_id")
+                method = str(configuration.get("method") or "GET").upper()
+                path = configuration.get("path")
+                query = configuration.get("query", {})
+                if (
+                    not isinstance(connector_id, str)
+                    or not re.fullmatch(r"[a-z][a-z0-9-]{0,62}[a-z0-9]", connector_id)
+                    or method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}
+                    or not isinstance(path, str) or not path.startswith("/")
+                    or path.startswith("//") or len(path) > 2_000
+                    or not isinstance(query, Mapping) or len(query) > 64
+                ):
+                    raise FatalCommandError("planned connector invocation is malformed")
+                configuration["method"] = method
+                if method in {"POST", "PUT", "PATCH", "DELETE"}:
+                    approval_node_id = configuration.get("approval_node_id")
+                    if not isinstance(approval_node_id, str) or not approval_node_id:
+                        raise FatalCommandError(
+                            "planned connector write requires a human approval node"
+                        )
+                    tool_sources.append((proposed.node_id, approval_node_id))
+                    production_approvals.append((proposed.node_id, approval_node_id))
             elif tool in {"deploy.static", "deploy.service"}:
                 deployment_kind = "static deployment" if tool == "deploy.static" else "service deployment"
                 app_slug = configuration.get("app_slug")
@@ -488,7 +533,8 @@ def materialize_mission_workflow(
                 configured_conditions.append((
                     proposed.node_id, "failure_condition", failure_condition,
                 ))
-            tool_sources.append((proposed.node_id, source_node_id))
+            if source_node_id is not None:
+                tool_sources.append((proposed.node_id, source_node_id))
         nodes.append(WorkflowNode(
             node_id=proposed.node_id,
             kind=kind,
@@ -573,7 +619,7 @@ def materialize_mission_workflow(
         approval_node = nodes_by_id.get(approval_node_id)
         if approval_node is None or approval_node.kind is not NodeKind.HUMAN:
             raise FatalCommandError(
-                f"planned production deployment {tool_node_id} approval must reference a human node"
+                f"planned consequential tool {tool_node_id} approval must reference a human node"
             )
     return definition
 
@@ -623,10 +669,12 @@ class MissionBootstrapHandler:
         graph_engine: GraphWorkflowEngine,
         lifecycle_engine: WorkflowEngine | None = None,
         available_tools: Collection[str] | None = None,
+        capability_context: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> None:
         self._graph = graph_engine
         self._lifecycle = lifecycle_engine
         self._available_tools = _mission_tools(available_tools)
+        self._capability_context = capability_context
 
     def execute(self, item: CommandEnvelope) -> Mapping[str, Any]:
         if self._lifecycle is not None:
@@ -646,6 +694,8 @@ class MissionBootstrapHandler:
             "lifecycle_expected_version": item.aggregate_version,
             "mission_bootstrap": True,
         }
+        if self._capability_context is not None:
+            context.update(dict(self._capability_context(item.organization_id)))
         receipt = self._graph.start_graph_run(
             item.organization_id,
             definition.workflow_id,

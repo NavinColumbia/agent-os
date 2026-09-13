@@ -57,6 +57,8 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert "migration_database_url" not in api_secrets
     assert "tenant_derivation_secret" in api_secrets
     assert "tenant_derivation_secret" not in worker_secrets
+    assert 'AOS_V2_CONNECTOR_SECRET_BACKEND         = "gcp"' in main
+    assert "AOS_V2_CONNECTOR_SECRET_PROJECT_ID      = var.project_id" in main
     assert 'AOS_V2_ARTIFACT_BACKEND                      = "gcs"' in main
     assert 'role   = "roles/storage.objectCreator"' in main
     assert 'role   = "roles/storage.objectViewer"' in main

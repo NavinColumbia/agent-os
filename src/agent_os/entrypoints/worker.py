@@ -32,6 +32,11 @@ from agent_os.infrastructure.graph_action_executor import DurableGraphActionExec
 from agent_os.infrastructure.graph_organization_effects import GraphOrganizationEffectHandler
 from agent_os.infrastructure.gcs_artifacts import build_artifact_store
 from agent_os.infrastructure.gcs_static_sites import GCSStaticSiteDeployer
+from agent_os.infrastructure.http_connector_tools import (
+    FileConnectorSecretResolver,
+    GCPConnectorSecretResolver,
+    HTTPConnectorToolNodeHandlers,
+)
 from agent_os.infrastructure.mission_workflows import (
     MissionBootstrapHandler,
     MissionCancellationHandler,
@@ -43,6 +48,7 @@ from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
 from agent_os.infrastructure.sandbox_tool_nodes import SandboxToolNodeHandlers
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
+from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
@@ -115,6 +121,9 @@ class WorkerSettings:
     management_check_seconds: int
     slow_work_seconds: int
     management_escalation_checks: int
+    connector_secret_directory: str
+    connector_secret_backend: str
+    connector_secret_project_id: str
 
     @classmethod
     def from_env(cls, *, organization_ids: Sequence[str] = ()) -> "WorkerSettings":
@@ -233,6 +242,24 @@ class WorkerSettings:
             raise ValueError("AOS_V2_SLOW_WORK_SECONDS cannot exceed 604800")
         if management_escalation_checks > 100:
             raise ValueError("AOS_V2_MANAGEMENT_ESCALATION_CHECKS cannot exceed 100")
+        connector_secret_directory = os.getenv(
+            "AOS_V2_CONNECTOR_SECRET_DIR", "/run/secrets/agent-os-connectors",
+        ).strip()
+        if not os.path.isabs(connector_secret_directory):
+            raise ValueError("AOS_V2_CONNECTOR_SECRET_DIR must be absolute")
+        connector_secret_backend = os.getenv(
+            "AOS_V2_CONNECTOR_SECRET_BACKEND",
+            "file",
+        ).strip().lower()
+        if connector_secret_backend not in {"file", "gcp"}:
+            raise ValueError("AOS_V2_CONNECTOR_SECRET_BACKEND must be file or gcp")
+        connector_secret_project_id = os.getenv(
+            "AOS_V2_CONNECTOR_SECRET_PROJECT_ID", "",
+        ).strip()
+        if connector_secret_backend == "gcp" and not connector_secret_project_id:
+            raise ValueError(
+                "GCP connector secrets require AOS_V2_CONNECTOR_SECRET_PROJECT_ID"
+            )
         worker_id = os.getenv("AOS_V2_WORKER_ID", "").strip()
         if not worker_id:
             worker_id = f"{socket.gethostname()}:{os.getpid()}"
@@ -273,6 +300,9 @@ class WorkerSettings:
             management_check_seconds=management_check_seconds,
             slow_work_seconds=slow_work_seconds,
             management_escalation_checks=management_escalation_checks,
+            connector_secret_directory=connector_secret_directory,
+            connector_secret_backend=connector_secret_backend,
+            connector_secret_project_id=connector_secret_project_id,
         )
 
     def with_organizations(self, organization_ids: Sequence[str]) -> "WorkerSettings":
@@ -311,6 +341,11 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(company_directory.close)
+        connector_registry = SQLConnectorRegistry(
+            settings.server.application_database_url,
+            create_schema=settings.server.create_schema,
+        )
+        resources.callback(connector_registry.close)
         notification_store = SQLNotificationStore(
             settings.server.application_database_url,
             create_schema=settings.server.create_schema,
@@ -368,6 +403,16 @@ def run_worker(
                 preview_deployments, static_deployer, service_deployer,
             ).named_handlers()
         )
+        connector_secrets = (
+            GCPConnectorSecretResolver(settings.connector_secret_project_id)
+            if settings.connector_secret_backend == "gcp"
+            else FileConnectorSecretResolver(settings.connector_secret_directory)
+        )
+        named_tool_handlers.update(HTTPConnectorToolNodeHandlers(
+            connector_registry,
+            artifact_store,
+            connector_secrets,
+        ).named_handlers())
         if settings.sandbox_backend == "docker":
             docker_binary = shutil.which("docker")
             if docker_binary is None:
@@ -394,6 +439,7 @@ def run_worker(
             named_tool_handlers.update(SandboxToolNodeHandlers(sandbox_runner).named_handlers())
         available_mission_tools = frozenset({
             "deploy.preview", "deploy.static", "deploy.service", "sandbox.run",
+            "connector.invoke",
         }) & frozenset(named_tool_handlers)
         named_tool_handlers.update(
             WorkflowLaunchToolNodeHandlers(
@@ -419,7 +465,19 @@ def run_worker(
         )
         lifecycle_handlers = dict(notification_effects.lifecycle_handlers())
         lifecycle_handlers[CommandKind.START_MISSION] = MissionBootstrapHandler(
-            graph_engine, engine, available_tools=available_mission_tools,
+            graph_engine,
+            engine,
+            available_tools=available_mission_tools,
+            capability_context=lambda tenant_id: {
+                "configured_connectors": [{
+                    "connector_id": item["connector_id"],
+                    "display_name": item["display_name"],
+                    "allowed_path_prefixes": item["allowed_path_prefixes"],
+                    "allowed_methods": item["allowed_methods"],
+                    "active": item["active"],
+                    "authentication_configured": item["auth_kind"] != "none",
+                } for item in connector_registry.list_connectors(tenant_id)],
+            },
         ).execute
         lifecycle_handlers[CommandKind.CANCEL_ACTIVE_OPERATION] = MissionCancellationHandler(
             graph_engine, artifact_store,

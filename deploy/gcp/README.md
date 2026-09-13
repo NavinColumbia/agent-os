@@ -102,6 +102,22 @@ server-generated tenant/capability secrets never need founder input.
 Configure the OIDC SPA callback/logout/web origin as `${AOS_V2_PUBLIC_BASE_URL}/app`. Configure the Stripe webhook
 as `${AOS_V2_PUBLIC_BASE_URL}/v2/billing/webhooks/stripe`; checkout redirects alone never grant an entitlement.
 
+For an authenticated tenant connector, derive its secret name without revealing either tenant or credential label:
+
+```bash
+DERIVED_NAME="$(agentos-v2 connector-secret-name \
+  --backend gcp --organization "$TENANT_ID" --credential-ref "$CREDENTIAL_REF" | jq -r .locator)"
+gcloud secrets create "$DERIVED_NAME" --replication-policy=automatic
+gcloud secrets versions add "$DERIVED_NAME" --data-file=-
+gcloud secrets add-iam-policy-binding "$DERIVED_NAME" \
+  --member="serviceAccount:${WORKER_SERVICE_ACCOUNT}" \
+  --role=roles/secretmanager.secretAccessor
+```
+
+Grant the worker on that individual secret only; it deliberately has no project-wide Secret Manager reader role.
+The credential value and its raw logical reference never enter OpenTofu state, PostgreSQL, model context, or
+connector receipts. Register the matching non-secret connector envelope through `POST /v2/connectors`.
+
 Then run `deploy/gcp/deploy.sh`. On a new cell it creates/version-enables the remote state bucket and bootstraps
 foundation resources without a runtime. On both first and repeat releases it adds only missing secret versions,
 builds all three images in Cloud Build, resolves immutable digests, updates only the migration Job, executes migrations,

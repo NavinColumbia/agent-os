@@ -18,6 +18,7 @@ from agent_os.domain.workflow_runtime import (
 )
 from agent_os.infrastructure.memory import InMemoryWorkflowEngine
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
+from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 
 
@@ -669,3 +670,55 @@ def test_external_staffing_api_requires_owner_attestation_before_activation(tmp_
         ).json()["items"] == []
     finally:
         directory.close()
+
+
+def test_connector_api_is_owner_governed_and_tenant_isolated(tmp_path):
+    registry = SQLConnectorRegistry(
+        f"sqlite:///{tmp_path / 'api-connectors.sqlite3'}", create_schema=True,
+    )
+    try:
+        api = TestClient(create_app(
+            engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+            connector_registry=registry,
+        ))
+        definition = {
+            "connector_id": "public-data",
+            "display_name": "Public data",
+            "base_url": "https://data.example.test",
+            "allowed_path_prefixes": ["/v1/records"],
+            "allowed_methods": ["GET"],
+            "auth_kind": "none",
+        }
+        assert api.post(
+            "/v2/connectors",
+            headers={
+                "Authorization": "Bearer viewer-a", "Idempotency-Key": "viewer-register",
+            },
+            json=definition,
+        ).status_code == 403
+        created = api.post(
+            "/v2/connectors",
+            headers={
+                "Authorization": "Bearer org-a", "Idempotency-Key": "owner-register",
+            },
+            json=definition,
+        )
+        assert created.status_code == 201
+        assert created.json()["connector_id"] == "public-data"
+        assert api.get(
+            "/v2/connectors", headers={"Authorization": "Bearer org-a"},
+        ).json()["items"][0]["active"] is True
+        assert api.get(
+            "/v2/connectors", headers={"Authorization": "Bearer org-b"},
+        ).json()["items"] == []
+        disabled = api.request(
+            "DELETE", "/v2/connectors/public-data",
+            headers={
+                "Authorization": "Bearer org-a", "Idempotency-Key": "owner-disable",
+            },
+            json={"reason": "No longer required"},
+        )
+        assert disabled.status_code == 200
+        assert disabled.json()["active"] is False
+    finally:
+        registry.close()

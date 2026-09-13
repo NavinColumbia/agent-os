@@ -97,19 +97,24 @@ bounded AI role with `POST /v2/company/agents` or retire a non-core role with
 manager, current team managers, and managers that still own direct reports. Active standing roles, reporting
 lines, capabilities, tool grants, hiring authority, and per-turn spending authority are supplied to graph agents
 as authoritative context and therefore carry into later directives. Mission-created graph roles remain scoped
-to that mission unless an authorized company change promotes them. Human/vendor hiring, team mutation, automatic
-application of model staffing proposals, and reassignment/onboarding bundles remain approval/effect milestones;
-this directory does not pretend an event record hired a real person or granted an unconfigured tool.
+to that mission unless an authorized company change promotes them. Team mutation, automatic application of model
+staffing proposals, and access provisioning remain approval/effect milestones; this directory does not pretend an
+event record granted an unconfigured tool.
 
 Mission staffing proposals now receive content-derived stable IDs and pending/approved/rejected status in the
 management projection. An owner/operator may decide an AI-agent proposal at
 `POST /v2/runs/{run_id}/management/proposals/{proposal_id}/hiring-decision`. Approval atomically records one
 immutable decision and promotes up to 32 deterministic agent identities into a selected standing team under one
 active manager, with explicit tool and spend limits; retries cannot create duplicate identities. Rejection records
-the durable decision without creating capacity. A proposal for a human or vendor fails closed at this endpoint,
-because a database event is not employment, contracting, identity verification, or onboarding. Fully autonomous
-proposal application also remains policy work: the model cannot approve its own staffing request merely because
-the requested spend is zero.
+the durable decision without creating capacity. Approved human/vendor proposals instead create deterministic
+`awaiting_external_onboarding` cases. They remain absent from the routable organization until an owner confirms the
+required identity, terms, access, and (for a vendor) contract attestations at
+`POST /v2/company/external-onboarding/{onboarding_id}/confirm`. Confirmed humans use their authenticated identity
+subject and an explicit response SLA; confirmed vendors become service participants under an accountable agent.
+`GET /v2/company/external-onboarding` exposes every case and its state. This completes the software workflow while
+truthfully leaving employment, contracting, identity verification, and account provisioning as external actions.
+Fully autonomous proposal application remains policy work: the model cannot approve its own staffing request merely
+because the requested spend is zero.
 
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as

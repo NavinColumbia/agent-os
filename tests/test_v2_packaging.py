@@ -28,6 +28,12 @@ def test_runtime_image_installs_locked_dependencies_before_local_package():
     assert "python:3.12-slim-trixie@sha256:" in dockerfile
 
 
+def test_migration_image_uses_numeric_order_after_three_digit_versions():
+    script = (ROOT / "deploy" / "migrate-v2.sh").read_text()
+    assert "sort -V" in script
+    assert "for migration in /migrations/*.sql" not in script
+
+
 def test_packaged_cli_exposes_api_and_worker_processes():
     result = CliRunner().invoke(main, ["--help"])
     assert result.exit_code == 0
@@ -50,6 +56,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "95-company-directory-v2.sql" in compose
     assert "96-company-proposal-decisions-v2.sql" in compose
     assert "99-external-artifacts-v2.sql" in compose
+    assert "99z-external-onboarding-v2.sql" in compose
     assert '127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080' in compose
     assert "GEMINI_API_KEY" in compose
     assert "AOS_V2_DATABASE_RUNTIME_PASSWORD" in compose

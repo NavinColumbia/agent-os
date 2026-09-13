@@ -329,6 +329,8 @@ class Organization:
         for participant_id, human in self.humans.items():
             if participant_id != human.participant_id or human.team_id not in self.teams:
                 raise ValueError("human identity/team is not part of the organization")
+            if human.manager_id is not None and human.manager_id not in self.agents:
+                raise ValueError("human manager must be an organization agent")
             if participant_id in identities:
                 raise ValueError("participant identities must be globally unique")
             identities.add(participant_id)

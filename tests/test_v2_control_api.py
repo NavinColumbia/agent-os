@@ -608,3 +608,64 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
     )
     assert hidden.status_code == 404
     directory.close()
+
+
+def test_external_staffing_api_requires_owner_attestation_before_activation(tmp_path):
+    directory = SQLCompanyDirectory(
+        f"sqlite:///{tmp_path / 'external-company.sqlite3'}", create_schema=True,
+    )
+    try:
+        decision = directory.decide_hiring_proposal(
+            tenant_id="org-a", proposal_id="proposal-human-qa", approved=True,
+            participant_kind="human", reason="A customer QA reviewer is required",
+            role="customer-qa", requested_count=1, team_id="quality",
+            manager_id="agent:quality-manager", capabilities=("acceptance-testing",),
+            tool_grants=("artifact.read",), spending_limit_cents=0,
+            actor_id="human-a",
+        )
+        onboarding_id = decision["payload"]["onboarding_cases"][0]["onboarding_id"]
+        api = TestClient(create_app(
+            engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+            company_directory=directory,
+        ))
+        assert api.get(
+            "/v2/company/external-onboarding",
+            headers={"Authorization": "Bearer viewer-a"},
+        ).status_code == 403
+        inventory = api.get(
+            "/v2/company/external-onboarding",
+            headers={"Authorization": "Bearer org-a"},
+        )
+        assert inventory.status_code == 200
+        assert inventory.json()["items"][0]["status"] == "awaiting_external_onboarding"
+
+        response = api.post(
+            f"/v2/company/external-onboarding/{onboarding_id}/confirm",
+            headers={
+                "Authorization": "Bearer org-a",
+                "Idempotency-Key": "confirm-external-qa",
+            },
+            json={
+                "display_name": "External QA Reviewer",
+                "identity_subject": "human:external-qa",
+                "response_sla_seconds": 7_200,
+                "quality_criteria": ["Attach acceptance evidence"],
+                "attestations": [
+                    "identity_verified", "terms_accepted", "access_approved",
+                ],
+            },
+        )
+        assert response.status_code == 200
+        organization = api.get(
+            "/v2/company/organization", headers={"Authorization": "Bearer org-a"},
+        ).json()
+        assert any(
+            item["participant_id"] == "human:external-qa"
+            for item in organization["humans"]
+        )
+        assert api.get(
+            "/v2/company/external-onboarding",
+            headers={"Authorization": "Bearer org-b"},
+        ).json()["items"] == []
+    finally:
+        directory.close()

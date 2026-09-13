@@ -232,6 +232,16 @@ class HiringProposalDecisionRequest(BaseModel):
     spending_limit_cents: int = Field(default=0, ge=0, le=100_000_000)
 
 
+class ExternalOnboardingConfirmationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str = Field(min_length=1, max_length=200)
+    identity_subject: str | None = Field(default=None, min_length=1, max_length=256)
+    response_sla_seconds: int = Field(default=86_400, ge=60, le=2_678_400)
+    quality_criteria: list[str] = Field(default_factory=list, max_length=32)
+    attestations: list[str] = Field(min_length=3, max_length=16)
+
+
 class BillingCheckoutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -542,6 +552,52 @@ def create_app(
             )
             next_version = after_version if not events else int(events[-1]["stream_version"])
             return {"items": list(events), "next_version": next_version}
+
+        @app.get("/v2/company/external-onboarding")
+        def get_external_onboarding(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(
+                    status_code=403,
+                    detail="external onboarding inventory requires owner authority",
+                )
+            return {
+                "items": list(company_directory.list_external_onboarding(
+                    principal.organization_id,
+                )),
+            }
+
+        @app.post("/v2/company/external-onboarding/{onboarding_id}/confirm")
+        def confirm_external_onboarding(
+            onboarding_id: str,
+            body: ExternalOnboardingConfirmationRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(
+                    status_code=403,
+                    detail="external onboarding confirmation requires owner authority",
+                )
+            try:
+                return company_directory.confirm_external_onboarding(
+                    tenant_id=principal.organization_id,
+                    onboarding_id=onboarding_id,
+                    display_name=body.display_name,
+                    identity_subject=body.identity_subject,
+                    response_sla_seconds=body.response_sla_seconds,
+                    quality_criteria=tuple(body.quality_criteria),
+                    attestations=tuple(body.attestations),
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail="external onboarding not found") from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         @app.post("/v2/company/agents", status_code=201)
         def hire_company_agent(
@@ -992,11 +1048,6 @@ def create_app(
                 if proposal is None:
                     raise HTTPException(status_code=404, detail="staffing proposal not found")
                 participant_kind = str(proposal.get("participant_kind") or "agent")
-                if body.approved and participant_kind != "agent":
-                    raise HTTPException(
-                        status_code=409,
-                        detail="human/vendor staffing requires its configured legal and onboarding workflow",
-                    )
                 role = str(proposal.get("role") or "").strip()
                 capabilities = proposal.get("capabilities", ())
                 requested_count = proposal.get("requested_count", 1)
@@ -1012,6 +1063,7 @@ def create_app(
                         tenant_id=principal.organization_id,
                         proposal_id=proposal_id,
                         approved=body.approved,
+                        participant_kind=participant_kind,
                         reason=body.reason,
                         role=role,
                         requested_count=requested_count,

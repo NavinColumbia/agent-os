@@ -11,7 +11,8 @@ case "$AOS_V2_DATABASE_RUNTIME_ROLE" in
         ;;
 esac
 
-for migration in /migrations/*.sql; do
+find /migrations -maxdepth 1 -type f -name '*.sql' -print | sort -V |
+while IFS= read -r migration; do
     psql "$AOS_V2_MIGRATION_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"
 done
 

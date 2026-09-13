@@ -16,6 +16,7 @@ COPY --chmod=0444 postgres/initdb/96-company-proposal-decisions-v2.sql /migratio
 COPY --chmod=0444 postgres/initdb/97-usage-meter-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/98-billing-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/99-external-artifacts-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/99z-external-onboarding-v2.sql /migrations/
 COPY --chmod=0555 deploy/migrate-v2.sh /usr/local/bin/agentos-migrate-v2
 
 USER 999:999

@@ -31,7 +31,13 @@ from sqlalchemy.exc import IntegrityError
 
 from agent_os.application.default_organization import default_organization
 from agent_os.application.ports import CompanyDirectory
-from agent_os.domain.organization import AgentProfile, AgentStatus, Organization
+from agent_os.domain.organization import (
+    AgentProfile,
+    AgentStatus,
+    HumanParticipant,
+    Organization,
+    ServiceParticipant,
+)
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
 
 
@@ -88,6 +94,16 @@ def _event_id(tenant_id: str, idempotency_key: str, operation: str) -> str:
 def _agent_id(tenant_id: str, idempotency_key: str) -> str:
     material = f"agent-os:standing-agent:v1:{tenant_id}:{idempotency_key}"
     return "agent:custom-" + hashlib.sha256(material.encode()).hexdigest()[:32]
+
+
+def _onboarding_id(tenant_id: str, proposal_id: str, position: int) -> str:
+    material = f"agent-os:external-onboarding:v1:{tenant_id}:{proposal_id}:{position}"
+    return "onboarding-" + hashlib.sha256(material.encode()).hexdigest()
+
+
+def _vendor_id(tenant_id: str, onboarding_id: str) -> str:
+    material = f"agent-os:vendor-participant:v1:{tenant_id}:{onboarding_id}"
+    return "service:vendor-" + hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
 class SQLCompanyDirectory(CompanyDirectory):
@@ -154,6 +170,8 @@ class SQLCompanyDirectory(CompanyDirectory):
     def get_organization(self, tenant_id: str) -> Organization:
         base = default_organization(tenant_id)
         agents = dict(base.agents)
+        humans = dict(base.humans)
+        services = dict(base.services)
         events = self.list_company_events(tenant_id, limit=5_000)
         for event in events:
             payload = event.get("payload", {})
@@ -200,14 +218,44 @@ class SQLCompanyDirectory(CompanyDirectory):
                     if profile.agent_id in agents:
                         raise ValueError("company history hires the same agent identity twice")
                     agents[profile.agent_id] = profile
+            elif kind == "external_participant_onboarded":
+                participant_kind = str(payload.get("participant_kind") or "")
+                participant_id = str(payload.get("participant_id") or "")
+                if participant_id in agents or participant_id in humans or participant_id in services:
+                    raise ValueError("company history onboards the same participant identity twice")
+                if participant_kind == "human":
+                    humans[participant_id] = HumanParticipant(
+                        participant_id=participant_id,
+                        display_name=str(payload["display_name"]),
+                        team_id=str(payload["team_id"]),
+                        responsibilities=tuple(
+                            str(item) for item in payload.get("responsibilities", ())
+                        ),
+                        manager_id=str(payload["manager_id"]),
+                        response_sla_seconds=int(payload["response_sla_seconds"]),
+                        quality_criteria=tuple(
+                            str(item) for item in payload.get("quality_criteria", ())
+                        ),
+                    )
+                elif participant_kind == "vendor":
+                    services[participant_id] = ServiceParticipant(
+                        participant_id=participant_id,
+                        name=str(payload["display_name"]),
+                        capabilities=frozenset(
+                            str(item) for item in payload.get("capabilities", ())
+                        ),
+                        owner_id=str(payload["manager_id"]),
+                    )
+                else:
+                    raise ValueError("company history has an unknown external participant kind")
         return Organization(
             base.tenant_id,
             base.organization_id,
             base.name,
             base.teams,
             agents,
-            base.humans,
-            base.services,
+            humans,
+            services,
         )
 
     def _append(
@@ -410,6 +458,7 @@ class SQLCompanyDirectory(CompanyDirectory):
         tenant_id: str,
         proposal_id: str,
         approved: bool,
+        participant_kind: str = "agent",
         reason: str,
         role: str,
         requested_count: int,
@@ -422,6 +471,9 @@ class SQLCompanyDirectory(CompanyDirectory):
     ) -> Mapping[str, Any]:
         if not proposal_id.strip() or not reason.strip():
             raise ValueError("proposal identity and decision reason are required")
+        participant_kind = participant_kind.strip().lower()
+        if participant_kind not in {"agent", "human", "vendor"}:
+            raise ValueError("staffing participant kind must be agent, human, or vendor")
         if not 1 <= requested_count <= 32:
             raise ValueError("one staffing decision may create between 1 and 32 AI agents")
         if len(capabilities) > 64 or len(tool_grants) > 64:
@@ -429,7 +481,8 @@ class SQLCompanyDirectory(CompanyDirectory):
         if spending_limit_cents < 0:
             raise ValueError("agent spending limit cannot be negative")
         agents: list[dict[str, Any]] = []
-        if approved:
+        onboarding_cases: list[dict[str, Any]] = []
+        if approved and participant_kind == "agent":
             if team_id is None or manager_id is None:
                 raise ValueError("approved AI staffing requires a team and accountable manager")
             for position in range(requested_count):
@@ -453,12 +506,32 @@ class SQLCompanyDirectory(CompanyDirectory):
                     "hiring_authority": False,
                     "spending_limit_cents": profile.spending_limit_cents,
                 })
+        elif approved:
+            if team_id is None or manager_id is None:
+                raise ValueError(
+                    "approved external staffing requires a team and accountable manager"
+                )
+            onboarding_cases = [{
+                "onboarding_id": _onboarding_id(tenant_id, proposal_id, position),
+                "proposal_id": proposal_id,
+                "participant_kind": participant_kind,
+                "role": role.strip(),
+                "position": position,
+                "team_id": team_id,
+                "manager_id": manager_id,
+                "capabilities": sorted(set(capabilities)),
+                "requested_tool_grants": sorted(set(tool_grants)),
+                "requested_spending_limit_cents": spending_limit_cents,
+                "status": "awaiting_external_onboarding",
+            } for position in range(requested_count)]
         event_id = _event_id(tenant_id, proposal_id, "decide-hiring-proposal")
         payload = {
             "proposal_id": proposal_id,
             "approved": approved,
+            "participant_kind": participant_kind,
             "reason": reason.strip(),
             "agents": agents,
+            "onboarding_cases": onboarding_cases,
         }
         existing = self._existing(
             tenant_id=tenant_id, event_id=event_id, kind="hiring_proposal_decided",
@@ -468,17 +541,162 @@ class SQLCompanyDirectory(CompanyDirectory):
             return existing
         if approved:
             organization = self.get_organization(tenant_id)
-            if len(organization.agents) + requested_count > 1_000:
+            if participant_kind == "agent" and len(organization.agents) + requested_count > 1_000:
                 raise ValueError("standing company agent limit reached")
             manager = organization.agents.get(str(manager_id))
             if team_id not in organization.teams:
-                raise ValueError("agent team does not exist")
+                raise ValueError("staffing team does not exist")
             if manager is None or manager.status is not AgentStatus.ACTIVE:
-                raise ValueError("agent manager must be an active standing agent")
+                raise ValueError("staffing manager must be an active standing agent")
         return self._append(
             tenant_id=tenant_id,
             event_id=event_id,
             kind="hiring_proposal_decided",
+            actor_id=actor_id,
+            payload=payload,
+        )
+
+    def list_external_onboarding(
+        self, tenant_id: str,
+    ) -> tuple[Mapping[str, Any], ...]:
+        cases: dict[str, dict[str, Any]] = {}
+        for event in self.list_company_events(tenant_id, limit=5_000):
+            payload = event.get("payload", {})
+            if not isinstance(payload, Mapping):
+                raise ValueError("persisted company event payload is malformed")
+            if event.get("kind") == "hiring_proposal_decided":
+                raw_cases = payload.get("onboarding_cases", ())
+                if not isinstance(raw_cases, list):
+                    raise ValueError("staffing decision onboarding cases are malformed")
+                for raw in raw_cases:
+                    if not isinstance(raw, Mapping):
+                        raise ValueError("staffing onboarding case is malformed")
+                    onboarding_id = str(raw.get("onboarding_id") or "")
+                    if not onboarding_id or onboarding_id in cases:
+                        raise ValueError("staffing onboarding identity is invalid or duplicated")
+                    cases[onboarding_id] = {
+                        **dict(raw),
+                        "requested_at": event.get("created_at"),
+                        "requested_by": event.get("actor_id"),
+                    }
+            elif event.get("kind") == "external_participant_onboarded":
+                onboarding_id = str(payload.get("onboarding_id") or "")
+                if onboarding_id not in cases:
+                    raise ValueError("company history confirms unknown external onboarding")
+                cases[onboarding_id].update({
+                    "status": "active",
+                    "participant_id": payload.get("participant_id"),
+                    "display_name": payload.get("display_name"),
+                    "confirmed_at": event.get("created_at"),
+                    "confirmed_by": event.get("actor_id"),
+                })
+        return tuple(cases[key] for key in sorted(cases))
+
+    def confirm_external_onboarding(
+        self,
+        *,
+        tenant_id: str,
+        onboarding_id: str,
+        display_name: str,
+        identity_subject: str | None,
+        response_sla_seconds: int,
+        quality_criteria: tuple[str, ...],
+        attestations: tuple[str, ...],
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]:
+        onboarding_id = onboarding_id.strip()
+        display_name = display_name.strip()
+        identity_subject = None if identity_subject is None else identity_subject.strip()
+        if not onboarding_id or not display_name or not idempotency_key.strip():
+            raise ValueError("onboarding identity, display name, and idempotency key are required")
+        if not 60 <= response_sla_seconds <= 31 * 24 * 60 * 60:
+            raise ValueError("external participant response SLA must be 60 seconds through 31 days")
+        if len(quality_criteria) > 32 or any(not item.strip() for item in quality_criteria):
+            raise ValueError("external quality criteria must contain at most 32 nonempty items")
+        case = next((
+            item for item in self.list_external_onboarding(tenant_id)
+            if item.get("onboarding_id") == onboarding_id
+        ), None)
+        if case is None:
+            raise LookupError("external onboarding case does not exist")
+        participant_kind = str(case.get("participant_kind") or "")
+        required_attestations = {
+            "identity_verified", "terms_accepted", "access_approved",
+        }
+        if participant_kind == "vendor":
+            required_attestations.add("vendor_contract_approved")
+        if not required_attestations.issubset(set(attestations)):
+            raise ValueError(
+                "external onboarding confirmation is missing required attestations"
+            )
+        if participant_kind == "human":
+            if not identity_subject:
+                raise ValueError("human onboarding requires its authenticated identity subject")
+            participant_id = identity_subject
+        elif participant_kind == "vendor":
+            participant_id = _vendor_id(tenant_id, onboarding_id)
+        else:
+            raise ValueError("only human or vendor onboarding can be externally confirmed")
+        payload = {
+            "onboarding_id": onboarding_id,
+            "proposal_id": case.get("proposal_id"),
+            "participant_id": participant_id,
+            "participant_kind": participant_kind,
+            "display_name": display_name,
+            "role": case.get("role"),
+            "team_id": case.get("team_id"),
+            "manager_id": case.get("manager_id"),
+            "responsibilities": [str(case.get("role"))],
+            "capabilities": list(case.get("capabilities", ())),
+            "response_sla_seconds": response_sla_seconds,
+            "quality_criteria": list(quality_criteria),
+            "attestations": sorted(set(attestations)),
+        }
+        event_id = _event_id(
+            tenant_id, f"{onboarding_id}:{idempotency_key}", "confirm-external-onboarding",
+        )
+        existing = self._existing(
+            tenant_id=tenant_id,
+            event_id=event_id,
+            kind="external_participant_onboarded",
+            actor_id=actor_id,
+            payload=payload,
+        )
+        if existing is not None:
+            return existing
+        if case.get("status") != "awaiting_external_onboarding":
+            raise ValueError("external onboarding case is no longer pending")
+        organization = self.get_organization(tenant_id)
+        identities = set(organization.agents) | set(organization.humans) | set(organization.services)
+        if participant_id in identities:
+            raise ValueError("external participant identity is already active")
+        if case.get("team_id") not in organization.teams:
+            raise ValueError("external participant team does not exist")
+        manager = organization.agents.get(str(case.get("manager_id") or ""))
+        if manager is None or manager.status is not AgentStatus.ACTIVE:
+            raise ValueError("external participant manager must be an active standing agent")
+        if participant_kind == "human":
+            HumanParticipant(
+                participant_id=participant_id,
+                display_name=display_name,
+                team_id=str(case["team_id"]),
+                responsibilities=(str(case["role"]),),
+                manager_id=str(case["manager_id"]),
+                response_sla_seconds=response_sla_seconds,
+                quality_criteria=quality_criteria,
+            )
+        else:
+            ServiceParticipant(
+                participant_id=participant_id,
+                name=display_name,
+                capabilities=frozenset(str(item) for item in case.get("capabilities", ())),
+                owner_id=str(case["manager_id"]),
+            )
+        return self._append(
+            tenant_id=tenant_id,
+            event_id=event_id,
+            kind="external_participant_onboarded",
             actor_id=actor_id,
             payload=payload,
         )

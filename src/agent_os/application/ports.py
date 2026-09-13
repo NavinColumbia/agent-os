@@ -244,6 +244,7 @@ class CompanyDirectory(Protocol):
         tenant_id: str,
         proposal_id: str,
         approved: bool,
+        participant_kind: str,
         reason: str,
         role: str,
         requested_count: int,
@@ -253,6 +254,24 @@ class CompanyDirectory(Protocol):
         tool_grants: tuple[str, ...],
         spending_limit_cents: int,
         actor_id: str,
+    ) -> Mapping[str, Any]: ...
+
+    def list_external_onboarding(
+        self, tenant_id: str,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def confirm_external_onboarding(
+        self,
+        *,
+        tenant_id: str,
+        onboarding_id: str,
+        display_name: str,
+        identity_subject: str | None,
+        response_sla_seconds: int,
+        quality_criteria: tuple[str, ...],
+        attestations: tuple[str, ...],
+        actor_id: str,
+        idempotency_key: str,
     ) -> Mapping[str, Any]: ...
 
     def list_company_events(

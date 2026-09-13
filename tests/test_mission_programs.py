@@ -272,3 +272,23 @@ def test_program_cannot_invent_budget_authority_or_hide_a_budget_gap():
             proposal, tenant_id="tenant-a", planning_run_id="planning-a",
             artifact_id="artifact-program", allowed_tools=set(),
         )
+
+
+def test_recursive_child_programs_cannot_oversubscribe_parent_budget():
+    proposal = mission_program()
+    proposal["authorized_budget_cents"] = 0
+    proposal["workflow"]["nodes"].append({
+        "node_id": "child-team", "kind": "subworkflow",
+        "purpose": "Delegate an independently governed child team.",
+        "owner_role": "mission-manager", "configuration": {
+            "source": {"node_id": "triage", "output_path": ["artifact_ids", "child-program"]},
+            "budget_limit_cents": 1, "success_condition": "child_succeeded",
+            "failure_condition": "child_failed", "max_iterations": 1,
+        },
+    })
+
+    with pytest.raises(FatalCommandError, match="child-program budgets exceed"):
+        materialize_mission_program(
+            proposal, tenant_id="tenant-a", planning_run_id="planning-a",
+            artifact_id="artifact-program", allowed_tools=set(),
+        )

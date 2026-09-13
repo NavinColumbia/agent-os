@@ -589,3 +589,152 @@ def test_successful_child_graph_projects_once_to_the_coarse_ceo_lifecycle():
     assert state.artifact_revision == "artifact-release"
     assert first["projected"] is True
     assert replay["duplicate"] is True
+
+
+def test_recursive_child_program_waits_resumes_and_returns_evidence(tmp_path: Path):
+    graph = SQLGraphWorkflowEngine(
+        f"sqlite:///{tmp_path / 'recursive-graph.sqlite3'}", create_schema=True,
+    )
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'recursive-artifacts.sqlite3'}", create_schema=True,
+    )
+    try:
+        child_program_id = artifacts.put(
+            organization_id="tenant-a", content=json.dumps(proposed_program()).encode(),
+            media_type="application/json", idempotency_key="recursive-child-program",
+        )
+        parent_plan = {
+            "name": "Delegate one independently governed team",
+            "entry_node_id": "design-child",
+            "nodes": [
+                {"node_id": "design-child", "kind": "agent",
+                 "purpose": "Design the child team program.", "owner_role": "mission-manager",
+                 "configuration": {"max_iterations": 1}},
+                {"node_id": "child-team", "kind": "subworkflow",
+                 "purpose": "Run and supervise the child delivery team.",
+                 "owner_role": "mission-manager", "configuration": {
+                     "source": {"node_id": "design-child",
+                                "output_path": ["artifact_ids", "child-program"]},
+                     "budget_limit_cents": 0, "success_condition": "child_succeeded",
+                     "failure_condition": "child_failed", "max_iterations": 1,
+                 }},
+                {"node_id": "done", "kind": "terminal", "purpose": "Accept child evidence.",
+                 "configuration": {"max_iterations": 1}},
+                {"node_id": "failed", "kind": "terminal", "purpose": "Accept failure evidence.",
+                 "configuration": {"max_iterations": 1}},
+            ],
+            "edges": [
+                {"source": "design-child", "target": "child-team", "condition": "planned"},
+                {"source": "child-team", "target": "done", "condition": "child_succeeded"},
+                {"source": "child-team", "target": "failed", "condition": "child_failed"},
+            ],
+        }
+        parent_definition = materialize_mission_workflow(
+            parent_plan, tenant_id="tenant-a", planning_run_id="recursive-parent-plan",
+            artifact_id="recursive-parent-artifact",
+        )
+        graph.register_workflow(parent_definition)
+        graph.start_graph_run(
+            "tenant-a", parent_definition.workflow_id, 1, run_id="recursive-parent",
+            request_id="recursive-parent-start", context={
+                "lifecycle_run_id": "lifecycle-recursive", "mission_execution": True,
+                "mission_depth": 0, "mission_program": {"authorized_budget_cents": 0},
+            },
+        )
+        parent = graph.get_graph_run("tenant-a", "recursive-parent")
+        design = parent.tokens[0]
+        parent = graph.submit_graph_event("tenant-a", parent.run_id, WorkflowEvent(
+            "recursive-design-began", WorkflowEventKind.NODE_BEGAN, parent.version,
+            {"token_id": design.token_id},
+        )).state
+        parent = graph.submit_graph_event("tenant-a", parent.run_id, WorkflowEvent(
+            "recursive-design-complete", WorkflowEventKind.NODE_COMPLETED, parent.version,
+            {"token_id": design.token_id, "satisfied_conditions": ["planned"],
+             "evidence_ids": [child_program_id],
+             "output": {"artifact_ids": {"child-program": child_program_id}}},
+        )).state
+        child_token = next(token for token in parent.tokens if token.node_id == "child-team")
+        parent = graph.submit_graph_event("tenant-a", parent.run_id, WorkflowEvent(
+            "recursive-child-began", WorkflowEventKind.NODE_BEGAN, parent.version,
+            {"token_id": child_token.token_id},
+        )).state
+        handler = WorkflowLaunchToolNodeHandlers(graph, artifacts)
+        child_node = next(node for node in parent_definition.nodes if node.node_id == "child-team")
+        first = handler.spawn(
+            "tenant-a", parent.run_id, parent_definition, parent,
+            WorkflowAction("spawn-child", WorkflowActionKind.EXECUTE_NODE,
+                           child_token.token_id, child_token.node_id), child_node,
+        )
+        waited = graph.submit_graph_event("tenant-a", parent.run_id, WorkflowEvent(
+            "recursive-child-waited", WorkflowEventKind.CHILD_WAITED, parent.version,
+            {"token_id": child_token.token_id, "child_run_id": first["child_run_id"],
+             "child_program": first["child_program"],
+             "program_artifact_id": first["program_artifact_id"],
+             "actor_role": first["actor_role"]},
+        ))
+        assert waited.state.status is WorkflowRunStatus.WAITING
+        assert [action.kind for action in waited.actions] == [WorkflowActionKind.RECORD_PROGRAM]
+
+        child_run_id = str(first["child_run_id"])
+        child = graph.get_graph_run("tenant-a", child_run_id)
+        assert child.context["mission_depth"] == 1
+        build = child.tokens[0]
+        child = graph.submit_graph_event("tenant-a", child_run_id, WorkflowEvent(
+            "recursive-build-began", WorkflowEventKind.NODE_BEGAN, child.version,
+            {"token_id": build.token_id},
+        )).state
+        child = graph.submit_graph_event("tenant-a", child_run_id, WorkflowEvent(
+            "recursive-build-complete", WorkflowEventKind.NODE_COMPLETED, child.version,
+            {"token_id": build.token_id, "satisfied_conditions": ["ready"],
+             "evidence_ids": ["child-build-evidence"], "output": {}},
+        )).state
+        replan = next(token for token in child.tokens if token.node_id == "replan")
+        child = graph.submit_graph_event("tenant-a", child_run_id, WorkflowEvent(
+            "recursive-replan-began", WorkflowEventKind.NODE_BEGAN, child.version,
+            {"token_id": replan.token_id},
+        )).state
+        child = graph.submit_graph_event("tenant-a", child_run_id, WorkflowEvent(
+            "recursive-replan-complete", WorkflowEventKind.NODE_COMPLETED, child.version,
+            {"token_id": replan.token_id, "satisfied_conditions": ["stable"],
+             "evidence_ids": ["child-review-evidence"], "output": {}},
+        )).state
+        terminal = next(token for token in child.tokens if token.node_id == "done")
+        child = graph.submit_graph_event("tenant-a", child_run_id, WorkflowEvent(
+            "recursive-terminal-began", WorkflowEventKind.NODE_BEGAN, child.version,
+            {"token_id": terminal.token_id},
+        )).state
+        terminal_receipt = graph.submit_graph_event("tenant-a", child_run_id, WorkflowEvent(
+            "recursive-terminal-complete", WorkflowEventKind.NODE_COMPLETED, child.version,
+            {"token_id": terminal.token_id, "evidence_ids": ["child-accepted-evidence"],
+             "output": {}},
+        ))
+        terminal_action = next(
+            action for action in terminal_receipt.actions
+            if action.kind is WorkflowActionKind.RUN_SUCCEEDED
+        )
+        resumed = MissionGraphEffectHandlers(
+            lifecycle_engine=InMemoryWorkflowEngine(), graph_engine=graph,
+            notification_handlers={},
+        )._succeeded(
+            {"tenant_id": "tenant-a", "run_id": child_run_id}, terminal_action,
+        )
+        assert resumed["resumed"] is True
+
+        parent = graph.get_graph_run("tenant-a", "recursive-parent")
+        child_token = parent.token(child_token.token_id)
+        assert child_token.status is TokenStatus.READY
+        parent = graph.submit_graph_event("tenant-a", parent.run_id, WorkflowEvent(
+            "recursive-child-collect-began", WorkflowEventKind.NODE_BEGAN, parent.version,
+            {"token_id": child_token.token_id},
+        )).state
+        collected = handler.spawn(
+            "tenant-a", parent.run_id, parent_definition, parent,
+            WorkflowAction("collect-child", WorkflowActionKind.EXECUTE_NODE,
+                           child_token.token_id, child_token.node_id), child_node,
+        )
+        assert collected["disposition"] == "complete"
+        assert collected["satisfied_conditions"] == ["child_succeeded"]
+        assert "child-build-evidence" in collected["evidence_ids"]
+    finally:
+        artifacts.close()
+        graph.close()

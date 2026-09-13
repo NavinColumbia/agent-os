@@ -186,6 +186,25 @@ class DurableGraphActionExecutor(GraphActionExecutor):
                 "reason": reason,
             })
             kind = WorkflowEventKind.NODE_WAITED
+        elif disposition == "wait_child":
+            child_run_id = str(result.get("child_run_id") or "")
+            child_program = result.get("child_program")
+            program_artifact_id = str(result.get("program_artifact_id") or "")
+            actor_role = str(result.get("actor_role") or "")
+            if (
+                not child_run_id or not isinstance(child_program, Mapping)
+                or not child_program or not program_artifact_id or not actor_role
+            ):
+                raise FatalCommandError(
+                    "graph child wait requires child identity, program, artifact, and owner"
+                )
+            payload.update({
+                "child_run_id": child_run_id,
+                "child_program": dict(child_program),
+                "program_artifact_id": program_artifact_id,
+                "actor_role": actor_role,
+            })
+            kind = WorkflowEventKind.CHILD_WAITED
         elif disposition == "fail":
             reason = str(result.get("reason") or "")
             if not reason:
@@ -193,7 +212,9 @@ class DurableGraphActionExecutor(GraphActionExecutor):
             payload.update({"reason": reason, "retryable": bool(result.get("retryable", False))})
             kind = WorkflowEventKind.NODE_FAILED
         else:
-            raise FatalCommandError("graph node disposition must be complete, wait, or fail")
+            raise FatalCommandError(
+                "graph node disposition must be complete, wait, wait_child, or fail"
+            )
 
         receipt = self._engine.submit_graph_event(
             tenant_id,

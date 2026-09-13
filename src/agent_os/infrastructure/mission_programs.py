@@ -19,15 +19,15 @@ class PlannedNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     node_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
-    kind: Literal["agent", "decision", "human", "tool", "terminal"]
+    kind: Literal["agent", "decision", "human", "tool", "subworkflow", "terminal"]
     purpose: str = Field(min_length=1, max_length=4_000)
     owner_role: str | None = Field(default=None, max_length=256)
     configuration: dict[str, Any] = Field(default_factory=dict, max_length=64)
 
     @model_validator(mode="after")
     def agent_has_owner(self) -> "PlannedNode":
-        if self.kind == "agent" and not self.owner_role:
-            raise ValueError("planned agent nodes require owner_role")
+        if self.kind in {"agent", "subworkflow"} and not self.owner_role:
+            raise ValueError("planned agent and subworkflow nodes require owner_role")
         return self
 
 
@@ -310,6 +310,15 @@ def validate_program_graph(
     capability_ids = set(capability_by_id)
     measure_ids = set(measure_by_id)
     tools = None if available_tools is None else frozenset(available_tools)
+    child_budget = sum(
+        int(node.configuration.get("budget_limit_cents", 0))
+        for node in program.workflow.nodes
+        if node.kind == "subworkflow"
+        and isinstance(node.configuration.get("budget_limit_cents", 0), int)
+        and not isinstance(node.configuration.get("budget_limit_cents", 0), bool)
+    )
+    if child_budget > program.authorized_budget_cents:
+        raise ValueError("mission child-program budgets exceed admitted budget authority")
     if program.feasibility.cost_estimate.likely > program.authorized_budget_cents and not any(
         resource.kind == "budget" and resource.status in {"missing", "requested"}
         for resource in program.resources

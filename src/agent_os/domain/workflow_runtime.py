@@ -36,6 +36,7 @@ class TokenStatus(str, Enum):
 
 class WorkflowActionKind(str, Enum):
     EXECUTE_NODE = "execute_node"
+    CANCEL_CHILD = "cancel_child"
     RECORD_PROGRAM = "record_program"
     RECORD_ORGANIZATION = "record_organization"
     NOTIFY_HUMAN = "notify_human"
@@ -213,6 +214,8 @@ class WorkflowEventKind(str, Enum):
     NODE_WAITED = "node_waited"
     WAIT_RESUMED = "wait_resumed"
     NODE_FAILED = "node_failed"
+    CHILD_WAITED = "child_waited"
+    CHILD_COMPLETED = "child_completed"
     RUN_REVISED = "run_revised"
     RUN_CANCELLED = "run_cancelled"
 
@@ -303,6 +306,17 @@ def _ensure_mutable(state: WorkflowRunState, expected_version: int) -> None:
         )
 
 
+def _waiting_child_ids(tokens: tuple[NodeToken, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        token.wait_correlation_id.removeprefix("child:")
+        for token in tokens
+        if token.status is TokenStatus.WAITING
+        and token.wait_correlation_id is not None
+        and token.wait_correlation_id.startswith("child:")
+        and token.wait_correlation_id != "child:"
+    ))
+
+
 def start_workflow(
     definition: WorkflowDefinition,
     *,
@@ -383,6 +397,62 @@ def wait_node(
     return WorkflowMutation(replace(state, version=version, status=status, tokens=tokens), (action,))
 
 
+def wait_for_child(
+    state: WorkflowRunState,
+    token_id: str,
+    *,
+    expected_version: int,
+    child_run_id: str,
+    child_program: Mapping[str, Any],
+    program_artifact_id: str,
+    actor_role: str,
+) -> WorkflowMutation:
+    """Park one subworkflow token without generating a human notification."""
+
+    _ensure_mutable(state, expected_version)
+    token = state.token(token_id)
+    if token.status is not TokenStatus.RUNNING:
+        raise WorkflowTransitionRejected("only a running subworkflow token can wait")
+    if (
+        not child_run_id.strip() or not child_program or not program_artifact_id.strip()
+        or not actor_role.strip()
+    ):
+        raise WorkflowTransitionRejected(
+            "child workflow wait requires child identity, program, artifact, and owner"
+        )
+    correlation_id = f"child:{child_run_id}"
+    updated = replace(
+        token,
+        status=TokenStatus.WAITING,
+        output={**dict(token.output), "child_run_id": child_run_id},
+        wait_correlation_id=correlation_id,
+        wait_reason=f"Waiting for child mission {child_run_id}",
+    )
+    tokens = _replace_token(state, updated)
+    status = WorkflowRunStatus.WAITING if not any(t.status in {
+        TokenStatus.READY, TokenStatus.RUNNING,
+    } for t in tokens) else WorkflowRunStatus.ACTIVE
+    next_state = replace(
+        state, version=state.version + 1, status=status, tokens=tokens,
+    )
+    return WorkflowMutation(next_state, (_action(
+        state.run_id,
+        next_state.version,
+        0,
+        WorkflowActionKind.RECORD_PROGRAM,
+        updated,
+        {
+            "organization_run_id": str(
+                state.context.get("lifecycle_run_id") or state.run_id
+            ),
+            "actor_role": actor_role,
+            "program": dict(child_program),
+            "program_artifact_id": program_artifact_id,
+            "child_run_id": child_run_id,
+        },
+    ),))
+
+
 def resume_wait(
     state: WorkflowRunState,
     *,
@@ -418,6 +488,47 @@ def resume_wait(
             "resumed_from": correlation_id,
         }),),
     )
+
+
+def resume_child(
+    state: WorkflowRunState,
+    *,
+    expected_version: int,
+    child_run_id: str,
+    result: Mapping[str, Any],
+) -> WorkflowMutation:
+    """Resume exactly the parent token correlated to one terminal child run."""
+
+    _ensure_mutable(state, expected_version)
+    correlation_id = f"child:{child_run_id}"
+    matches = [
+        token for token in state.tokens
+        if token.status is TokenStatus.WAITING
+        and token.wait_correlation_id == correlation_id
+        and token.output.get("child_run_id") == child_run_id
+    ]
+    if len(matches) != 1:
+        raise WorkflowTransitionRejected("child completion must match exactly one waiting token")
+    token = matches[0]
+    updated = replace(
+        token,
+        status=TokenStatus.READY,
+        output={**dict(token.output), "child_result": dict(result)},
+        wait_correlation_id=None,
+        wait_reason=None,
+    )
+    version = state.version + 1
+    next_state = replace(
+        state,
+        version=version,
+        status=WorkflowRunStatus.ACTIVE,
+        tokens=_replace_token(state, updated),
+    )
+    return WorkflowMutation(next_state, (
+        _action(state.run_id, version, 0, WorkflowActionKind.EXECUTE_NODE, updated, {
+            "resumed_from_child": child_run_id,
+        }),
+    ))
 
 
 def complete_node(
@@ -610,15 +721,27 @@ def cancel_workflow(
 ) -> WorkflowMutation:
     _ensure_mutable(state, expected_version)
     tokens = tuple(
-        replace(token, status=TokenStatus.CANCELLED)
+        replace(
+            token, status=TokenStatus.CANCELLED,
+            wait_correlation_id=None, wait_reason=None,
+        )
         if token.status in _LIVE else token
         for token in state.tokens
     )
     version = state.version + 1
     next_state = replace(state, version=version, status=WorkflowRunStatus.CANCELLED, tokens=tokens)
-    return WorkflowMutation(next_state, (
-        _action(state.run_id, version, 0, WorkflowActionKind.RUN_CANCELLED, None, {"reason": reason}),
+    actions = [
+        _action(state.run_id, version, position, WorkflowActionKind.CANCEL_CHILD, None, {
+            "child_run_id": child_run_id,
+            "reason": reason,
+        })
+        for position, child_run_id in enumerate(_waiting_child_ids(state.tokens))
+    ]
+    actions.append(_action(
+        state.run_id, version, len(actions), WorkflowActionKind.RUN_CANCELLED, None,
+        {"reason": reason},
     ))
+    return WorkflowMutation(next_state, tuple(actions))
 
 
 def revise_workflow(
@@ -690,8 +813,15 @@ def revise_workflow(
         terminal_token_ids=(),
         failure=None,
     )
-    return WorkflowMutation(next_state, (
-        _action(state.run_id, version, 0, WorkflowActionKind.RECORD_PROGRAM, entry, {
+    actions = [
+        _action(state.run_id, version, position, WorkflowActionKind.CANCEL_CHILD, None, {
+            "child_run_id": child_run_id,
+            "reason": f"Parent mission superseded child during revision: {reason}",
+        })
+        for position, child_run_id in enumerate(_waiting_child_ids(state.tokens))
+    ]
+    actions.extend((
+        _action(state.run_id, version, len(actions), WorkflowActionKind.RECORD_PROGRAM, entry, {
             "organization_run_id": str(
                 state.context.get("lifecycle_run_id") or state.run_id
             ),
@@ -699,12 +829,13 @@ def revise_workflow(
             "program": dict(program),
             "program_artifact_id": evidence_ids[0],
         }),
-        _action(state.run_id, version, 1, WorkflowActionKind.EXECUTE_NODE, entry, {
+        _action(state.run_id, version, len(actions) + 1, WorkflowActionKind.EXECUTE_NODE, entry, {
             "workflow_revised": True,
             "prior_workflow_version": state.workflow_version,
             "mission_program_revision": revision,
         }),
     ))
+    return WorkflowMutation(next_state, tuple(actions))
 
 
 def evolve_workflow(
@@ -741,6 +872,19 @@ def evolve_workflow(
             reason=str(payload.get("reason") or ""),
             recipient_ids=tuple(str(item) for item in payload.get("recipient_ids", ())),
         )
+    if event.kind is WorkflowEventKind.CHILD_WAITED:
+        program = payload.get("child_program")
+        if not isinstance(program, Mapping):
+            raise WorkflowTransitionRejected("child wait program must be an object")
+        return wait_for_child(
+            state,
+            str(payload.get("token_id") or ""),
+            expected_version=event.expected_version,
+            child_run_id=str(payload.get("child_run_id") or ""),
+            child_program=program,
+            program_artifact_id=str(payload.get("program_artifact_id") or ""),
+            actor_role=str(payload.get("actor_role") or ""),
+        )
     if event.kind is WorkflowEventKind.WAIT_RESUMED:
         response = payload.get("response", {})
         if not isinstance(response, Mapping):
@@ -750,6 +894,16 @@ def evolve_workflow(
             expected_version=event.expected_version,
             correlation_id=str(payload.get("correlation_id") or ""),
             response=response,
+        )
+    if event.kind is WorkflowEventKind.CHILD_COMPLETED:
+        result = payload.get("result", {})
+        if not isinstance(result, Mapping):
+            raise WorkflowTransitionRejected("child result must be an object")
+        return resume_child(
+            state,
+            expected_version=event.expected_version,
+            child_run_id=str(payload.get("child_run_id") or ""),
+            result=result,
         )
     if event.kind is WorkflowEventKind.NODE_FAILED:
         return fail_node(

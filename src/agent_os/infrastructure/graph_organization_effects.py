@@ -154,6 +154,7 @@ class GraphOrganizationEffectHandler:
             raise FatalCommandError("program effect received the wrong action kind")
         tenant_id = str(envelope.get("tenant_id") or "")
         graph_run_id = str(envelope.get("run_id") or "")
+        admitted_graph_run_id = str(action.payload.get("child_run_id") or graph_run_id)
         organization_run_id = str(action.payload.get("organization_run_id") or graph_run_id)
         role = str(action.payload.get("actor_role") or "mission-architect").strip()
         program = action.payload.get("program")
@@ -184,11 +185,11 @@ class GraphOrganizationEffectHandler:
             payload={
                 "program": dict(program),
                 "program_artifact_id": artifact_id,
-                "graph_run_id": graph_run_id,
+                "graph_run_id": admitted_graph_run_id,
                 "program_revision": program.get("revision"),
             },
             causation_id=action.action_id,
-            correlation_id=graph_run_id,
+            correlation_id=admitted_graph_run_id,
         )
         try:
             receipt = self._ledger.append_organization_event(event)

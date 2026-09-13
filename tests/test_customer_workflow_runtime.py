@@ -9,10 +9,12 @@ from agent_os.domain.workflow_runtime import (
     WorkflowRunStatus,
     WorkflowTransitionRejected,
     begin_node,
+    cancel_workflow,
     complete_node,
     resume_wait,
     start_workflow,
     wait_node,
+    wait_for_child,
 )
 
 
@@ -138,3 +140,34 @@ def test_definition_state_tokens_and_actions_round_trip_for_durable_adapters():
     assert WorkflowDefinition.from_dict(graph.to_dict()) == graph
     assert type(started.state).from_dict(started.state.to_dict()) == started.state
     assert type(started.actions[0]).from_dict(started.actions[0].to_dict()) == started.actions[0]
+
+
+def test_parent_cancellation_cascades_to_a_durably_waiting_child_without_human_noise():
+    graph = WorkflowDefinition(
+        "recursive", "tenant-1", "Recursive", 1, "team",
+        (
+            WorkflowNode("team", NodeKind.SUBWORKFLOW, "Delegate team", "manager"),
+            WorkflowNode("done", NodeKind.TERMINAL, "Done"),
+        ),
+        (WorkflowEdge("team", "done", "child_succeeded"),),
+        "architect",
+    )
+    state = start_workflow(graph, run_id="recursive-parent").state
+    token = state.ready()[0]
+    state = begin_node(state, token.token_id, expected_version=0).state
+    waiting = wait_for_child(
+        state, token.token_id, expected_version=1, child_run_id="recursive-child",
+        child_program={"format": "agent-os.mission-program.v1", "revision": 1},
+        program_artifact_id="program-artifact", actor_role="manager",
+    )
+
+    assert waiting.state.status is WorkflowRunStatus.WAITING
+    assert all(action.kind is not WorkflowActionKind.NOTIFY_HUMAN for action in waiting.actions)
+    cancelled = cancel_workflow(
+        waiting.state, expected_version=waiting.state.version, reason="CEO cancelled parent",
+    )
+    assert [action.kind for action in cancelled.actions] == [
+        WorkflowActionKind.CANCEL_CHILD,
+        WorkflowActionKind.RUN_CANCELLED,
+    ]
+    assert cancelled.actions[0].payload["child_run_id"] == "recursive-child"

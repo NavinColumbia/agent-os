@@ -431,6 +431,7 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
         ).hexdigest()[:32]
     )
     child_run_id = "mission-run-child"
+    subprogram_run_id = "mission-run-child-security"
     planning = WorkflowRunState(
         planning_run_id,
         "org-a",
@@ -459,7 +460,8 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
         WorkflowRunStatus.ACTIVE,
         (NodeToken(
             "work-token", "work", TokenStatus.READY, 1,
-            output={"organization_actions": {"hiring_requests": [{
+            output={"child_run_id": subprogram_run_id,
+                    "organization_actions": {"hiring_requests": [{
                 "role": "security-specialist",
                 "reason": "Independent security capacity is missing",
                 "participant_kind": "agent",
@@ -477,12 +479,30 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
             },
         )),
     )
+    subprogram = WorkflowRunState(
+        subprogram_run_id,
+        "org-a",
+        "security-workflow",
+        1,
+        3,
+        WorkflowRunStatus.SUCCEEDED,
+        (NodeToken(
+            "security-done", "done", TokenStatus.SUCCEEDED, 1,
+            evidence_ids=("artifact-security-review",),
+        ),),
+        {"mission_program": {"objective": "Verify the release security boundary."}},
+        ("security-done",),
+    )
 
     class MissionGraphs:
         def get_graph_run(self, tenant_id, run_id):
             if tenant_id != "org-a":
                 return None
-            return {planning_run_id: planning, child_run_id: execution}.get(run_id)
+            return {
+                planning_run_id: planning,
+                child_run_id: execution,
+                subprogram_run_id: subprogram,
+            }.get(run_id)
 
         def get_workflow_definition(self, tenant_id, workflow_id, version):
             if tenant_id != "org-a" or workflow_id != "mission-workflow" or version != 1:
@@ -526,6 +546,23 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
     assert response.json()["planning_run_id"] == planning_run_id
     assert response.json()["execution_run_id"] == child_run_id
     assert response.json()["execution"]["status"] == "active"
+    assert response.json()["subprograms"] == [{
+        "run_id": subprogram_run_id,
+        "parent_run_id": child_run_id,
+        "parent_token_id": "work-token",
+        "depth": 1,
+        "workflow_id": "security-workflow",
+        "workflow_version": 1,
+        "state_version": 3,
+        "status": "succeeded",
+        "objective": "Verify the release security boundary.",
+        "token_counts": {
+            "ready": 0, "running": 0, "waiting": 0, "succeeded": 1,
+            "failed": 0, "cancelled": 0,
+        },
+        "failure": None,
+    }]
+    assert response.json()["subprograms_truncated"] is False
     assert response.json()["deliverables"] == [{
         "kind": "cloud_run_service",
         "node_id": "publish",
@@ -541,6 +578,7 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
     assert management.json()["execution_run_id"] == child_run_id
     assert management.json()["work_items"][0]["owner_id"] == "agent:engineer"
     assert management.json()["progress"]["live"] == 1
+    assert management.json()["subprograms"][0]["run_id"] == subprogram_run_id
     proposal = management.json()["hiring_requests"][0]
     assert proposal["status"] == "pending"
     approved = api.post(

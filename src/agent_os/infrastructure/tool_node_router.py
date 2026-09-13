@@ -17,7 +17,7 @@ class GraphToolNodeRouter:
             raise ValueError("at least one named tool handler is required")
 
     def handlers(self):
-        return {NodeKind.TOOL: self.execute}
+        return {NodeKind.TOOL: self.execute, NodeKind.SUBWORKFLOW: self.execute}
 
     def execute(
         self,
@@ -28,7 +28,11 @@ class GraphToolNodeRouter:
         action: WorkflowAction,
         node: WorkflowNode,
     ):
-        tool = str(node.configuration.get("tool") or "")
+        tool = (
+            "workflow.spawn"
+            if node.kind is NodeKind.SUBWORKFLOW
+            else str(node.configuration.get("tool") or "")
+        )
         handler = self._handlers.get(tool)
         if handler is None:
             raise FatalCommandError(f"tool {tool or '<missing>'} is not registered")

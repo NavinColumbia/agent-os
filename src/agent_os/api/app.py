@@ -42,6 +42,81 @@ from agent_os.domain.workflow_runtime import (
 )
 
 
+_MAX_MISSION_SUBPROGRAMS = 256
+
+
+def _project_mission_subprograms(
+    graph_engine: GraphWorkflowEngine,
+    tenant_id: str,
+    root_run_id: str | None,
+) -> tuple[list[Mapping[str, Any]], bool]:
+    """Return a bounded, tenant-fenced hierarchy of recursively launched missions."""
+
+    if root_run_id is None:
+        return [], False
+    root = graph_engine.get_graph_run(tenant_id, root_run_id)
+    if root is None:
+        return [], False
+    queue: list[tuple[str, int]] = [(root_run_id, 0)]
+    seen = {root_run_id}
+    projected: list[Mapping[str, Any]] = []
+    truncated = False
+    while queue:
+        parent_run_id, parent_depth = queue.pop(0)
+        parent = graph_engine.get_graph_run(tenant_id, parent_run_id)
+        if parent is None:
+            continue
+        child_tokens = sorted(
+            (
+                (token.token_id, str(token.output["child_run_id"]))
+                for token in parent.tokens
+                if isinstance(token.output.get("child_run_id"), str)
+                and token.output["child_run_id"]
+            ),
+            key=lambda item: (item[1], item[0]),
+        )
+        for parent_token_id, child_run_id in child_tokens:
+            if child_run_id in seen:
+                continue
+            if len(projected) >= _MAX_MISSION_SUBPROGRAMS:
+                truncated = True
+                return projected, truncated
+            seen.add(child_run_id)
+            child = graph_engine.get_graph_run(tenant_id, child_run_id)
+            if child is None:
+                projected.append({
+                    "run_id": child_run_id,
+                    "parent_run_id": parent_run_id,
+                    "parent_token_id": parent_token_id,
+                    "depth": parent_depth + 1,
+                    "status": "unavailable",
+                })
+                continue
+            counts = {
+                status.value: sum(1 for token in child.tokens if token.status is status)
+                for status in TokenStatus
+            }
+            program = child.context.get("mission_program")
+            projected.append({
+                "run_id": child.run_id,
+                "parent_run_id": parent_run_id,
+                "parent_token_id": parent_token_id,
+                "depth": parent_depth + 1,
+                "workflow_id": child.workflow_id,
+                "workflow_version": child.workflow_version,
+                "state_version": child.version,
+                "status": child.status.value,
+                "objective": (
+                    program.get("objective")
+                    if isinstance(program, Mapping) else None
+                ),
+                "token_counts": counts,
+                "failure": child.failure,
+            })
+            queue.append((child_run_id, parent_depth + 1))
+    return projected, truncated
+
+
 class DirectiveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -880,7 +955,7 @@ def create_app(
                 company_events = company_directory.list_company_events(
                     principal.organization_id, limit=5_000,
                 )
-            return project_mission_control(
+            projection = dict(project_mission_control(
                 lifecycle_run_id=run_id,
                 planning_state=planning,
                 execution_state=execution,
@@ -889,7 +964,13 @@ def create_app(
                 organization_events=organization_events,
                 company_events=company_events,
                 slow_after_seconds=slow_after_seconds,
+            ))
+            subprograms, truncated = _project_mission_subprograms(
+                graph_engine, principal.organization_id, execution_run_id,
             )
+            projection["subprograms"] = subprograms
+            projection["subprograms_truncated"] = truncated
+            return projection
 
         if company_directory is not None:
             @app.post("/v2/runs/{run_id}/management/proposals/{proposal_id}/hiring-decision")
@@ -1017,6 +1098,9 @@ def create_app(
                     if deployment_nodes[token.node_id] == "deploy.preview":
                         deliverable["expires_at"] = output.get("expires_at")
                     deliverables.append(deliverable)
+            subprograms, truncated = _project_mission_subprograms(
+                graph_engine, principal.organization_id, execution_run_id,
+            )
             return {
                 "lifecycle": lifecycle.to_dict(),
                 "planning_run_id": planning_run_id,
@@ -1025,6 +1109,8 @@ def create_app(
                 "execution": None if execution is None else execution.to_dict(),
                 "program": None if execution is None else execution.context.get("mission_program"),
                 "deliverables": deliverables,
+                "subprograms": subprograms,
+                "subprograms_truncated": truncated,
             }
 
         @app.post("/v2/workflows", status_code=201)
@@ -1107,7 +1193,11 @@ def create_app(
             if state_value is None:
                 raise HTTPException(status_code=404, detail="graph run not found")
             owner_authority = bool(principal.roles & {"owner", "operator", "system"})
-            if body.kind is WorkflowEventKind.RUN_REVISED:
+            if body.kind in {
+                WorkflowEventKind.RUN_REVISED,
+                WorkflowEventKind.CHILD_WAITED,
+                WorkflowEventKind.CHILD_COMPLETED,
+            }:
                 # Revision is a compound authority: validate a complete mission
                 # program, register its immutable definition, then atomically
                 # advance the run.  The in-process workflow.revise handler owns
@@ -1115,7 +1205,11 @@ def create_app(
                 # a run at an unregistered or policy-bypassing definition.
                 raise HTTPException(
                     status_code=403,
-                    detail="workflow revisions require the internal program-revision authority",
+                    detail=(
+                        "workflow revisions require the internal program-revision authority"
+                        if body.kind is WorkflowEventKind.RUN_REVISED
+                        else "child workflow coordination requires an internal compound authority"
+                    ),
                 )
             if body.kind is WorkflowEventKind.RUN_CANCELLED and not owner_authority:
                 raise HTTPException(status_code=403, detail="graph cancellation requires owner authority")

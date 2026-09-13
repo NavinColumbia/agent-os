@@ -20,8 +20,8 @@ actions use independent renewable leases and deterministic begin/result events. 
 structured model output, human nodes create and resume correlated waits without model spend, and terminal nodes
 accept upstream evidence rather than inventing new evidence. Provider retries keep a token running and reuse the
 same action ID; recovery after a committed result does not execute the node twice. A deterministic node rejection
-is committed as a graph failure instead of leaving a permanently running token. Timer, arbitrary subworkflow, and
-production release actions stay fail-closed until an idempotent adapter is registered.
+is committed as a graph failure instead of leaving a permanently running token. Timer and unregistered production
+release actions stay fail-closed until an idempotent adapter is registered.
 
 Before any lifecycle or graph agent calls a model provider, the worker creates an idempotent tenant usage
 reservation keyed by the durable command/action ID. A per-tenant monthly ceiling serializes concurrent reservations,
@@ -113,9 +113,19 @@ the requested spend is zero.
 
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
-email, Slack, SMS, and push remain separate adapters. `schedule_retry`, arbitrary external tool execution, and
-general subworkflows still require explicitly registered executors; until those adapters exist, the router marks
-the effect failed with a durable explanation rather than reporting an operation that did not happen.
+email, Slack, SMS, and push remain separate adapters. `schedule_retry` and arbitrary external tool execution still
+require explicitly registered executors; until those adapters exist, the router marks the effect failed with a
+durable explanation rather than reporting an operation that did not happen.
+
+General mission decomposition is recursive rather than a fixed six-step chain. An admitted workflow may use a
+`subworkflow` node whose source is another complete, immutable mission-program artifact. The runtime revalidates
+that child charter, enforces the parent's delegated budget and an eight-level recursion bound, starts it under a
+deterministic tenant-owned identity, and parks only the parent token while independent siblings continue. Terminal
+child evidence resumes the exact correlated token; child failure follows an explicit failure route, and revision or
+cancellation cascades to every still-waiting child without generating a fake human notification. Both mission and
+management APIs expose a bounded recursive hierarchy with parent/token identities, objective, state, and token
+counts. A child program has the same clarification, organization, resource, capability, verification, and replan
+contract as its parent, so adding teams does not bypass governance.
 
 `cancel_active_operation` now has a mission-aware executor. A terminal CEO cancellation is propagated to both the
 planner and any launched child graph, turns all live graph tokens into cancelled tokens, and produces the graph's

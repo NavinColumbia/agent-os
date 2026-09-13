@@ -7,7 +7,7 @@ import json
 import re
 from typing import Any, Collection, Mapping
 
-from agent_os.application.command_worker import FatalCommandError
+from agent_os.application.command_worker import FatalCommandError, RetryableCommandError
 from agent_os.application.lifecycle import CommandEnvelope
 from agent_os.application.mission import mission_planning_run_id
 from agent_os.application.ports import (
@@ -41,6 +41,7 @@ _MISSION_PLAN_MAX_NODES = 64
 _MISSION_PLAN_MAX_EDGES = 256
 _MISSION_PLAN_MAX_ITERATIONS_PER_NODE = 16
 _MISSION_PLAN_MAX_TOTAL_ITERATIONS = 128
+_MISSION_MAX_DEPTH = 8
 _MISSION_INTERNAL_TOOLS = frozenset({"workflow.revise"})
 _MISSION_TOOL_ALLOWLIST = frozenset({
     "deploy.preview", "deploy.service", "deploy.static", "sandbox.run", "workflow.revise",
@@ -67,6 +68,11 @@ def _workflow_id(tenant_id: str, planning_run_id: str, artifact_id: str) -> str:
 def _child_run_id(planning_run_id: str, workflow_id: str) -> str:
     material = f"agent-os:mission-run:v1:{planning_run_id}:{workflow_id}"
     return "mission-run-" + hashlib.sha256(material.encode()).hexdigest()[:32]
+
+
+def _subprogram_run_id(parent_run_id: str, token_id: str, workflow_id: str) -> str:
+    material = f"agent-os:mission-subprogram:v1:{parent_run_id}:{token_id}:{workflow_id}"
+    return "mission-subrun-" + hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
 def _cancel_graph_run(
@@ -125,8 +131,11 @@ def mission_bootstrap_definition(
             "hiring, credentials, legal authority, production release, and irreversible decisions remain "
             "human-governed. A material-replan path must enter workflow.revise and source a newly proposed "
             "complete mission-program JSON artifact from its replan agent; that atomic authority replaces "
-            "obsolete live work in the same run. Design the smallest sufficient non-linear program for the "
-            "CEO directive."
+            "obsolete live work in the same run. For work that needs an independently governed team or would "
+            "make this graph too large, use a subworkflow node sourced from a complete child mission-program "
+            "artifact; delegate an explicit bounded budget and provide both success and failure paths. Child "
+            "programs may recursively decompose work within the admitted depth bound. Design the smallest "
+            "sufficient non-linear program for the CEO directive."
         ),
         "plan_schema": MissionProgramPlan.model_json_schema(),
         "available_tools": sorted(tools),
@@ -322,6 +331,59 @@ def materialize_mission_workflow(
                 raise FatalCommandError(
                     f"planned terminal node has unsupported configuration: {sorted(unexpected)}"
                 )
+        elif kind is NodeKind.SUBWORKFLOW:
+            unexpected = set(configuration) - {
+                "source", "success_condition", "failure_condition",
+                "budget_limit_cents", "max_iterations",
+            }
+            if unexpected:
+                raise FatalCommandError(
+                    f"planned subworkflow node has unsupported configuration: {sorted(unexpected)}"
+                )
+            source = configuration.get("source")
+            if not isinstance(source, Mapping):
+                raise FatalCommandError("planned subworkflow requires a prior-node source")
+            source_node_id = source.get("node_id")
+            output_path = source.get("output_path")
+            if (
+                not isinstance(source_node_id, str)
+                or not source_node_id
+                or not isinstance(output_path, (list, tuple))
+                or not output_path
+                or len(output_path) > 16
+                or any(
+                    isinstance(part, bool)
+                    or not isinstance(part, (str, int))
+                    or (isinstance(part, str) and not part)
+                    or (isinstance(part, int) and part < 0)
+                    for part in output_path
+                )
+            ):
+                raise FatalCommandError("planned subworkflow source reference is invalid")
+            child_budget = configuration.get("budget_limit_cents", 0)
+            if (
+                isinstance(child_budget, bool)
+                or not isinstance(child_budget, int)
+                or not 0 <= child_budget <= 100_000_000_000
+            ):
+                raise FatalCommandError(
+                    "planned subworkflow budget must be a nonnegative integer number of cents"
+                )
+            success_condition = configuration.get("success_condition")
+            failure_condition = configuration.get("failure_condition")
+            if (
+                not isinstance(success_condition, str) or not success_condition
+                or not isinstance(failure_condition, str) or not failure_condition
+                or success_condition == failure_condition
+            ):
+                raise FatalCommandError(
+                    "planned subworkflow requires distinct success and failure conditions"
+                )
+            configured_conditions.extend((
+                (proposed.node_id, "success_condition", success_condition),
+                (proposed.node_id, "failure_condition", failure_condition),
+            ))
+            tool_sources.append((proposed.node_id, source_node_id))
         elif kind is NodeKind.TOOL:
             tool = configuration.get("tool")
             allowed_configuration = {
@@ -624,7 +686,11 @@ class WorkflowLaunchToolNodeHandlers:
         return lifecycle.status is LifecycleStatus.CANCELLED
 
     def named_handlers(self):
-        return {"workflow.launch": self.execute, "workflow.revise": self.revise}
+        return {
+            "workflow.launch": self.execute,
+            "workflow.revise": self.revise,
+            "workflow.spawn": self.spawn,
+        }
 
     def _program_artifact(self, tenant_id: str, artifact_id: str) -> Mapping[str, Any]:
         record = self._artifacts.describe(tenant_id, artifact_id)
@@ -687,6 +753,9 @@ class WorkflowLaunchToolNodeHandlers:
         }
         child_context.update({
             "mission_execution": True,
+            "mission_subprogram": False,
+            "mission_depth": 0,
+            "mission_root_run_id": child_run_id,
             "planning_run_id": run_id,
             "workflow_plan_artifact_id": artifact_id,
             "mission_program": program.model_dump(mode="json", exclude={"workflow"}),
@@ -745,6 +814,126 @@ class WorkflowLaunchToolNodeHandlers:
                 "launch_artifact_id": launch_artifact_id,
                 "admitted_program": program.model_dump(mode="json", exclude={"workflow"}),
             },
+        }
+
+    def spawn(
+        self,
+        tenant_id: str,
+        run_id: str,
+        definition: WorkflowDefinition,
+        state: WorkflowRunState,
+        action: WorkflowAction,
+        node: WorkflowNode,
+    ) -> Mapping[str, Any]:
+        """Launch or collect one recursively governed child mission program."""
+
+        del definition
+        if node.kind is not NodeKind.SUBWORKFLOW:
+            raise FatalCommandError("subworkflow handler received the wrong node kind")
+        result = state.token(action.token_id or "").output.get("child_result")
+        if result is not None:
+            if not isinstance(result, Mapping):
+                raise FatalCommandError("durable child result is malformed")
+            child_run_id = str(result.get("child_run_id") or "")
+            child = self._graph.get_graph_run(tenant_id, child_run_id)
+            if child is None:
+                raise RetryableCommandError("terminal child mission is not yet readable")
+            if child.status.value not in {"succeeded", "failed", "cancelled"}:
+                raise RetryableCommandError("child mission resumed its parent before becoming terminal")
+            if str(result.get("status") or "") != child.status.value:
+                raise FatalCommandError("child mission result conflicts with durable child state")
+            evidence_ids = list(dict.fromkeys([
+                evidence_id
+                for token in child.tokens
+                if token.status is TokenStatus.SUCCEEDED
+                for evidence_id in token.evidence_ids
+            ]))
+            evidence_ids.append(
+                "graph-run-" + hashlib.sha256(
+                    f"{tenant_id}:{child_run_id}:{child.version}:{child.status.value}".encode()
+                ).hexdigest()
+            )
+            condition_key = (
+                "success_condition" if child.status is WorkflowRunStatus.SUCCEEDED
+                else "failure_condition"
+            )
+            return {
+                "disposition": "complete",
+                "satisfied_conditions": [str(node.configuration[condition_key])],
+                "evidence_ids": evidence_ids,
+                "output": {
+                    "child_run_id": child_run_id,
+                    "child_status": child.status.value,
+                    "child_workflow_id": child.workflow_id,
+                    "child_workflow_version": child.workflow_version,
+                    "child_evidence_ids": evidence_ids,
+                    "child_failure": child.failure,
+                },
+            }
+
+        raw_depth = state.context.get("mission_depth", 0)
+        if isinstance(raw_depth, bool) or not isinstance(raw_depth, int) or raw_depth < 0:
+            raise FatalCommandError("mission recursion depth is invalid")
+        if raw_depth >= _MISSION_MAX_DEPTH:
+            raise FatalCommandError("mission recursion exceeded its admitted depth bound")
+        artifact_id = resolve_prior_output(
+            state, node.configuration.get("source"), subject="subworkflow launch",
+        )
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise FatalCommandError("subworkflow source is not a mission-program artifact ID")
+        raw = self._program_artifact(tenant_id, artifact_id)
+        child_budget = node.configuration.get("budget_limit_cents", 0)
+        if isinstance(child_budget, bool) or not isinstance(child_budget, int):
+            raise FatalCommandError("delegated child budget is invalid")
+        current_program = state.context.get("mission_program")
+        if not isinstance(current_program, Mapping):
+            raise FatalCommandError("subworkflow parent has no admitted mission program")
+        parent_budget = current_program.get("authorized_budget_cents", 0)
+        if (
+            isinstance(parent_budget, bool) or not isinstance(parent_budget, int)
+            or child_budget < 0 or child_budget > parent_budget
+        ):
+            raise FatalCommandError("delegated child budget exceeds parent authority")
+        program, child_definition = materialize_mission_program(
+            raw,
+            tenant_id=tenant_id,
+            planning_run_id=f"{run_id}:{action.token_id}",
+            artifact_id=artifact_id,
+            allowed_tools=self._available_tools,
+            authorized_budget_cents=child_budget,
+        )
+        if program.revision != 1:
+            raise FatalCommandError("a new child mission program must begin at revision one")
+        self._graph.register_workflow(child_definition)
+        child_run_id = _subprogram_run_id(
+            run_id, str(action.token_id or ""), child_definition.workflow_id,
+        )
+        child_context = {
+            **dict(state.context),
+            "mission_execution": False,
+            "mission_subprogram": True,
+            "mission_depth": raw_depth + 1,
+            "mission_root_run_id": str(state.context.get("mission_root_run_id") or run_id),
+            "parent_graph_run_id": run_id,
+            "parent_token_id": action.token_id,
+            "mission_program": program.model_dump(mode="json", exclude={"workflow"}),
+            "mission_program_revision": program.revision,
+            "workflow_plan_artifact_id": artifact_id,
+        }
+        self._graph.start_graph_run(
+            tenant_id,
+            child_definition.workflow_id,
+            child_definition.version,
+            run_id=child_run_id,
+            request_id="mission-subprogram-" + hashlib.sha256(action.action_id.encode()).hexdigest(),
+            context=child_context,
+        )
+        return {
+            "disposition": "wait_child",
+            "child_run_id": child_run_id,
+            "child_program": program.model_dump(mode="json", exclude={"workflow"}),
+            "program_artifact_id": artifact_id,
+            "actor_role": node.owner_role or "mission-manager",
         }
 
     def revise(
@@ -934,8 +1123,10 @@ class MissionGraphEffectHandlers:
 
     def graph_handlers(self):
         handlers = dict(self._notifications)
+        handlers[WorkflowActionKind.CANCEL_CHILD] = self._cancel_child
         handlers[WorkflowActionKind.RUN_SUCCEEDED] = self._succeeded
         handlers[WorkflowActionKind.RUN_FAILED] = self._failed
+        handlers[WorkflowActionKind.RUN_CANCELLED] = self._cancelled
         return handlers
 
     def _state(self, envelope: Mapping[str, Any]) -> WorkflowRunState:
@@ -958,6 +1149,9 @@ class MissionGraphEffectHandlers:
         lifecycle_run_id = str(context.get("lifecycle_run_id") or "")
         is_bootstrap = context.get("mission_bootstrap") is True
         is_execution = context.get("mission_execution") is True
+        is_subprogram = context.get("mission_subprogram") is True
+        if is_subprogram:
+            return self._resume_parent(state)
         if not lifecycle_run_id or (not is_bootstrap and not is_execution):
             handler = self._notifications.get(action.kind)
             if handler is None:
@@ -1027,6 +1221,97 @@ class MissionGraphEffectHandlers:
             "duplicate": receipt.duplicate,
         }
 
+    def _resume_parent(self, child: WorkflowRunState) -> Mapping[str, Any]:
+        if child.status not in {
+            WorkflowRunStatus.SUCCEEDED,
+            WorkflowRunStatus.FAILED,
+            WorkflowRunStatus.CANCELLED,
+        }:
+            raise RetryableCommandError("child terminal effect ran before terminal state was readable")
+        parent_run_id = str(child.context.get("parent_graph_run_id") or "")
+        parent_token_id = str(child.context.get("parent_token_id") or "")
+        if not parent_run_id or not parent_token_id:
+            raise FatalCommandError("child mission has no durable parent correlation")
+        event_id = "mission-child-result-" + hashlib.sha256(
+            f"{child.run_id}:{child.status.value}:{child.version}".encode()
+        ).hexdigest()
+        for _ in range(8):
+            parent = self._graph.get_graph_run(child.tenant_id, parent_run_id)
+            if parent is None:
+                raise FatalCommandError("parent mission disappeared before child completion")
+            if parent.status in {
+                WorkflowRunStatus.SUCCEEDED,
+                WorkflowRunStatus.FAILED,
+                WorkflowRunStatus.CANCELLED,
+            }:
+                return {"resumed": False, "reason": f"parent_{parent.status.value}"}
+            try:
+                parent_token = parent.token(parent_token_id)
+            except LookupError:
+                return {"resumed": False, "reason": "parent_revision_superseded_child"}
+            expected_correlation = f"child:{child.run_id}"
+            if (
+                parent_token.status is not TokenStatus.WAITING
+                or parent_token.wait_correlation_id != expected_correlation
+            ):
+                prior = parent_token.output.get("child_result")
+                if isinstance(prior, Mapping) and prior.get("child_run_id") == child.run_id:
+                    return {"resumed": True, "duplicate": True, "parent_run_id": parent_run_id}
+                return {"resumed": False, "reason": "parent_no_longer_waits_for_child"}
+            try:
+                receipt = self._graph.submit_graph_event(
+                    child.tenant_id,
+                    parent_run_id,
+                    WorkflowEvent(
+                        event_id,
+                        WorkflowEventKind.CHILD_COMPLETED,
+                        parent.version,
+                        {
+                            "child_run_id": child.run_id,
+                            "result": {
+                                "child_run_id": child.run_id,
+                                "status": child.status.value,
+                                "workflow_id": child.workflow_id,
+                                "workflow_version": child.workflow_version,
+                                "state_version": child.version,
+                                "failure": child.failure,
+                            },
+                        },
+                    ),
+                )
+            except WorkflowTransitionRejected as exc:
+                if "stale" in str(exc):
+                    continue
+                raise FatalCommandError(f"child completion could not resume its parent: {exc}") from exc
+            return {
+                "resumed": True,
+                "duplicate": receipt.duplicate,
+                "parent_run_id": parent_run_id,
+                "parent_state_version": receipt.state.version,
+            }
+        raise RetryableCommandError("child completion exceeded its parent concurrency retry bound")
+
+    def _cancel_child(
+        self, envelope: Mapping[str, Any], action: WorkflowAction,
+    ) -> Mapping[str, Any]:
+        parent = self._state(envelope)
+        child_run_id = str(action.payload.get("child_run_id") or "")
+        if not child_run_id:
+            raise FatalCommandError("child cancellation is missing the child run ID")
+        child = self._graph.get_graph_run(parent.tenant_id, child_run_id)
+        if child is None:
+            return {"cancelled": False, "reason": "child_missing", "child_run_id": child_run_id}
+        if child.context.get("parent_graph_run_id") != parent.run_id:
+            raise FatalCommandError("child cancellation does not match the authoritative parent")
+        status = _cancel_graph_run(
+            self._graph,
+            tenant_id=parent.tenant_id,
+            run_id=child_run_id,
+            reason=str(action.payload.get("reason") or "parent mission cancelled child"),
+            source_id=action.action_id,
+        )
+        return {"cancelled": status == "cancelled", "status": status, "child_run_id": child_run_id}
+
     def _succeeded(
         self, envelope: Mapping[str, Any], action: WorkflowAction,
     ) -> Mapping[str, Any]:
@@ -1036,3 +1321,14 @@ class MissionGraphEffectHandlers:
         self, envelope: Mapping[str, Any], action: WorkflowAction,
     ) -> Mapping[str, Any]:
         return self._project(envelope, action, succeeded=False)
+
+    def _cancelled(
+        self, envelope: Mapping[str, Any], action: WorkflowAction,
+    ) -> Mapping[str, Any]:
+        state = self._state(envelope)
+        if state.context.get("mission_subprogram") is True:
+            return self._resume_parent(state)
+        handler = self._notifications.get(WorkflowActionKind.RUN_CANCELLED)
+        if handler is None:
+            raise FatalCommandError("no notification handler for run_cancelled")
+        return dict(handler(envelope, action))

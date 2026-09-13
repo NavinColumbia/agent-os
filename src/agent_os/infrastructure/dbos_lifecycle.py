@@ -47,7 +47,7 @@ from agent_os.application.ports import (
     WorkflowEngine,
     WorkflowReceipt,
 )
-from agent_os.domain.lifecycle import Event, EventKind, LifecycleState
+from agent_os.domain.lifecycle import CommandKind, Event, EventKind, LifecycleState
 from agent_os.domain.organization_events import (
     OrganizationEvent,
     OrganizationEventKind,
@@ -148,6 +148,25 @@ def _now() -> datetime:
 
 def _canonical(value: Mapping[str, Any]) -> str:
     return json.dumps(value, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _command_available_at(envelope: Mapping[str, Any], now: datetime) -> datetime:
+    command = envelope.get("command")
+    if not isinstance(command, Mapping) or command.get("kind") != CommandKind.SCHEDULE_RETRY.value:
+        return now
+    payload = command.get("payload")
+    raw = payload.get("retry_at") if isinstance(payload, Mapping) else None
+    if raw is None:
+        return now
+    if not isinstance(raw, str):
+        raise ValueError("scheduled retry timestamp must be a string")
+    try:
+        due = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("scheduled retry timestamp must be RFC 3339") from exc
+    if due.tzinfo is None:
+        raise ValueError("scheduled retry timestamp must include a timezone")
+    return max(now, due.astimezone(timezone.utc))
 
 
 def _digest(value: Mapping[str, Any]) -> str:
@@ -326,7 +345,7 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
                     "envelope": item,
                     "status": "pending",
                     "attempts": 0,
-                    "available_at": now,
+                    "available_at": _command_available_at(item, now),
                     "created_at": now,
                 } for item in envelopes])
             if event.kind is EventKind.SCOPE_ACCEPTED:

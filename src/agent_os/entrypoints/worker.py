@@ -46,6 +46,7 @@ from agent_os.infrastructure.mission_workflows import (
 from agent_os.infrastructure.notification_effects import NotificationEffectHandlers
 from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
+from agent_os.infrastructure.retry_effects import RetryScheduleHandler
 from agent_os.infrastructure.sandbox_tool_nodes import SandboxToolNodeHandlers
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
@@ -464,6 +465,7 @@ def run_worker(
             max_turn_budget_cents=settings.max_turn_budget_cents,
         )
         lifecycle_handlers = dict(notification_effects.lifecycle_handlers())
+        lifecycle_handlers[CommandKind.SCHEDULE_RETRY] = RetryScheduleHandler(engine).execute
         lifecycle_handlers[CommandKind.START_MISSION] = MissionBootstrapHandler(
             graph_engine,
             engine,

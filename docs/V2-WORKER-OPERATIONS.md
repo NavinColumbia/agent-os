@@ -118,9 +118,11 @@ because the requested spend is zero.
 
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
 tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
-email, Slack, SMS, and push remain separate adapters. `schedule_retry` and any protocol-specific effect outside the
-registered HTTP/deployment/sandbox adapters still require an explicit executor; until one exists, the router marks
-the effect failed with a durable explanation rather than reporting an operation that did not happen.
+email, Slack, SMS, and push remain separate adapters. Retry waits use an RFC 3339 due time written directly into the
+command outbox's `available_at`; no worker sleeps while waiting. When claimed, the explicit `schedule_retry`
+executor re-checks the exact correlation against current lifecycle state, treats cancelled/superseded timers as
+harmless, and idempotently emits the original resume command. Protocol-specific effects outside the registered
+HTTP/deployment/sandbox adapters still fail closed until an explicit executor exists.
 
 `connector.invoke` is the governed general HTTP capability adapter. An owner registers an immutable tenant-scoped
 HTTPS origin, path prefixes, methods, response/time bounds, authentication mode, opaque credential reference, and

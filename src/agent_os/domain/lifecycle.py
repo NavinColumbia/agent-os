@@ -14,6 +14,7 @@ lifecycle states.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping
 
@@ -266,6 +267,20 @@ def _required_text(payload: Mapping[str, Any], key: str) -> str:
     return value
 
 
+def _validated_retry_at(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 64:
+        raise TransitionRejected("retry_at must be a bounded RFC 3339 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise TransitionRejected("retry_at must be an RFC 3339 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise TransitionRejected("retry_at must include a timezone")
+    return value.strip()
+
+
 def _command_kind(payload: Mapping[str, Any], key: str = "resume_command") -> CommandKind:
     try:
         return CommandKind(str(payload.get(key) or CommandKind.RESUME_PHASE.value))
@@ -376,12 +391,13 @@ def evolve(state: LifecycleState, event: Event) -> Transition:
         if retryable:
             correlation_id = str(event.payload.get("correlation_id") or event.event_id)
             resume = _command_kind(event.payload)
+            retry_at = _validated_retry_at(event.payload.get("retry_at"))
             wait = WaitState(
                 WaitKind.RETRY,
                 correlation_id,
                 reason,
                 resume,
-                event.payload.get("retry_at"),
+                retry_at,
             )
             return _commit(
                 state,

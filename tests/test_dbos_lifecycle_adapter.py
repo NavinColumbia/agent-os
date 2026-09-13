@@ -12,6 +12,7 @@ from agent_os.domain.lifecycle import CommandKind, Event, EventKind, LifecyclePh
 from agent_os.domain.organization_events import OrganizationEvent, OrganizationEventKind
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine, sqlalchemy_url
+from agent_os.infrastructure.retry_effects import RetryScheduleHandler
 
 
 @pytest.fixture
@@ -168,6 +169,82 @@ def test_command_outbox_is_tenant_fenced_retryable_and_worker_lease_owned(engine
     assert record["attempts"] == 2
     assert record["result"] == {"evidence_ids": ["artifact-1"]}
     assert record["last_error"] is None
+
+
+def test_retry_timer_command_is_not_claimable_before_its_durable_due_time(engine):
+    started = engine.start_run(LifecycleState(run_id="run-timer", organization_id="org-a"))
+    engine.get_result(started.workflow_id)
+    failed = engine.submit_event(
+        "org-a", "run-timer",
+        Event(
+            "provider-throttled", EventKind.OPERATION_FAILED, 0,
+            {
+                "operation": "research",
+                "reason": "provider rate limited",
+                "retryable": True,
+                "retry_at": "2099-01-01T00:00:00Z",
+                "resume_command": CommandKind.START_RESEARCH.value,
+                "correlation_id": "retry-future",
+            },
+        ),
+    )
+    result = engine.get_result(failed.workflow_id)
+    command_id = result["commands"][0]["command_id"]
+
+    assert engine.claim_command("org-a", worker_id="worker-a") is None
+    record = engine.get_command_record("org-a", command_id)
+    assert record is not None
+    assert record["status"] == "pending"
+    assert record["available_at"].year == 2099
+
+
+def test_due_retry_timer_resumes_the_lifecycle_and_emits_its_original_command(engine):
+    started = engine.start_run(LifecycleState(run_id="run-due-timer", organization_id="org-a"))
+    engine.get_result(started.workflow_id)
+    failed = engine.submit_event(
+        "org-a", "run-due-timer",
+        Event(
+            "provider-throttled-due", EventKind.OPERATION_FAILED, 0,
+            {
+                "operation": "research",
+                "reason": "provider rate limited",
+                "retryable": True,
+                "retry_at": "2020-01-01T00:00:00Z",
+                "resume_command": CommandKind.START_RESEARCH.value,
+                "correlation_id": "retry-due",
+            },
+        ),
+    )
+    result = engine.get_result(failed.workflow_id)
+    timer_id = result["commands"][0]["command_id"]
+
+    class NoAgentCommands:
+        @staticmethod
+        def supports(kind):
+            return False
+
+        def execute(self, envelope):
+            raise AssertionError(f"unexpected agent command: {envelope}")
+
+    worker = DurableCommandWorker(
+        outbox=engine,
+        executor=LifecycleCommandRouter(
+            agent_executor=NoAgentCommands(),
+            handlers={CommandKind.SCHEDULE_RETRY: RetryScheduleHandler(engine).execute},
+        ),
+        worker_id="timer-worker",
+        lease_seconds=3,
+        workflow_engine=engine,
+        workflow_result_waiter=engine.get_result,
+    )
+
+    report = worker.run_one("org-a")
+
+    assert report.status is CommandRunStatus.SUCCEEDED
+    assert engine.get_command_record("org-a", timer_id)["status"] == "succeeded"
+    state = engine.get_run("org-a", "run-due-timer")
+    assert state is not None and state.version == 2 and state.wait is None
+    assert engine.list_commands("org-a", "run-due-timer")[-1]["command"]["kind"] == "start_research"
 
 
 def test_real_worker_routes_initial_directive_to_the_mission_bootstrap_handler(engine):

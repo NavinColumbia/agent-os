@@ -26,6 +26,8 @@ from agent_os.infrastructure.pydantic_agents import (
     ProposedDecision,
     ProposedMessage,
     ProposedWork,
+    ModelSelection,
+    default_model_name,
     model_usage_record,
 )
 
@@ -108,6 +110,7 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         organization_loader: Callable[[str], Organization] | None = None,
         usage_meter: UsageMeter | None = None,
         model_name: str | None = None,
+        model_selector: Callable[[str], ModelSelection] | None = None,
     ) -> None:
         if (
             request_limit < 1
@@ -128,9 +131,18 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         self._context_character_limit = context_character_limit
         self._organization_loader = organization_loader
         self._usage_meter = usage_meter
-        self._model_name = (model_name or str(model)).strip()
+        self._model_name = default_model_name(model, model_name)
+        self._model_selector = model_selector
         if usage_meter is not None and not self._model_name:
             raise ValueError("a metered graph runtime requires a model name")
+
+    def _selection(self, tenant_id: str) -> ModelSelection:
+        if self._model_selector is None:
+            return ModelSelection(self._model, self._model_name)
+        selected = self._model_selector(tenant_id)
+        if not isinstance(selected, ModelSelection):
+            raise TypeError("model selector must return ModelSelection")
+        return selected
 
     @staticmethod
     def _node(definition: WorkflowDefinition, node_id: str) -> WorkflowNode:
@@ -282,8 +294,9 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
                 "authoritative graph context exceeds the configured model-context boundary; "
                 "a compaction node is required"
             )
+        selection = self._selection(tenant_id)
         agent = Agent(
-            self._model,
+            selection.model,
             output_type=GraphAgentNodeOutput,
             instructions=instructions,
             tools=self._tools,
@@ -296,7 +309,7 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
                 source_id=idempotency_key,
                 run_id=run_id,
                 category="graph_agent",
-                model=self._model_name,
+                model=selection.name,
                 maximum_cost_cents=self._max_turn_budget_cents,
             )
         result = agent.run_sync(

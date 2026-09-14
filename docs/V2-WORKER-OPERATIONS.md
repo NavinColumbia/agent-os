@@ -306,7 +306,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–99zzz), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–99zzzz), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
 actual provider tenant, secrets management, production configuration, artifact garbage collection,
 usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch
@@ -355,4 +355,13 @@ the token digest, expiry, roles, claim identity, and revocation history. An auth
 invited company with `X-Agent-OS-Organization`; every request re-checks the active membership before applying that
 tenant's RLS scope. The CEO workspace exposes organization selection, invitation claim/creation, member inventory,
 and revocation. Subject-scoped RLS permits a user to discover only their own memberships, while mutations remain
-tenant-scoped. Per-tenant model-provider configuration remains launch work.
+tenant-scoped.
+
+Each company can choose its model policy through `GET/PUT /v2/settings/model` or the CEO workspace. The setting is
+versioned, idempotent, tenant-RLS fenced, and limited to a provider/model plus an optional opaque credential
+reference. No provider key enters the API request, browser, SQL, prompt, or audit record. With no company setting,
+the worker uses its explicit `AOS_V2_MODEL` platform default. With a credential reference, the worker resolves the
+same tenant-digest-namespaced file or GCP Secret Manager locator used by connectors and constructs an isolated
+OpenAI, Anthropic, or Google provider client just for that turn. The usage ledger records the model actually chosen.
+This makes provider choice and BYOK fully implemented; provisioning the referenced secret remains an external
+credential action.

@@ -76,6 +76,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "99z-external-onboarding-v2.sql" in compose
     assert "99zz-connectors-v2.sql" in compose
     assert "99zzz-memberships-v2.sql" in compose
+    assert "99zzzz-tenant-models-v2.sql" in compose
     assert '127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080' in compose
     assert "GEMINI_API_KEY" in compose
     assert "AOS_V2_DATABASE_RUNTIME_PASSWORD" in compose

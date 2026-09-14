@@ -31,6 +31,7 @@ from agent_os.application.ports import (
     OrganizationLedger,
     PreviewDeploymentStore,
     UsageMeter,
+    TenantModelStore,
     WorkflowEngine,
     WorkflowReceipt,
 )
@@ -285,6 +286,14 @@ class MembershipRevokeRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2_000)
 
 
+class TenantModelSettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = Field(pattern=r"^(openai|anthropic|google)$")
+    model_name: str = Field(min_length=1, max_length=256)
+    credential_ref: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class BillingCheckoutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -406,6 +415,7 @@ def create_app(
     company_directory: CompanyDirectory | None = None,
     connector_registry: ConnectorRegistry | None = None,
     membership_store: MembershipStore | None = None,
+    tenant_model_store: TenantModelStore | None = None,
     usage_meter: UsageMeter | None = None,
     billing_service: BillingService | None = None,
     client_identity_config: Mapping[str, str] | None = None,
@@ -623,6 +633,39 @@ def create_app(
             if result is None:
                 raise HTTPException(status_code=404, detail="membership does not exist")
             return result
+
+    if tenant_model_store is not None:
+        @app.get("/v2/settings/model")
+        def get_tenant_model_setting(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            configured = tenant_model_store.get_model_setting(principal.organization_id)
+            return {
+                "configured": configured is not None,
+                "setting": configured,
+            }
+
+        @app.put("/v2/settings/model")
+        def set_tenant_model_setting(
+            body: TenantModelSettingRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "system"}):
+                raise HTTPException(status_code=403, detail="model settings require owner authority")
+            try:
+                return tenant_model_store.set_model_setting(
+                    tenant_id=principal.organization_id,
+                    provider=body.provider,
+                    model_name=body.model_name,
+                    credential_ref=body.credential_ref,
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if billing_service is not None:
         @app.post("/v2/billing/webhooks/stripe", include_in_schema=False)

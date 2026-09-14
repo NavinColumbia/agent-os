@@ -19,6 +19,7 @@ COPY --chmod=0444 postgres/initdb/99-external-artifacts-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/99z-external-onboarding-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/99zz-connectors-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/99zzz-memberships-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/99zzzz-tenant-models-v2.sql /migrations/
 COPY --chmod=0555 deploy/migrate-v2.sh /usr/local/bin/agentos-migrate-v2
 
 USER 999:999

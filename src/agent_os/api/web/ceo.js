@@ -193,8 +193,9 @@ async function loadMissions() {
 }
 
 async function loadCompany() {
-  const [org, memberships] = await Promise.all([
+  const [org, memberships, modelSetting] = await Promise.all([
     api("/v2/company/organization"), api("/v2/memberships").catch(() => null),
+    api("/v2/settings/model").catch(() => null),
   ]);
   const activeAgents = (org.agents || []).filter((item) => item.status === "active");
   byId("company-summary").replaceChildren(
@@ -204,6 +205,7 @@ async function loadCompany() {
   const content = byId("company-content");
   content.replaceChildren();
   content.append(accessPanel(memberships));
+  if (modelSetting) content.append(modelPanel(modelSetting));
   for (const team of org.teams || []) {
     const block = el("section", "team-block");
     block.append(el("h4", "", team.name));
@@ -222,6 +224,50 @@ async function loadCompany() {
     block.append(people);
     content.append(block);
   }
+}
+
+function modelPanel(payload) {
+  const current = payload.setting || {};
+  const block = el("section", "team-block access-panel");
+  block.append(
+    el("h4", "", "AI model policy"),
+    el("small", "muted", current.model_name
+      ? `Current: ${current.provider}:${current.model_name} · ${current.credential_source} credentials`
+      : "Using the platform default model."),
+  );
+  const form = el("div", "model-form");
+  const provider = document.createElement("select");
+  provider.setAttribute("aria-label", "Model provider");
+  for (const value of ["openai", "anthropic", "google"]) {
+    const option = el("option", "", value); option.value = value;
+    option.selected = current.provider === value; provider.append(option);
+  }
+  const name = document.createElement("input");
+  name.maxLength = 256; name.placeholder = "Model name, for example gpt-5";
+  name.value = current.model_name || ""; name.setAttribute("aria-label", "Model name");
+  const credential = document.createElement("input");
+  credential.maxLength = 128; credential.placeholder = "Credential reference (optional BYOK)";
+  credential.value = current.credential_ref || "";
+  credential.setAttribute("aria-label", "Credential reference");
+  const save = el("button", "primary", "Save model policy"); save.type = "button";
+  save.addEventListener("click", async () => {
+    if (!name.value.trim()) return setFlash("Enter a model name.", "error");
+    save.disabled = true;
+    try {
+      await api("/v2/settings/model", {
+        method: "PUT", headers: {"Idempotency-Key": `model-${crypto.randomUUID()}`},
+        body: JSON.stringify({
+          provider: provider.value, model_name: name.value.trim(),
+          credential_ref: credential.value.trim() || null,
+        }),
+      });
+      setFlash("Model policy saved. New agent turns use it immediately.");
+      await loadCompany();
+    } catch (error) { setFlash(error.message, "error"); }
+    finally { save.disabled = false; }
+  });
+  form.append(provider, name, credential, save); block.append(form);
+  return block;
 }
 
 function accessPanel(memberships) {

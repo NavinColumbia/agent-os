@@ -352,6 +352,25 @@ class MembershipStore(Protocol):
         idempotency_key: str,
     ) -> Mapping[str, Any] | None: ...
 
+
+@runtime_checkable
+class TenantModelStore(Protocol):
+    """Tenant-owned model choice with an optional opaque credential reference."""
+
+    def get_model_setting(self, tenant_id: str) -> Mapping[str, Any] | None: ...
+
+    def set_model_setting(
+        self,
+        *,
+        tenant_id: str,
+        provider: str,
+        model_name: str,
+        credential_ref: str | None,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+
 @runtime_checkable
 class GraphWorkflowEngine(Protocol):
     """Persistence boundary for arbitrary versioned customer workflow graphs."""

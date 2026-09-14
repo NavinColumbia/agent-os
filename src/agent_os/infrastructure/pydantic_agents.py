@@ -9,9 +9,10 @@ which consequential actions commit.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_CEILING
 from enum import Enum
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_ai import Agent, UsageLimits
@@ -135,6 +136,27 @@ Consequential proposals are reviewed by durable policy and approval layers after
 """.strip()
 
 
+@dataclass(frozen=True)
+class ModelSelection:
+    """One tenant's resolved model instance and non-secret billing identity."""
+
+    model: Model | str
+    name: str
+
+    def __post_init__(self) -> None:
+        if not self.name.strip() or len(self.name) > 512:
+            raise ValueError("resolved model name must be bounded and nonempty")
+
+
+def default_model_name(model: Model | str, configured: str | None) -> str:
+    if configured is not None:
+        return configured.strip()
+    if isinstance(model, str):
+        return model.strip()
+    value = str(getattr(model, "model_name", "") or type(model).__name__).strip()
+    return value[:512]
+
+
 def model_usage_record(usage: Any) -> dict[str, int | None]:
     provider_cost_usd_micros = None
     if usage.cost is not None:
@@ -164,6 +186,7 @@ class PydanticAgentRuntime(AgentRuntime):
         request_timeout_seconds: float = 120,
         usage_meter: UsageMeter | None = None,
         model_name: str | None = None,
+        model_selector: Callable[[str], ModelSelection] | None = None,
     ) -> None:
         if request_limit < 1 or output_tokens_limit < 1 or request_timeout_seconds <= 0:
             raise ValueError("agent runtime limits must be positive")
@@ -173,9 +196,18 @@ class PydanticAgentRuntime(AgentRuntime):
         self._output_tokens_limit = output_tokens_limit
         self._request_timeout_seconds = request_timeout_seconds
         self._usage_meter = usage_meter
-        self._model_name = (model_name or str(model)).strip()
+        self._model_name = default_model_name(model, model_name)
+        self._model_selector = model_selector
         if usage_meter is not None and not self._model_name:
             raise ValueError("a metered agent runtime requires a model name")
+
+    def _selection(self, organization_id: str) -> ModelSelection:
+        if self._model_selector is None:
+            return ModelSelection(self._model, self._model_name)
+        selected = self._model_selector(organization_id)
+        if not isinstance(selected, ModelSelection):
+            raise TypeError("model selector must return ModelSelection")
+        return selected
 
     def run_agent(
         self,
@@ -194,8 +226,9 @@ class PydanticAgentRuntime(AgentRuntime):
             raise ValueError("budget_cents cannot be negative")
         context_text = "" if not context else f"\nAuthoritative work context:\n{dict(context)}"
         instructions = f"{_BASE_INSTRUCTIONS}\n\nYour assigned role is: {role}.{context_text}"
+        selection = self._selection(organization_id)
         agent = Agent(
-            self._model,
+            selection.model,
             output_type=AgentTurnOutput,
             instructions=instructions,
             tools=self._tools,
@@ -208,7 +241,7 @@ class PydanticAgentRuntime(AgentRuntime):
                 source_id=idempotency_key,
                 run_id=run_id,
                 category="lifecycle_agent",
-                model=self._model_name,
+                model=selection.name,
                 maximum_cost_cents=max(1, budget_cents),
             )
         result = agent.run_sync(

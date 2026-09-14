@@ -110,6 +110,8 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .access-panel { padding-bottom: 1.2rem; border-bottom: 1px solid var(--line); }
 .access-form { display: grid; grid-template-columns: minmax(180px,1fr) auto; gap: .55rem; margin: .65rem 0; }
 .access-form select { padding: .65rem; }
+.model-form { display: grid; grid-template-columns: 130px minmax(180px,1fr) minmax(180px,1fr) auto; gap: .55rem; margin-top: .8rem; }
+.model-form select { padding: .65rem; }
 .access-panel textarea { margin: .55rem 0; }
 .person .danger { margin-top: .55rem; }
 .team-block h4 { margin: 0 0 .65rem; }
@@ -171,6 +173,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
   .mission { grid-template-columns: minmax(0,1fr) auto; }
   .mission .phase { display: none; }
   .human-actions { grid-template-columns: 1fr 1fr 1fr; }
+  .model-form { grid-template-columns: 1fr; }
   .human-actions input { grid-column: 1 / -1; }
   .auth-card { padding: 2rem; }
 }

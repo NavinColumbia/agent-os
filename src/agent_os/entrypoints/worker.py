@@ -55,6 +55,8 @@ from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_ready_tenants import SQLReadyTenantSource
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
+from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
+from agent_os.infrastructure.tenant_model_resolver import TenantModelResolver
 from agent_os.infrastructure.tool_node_router import GraphToolNodeRouter
 
 
@@ -347,6 +349,11 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(connector_registry.close)
+        tenant_model_store = SQLTenantModelStore(
+            settings.server.application_database_url,
+            create_schema=settings.server.create_schema,
+        )
+        resources.callback(tenant_model_store.close)
         notification_store = SQLNotificationStore(
             settings.server.application_database_url,
             create_schema=settings.server.create_schema,
@@ -409,6 +416,11 @@ def run_worker(
             if settings.connector_secret_backend == "gcp"
             else FileConnectorSecretResolver(settings.connector_secret_directory)
         )
+        tenant_model_resolver = TenantModelResolver(
+            tenant_model_store,
+            connector_secrets,
+            fallback_model=settings.model,
+        )
         named_tool_handlers.update(HTTPConnectorToolNodeHandlers(
             connector_registry,
             artifact_store,
@@ -456,6 +468,7 @@ def run_worker(
             request_timeout_seconds=settings.request_timeout_seconds,
             usage_meter=usage_meter,
             model_name=settings.model,
+            model_selector=tenant_model_resolver,
         )
         agent_executor = DurableAgentCommandExecutor(
             runtime=runtime,
@@ -508,6 +521,7 @@ def run_worker(
             organization_loader=company_directory.get_organization,
             usage_meter=usage_meter,
             model_name=settings.model,
+            model_selector=tenant_model_resolver,
         )
         graph_effect_handlers = MissionGraphEffectHandlers(
             lifecycle_engine=engine,

@@ -18,6 +18,7 @@ from agent_os.infrastructure.gcs_artifacts import build_artifact_store
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
+from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_billing import SQLBillingStore
@@ -362,6 +363,11 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(membership_store.close)
+        tenant_model_store = SQLTenantModelStore(
+            settings.application_database_url,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(tenant_model_store.close)
         notification_store = SQLNotificationStore(
             settings.application_database_url,
             create_schema=settings.create_schema,
@@ -437,6 +443,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             company_directory=company_directory,
             connector_registry=connector_registry,
             membership_store=membership_store,
+            tenant_model_store=tenant_model_store,
             usage_meter=usage_meter,
             billing_service=billing_service,
             client_identity_config=browser_identity_config(settings),
@@ -453,6 +460,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.company_directory = company_directory
     app.state.connector_registry = connector_registry
     app.state.membership_store = membership_store
+    app.state.tenant_model_store = tenant_model_store
     app.state.usage_meter = usage_meter
     app.state.billing_store = billing_store
     app.state.billing_service = billing_service

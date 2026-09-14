@@ -20,6 +20,7 @@ from agent_os.infrastructure.memory import InMemoryWorkflowEngine
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
+from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 
 
@@ -134,6 +135,39 @@ def test_invitation_capability_cannot_be_tampered_or_claimed_by_two_subjects(tmp
             json={"token": token},
         )
         assert second.status_code == 409
+
+
+def test_tenant_model_settings_are_owner_controlled_secret_free_and_isolated(tmp_path):
+    settings = SQLTenantModelStore(
+        f"sqlite:///{tmp_path / 'api-tenant-models.sqlite3'}", create_schema=True,
+    )
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+        tenant_model_store=settings, shutdown=settings.close,
+    ))
+    with api:
+        configured = api.put(
+            "/v2/settings/model",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "model-api-one"},
+            json={
+                "provider": "anthropic", "model_name": "claude-opus-4-1",
+                "credential_ref": "tenant-anthropic-key",
+            },
+        )
+        assert configured.status_code == 200
+        assert configured.json()["credential_source"] == "tenant"
+        assert "key" not in configured.json()
+        assert api.get(
+            "/v2/settings/model", headers={"Authorization": "Bearer org-a"},
+        ).json()["setting"]["model_name"] == "claude-opus-4-1"
+        assert api.get(
+            "/v2/settings/model", headers={"Authorization": "Bearer org-b"},
+        ).json() == {"configured": False, "setting": None}
+        assert api.put(
+            "/v2/settings/model",
+            headers={"Authorization": "Bearer viewer-a", "Idempotency-Key": "viewer-model"},
+            json={"provider": "google", "model_name": "gemini-2.5-pro"},
+        ).status_code == 403
 
 
 def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():

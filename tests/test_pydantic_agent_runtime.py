@@ -4,7 +4,7 @@ import pytest
 
 from pydantic_ai.models.test import TestModel
 
-from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
+from agent_os.infrastructure.pydantic_agents import ModelSelection, PydanticAgentRuntime
 
 
 class FakeUsageMeter:
@@ -95,3 +95,27 @@ def test_agent_turn_can_delegate_hire_message_decide_and_raise_risk_without_netw
 def test_agent_runtime_rejects_unbounded_or_zero_limits():
     with pytest.raises(ValueError, match="limits must be positive"):
         PydanticAgentRuntime(TestModel(), request_timeout_seconds=0)
+
+
+def test_agent_runtime_selects_and_meters_the_model_for_each_tenant():
+    selected_tenants = []
+    meter = FakeUsageMeter()
+    output = {
+        "summary": "Completed with tenant model.", "disposition": "complete",
+        "progress_percent": 100, "evidence_ids": ["evidence-1"],
+    }
+
+    def select(tenant_id):
+        selected_tenants.append(tenant_id)
+        return ModelSelection(TestModel(custom_output_args=output), "test:tenant-model")
+
+    runtime = PydanticAgentRuntime(
+        TestModel(), usage_meter=meter, model_name="test:fallback", model_selector=select,
+    )
+    runtime.run_agent(
+        organization_id="tenant-special", run_id="run-1", role="engineer",
+        prompt="Complete", idempotency_key="tenant-model-turn", budget_cents=1,
+    )
+
+    assert selected_tenants == ["tenant-special"]
+    assert meter.reservations[0]["model"] == "test:tenant-model"

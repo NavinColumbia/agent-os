@@ -65,6 +65,11 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     writers = main.split('resource "google_storage_bucket_iam_member" "artifact_writers"', 1)[1]
     assert "api    = google_service_account.api.email" in writers
     assert "worker = google_service_account.worker.email" in writers
+    assert 'matches_prefix = ["tenants/"]' in main
+    assert "age            = var.artifact_retention_days" in main
+    assert "AOS_V2_ARTIFACT_RETENTION_DAYS" in main
+    assert "days_since_noncurrent_time = 7" in main
+    assert 'TF_VAR_artifact_retention_days="${AOS_V2_ARTIFACT_RETENTION_DAYS:-365}"' in deploy
     subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/deploy.sh")], check=True)
 
 

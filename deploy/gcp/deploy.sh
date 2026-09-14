@@ -57,6 +57,7 @@ export TF_VAR_oidc_authorization_audience_parameter="${AOS_V2_OIDC_AUTHORIZATION
 export TF_VAR_stripe_starter_price_id="$AOS_V2_STRIPE_STARTER_PRICE_ID"
 export TF_VAR_stripe_growth_price_id="$AOS_V2_STRIPE_GROWTH_PRICE_ID"
 export TF_VAR_model="$AOS_V2_MODEL"
+export TF_VAR_artifact_retention_days="${AOS_V2_ARTIFACT_RETENTION_DAYS:-365}"
 export TF_VAR_database_runtime_role="$AOS_V2_DATABASE_RUNTIME_ROLE"
 export TF_VAR_model_provider_secret_environment="${AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT:-OPENAI_API_KEY}"
 export TF_VAR_alert_notification_channels="$AOS_ALERT_NOTIFICATION_CHANNELS"

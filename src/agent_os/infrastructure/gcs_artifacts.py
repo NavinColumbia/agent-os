@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
 from google.api_core.exceptions import NotFound, PreconditionFailed
@@ -35,6 +36,7 @@ class GCSArtifactStore(SQLArtifactStore):
         bucket_name: str,
         create_schema: bool = False,
         max_content_bytes: int = 64 * 1024 * 1024,
+        retention_days: int = 365,
         timeout_seconds: float = 60.0,
         clock: Callable[..., Any] | None = None,
         client: Any | None = None,
@@ -44,6 +46,8 @@ class GCSArtifactStore(SQLArtifactStore):
             raise ValueError("a valid private GCS bucket name is required")
         if timeout_seconds <= 0:
             raise ValueError("GCS timeout must be positive")
+        if not 30 <= retention_days <= 3650:
+            raise ValueError("GCS retention days must be between 30 and 3650")
         super().__init__(
             database_url,
             create_schema=create_schema,
@@ -53,6 +57,7 @@ class GCSArtifactStore(SQLArtifactStore):
         self._owns_client = client is None
         self._client = client or storage.Client()
         self._bucket = self._client.bucket(bucket_name)
+        self._retention_days = retention_days
         self._timeout_seconds = timeout_seconds
 
     @staticmethod
@@ -113,6 +118,9 @@ class GCSArtifactStore(SQLArtifactStore):
         prepared_record.update({
             "storage_backend": "gcs",
             "generation": generation,
+            "retention_until": (
+                prepared["created_at"] + timedelta(days=self._retention_days)
+            ).isoformat(),
         })
         prepared["record"] = prepared_record
         return self._persist_prepared(
@@ -149,6 +157,20 @@ class GCSArtifactStore(SQLArtifactStore):
                 timeout=self._timeout_seconds,
             )
         except NotFound as exc:
+            retention_value = record.get("retention_until")
+            if isinstance(retention_value, str):
+                try:
+                    retention_until = datetime.fromisoformat(retention_value)
+                except ValueError:
+                    retention_until = None
+                if retention_until is not None:
+                    if retention_until.tzinfo is None:
+                        retention_until = retention_until.replace(tzinfo=timezone.utc)
+                    now = self._clock()
+                    if now.tzinfo is None:
+                        now = now.replace(tzinfo=timezone.utc)
+                    if now >= retention_until:
+                        return None
             raise RuntimeError("artifact object is missing from private storage") from exc
         if (
             len(content) != int(record["byte_length"])
@@ -172,6 +194,7 @@ def build_artifact_store(
     bucket_name: str,
     create_schema: bool,
     max_content_bytes: int,
+    retention_days: int = 365,
 ) -> SQLArtifactStore:
     """Construct the configured adapter without leaking cloud concerns upward."""
     if backend == "sql":
@@ -186,5 +209,6 @@ def build_artifact_store(
             bucket_name=bucket_name,
             create_schema=create_schema,
             max_content_bytes=max_content_bytes,
+            retention_days=retention_days,
         )
     raise ValueError("artifact backend must be sql or gcs")

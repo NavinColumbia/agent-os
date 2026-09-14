@@ -365,6 +365,7 @@ def run_worker(
             bucket_name=settings.server.artifact_bucket,
             create_schema=settings.server.create_schema,
             max_content_bytes=settings.server.artifact_max_content_bytes,
+            retention_days=settings.server.artifact_retention_days,
         )
         resources.callback(artifact_store.close)
         usage_meter = SQLUsageMeter(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import sqlite3
 from pathlib import Path
@@ -130,10 +130,11 @@ def test_gcs_artifacts_are_immutable_integrity_checked_and_tenant_isolated(store
     assert client.value.objects[object_name]["content"] == b"deployable source"
 
     with sqlite3.connect(database) as connection:
-        backend, content, locator = connection.execute(
-            "SELECT storage_backend, content, object_name FROM aos_v2_artifacts"
+        backend, content, locator, record = connection.execute(
+            "SELECT storage_backend, content, object_name, record FROM aos_v2_artifacts"
         ).fetchone()
     assert (backend, content, locator) == ("gcs", None, object_name)
+    assert "2027-09-08T20:00:00+00:00" in record
 
     client.value.objects[object_name]["content"] = b"corrupted"
     with pytest.raises(RuntimeError, match="integrity verification"):
@@ -188,3 +189,45 @@ def test_gcs_adapter_reads_inline_artifacts_during_migration(tmp_path: Path):
         assert external.get("tenant-a", artifact_id) == b"old inline evidence"
     finally:
         external.close()
+
+
+def test_gcs_missing_payload_is_expected_only_after_declared_retention(tmp_path: Path):
+    now = [datetime(2026, 9, 8, 20, tzinfo=timezone.utc)]
+    client = FakeClient()
+    store = GCSArtifactStore(
+        f"sqlite:///{tmp_path / 'retention.sqlite3'}",
+        bucket_name="agent-os-artifacts",
+        create_schema=True,
+        retention_days=30,
+        clock=lambda: now[0],
+        client=client,
+    )
+    try:
+        artifact_id = store.put(
+            organization_id="tenant-a",
+            content=b"retained",
+            media_type="text/plain",
+            idempotency_key="retention-proof",
+        )
+        client.value.objects.clear()
+        with pytest.raises(RuntimeError, match="missing from private storage"):
+            store.get("tenant-a", artifact_id)
+
+        now[0] += timedelta(days=30)
+        assert store.get("tenant-a", artifact_id) is None
+        assert store.describe("tenant-a", artifact_id)["retention_until"] == (
+            "2026-10-08T20:00:00+00:00"
+        )
+    finally:
+        store.close()
+
+
+def test_gcs_retention_bounds_fail_closed(tmp_path: Path):
+    for value in (29, 3651):
+        with pytest.raises(ValueError, match="between 30 and 3650"):
+            GCSArtifactStore(
+                f"sqlite:///{tmp_path / f'invalid-{value}.sqlite3'}",
+                bucket_name="agent-os-artifacts",
+                retention_days=value,
+                client=FakeClient(),
+            )

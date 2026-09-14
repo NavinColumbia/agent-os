@@ -415,14 +415,17 @@ async function resolveHumanRequest(item, response, actions) {
 }
 
 async function loadPreviews() {
-  const payload = await api("/v2/deployments/previews?limit=100");
+  const payload = await api("/v2/deployments?limit=100");
   const items = payload.items || [];
   const content = byId("previews-content");
   content.replaceChildren();
-  if (!items.length) return content.append(el("div", "empty", "Released previews will appear here."));
+  if (!items.length) return content.append(el("div", "empty", "Released applications and previews will appear here."));
   for (const item of items) {
     const node = el("article", "release");
-    node.append(el("strong", "", item.deployment_id || "Preview"), el("small", "", `Status: ${label(item.status)} · Expires ${item.expires_at || "—"}`));
+    node.append(
+      el("strong", "", item.app_slug || item.deployment_id || "Release"),
+      el("small", "", `${label(item.kind || "deployment")} · ${label(item.status)}${item.expires_at ? ` · Expires ${item.expires_at}` : ""}`),
+    );
     if (item.public_url && item.status !== "revoked") {
       const link = el("a", "", "Open preview ↗");
       link.href = item.public_url; link.target = "_blank"; link.rel = "noopener noreferrer";

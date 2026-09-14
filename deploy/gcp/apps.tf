@@ -49,6 +49,15 @@ resource "google_storage_bucket" "app_sources" {
     }
   }
 
+  lifecycle_rule {
+    condition {
+      days_since_noncurrent_time = 1
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
   depends_on = [google_project_service.apps_required]
 }
 

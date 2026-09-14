@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from typing import Any, Mapping
 
 from fastapi.testclient import TestClient
@@ -18,6 +19,7 @@ from agent_os.domain.workflow_runtime import (
 )
 from agent_os.infrastructure.memory import InMemoryWorkflowEngine
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
+from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
@@ -168,6 +170,39 @@ def test_tenant_model_settings_are_owner_controlled_secret_free_and_isolated(tmp
             headers={"Authorization": "Bearer viewer-a", "Idempotency-Key": "viewer-model"},
             json={"provider": "google", "model_name": "gemini-2.5-pro"},
         ).status_code == 403
+
+
+def test_deployment_inventory_projects_immutable_release_receipts_by_tenant(tmp_path):
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'deployment-inventory.sqlite3'}", create_schema=True,
+    )
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+        artifact_store=artifacts, shutdown=artifacts.close,
+    ))
+    with api:
+        receipt = {
+            "kind": "static_site", "deployment_id": "static-one", "app_slug": "income-app",
+            "revision": "a" * 64, "public_url": "https://apps.example.test/p/opaque/",
+        }
+        artifacts.put(
+            organization_id="org-a", content=json.dumps(receipt).encode(),
+            media_type="application/vnd.agent-os.static-site-release+json",
+            idempotency_key="static-release-receipt",
+        )
+        artifacts.put(
+            organization_id="org-b", content=b'{"kind":"hidden"}',
+            media_type="application/vnd.agent-os.static-site-release+json",
+            idempotency_key="hidden-release-receipt",
+        )
+
+        inventory = api.get(
+            "/v2/deployments", headers={"Authorization": "Bearer org-a"},
+        )
+        assert inventory.status_code == 200
+        assert inventory.json()["items"][0]["deployment_id"] == "static-one"
+        assert inventory.json()["items"][0]["status"] == "active"
+        assert "hidden" not in str(inventory.json())
 
 
 def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():

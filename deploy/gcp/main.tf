@@ -104,6 +104,7 @@ locals {
     AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS     = tostring(var.free_model_budget_cents)
     AOS_V2_ARTIFACT_BACKEND                      = "gcs"
     AOS_V2_ARTIFACT_MAX_CONTENT_BYTES            = tostring(var.artifact_max_content_bytes)
+    AOS_V2_ARTIFACT_RETENTION_DAYS               = tostring(var.artifact_retention_days)
   }
 
   api_environment = merge(local.common_environment, {
@@ -201,6 +202,25 @@ resource "google_storage_bucket" "artifacts" {
     condition {
       age            = 30
       matches_prefix = ["temporary/"]
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  lifecycle_rule {
+    condition {
+      age            = var.artifact_retention_days
+      matches_prefix = ["tenants/"]
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  lifecycle_rule {
+    condition {
+      days_since_noncurrent_time = 7
     }
     action {
       type = "Delete"

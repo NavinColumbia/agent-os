@@ -247,6 +247,17 @@ variable "artifact_max_content_bytes" {
   }
 }
 
+variable "artifact_retention_days" {
+  description = "Customer artifact retention window; metadata remains as an audit tombstone after payload expiry."
+  type        = number
+  default     = 365
+
+  validation {
+    condition     = var.artifact_retention_days >= 30 && var.artifact_retention_days <= 3650
+    error_message = "artifact_retention_days must be between 30 and 3650."
+  }
+}
+
 variable "model" {
   description = "Explicit PydanticAI provider:model selected for the worker."
   type        = string

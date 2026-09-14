@@ -642,6 +642,14 @@ class ArtifactStore(Protocol):
         self, organization_id: str, idempotency_key: str,
     ) -> Mapping[str, Any] | None: ...
 
+    def list_artifacts(
+        self,
+        organization_id: str,
+        *,
+        media_types: tuple[str, ...] = (),
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
 
 @runtime_checkable
 class SandboxRunner(Protocol):

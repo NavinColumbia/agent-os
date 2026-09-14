@@ -21,6 +21,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
         "AOS_V2_STRIPE_GROWTH_MODEL_BUDGET_CENTS", "AOS_V2_STRIPE_API_VERSION",
         "AOS_V2_ARTIFACT_BACKEND", "AOS_V2_ARTIFACT_BUCKET",
         "AOS_V2_ARTIFACT_MAX_CONTENT_BYTES",
+        "AOS_V2_ARTIFACT_RETENTION_DAYS",
         "AOS_V2_OIDC_PERSONAL_TENANTS", "AOS_V2_TENANT_DERIVATION_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -38,6 +39,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
     assert settings.artifact_backend == "sql"
     assert settings.artifact_bucket == ""
     assert settings.artifact_max_content_bytes == 2 * 1024 * 1024
+    assert settings.artifact_retention_days == 365
     assert settings.oidc_personal_tenants is False
 
 
@@ -119,4 +121,9 @@ def test_production_fails_closed_without_postgres_migrations_and_strong_secret(m
 
     monkeypatch.setenv("AOS_V2_PREVIEW_TTL_SECONDS", "59")
     with pytest.raises(ValueError, match="between 60 and 2592000"):
+        ServerSettings.from_env()
+
+    monkeypatch.setenv("AOS_V2_PREVIEW_TTL_SECONDS", "604800")
+    monkeypatch.setenv("AOS_V2_ARTIFACT_RETENTION_DAYS", "29")
+    with pytest.raises(ValueError, match="between 30 and 3650"):
         ServerSettings.from_env()

@@ -358,5 +358,32 @@ class SQLArtifactStore(ArtifactStore):
             ))).scalar_one()
         return dict(value)
 
+    def list_artifacts(
+        self,
+        organization_id: str,
+        *,
+        media_types: tuple[str, ...] = (),
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("artifact inventory limit must be between 1 and 500")
+        normalized = tuple(dict.fromkeys(item.strip().lower() for item in media_types))
+        if any(not _MEDIA_TYPE.fullmatch(item) for item in normalized):
+            raise ValueError("artifact inventory media type is invalid")
+        criteria = [artifacts.c.tenant_id == organization_id]
+        if normalized:
+            criteria.append(artifacts.c.media_type.in_(normalized))
+        with self._tenant_connection(organization_id) as connection:
+            rows = connection.execute(select(
+                artifacts.c.record,
+                artifacts.c.storage_backend,
+            ).where(and_(*criteria)).order_by(
+                artifacts.c.created_at.desc(), artifacts.c.artifact_id.desc(),
+            ).limit(limit)).mappings().all()
+        return tuple({
+            **dict(row["record"]),
+            "storage_backend": row["storage_backend"],
+        } for row in rows)
+
     def close(self) -> None:
         self._engine.dispose()

@@ -206,8 +206,11 @@ interactive demo, but network connections, forms, top-level navigation, parent-o
 resources remain blocked. This is a disposable static evaluation surface, not production promotion, a custom
 domain, or an arbitrary backend deployment. Every capability expires (seven days by default). An authenticated
 owner/operator can list tenant previews with `GET /v2/deployments/previews` and idempotently revoke one with
-`DELETE /v2/deployments/previews/{deployment_id}` plus `Idempotency-Key`. A managed object-storage adapter and
-cleanup of expired bytes remain to be implemented before customer launch.
+`DELETE /v2/deployments/previews/{deployment_id}` plus `Idempotency-Key`. Preview expiry revokes the public
+capability; it does not delete a source artifact that may also be mission evidence. Hosted GCS artifact payloads
+use the configured 365-day retention window (30–3650 days), and noncurrent object generations are removed after
+seven more days so bucket versioning cannot silently defeat that policy. SQL retains the secret-free artifact
+identity as an audit tombstone. Local SQL storage is an explicitly capped evaluation backend, not production.
 
 `deploy.static` is the first production promotion adapter. It consumes a bounded same-tenant
 `application/vnd.agent-os.source-bundle+json` artifact with `index.html`, stores each release below an immutable
@@ -221,8 +224,12 @@ identity can only read exact objects from the publication bucket and receives no
 control-plane secret. The publishing worker has prefix-conditioned object permissions and no delete permission.
 Credential-bearing paths and high-signal credential patterns are rejected before upload. HTML receives a
 restrictive CSP, generated apps cannot connect to the network, and the service never handles CEO
-sessions. This adapter intentionally covers static applications only; dynamic services, custom per-app domains,
-rollback/promotion inventory, deletion/retention, abuse response, and a real cloud smoke test remain separate gates.
+sessions. Static publication is one option; `deploy.service` also builds bounded source bundles in an isolated
+project, promotes digest-pinned images to scale-to-zero Cloud Run services, checks the declared health path, and
+automatically restores the prior ready revision on a failed promotion. `GET /v2/deployments` projects the
+tenant-fenced immutable receipts for previews, static sites, successful services, and failed/rolled-back releases.
+An owner can redeploy any prior source-artifact ID through the same human-approved workflow, which is the audited
+rollback path. Custom per-app domains, abuse response operations, and a real cloud smoke test remain separate gates.
 
 The CEO inbox renders live graph waits with Approve, Decline, and free-response controls. The API recomputes
 actionability from the current durable token rather than trusting a stale notification. Only owners/operators or

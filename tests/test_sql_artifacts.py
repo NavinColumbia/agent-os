@@ -99,3 +99,28 @@ def test_media_type_is_part_of_artifact_identity(store):
             organization_id="tenant-a", content=b"x", media_type="text/html\r\nX-Evil: true",
             idempotency_key="bad-media-type",
         )
+
+
+def test_artifact_inventory_is_bounded_filtered_and_tenant_scoped(store):
+    plain = store.put(
+        organization_id="tenant-a", content=b"plain", media_type="text/plain",
+        idempotency_key="inventory-plain",
+    )
+    structured = store.put(
+        organization_id="tenant-a", content=b"{}", media_type="application/json",
+        idempotency_key="inventory-json",
+    )
+    store.put(
+        organization_id="tenant-b", content=b"hidden", media_type="text/plain",
+        idempotency_key="inventory-hidden",
+    )
+
+    assert [item["artifact_id"] for item in store.list_artifacts("tenant-a")] == [
+        structured, plain,
+    ]
+    assert store.list_artifacts(
+        "tenant-a", media_types=("application/json",), limit=1,
+    )[0]["artifact_id"] == structured
+    assert store.list_artifacts("tenant-b")[0]["tenant_id"] == "tenant-b"
+    with pytest.raises(ValueError, match="limit"):
+        store.list_artifacts("tenant-a", limit=0)

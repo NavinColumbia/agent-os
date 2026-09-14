@@ -65,6 +65,7 @@ class ServerSettings:
     artifact_backend: str
     artifact_bucket: str
     artifact_max_content_bytes: int
+    artifact_retention_days: int
     host: str
     port: int
     create_schema: bool
@@ -254,6 +255,9 @@ class ServerSettings:
         ))
         if not 1 <= artifact_max_content_bytes <= 1024 * 1024 * 1024:
             raise ValueError("AOS_V2_ARTIFACT_MAX_CONTENT_BYTES must be between 1 and 1073741824")
+        artifact_retention_days = int(os.getenv("AOS_V2_ARTIFACT_RETENTION_DAYS", "365"))
+        if not 30 <= artifact_retention_days <= 3650:
+            raise ValueError("AOS_V2_ARTIFACT_RETENTION_DAYS must be between 30 and 3650")
         return cls(
             environment=environment,
             system_database_url=system_database_url,
@@ -291,6 +295,7 @@ class ServerSettings:
             artifact_backend=artifact_backend,
             artifact_bucket=artifact_bucket,
             artifact_max_content_bytes=artifact_max_content_bytes,
+            artifact_retention_days=artifact_retention_days,
             host=os.getenv("AOS_V2_HOST", "127.0.0.1"),
             port=port,
             create_schema=create_schema,
@@ -379,6 +384,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             bucket_name=settings.artifact_bucket,
             create_schema=settings.create_schema,
             max_content_bytes=settings.artifact_max_content_bytes,
+            retention_days=settings.artifact_retention_days,
         )
         resources.callback(artifact_store.close)
         usage_meter = SQLUsageMeter(

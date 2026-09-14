@@ -305,6 +305,11 @@ _INTERNAL_ROLES = {"agent", "operator", "system"}
 _MAX_API_ARTIFACT_BYTES = 2 * 1024 * 1024
 _MAX_STRIPE_WEBHOOK_BYTES = 1_000_000
 _MAX_HUMAN_RESPONSE_BYTES = 16 * 1024
+_DEPLOYMENT_RECEIPT_MEDIA_TYPES = (
+    "application/vnd.agent-os.static-site-release+json",
+    "application/vnd.agent-os.service-release+json",
+    "application/vnd.agent-os.service-release-failure+json",
+)
 _WEB_ROOT = Path(__file__).with_name("web")
 _PUBLIC_IDENTITY_KEYS = {
     "identity_mode", "authorization_url", "token_url", "client_id", "scope", "audience",
@@ -1156,6 +1161,53 @@ def create_app(
             return {"items": rendered}
 
     if artifact_store is not None:
+        @app.get("/v2/deployments")
+        def list_deployments(
+            principal: Annotated[Principal, Depends(current_principal)],
+            limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        ) -> Mapping[str, Any]:
+            items: list[dict[str, Any]] = []
+            for record in artifact_store.list_artifacts(
+                principal.organization_id,
+                media_types=_DEPLOYMENT_RECEIPT_MEDIA_TYPES,
+                limit=limit,
+            ):
+                artifact_id = str(record.get("artifact_id") or "")
+                content = artifact_store.get(principal.organization_id, artifact_id)
+                try:
+                    receipt = json.loads(content) if content is not None else None
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    receipt = None
+                if not isinstance(receipt, Mapping):
+                    items.append({
+                        "kind": "deployment_receipt",
+                        "status": (
+                            "receipt_expired" if content is None else "corrupt"
+                        ),
+                        "receipt_artifact_id": artifact_id,
+                        "created_at": record.get("created_at"),
+                    })
+                    continue
+                item = dict(receipt)
+                item.update({
+                    "status": (
+                        "failed" if item.get("kind") == "cloud_run_service_failure"
+                        else "active"
+                    ),
+                    "receipt_artifact_id": artifact_id,
+                    "created_at": record.get("created_at"),
+                })
+                items.append(item)
+            if preview_deployments is not None:
+                items.extend({"kind": "preview", **dict(item)} for item in (
+                    preview_deployments.list_previews(principal.organization_id, limit=limit)
+                ))
+            items.sort(
+                key=lambda item: (str(item.get("created_at") or ""), str(item.get("deployment_id") or "")),
+                reverse=True,
+            )
+            return {"items": items[:limit]}
+
         @app.post("/v2/artifacts", status_code=201)
         def upload_artifact(
             body: ArtifactUploadRequest,

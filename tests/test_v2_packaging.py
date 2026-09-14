@@ -39,6 +39,10 @@ def test_migration_image_orders_numeric_revisions_and_compatibility_suffixes():
     assert "for f in postgres/initdb/*.sql" not in ci
     assert "suffix_length" in ci
     assert "-k1,1n -k2,2n" in ci
+    assert "actions/checkout@v5" not in ci
+    assert "actions/setup-python@v6" not in ci
+    assert "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09" in ci
+    assert "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1" in ci
 
 
 def test_packaged_cli_exposes_api_and_worker_processes():

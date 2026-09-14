@@ -235,11 +235,12 @@ def evaluate(values: Mapping[str, str], *, require_bootstrap_secrets: bool) -> d
         values.get("AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT") or "OPENAI_API_KEY"
     )
     expected_environment = (
-        "OPENAI_API_KEY" if model.startswith("openai:")
-        else "ANTHROPIC_API_KEY" if model.startswith("anthropic:")
-        else None
+        {"OPENAI_API_KEY"} if model.startswith("openai:")
+        else {"ANTHROPIC_API_KEY"} if model.startswith("anthropic:")
+        else {"GEMINI_API_KEY", "GOOGLE_API_KEY"} if model.startswith("google:")
+        else set()
     )
-    model_ok = expected_environment is not None and provider_environment == expected_environment
+    model_ok = provider_environment in expected_environment
     add(
         "model provider binding",
         model_ok,

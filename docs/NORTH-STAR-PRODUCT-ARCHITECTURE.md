@@ -408,16 +408,16 @@ Before public paid access, the thin vertical must prove:
 - status derives from authoritative workflow/domain state and includes last progress, current owner, reason,
   evidence, expected next update, and customer options.
 
-The initial V2 management projection now implements the read side of the final item: it joins adaptive graph
-tokens to tenant-fenced queue attempts and leases, exposes mission-scoped roles and managers, and retains bounded
-agent proposals for communication, delegation, staffing, risks, and decisions. It treats “slow but owned” as a
-diagnostic condition rather than a timeout. Durable periodic watches now deliver deduplicated nonterminal manager
-signals, bounded persistent-condition escalation, and recovery notices. The write side is still incremental:
-an immutable standing company stream now preserves authorized AI-role hiring and retirement across directives
-and injects that roster into agent context. Human/vendor/team changes, automatic policy-bounded proposal
-application, and contextual manager-agent repair/reassignment turns must still be completed before this is
-described as the full persistent AI organization runtime. AI staffing proposals now have stable identities and
-an authorized, atomic promote/reject path; automatic approval is intentionally separate from self-approval.
+The V2 management projection joins adaptive graph tokens to tenant-fenced queue attempts and leases, exposes
+mission-scoped roles and managers, and retains bounded agent proposals for communication, delegation, staffing,
+risks, and decisions. It treats “slow but owned” as a diagnostic condition rather than a timeout. Durable periodic
+watches deliver deduplicated nonterminal health signals, metered manager-agent diagnosis, bounded escalation, and
+recovery notices while renewing their lease through a long model turn. An immutable standing company stream
+preserves authorized AI-role hiring and retirement across directives and injects that roster into agent context.
+Human/vendor onboarding, team placement, and role changes use explicit proposal/decision/effect records; AI
+staffing proposals have stable identities and an atomic promote/reject path. Policy-authorized actions may proceed
+automatically, while external spend, hiring, credentials, and typed human authority remain correlated waits rather
+than self-approval.
 
 Initial external SLOs should be honest rather than copying the aspirational 99.99% North-Star target:
 
@@ -546,16 +546,27 @@ scale-to-zero API, worker pool, ordered migration job, private registry/storage,
 service identities, remote state and repository-ID-bound GitHub federation, but it has not been applied to a real
 cloud account. Its private bucket is now used by a production GCS `ArtifactStore`: create-only object generations
 hold payload bytes while RLS-protected SQL retains tenant identity/idempotency, and reads verify the recorded
-generation, length, and digest. Production refuses the small inline SQL adapter. It still has overlapping legacy
-controllers, local-host assumptions, unfinished public infrastructure, no configured provider tenant or complete
-multi-user invite/organization onboarding (although provider-neutral OIDC/JWKS verification now supports a
-zero-touch personal-company path derived from the verified issuer/subject),
-no per-paying-tenant sandbox/generated-app project allocator or general-subworkflow adapters (although the first
-secretless cross-project Cloud Run Job sandbox, human-gated static publisher, and digest-pinned Cloud Run service
-deployer are now wired). The remaining browser-to-production proof is the managed-cloud activation path: apply
+generation, length, and digest. Production refuses the small inline SQL adapter. The repository retains the legacy
+runtime as migration evidence, but the production image and GCP processes contain only V2. Public edge, personal
+tenant onboarding, identity-bound memberships/invitations, and external-human onboarding are implemented; their
+provider accounts and live configuration are not. Per-paying-tenant sandbox/generated-app project allocation is a
+higher-isolation scale tier; the bootstrap cell uses separate shared sandbox and generated-app projects with
+secretless runtimes and hard resource ceilings. Recursive general-subworkflow launch, the first secretless
+cross-project Cloud Run Job sandbox, human-gated static publisher, and digest-pinned Cloud Run service deployer are
+wired. The remaining browser-to-production proof is the managed-cloud activation path: apply
 the cell in a real account, connect identity/model/billing secrets and DNS, run the same vertical against managed
 PostgreSQL, GCS, Cloud Run Jobs, and the public router, then retain its health/rollback evidence.
-This is a real durable execution spine, not yet the finished platform.
+The worker now also performs metered, lease-renewed mission-manager diagnosis when sustained health signals appear;
+provider failure cannot suppress deterministic alerts or escalation. Notification routes deliver through governed
+tenant HTTP connectors with durable retry/redrive, and generated static/backend applications have least-privilege,
+auditable emergency suspend/restore operations. Identity-bound memberships, external human staffing onboarding,
+tenant BYOK model policy, and OpenAI/Anthropic/Google platform-model deployment are wired. The clean production
+image excludes the legacy controllers entirely.
+
+This is a real durable execution spine and a complete repository-side bootstrap cell. Managed-cloud activation is
+blocked on external projects, database/identity/payment/model/DNS/notification configuration and the resulting live
+evidence, not on another local state-machine rewrite. Higher isolation tiers and million-user capacity remain
+measurement-driven scale work after initial customer operation, as documented in `PRODUCTION-ACTIVATION.md`.
 
 Therefore:
 

@@ -78,6 +78,9 @@ export AOS_V2_MODEL=openai:gpt-5-mini
 export AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT=OPENAI_API_KEY
 export AOS_V2_MODEL_PROVIDER_KEY=replace
 
+# Google/Gemini is also supported: use `google:<model>` with
+# AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT=GEMINI_API_KEY (or GOOGLE_API_KEY).
+
 # Optional reviewed override; the repository already carries an immutable default.
 export AOS_V2_APP_BUILDER_IMAGE='gcr.io/cloud-builders/docker@sha256:3d00b6c1a9b862621c30fc74d4f2abfc62bcbdee631ed3febd31e7edbdf6252c'
 
@@ -146,8 +149,9 @@ no database, model, Stripe, or application secret. The worker passes one input a
 short-lived V4 signed URLs; its self-signing permission cannot add storage authority it does not already possess.
 The Job uses a bounded in-memory workspace, a digest-pinned minimal image, a non-root tenant child process, direct
 argv, resource/time/log/output ceilings, and immutable result evidence. Temporary transfer objects expire under the
-bucket's 30-day cleanup rule. A future project-pool allocator will tighten the boundary from one separate untrusted
-execution project to Google's recommended one-project-per-paying-tenant model.
+bucket's 30-day cleanup rule. At higher-risk or materially larger scale, a project-pool allocator can tighten the
+boundary from this separate shared untrusted-execution project to one project per paying tenant without changing
+the sandbox adapter contract.
 
 The generated-app project contains only a seven-day source-staging bucket, a customer-image registry, the minimal
 build and zero-role runtime identities, and dynamically created Cloud Run services. The control worker can
@@ -242,8 +246,10 @@ Rollback updates only the API, worker, and public app router to the prior digest
 nor executes the migration Job. Database revisions must therefore follow the documented expand/contract contract;
 destructive schema reversal is an incident-specific, reviewed recovery action rather than an automated rollback.
 
-The GCP plane does not make the current product fully launch-ready by itself. A real domain, OIDC organization
-tenant, Stripe products/webhook, managed PostgreSQL, model key, per-paying-tenant generated-app project allocator,
-artifact/image garbage collector,
-backup/restore drills, notification-channel delivery, and an external smoke test
-must still be configured or proven.
+The repository-side bootstrap cell is complete, but it cannot activate itself. A real domain, OIDC application,
+Stripe products/webhook, managed PostgreSQL, model key, notification destination, deploy identity, and external
+DNS/TLS/smoke evidence must still be supplied or observed. Artifact payload expiry is already enforced by the GCS
+lifecycle policy; generated applications remain live until an approved release, incident suspension, or later
+customer offboarding action. Per-customer project allocation, higher worker capacity, database partitioning, and
+regional recovery are measured scale stages before materially exceeding the first-customer cell—not reasons to
+replace its ports or state model. See `docs/PRODUCTION-ACTIVATION.md` for the exact handoff boundary.

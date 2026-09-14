@@ -70,6 +70,9 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert "AOS_V2_ARTIFACT_RETENTION_DAYS" in main
     assert "days_since_noncurrent_time = 7" in main
     assert 'TF_VAR_artifact_retention_days="${AOS_V2_ARTIFACT_RETENTION_DAYS:-365}"' in deploy
+    variables = text("deploy/gcp/variables.tf")
+    assert "GEMINI_API_KEY" in variables and "GOOGLE_API_KEY" in variables
+    assert 'startswith(var.model, "google:")' in main
     subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/deploy.sh")], check=True)
 
 

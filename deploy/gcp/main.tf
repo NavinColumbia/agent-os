@@ -26,6 +26,17 @@ check "production_inputs" {
   }
 
   assert {
+    condition = (
+      (startswith(var.model, "openai:") && var.model_provider_secret_environment == "OPENAI_API_KEY") ||
+      (startswith(var.model, "anthropic:") && var.model_provider_secret_environment == "ANTHROPIC_API_KEY") ||
+      (startswith(var.model, "google:") && contains(
+        ["GEMINI_API_KEY", "GOOGLE_API_KEY"], var.model_provider_secret_environment
+      ))
+    )
+    error_message = "The model provider and isolated provider-secret environment must match."
+  }
+
+  assert {
     condition     = var.github_repository_id == "" || var.state_bucket_name != ""
     error_message = "state_bucket_name is required when GitHub deployment identity is enabled."
   }

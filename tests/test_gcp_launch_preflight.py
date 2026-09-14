@@ -57,6 +57,26 @@ def test_launch_preflight_accepts_complete_isolated_live_configuration():
     assert all(check["ok"] for check in report["checks"])
 
 
+def test_launch_preflight_accepts_google_provider_with_either_supported_secret_name():
+    for environment in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        values = complete_values()
+        values["AOS_V2_MODEL"] = "google:gemini-2.5-pro"
+        values["AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT"] = environment
+        report = preflight.evaluate(values, require_bootstrap_secrets=True)
+        assert report["ok"] is True, report
+
+
+def test_launch_preflight_rejects_a_provider_secret_name_mismatch():
+    values = complete_values()
+    values["AOS_V2_MODEL"] = "google:gemini-2.5-pro"
+    values["AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT"] = "OPENAI_API_KEY"
+    report = preflight.evaluate(values, require_bootstrap_secrets=True)
+    assert report["ok"] is False
+    assert "model provider binding" in {
+        item["check"] for item in report["checks"] if not item["ok"]
+    }
+
+
 def test_launch_preflight_names_missing_inputs_without_exposing_values():
     values = complete_values()
     values.pop("GCP_APP_PROJECT_ID")

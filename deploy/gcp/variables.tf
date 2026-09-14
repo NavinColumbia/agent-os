@@ -279,8 +279,10 @@ variable "model_provider_secret_environment" {
   default     = "OPENAI_API_KEY"
 
   validation {
-    condition     = contains(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"], var.model_provider_secret_environment)
-    error_message = "Only the currently packaged OpenAI or Anthropic provider secret names are supported."
+    condition = contains([
+      "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    ], var.model_provider_secret_environment)
+    error_message = "Only packaged OpenAI, Anthropic, or Google provider secret names are supported."
   }
 }
 

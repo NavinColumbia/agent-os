@@ -158,6 +158,20 @@ def test_static_release_is_immutable_idempotent_and_served_from_separate_router(
         assert "connect-src 'none'" in immutable.headers["content-security-policy"]
         assert immutable.headers["x-content-type-options"] == "nosniff"
         assert "Shipped" in immutable.text
+
+        pointer_name = f"routes/{first['route_id']}.json"
+        pointer = json.loads(cloud.value.objects[pointer_name]["content"])
+        pointer["status"] = "suspended"
+        cloud.value.objects[pointer_name]["content"] = json.dumps(pointer).encode()
+        assert router.get(f"/p/{first['route_id']}/").status_code == 410
+        suspended_asset = router.get(stable.headers["location"])
+        assert suspended_asset.status_code == 410
+        assert suspended_asset.headers["cache-control"] == "no-store"
+
+        pointer["status"] = "active"
+        cloud.value.objects[pointer_name]["content"] = json.dumps(pointer).encode()
+        assert router.get(f"/p/{first['route_id']}/", follow_redirects=False).status_code == 307
+        assert router.get(stable.headers["location"]).status_code == 200
         assert router.get("/p/not-a-route/").status_code == 404
     finally:
         artifacts.close()

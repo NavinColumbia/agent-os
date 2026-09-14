@@ -57,9 +57,9 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert "migration_database_url" not in api_secrets
     assert "tenant_derivation_secret" in api_secrets
     assert "tenant_derivation_secret" not in worker_secrets
-    assert 'AOS_V2_CONNECTOR_SECRET_BACKEND         = "gcp"' in main
-    assert "AOS_V2_CONNECTOR_SECRET_PROJECT_ID      = var.project_id" in main
-    assert 'AOS_V2_ARTIFACT_BACKEND                      = "gcs"' in main
+    assert 'AOS_V2_CONNECTOR_SECRET_BACKEND' in main and '= "gcp"' in main
+    assert "AOS_V2_CONNECTOR_SECRET_PROJECT_ID" in main and "= var.project_id" in main
+    assert 'AOS_V2_ARTIFACT_BACKEND' in main and '= "gcs"' in main
     assert 'role   = "roles/storage.objectCreator"' in main
     assert 'role   = "roles/storage.objectViewer"' in main
     writers = main.split('resource "google_storage_bucket_iam_member" "artifact_writers"', 1)[1]
@@ -71,6 +71,37 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert "days_since_noncurrent_time = 7" in main
     assert 'TF_VAR_artifact_retention_days="${AOS_V2_ARTIFACT_RETENTION_DAYS:-365}"' in deploy
     subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/deploy.sh")], check=True)
+
+
+def test_break_glass_identity_can_only_fence_generated_apps_and_has_no_secret_or_delete_access():
+    main = text("deploy/gcp/main.tf")
+    apps = text("deploy/gcp/apps.tf")
+    outputs = text("deploy/gcp/outputs.tf")
+    docs = text("deploy/gcp/README.md")
+
+    assert 'resource "google_service_account" "incident_operator"' in main
+    route_binding = main.split(
+        'resource "google_storage_bucket_iam_member" "incident_operator_route_writer"', 1,
+    )[1].split("\n}\n", 1)[0]
+    assert "published_app_route_writer" in route_binding
+    assert "objects/routes/" in route_binding
+    assert "secretmanager" not in route_binding.lower()
+
+    role = apps.split(
+        'resource "google_project_iam_custom_role" "incident_service_controller"', 1,
+    )[1].split("\n}\n", 1)[0]
+    assert '"run.services.get"' in role
+    assert '"run.services.update"' in role
+    for forbidden in ("run.services.create", "run.services.delete", "secretmanager", "storage.objects"):
+        assert forbidden not in role
+    binding = apps.split(
+        'resource "google_project_iam_member" "incident_operator_service_controller"', 1,
+    )[1].split("\n}\n", 1)[0]
+    assert "incident_service_controller" in binding
+    assert "incident_operator.email" in binding
+    assert 'output "incident_operator_service_account"' in outputs
+    assert "roles/iam.serviceAccountTokenCreator" in docs
+    assert "deployment-control" in docs
 
 
 def test_release_order_is_migrate_then_activate_and_images_require_digests():

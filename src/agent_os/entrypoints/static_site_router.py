@@ -111,14 +111,7 @@ def create_static_site_router(
                 detail="published application storage is temporarily unavailable",
             ) from exc
 
-    @app.get("/health", include_in_schema=False)
-    def health() -> Mapping[str, str]:
-        return {"status": "ok"}
-
-    @app.get("/p/{route_id}/", include_in_schema=False)
-    def stable_route(route_id: str) -> Response:
-        if not _ROUTE_ID.fullmatch(route_id):
-            raise HTTPException(status_code=404, detail="published application not found")
+    def active_revision(route_id: str) -> str:
         content = download(f"routes/{route_id}.json")
         try:
             pointer = json.loads(content)
@@ -132,6 +125,26 @@ def create_static_site_router(
             or not _REVISION.fullmatch(revision)
         ):
             raise HTTPException(status_code=503, detail="published route is corrupt")
+        route_status = pointer.get("status", "active")
+        if route_status == "suspended":
+            raise HTTPException(
+                status_code=410,
+                detail="published application is suspended",
+                headers={"Cache-Control": "no-store", **_security_headers(html=False)},
+            )
+        if route_status != "active":
+            raise HTTPException(status_code=503, detail="published route is corrupt")
+        return revision
+
+    @app.get("/health", include_in_schema=False)
+    def health() -> Mapping[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/p/{route_id}/", include_in_schema=False)
+    def stable_route(route_id: str) -> Response:
+        if not _ROUTE_ID.fullmatch(route_id):
+            raise HTTPException(status_code=404, detail="published application not found")
+        revision = active_revision(route_id)
         response = RedirectResponse(
             url=f"/p/{route_id}/{revision}/index.html",
             status_code=307,
@@ -143,6 +156,10 @@ def create_static_site_router(
     def immutable_asset(route_id: str, revision: str, asset_path: str) -> Response:
         if not _ROUTE_ID.fullmatch(route_id) or not _REVISION.fullmatch(revision):
             raise HTTPException(status_code=404, detail="application asset not found")
+        # Immutable URLs stay cacheable, but every fresh request still checks
+        # the stable route kill switch so incident response can fence all known
+        # revisions without deleting forensic release objects.
+        active_revision(route_id)
         path = _safe_asset_path(asset_path)
         content = download(f"releases/{route_id}/{revision}/{path}")
         media_type = mimetypes.guess_type(path)[0]

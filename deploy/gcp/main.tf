@@ -289,6 +289,14 @@ resource "google_service_account" "builder" {
   display_name = "Agent OS ${var.environment} Cloud Build"
 }
 
+# A human assumes this identity only during a declared incident. It can fence
+# generated applications, but cannot read runtime secrets, delete evidence, or
+# mutate the Agent OS control API/worker.
+resource "google_service_account" "incident_operator" {
+  account_id   = "${local.prefix}-incident"
+  display_name = "Agent OS ${var.environment} generated-app incident operator"
+}
+
 resource "google_secret_manager_secret" "runtime" {
   for_each = local.secret_ids
 
@@ -390,6 +398,17 @@ resource "google_storage_bucket_iam_member" "published_app_route_writer" {
 
   condition {
     title      = "route_pointer_prefix_only"
+    expression = "resource.name.startsWith('projects/_/buckets/${google_storage_bucket.published_apps.name}/objects/routes/')"
+  }
+}
+
+resource "google_storage_bucket_iam_member" "incident_operator_route_writer" {
+  bucket = google_storage_bucket.published_apps.name
+  role   = google_project_iam_custom_role.published_app_route_writer.name
+  member = "serviceAccount:${google_service_account.incident_operator.email}"
+
+  condition {
+    title      = "incident_route_pointer_prefix_only"
     expression = "resource.name.startsWith('projects/_/buckets/${google_storage_bucket.published_apps.name}/objects/routes/')"
   }
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from threading import Event
 
 import click
@@ -18,6 +19,7 @@ from agent_os.infrastructure.http_connector_tools import (
     FileConnectorSecretResolver,
     GCPConnectorSecretResolver,
 )
+from agent_os.infrastructure.deployment_operations import GCPDeploymentOperator
 
 
 @click.group()
@@ -108,3 +110,34 @@ def connector_secret_name(organization: str, credential_ref: str, backend: str) 
             + "/" + credential_ref
         )
     click.echo(json.dumps({"backend": backend, "locator": locator}))
+
+
+@main.command("deployment-control")
+@click.option("--kind", type=click.Choice(("static", "service")), required=True)
+@click.option("--action", type=click.Choice(("suspend", "resume")), required=True)
+@click.option("--target", required=True, help="Opaque route ID or generated Cloud Run service name.")
+@click.option("--reason", default="", help="Required for suspension; recorded in the operator result.")
+@click.option("--actor", required=True, help="Incident operator identity or ticket reference.")
+def deployment_control(kind: str, action: str, target: str, reason: str, actor: str) -> None:
+    """Suspend or restore one generated application using ADC break-glass authority."""
+
+    try:
+        operator = GCPDeploymentOperator(
+            published_bucket=os.getenv("AOS_V2_PUBLISHED_APP_BUCKET", "").strip(),
+            app_project_id=os.getenv("AOS_V2_APP_PROJECT_ID", "").strip(),
+            region=os.getenv("AOS_V2_APP_REGION", "").strip(),
+        )
+        try:
+            if kind == "static":
+                result = operator.set_static_route(
+                    target, suspended=action == "suspend", reason=reason, actor=actor,
+                )
+            else:
+                result = operator.set_service(
+                    target, suspended=action == "suspend", reason=reason, actor=actor,
+                )
+        finally:
+            operator.close()
+    except (ConnectionError, LookupError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, sort_keys=True))

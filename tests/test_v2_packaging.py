@@ -56,6 +56,7 @@ def test_packaged_cli_exposes_api_and_worker_processes():
     assert "serve" in result.output
     assert "worker" in result.output
     assert "connector-secret-name" in result.output
+    assert "deployment-control" in result.output
 
 
 def test_connector_secret_locator_cli_is_deterministic_and_secret_free():
@@ -69,6 +70,41 @@ def test_connector_secret_locator_cli_is_deterministic_and_secret_free():
     assert payload["locator"].startswith("agentos-connector-")
     assert "tenant-a" not in payload["locator"]
     assert "jira-token" not in payload["locator"]
+
+
+def test_deployment_control_cli_routes_one_bounded_break_glass_action(monkeypatch):
+    calls = []
+
+    class Operator:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def set_static_route(self, target, **kwargs):
+            calls.append((target, kwargs))
+            return {"kind": "static_site", "target": target, "status": "suspended"}
+
+        def close(self):
+            calls.append(("close", {}))
+
+    monkeypatch.setattr("agent_os.entrypoints.cli.GCPDeploymentOperator", Operator)
+    monkeypatch.setenv("AOS_V2_PUBLISHED_APP_BUCKET", "bucket")
+    monkeypatch.setenv("AOS_V2_APP_PROJECT_ID", "app-project")
+    monkeypatch.setenv("AOS_V2_APP_REGION", "us-central1")
+    result = CliRunner().invoke(main, [
+        "deployment-control", "--kind", "static", "--action", "suspend",
+        "--target", "R" * 43, "--reason", "INC-9", "--actor", "on-call",
+    ])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["status"] == "suspended"
+    assert calls == [
+        ("init", {
+            "published_bucket": "bucket", "app_project_id": "app-project",
+            "region": "us-central1",
+        }),
+        ("R" * 43, {"suspended": True, "reason": "INC-9", "actor": "on-call"}),
+        ("close", {}),
+    ]
 
 
 def test_evaluation_compose_runs_api_and_worker_from_the_same_image():

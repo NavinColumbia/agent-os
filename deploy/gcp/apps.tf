@@ -202,6 +202,26 @@ resource "google_project_iam_member" "worker_app_service_controller" {
   member  = "serviceAccount:${google_service_account.worker.email}"
 }
 
+resource "google_project_iam_custom_role" "incident_service_controller" {
+  provider = google.apps
+
+  role_id     = replace("${local.prefix}_incident_service_controller", "-", "_")
+  title       = "Agent OS ${var.environment} generated-app incident control"
+  description = "Read and suspend or restore existing generated Cloud Run services without create or delete authority"
+  permissions = [
+    "run.services.get",
+    "run.services.update",
+  ]
+}
+
+resource "google_project_iam_member" "incident_operator_service_controller" {
+  provider = google.apps
+
+  project = var.app_project_id
+  role    = google_project_iam_custom_role.incident_service_controller.name
+  member  = "serviceAccount:${google_service_account.incident_operator.email}"
+}
+
 resource "google_service_account_iam_member" "worker_app_builder_act_as" {
   provider = google.apps
 

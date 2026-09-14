@@ -161,6 +161,41 @@ minutes. Pass one or more existing Monitoring notification-channel resource name
 `TF_VAR_alert_notification_channels`; the policy is still created without a destination so missing paging wiring is
 visible in infrastructure state rather than silently invented. Test every configured channel before launch.
 
+## Generated-application emergency control
+
+The cell creates a dedicated incident-operator service account with no Secret Manager, database, build, artifact
+deletion, or control-plane authority. It can atomically change only static route pointers and can get/update (but
+not create or delete) generated Cloud Run services. Grant a named on-call principal
+`roles/iam.serviceAccountTokenCreator` on that one service account after the external identity is known; do not
+download a service-account key.
+
+During a declared incident, authenticate with Application Default Credentials by impersonating the
+`incident_operator_service_account` output, retain the incident ticket in `--reason`, and fence only the opaque
+route or deterministic service named by the deployment receipt:
+
+```bash
+export AOS_V2_PUBLISHED_APP_BUCKET="$(tofu -chdir=deploy/gcp output -raw published_app_bucket)"
+export AOS_V2_APP_PROJECT_ID="$GCP_APP_PROJECT_ID"
+export AOS_V2_APP_REGION="$GCP_REGION"
+INCIDENT_SA="$(tofu -chdir=deploy/gcp output -raw incident_operator_service_account)"
+gcloud auth application-default login --impersonate-service-account="$INCIDENT_SA"
+
+agentos-v2 deployment-control --kind static --action suspend \
+  --target "$OPAQUE_ROUTE_ID" --reason "INC-123 containment" --actor "$ON_CALL_IDENTITY"
+agentos-v2 deployment-control --kind service --action suspend \
+  --target "$GENERATED_SERVICE_NAME" --reason "INC-123 containment" --actor "$ON_CALL_IDENTITY"
+
+# Restore only after the incident decision is recorded.
+agentos-v2 deployment-control --kind static --action resume \
+  --target "$OPAQUE_ROUTE_ID" --actor "$ON_CALL_IDENTITY"
+```
+
+Static suspension is stored in the generation-guarded route pointer and fences both the stable URL and fresh
+requests to every immutable revision while retaining release objects for forensics. Cloud Run suspension restores
+IAM enforcement by setting `invokerIamDisabled=false`; resumption reverses that exact field. Both operations are
+idempotent, bounded, and appear under the assumed identity in Cloud Audit Logs. Save the command's JSON result with
+the incident record.
+
 The script defaults GitHub repository ID to this repository's immutable ID (`1276674620`), not its reusable name.
 After the first apply, set these GitHub repository/environment variables from the OpenTofu outputs:
 

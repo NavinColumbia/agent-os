@@ -93,6 +93,10 @@ output "build_service_account" {
   value = google_service_account.builder.name
 }
 
+output "incident_operator_service_account" {
+  value = google_service_account.incident_operator.email
+}
+
 output "github_workload_identity_provider" {
   value = try(google_iam_workload_identity_pool_provider.github[0].name, null)
 }

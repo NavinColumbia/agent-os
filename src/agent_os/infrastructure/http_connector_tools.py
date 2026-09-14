@@ -321,7 +321,8 @@ class HTTPConnectorToolNodeHandlers:
             or any(character in path for character in "\r\n?#")
             or any(segment in {".", ".."} for segment in decoded_segments)
             or not any(
-                path == prefix or prefix.endswith("/") or path.startswith(prefix + "/")
+                path == prefix
+                or path.startswith(prefix if prefix.endswith("/") else prefix + "/")
                 for prefix in connector.allowed_path_prefixes
             )
         ):

@@ -44,6 +44,10 @@ from agent_os.infrastructure.mission_workflows import (
     WorkflowLaunchToolNodeHandlers,
 )
 from agent_os.infrastructure.notification_effects import NotificationEffectHandlers
+from agent_os.infrastructure.notification_delivery import (
+    DurableNotificationDeliveryWorker,
+    GovernedNotificationSender,
+)
 from agent_os.infrastructure.pydantic_agents import PydanticAgentRuntime
 from agent_os.infrastructure.pydantic_graph_nodes import PydanticGraphNodeRuntime
 from agent_os.infrastructure.retry_effects import RetryScheduleHandler
@@ -555,10 +559,21 @@ def run_worker(
             escalation_checks=settings.management_escalation_checks,
             retry_delay_seconds=max(1, int(settings.error_backoff_seconds)),
         )
+        notification_worker = DurableNotificationDeliveryWorker(
+            store=notification_store,
+            sender=GovernedNotificationSender(
+                connector_registry,
+                connector_secrets,
+            ),
+            worker_id=settings.worker_id,
+            lease_seconds=settings.lease_seconds,
+            retry_policy=RetryPolicy(max_attempts=settings.retry_max_attempts),
+        )
         tenant_worker = TenantWorkMultiplexer(
             lifecycle_worker=worker,
             graph_worker=graph_worker,
             management_worker=management_worker,
+            notification_worker=notification_worker,
         )
         loop_options: dict[str, Any] = {"organization_ids": settings.organization_ids}
         if not settings.organization_ids:

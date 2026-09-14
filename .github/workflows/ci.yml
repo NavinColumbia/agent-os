@@ -49,7 +49,21 @@ jobs:
           } > .env.local
       - name: migrations
         run: |
-          for f in postgres/initdb/*.sql; do
+          find postgres/initdb -maxdepth 1 -type f -name '*.sql' -print |
+          awk '
+          {
+            count = split($0, parts, "/")
+            base = parts[count]
+            match(base, /^[0-9]+/)
+            revision = substr(base, RSTART, RLENGTH) + 0
+            stem = base
+            sub(/-.*/, "", stem)
+            suffix_length = length(stem) - RLENGTH
+            printf "%012d\t%04d\t%s\n", revision, suffix_length, $0
+          }' |
+          sort -t $'\t' -k1,1n -k2,2n -k3,3 |
+          cut -f3- |
+          while IFS= read -r f; do
             PGPASSWORD=ci psql -h 127.0.0.1 -p 5433 -U agentos -d agentos -v ON_ERROR_STOP=1 -f "$f"
           done
       - name: security scan

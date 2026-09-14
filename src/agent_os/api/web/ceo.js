@@ -414,6 +414,191 @@ async function resolveHumanRequest(item, response, actions) {
   }
 }
 
+function field(placeholder, ariaLabel, maxLength = 256) {
+  const input = document.createElement("input");
+  input.placeholder = placeholder; input.maxLength = maxLength;
+  input.setAttribute("aria-label", ariaLabel);
+  return input;
+}
+
+function integrationCard(title, description) {
+  const card = el("section", "panel integration-card");
+  card.append(el("h4", "", title), el("p", "muted", description));
+  return card;
+}
+
+async function disableIntegration(path, reason) {
+  await api(path, {
+    method: "DELETE", headers: {"Idempotency-Key": `disable-${crypto.randomUUID()}`},
+    body: JSON.stringify({reason}),
+  });
+  setFlash("Integration disabled. Queued notifications were cancelled.");
+  await loadIntegrations();
+}
+
+async function loadIntegrations() {
+  const content = byId("integrations-content");
+  content.replaceChildren(el("div", "empty", "Loading governed capabilities…"));
+  const [connectorPayload, routePayload, deliveryPayload] = await Promise.all([
+    api("/v2/connectors"), api("/v2/notification-routes"),
+    api("/v2/notification-deliveries?limit=100"),
+  ]);
+  const connectors = connectorPayload.items || [];
+  const routes = routePayload.items || [];
+  const deliveries = deliveryPayload.items || [];
+  content.replaceChildren();
+
+  const connectorCard = integrationCard(
+    "Add an HTTPS connector",
+    "Approve one exact origin, path family, and authentication reference. Secret values stay outside the application database.",
+  );
+  const connectorForm = el("div", "integration-form");
+  const connectorId = field("Connector ID (for example slack-api)", "Connector ID", 64);
+  const connectorName = field("Display name", "Connector display name", 200);
+  const connectorOrigin = field("HTTPS origin (https://api.example.com)", "Connector HTTPS origin", 2000);
+  const connectorPath = field("Allowed path prefix (/v1/events)", "Allowed connector path", 2000);
+  const credentialRef = field("Credential reference (optional)", "Connector credential reference", 128);
+  const authKind = document.createElement("select"); authKind.setAttribute("aria-label", "Authentication kind");
+  for (const [value, title] of [["bearer", "Bearer token"], ["header", "API key header"], ["none", "No authentication"]]) {
+    const option = el("option", "", title); option.value = value; authKind.append(option);
+  }
+  const authHeader = field("Header name (for API key)", "Authentication header", 128);
+  const addConnector = el("button", "primary", "Add connector"); addConnector.type = "button";
+  addConnector.addEventListener("click", async () => {
+    addConnector.disabled = true;
+    try {
+      const auth = authKind.value;
+      await api("/v2/connectors", {
+        method: "POST", headers: {"Idempotency-Key": `connector-${crypto.randomUUID()}`},
+        body: JSON.stringify({
+          connector_id: connectorId.value.trim(), display_name: connectorName.value.trim(),
+          base_url: connectorOrigin.value.trim(), allowed_path_prefixes: [connectorPath.value.trim()],
+          allowed_methods: ["POST"], auth_kind: auth,
+          credential_ref: auth === "none" ? null : credentialRef.value.trim(),
+          auth_header: auth === "header" ? authHeader.value.trim() : null,
+          idempotency_header: "Idempotency-Key", timeout_seconds: 30,
+          max_response_bytes: 262144,
+        }),
+      });
+      setFlash("Connector policy saved. Provision the named credential, then attach an alert route.");
+      await loadIntegrations();
+    } catch (error) { setFlash(error.message, "error"); }
+    finally { addConnector.disabled = false; }
+  });
+  connectorForm.append(
+    connectorId, connectorName, connectorOrigin, connectorPath,
+    authKind, credentialRef, authHeader, addConnector,
+  );
+  connectorCard.append(connectorForm);
+  const connectorList = el("div", "people");
+  for (const connector of connectors) {
+    const item = el("div", "person");
+    item.append(
+      el("strong", "", connector.display_name),
+      el("small", "", `${connector.connector_id} · ${connector.active ? "active" : "disabled"} · ${connector.base_url}`),
+    );
+    if (connector.active) {
+      const disable = el("button", "danger", "Disable"); disable.type = "button";
+      disable.addEventListener("click", () => disableIntegration(
+        `/v2/connectors/${encodeURIComponent(connector.connector_id)}`,
+        "Disabled in the CEO workspace",
+      ).catch((error) => setFlash(error.message, "error")));
+      item.append(disable);
+    }
+    connectorList.append(item);
+  }
+  if (!connectors.length) connectorList.append(el("div", "empty", "No connectors yet."));
+  connectorCard.append(connectorList); content.append(connectorCard);
+
+  const routeCard = integrationCard(
+    "Send important alerts externally",
+    "Route human decisions, failures, and management escalations through an active POST connector. Deliveries retry durably and remain auditable.",
+  );
+  const routeForm = el("div", "integration-form compact-form");
+  const routeId = field("Route ID (executive-alerts)", "Notification route ID", 64);
+  const routeName = field("Route display name", "Notification route display name", 200);
+  const routeConnector = document.createElement("select"); routeConnector.setAttribute("aria-label", "Notification connector");
+  for (const connector of connectors.filter((item) => item.active && (item.allowed_methods || []).includes("POST"))) {
+    const option = el("option", "", connector.display_name); option.value = connector.connector_id; routeConnector.append(option);
+  }
+  const routePath = field("Exact delivery path (/v1/events/agent-os)", "Notification delivery path", 2000);
+  const routeFormat = document.createElement("select"); routeFormat.setAttribute("aria-label", "Notification payload format");
+  for (const value of ["agent-os", "slack"]) {
+    const option = el("option", "", value === "agent-os" ? "Generic Agent OS webhook" : "Slack channel message");
+    option.value = value; routeFormat.append(option);
+  }
+  const destination = field("Slack channel (only for Slack)", "Notification destination", 256);
+  const addRoute = el("button", "primary", "Activate alerts"); addRoute.type = "button";
+  addRoute.disabled = !routeConnector.options.length;
+  addRoute.addEventListener("click", async () => {
+    addRoute.disabled = true;
+    try {
+      await api("/v2/notification-routes", {
+        method: "POST", headers: {"Idempotency-Key": `route-${crypto.randomUUID()}`},
+        body: JSON.stringify({
+          route_id: routeId.value.trim(), display_name: routeName.value.trim(),
+          connector_id: routeConnector.value, path: routePath.value.trim(),
+          categories: ["human_action_required", "operator_attention", "run_failed", "management_attention", "work_recovered"],
+          payload_format: routeFormat.value,
+          destination: routeFormat.value === "slack" ? destination.value.trim() : null,
+        }),
+      });
+      setFlash("External alert route activated."); await loadIntegrations();
+    } catch (error) { setFlash(error.message, "error"); }
+    finally { addRoute.disabled = false; }
+  });
+  routeForm.append(routeId, routeName, routeConnector, routePath, routeFormat, destination, addRoute);
+  routeCard.append(routeForm);
+  const routeList = el("div", "people");
+  for (const route of routes) {
+    const item = el("div", "person");
+    item.append(
+      el("strong", "", route.display_name),
+      el("small", "", `${route.connector_id}${route.path} · ${route.payload_format} · ${route.active ? "active" : "disabled"}`),
+    );
+    if (route.active) {
+      const disable = el("button", "danger", "Disable"); disable.type = "button";
+      disable.addEventListener("click", () => disableIntegration(
+        `/v2/notification-routes/${encodeURIComponent(route.route_id)}`,
+        "Disabled in the CEO workspace",
+      ).catch((error) => setFlash(error.message, "error")));
+      item.append(disable);
+    }
+    routeList.append(item);
+  }
+  if (!routes.length) routeList.append(el("div", "empty", "No external alert routes yet."));
+  routeCard.append(routeList); content.append(routeCard);
+
+  const auditCard = integrationCard(
+    "Delivery audit", "Failed sends can be redriven after the external credential or provider is fixed.",
+  );
+  const auditList = el("div", "people");
+  for (const delivery of deliveries) {
+    const item = el("div", "person");
+    item.append(
+      el("strong", "", delivery.route_id),
+      el("small", "", `${label(delivery.status)} · ${delivery.attempts} attempt(s) · ${shortId(delivery.notification_id)}`),
+    );
+    if (delivery.status === "failed") {
+      const redrive = el("button", "quiet", "Retry after fix"); redrive.type = "button";
+      redrive.addEventListener("click", async () => {
+        redrive.disabled = true;
+        try {
+          await api(`/v2/notification-deliveries/${encodeURIComponent(delivery.delivery_id)}/redrive`, {
+            method: "POST", headers: {"Idempotency-Key": `redrive-${crypto.randomUUID()}`},
+          });
+          setFlash("Delivery queued again."); await loadIntegrations();
+        } catch (error) { setFlash(error.message, "error"); }
+        finally { redrive.disabled = false; }
+      });
+      item.append(redrive);
+    }
+    auditList.append(item);
+  }
+  if (!deliveries.length) auditList.append(el("div", "empty", "No external deliveries yet."));
+  auditCard.append(auditList); content.append(auditCard);
+}
+
 async function loadPreviews() {
   const payload = await api("/v2/deployments?limit=100");
   const items = payload.items || [];
@@ -482,6 +667,7 @@ async function refreshView(silent = false) {
     if (state.view === "missions") await loadMissions();
     if (state.view === "company") await loadCompany();
     if (state.view === "inbox") await loadInbox();
+    if (state.view === "integrations") await loadIntegrations();
     if (state.view === "previews") await loadPreviews();
     if (state.view === "billing") await loadBilling();
     byId("last-refresh").textContent = `Updated ${new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
@@ -676,7 +862,7 @@ function selectView(name) {
   document.querySelectorAll(".nav-item").forEach((node) => node.classList.toggle("active", node.dataset.view === name));
   document.querySelectorAll(".view").forEach((node) => node.classList.add("hidden"));
   byId(`${name}-view`).classList.remove("hidden");
-  byId("view-title").textContent = { missions: "Missions", company: "Company", inbox: "Inbox", previews: "Releases", billing: "Billing" }[name];
+  byId("view-title").textContent = { missions: "Missions", company: "Company", inbox: "Inbox", integrations: "Integrations", previews: "Releases", billing: "Billing" }[name];
   closeDrawer(); refreshView();
 }
 

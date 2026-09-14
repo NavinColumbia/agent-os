@@ -222,6 +222,47 @@ def test_ssrf_guard_rejects_any_non_public_dns_answer(monkeypatch):
         _public_addresses("example.test", 443)
 
 
+def test_connector_prefix_ending_in_slash_does_not_admit_unrelated_paths(connector_stores):
+    registry, artifacts = connector_stores
+    registry.register_connector(
+        tenant_id="tenant-a",
+        definition=connector_definition(
+            allowed_path_prefixes=["/api/issues/"], allowed_methods=["GET"],
+        ),
+        actor_id="human:ceo",
+        idempotency_key="register-trailing-prefix",
+    )
+    definition = WorkflowDefinition(
+        "prefix-workflow", "tenant-a", "Prove path boundary", 1, "escape",
+        (
+            WorkflowNode("escape", NodeKind.TOOL, "Escape", "research-lead", {
+                "tool": "connector.invoke", "connector_id": "issue-tracker",
+                "method": "GET", "path": "/admin", "success_condition": "done",
+            }),
+            WorkflowNode("done", NodeKind.TERMINAL, "Done"),
+        ),
+        (WorkflowEdge("escape", "done", "done"),), "architect",
+    )
+    state = WorkflowRunState(
+        "prefix-run", "tenant-a", definition.workflow_id, 1, 1,
+        WorkflowRunStatus.ACTIVE,
+        (NodeToken("escape-token", "escape", TokenStatus.RUNNING, 1, attempt=1),),
+    )
+    handler = HTTPConnectorToolNodeHandlers(
+        registry, artifacts, type("Secrets", (), {"resolve": lambda *_: "token"})(),
+        transport=lambda *_: (200, {}, b"ok"),
+    )
+    with pytest.raises(FatalCommandError, match="owner-approved capability"):
+        handler.execute(
+            "tenant-a", "prefix-run", definition, state,
+            WorkflowAction(
+                "prefix-action", WorkflowActionKind.EXECUTE_NODE,
+                "escape-token", "escape",
+            ),
+            definition.nodes[0],
+        )
+
+
 def test_file_secret_resolver_is_tenant_derived_and_rejects_symlinks(tmp_path: Path):
     resolver = FileConnectorSecretResolver(str(tmp_path))
     tenant_dir = tmp_path / resolver.tenant_directory("tenant-a")

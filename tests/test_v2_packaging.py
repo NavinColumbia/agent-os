@@ -35,6 +35,10 @@ def test_migration_image_orders_numeric_revisions_and_compatibility_suffixes():
     assert "-k1,1n -k2,2n" in script
     assert "sort -V" not in script
     assert "for migration in /migrations/*.sql" not in script
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    assert "for f in postgres/initdb/*.sql" not in ci
+    assert "suffix_length" in ci
+    assert "-k1,1n -k2,2n" in ci
 
 
 def test_packaged_cli_exposes_api_and_worker_processes():
@@ -77,6 +81,9 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "99zz-connectors-v2.sql" in compose
     assert "99zzz-memberships-v2.sql" in compose
     assert "99zzzz-tenant-models-v2.sql" in compose
+    assert "99zzzzz-notification-delivery-v2.sql" in compose
+    migration_image = (ROOT / "deploy" / "Dockerfile.migrations-v2").read_text()
+    assert "99zzzzz-notification-delivery-v2.sql" in migration_image
     assert '127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080' in compose
     assert "GEMINI_API_KEY" in compose
     assert "AOS_V2_DATABASE_RUNTIME_PASSWORD" in compose

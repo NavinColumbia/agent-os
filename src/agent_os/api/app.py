@@ -267,6 +267,24 @@ class ConnectorDisableRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2_000)
 
 
+class NotificationRouteRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    route_id: str = Field(min_length=2, max_length=64)
+    display_name: str = Field(min_length=1, max_length=200)
+    connector_id: str = Field(min_length=2, max_length=64)
+    path: str = Field(min_length=1, max_length=2_000)
+    categories: list[str] = Field(min_length=1, max_length=16)
+    payload_format: str = Field(default="agent-os", pattern=r"^(agent-os|slack)$")
+    destination: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class NotificationRouteDisableRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2_000)
+
+
 class InvitationCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1159,6 +1177,116 @@ def create_app(
                         item["actionable"] = False
                 rendered.append(item)
             return {"items": rendered}
+
+        @app.get("/v2/notification-routes")
+        def list_notification_routes(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="notification routes require owner authority")
+            return {"items": list(notification_store.list_notification_routes(
+                principal.organization_id,
+            ))}
+
+        @app.post("/v2/notification-routes", status_code=201)
+        def register_notification_route(
+            body: NotificationRouteRegistrationRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="notification route creation requires owner authority")
+            if connector_registry is None:
+                raise HTTPException(status_code=503, detail="connector registry is unavailable")
+            connector = connector_registry.get_connector(
+                principal.organization_id, body.connector_id,
+            )
+            prefixes = () if connector is None else connector.get("allowed_path_prefixes", ())
+            path_allowed = isinstance(prefixes, list) and any(
+                body.path == str(prefix)
+                or body.path.startswith(
+                    str(prefix) if str(prefix).endswith("/") else str(prefix) + "/"
+                )
+                for prefix in prefixes
+            )
+            if (
+                connector is None or not connector.get("active")
+                or "POST" not in connector.get("allowed_methods", ()) or not path_allowed
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="route requires an active POST connector admitting the exact path",
+                )
+            try:
+                return notification_store.register_notification_route(
+                    tenant_id=principal.organization_id,
+                    definition=body.model_dump(),
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.delete("/v2/notification-routes/{route_id}")
+        def disable_notification_route(
+            route_id: str,
+            body: NotificationRouteDisableRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="notification route removal requires owner authority")
+            try:
+                result = notification_store.disable_notification_route(
+                    tenant_id=principal.organization_id,
+                    route_id=route_id,
+                    actor_id=principal.subject_id,
+                    reason=body.reason,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(status_code=404, detail="notification route not found")
+            return result
+
+        @app.get("/v2/notification-deliveries")
+        def list_notification_deliveries(
+            principal: Annotated[Principal, Depends(current_principal)],
+            limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="notification delivery audit requires owner authority")
+            return {"items": list(notification_store.list_notification_deliveries(
+                principal.organization_id, limit=limit,
+            ))}
+
+        @app.post("/v2/notification-deliveries/{delivery_id}/redrive")
+        def redrive_notification_delivery(
+            delivery_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not (principal.roles & {"owner", "operator", "system"}):
+                raise HTTPException(status_code=403, detail="notification redrive requires owner authority")
+            try:
+                result = notification_store.redrive_notification_delivery(
+                    tenant_id=principal.organization_id,
+                    delivery_id=delivery_id,
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(status_code=404, detail="notification delivery not found")
+            return result
 
     if artifact_store is not None:
         @app.get("/v2/deployments")

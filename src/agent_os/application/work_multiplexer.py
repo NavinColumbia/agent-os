@@ -1,4 +1,4 @@
-"""Fairly alternate lifecycle and graph queues within each tenant shard."""
+"""Fairly alternate durable work queues within each tenant shard."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from agent_os.application.worker_loop import TenantWorker
 
 
 class TenantWorkMultiplexer:
-    """Expose two durable queues as one fair tenant worker to the supervisor."""
+    """Expose durable execution/management/delivery queues through one fair worker."""
 
     def __init__(
         self,
@@ -16,10 +16,12 @@ class TenantWorkMultiplexer:
         lifecycle_worker: DurableCommandWorker,
         graph_worker: DurableGraphActionWorker,
         management_worker: TenantWorker | None = None,
+        notification_worker: TenantWorker | None = None,
     ) -> None:
         self._lifecycle = lifecycle_worker
         self._graph = graph_worker
         self._management = management_worker
+        self._notification = notification_worker
         self._next_queue: dict[str, int] = {}
 
     @staticmethod
@@ -36,6 +38,8 @@ class TenantWorkMultiplexer:
         ]
         if self._management is not None:
             queues.append(lambda: self._management.run_one(tenant_id))
+        if self._notification is not None:
+            queues.append(lambda: self._notification.run_one(tenant_id))
         start = self._next_queue.get(tenant_id, 0) % len(queues)
         self._next_queue[tenant_id] = (start + 1) % len(queues)
         for offset in range(len(queues)):

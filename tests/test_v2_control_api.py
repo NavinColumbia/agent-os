@@ -10,6 +10,7 @@ import pytest
 
 from agent_os.api.app import create_app
 from agent_os.application.mission import mission_planning_run_id
+from agent_os.domain.notifications import Notification, NotificationCategory
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.domain.workflow_runtime import (
     NodeToken,
@@ -22,6 +23,7 @@ from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 
@@ -887,4 +889,92 @@ def test_connector_api_is_owner_governed_and_tenant_isolated(tmp_path):
         assert disabled.status_code == 200
         assert disabled.json()["active"] is False
     finally:
+        registry.close()
+
+
+def test_notification_route_and_delivery_api_are_owner_governed_and_tenant_isolated(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'api-notification-routes.sqlite3'}"
+    registry = SQLConnectorRegistry(database_url, create_schema=True)
+    notifications = SQLNotificationStore(database_url, create_schema=True)
+    try:
+        registry.register_connector(
+            tenant_id="org-a",
+            actor_id="human-a",
+            idempotency_key="register-notifier",
+            definition={
+                "connector_id": "notifier",
+                "display_name": "Notifier",
+                "base_url": "https://notify.example.test",
+                "allowed_path_prefixes": ["/v1/events/"],
+                "allowed_methods": ["POST"],
+                "auth_kind": "bearer",
+                "credential_ref": "notifier-token",
+                "idempotency_header": "Idempotency-Key",
+            },
+        )
+        api = TestClient(create_app(
+            engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+            connector_registry=registry, notification_store=notifications,
+        ))
+        route = {
+            "route_id": "executive-alerts",
+            "display_name": "Executive alerts",
+            "connector_id": "notifier",
+            "path": "/v1/events/agent-os",
+            "categories": ["human_action_required"],
+            "payload_format": "agent-os",
+        }
+        assert api.post(
+            "/v2/notification-routes",
+            headers={"Authorization": "Bearer viewer-a", "Idempotency-Key": "viewer-route"},
+            json=route,
+        ).status_code == 403
+        assert api.post(
+            "/v2/notification-routes",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "bad-route-path"},
+            json={**route, "path": "/admin"},
+        ).status_code == 409
+        created = api.post(
+            "/v2/notification-routes",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "owner-route"},
+            json=route,
+        )
+        assert created.status_code == 201
+        assert api.get(
+            "/v2/notification-routes", headers={"Authorization": "Bearer org-b"},
+        ).json()["items"] == []
+
+        notifications.publish_notification(Notification(
+            notification_id="notification-api",
+            tenant_id="org-a",
+            run_id="run-api",
+            category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+            recipient_ids=("human:ceo",),
+            subject="Approve",
+            body="Approve this action",
+            source_id="source-api",
+            created_at="2026-09-13T12:00:00+00:00",
+        ))
+        lease = notifications.claim_notification_delivery(
+            "org-a", worker_id="worker-a",
+        )
+        notifications.fail_notification_delivery(
+            "org-a", lease.delivery_id, worker_id="worker-a",
+            error={"type": "MissingCredential", "message": "provision credential"},
+        )
+        deliveries = api.get(
+            "/v2/notification-deliveries", headers={"Authorization": "Bearer org-a"},
+        ).json()["items"]
+        assert deliveries[0]["status"] == "failed"
+        assert api.get(
+            "/v2/notification-deliveries", headers={"Authorization": "Bearer org-b"},
+        ).json()["items"] == []
+        redrive = api.post(
+            f"/v2/notification-deliveries/{lease.delivery_id}/redrive",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "redrive-api"},
+        )
+        assert redrive.status_code == 200
+        assert redrive.json()["status"] == "pending"
+    finally:
+        notifications.close()
         registry.close()

@@ -117,9 +117,16 @@ Fully autonomous proposal application remains policy work: the model cannot appr
 because the requested spend is zero.
 
 Human questions, operator alerts, and lifecycle/graph completion state are idempotently delivered to the real,
-tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. External transports such as
-email, Slack, SMS, and push remain separate adapters. Retry waits use an RFC 3339 due time written directly into the
-command outbox's `available_at`; no worker sleeps while waiting. When claimed, the explicit `schedule_retry`
+tenant-isolated in-app notification ledger and exposed by `GET /v2/notifications`. Owners can bind selected
+categories to any active, write-capable governed connector with `POST /v2/notification-routes`; `agent-os` emits a
+versioned generic webhook and `slack` emits a channel message. Publication transactionally creates one deterministic
+delivery per matching route. The same horizontally scalable worker loop leases, heartbeats, retries, and audits each
+delivery, sends the delivery ID through the connector's upstream idempotency header, and exposes failures at
+`GET /v2/notification-deliveries`. After provisioning or rotating an external credential, an owner can redrive a
+failed delivery explicitly. Disabling a route stops new deliveries and cancels queued ones; an already in-flight
+HTTP request cannot be retracted, so receivers must honor idempotency. Provider credentials remain external.
+
+Retry waits use an RFC 3339 due time written directly into the command outbox's `available_at`; no worker sleeps while waiting. When claimed, the explicit `schedule_retry`
 executor re-checks the exact correlation against current lifecycle state, treats cancelled/superseded timers as
 harmless, and idempotently emits the original resume command. Protocol-specific effects outside the registered
 HTTP/deployment/sandbox adapters still fail closed until an explicit executor exists.
@@ -298,7 +305,7 @@ validated token origin, with no inline script/style execution or framing. `GET /
 bounded summaries; the full directive is available only from the authenticated single-run view.
 
 With no static allowlist, staging/production workers use the narrow `agentos_worker` database role to discover
-only tenant IDs with due or abandoned queue work. That role receives column-level access to scheduling metadata,
+only tenant IDs with due or abandoned lifecycle, graph, management, or notification-delivery work. That role receives column-level access to scheduling metadata,
 not customer command/action payloads. Actual claims and mutations still enter the existing `agentos_app` tenant
 role with RLS, and renewable leases coordinate replicas. Discovery rotates from a cursor so a tenant with a deep
 backlog cannot permanently hide later tenant IDs. A production database runtime principal must be allowed to

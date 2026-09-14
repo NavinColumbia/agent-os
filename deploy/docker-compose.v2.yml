@@ -71,6 +71,7 @@ services:
       - ../postgres/initdb/99zz-connectors-v2.sql:/migrations/99zz-connectors-v2.sql:ro
       - ../postgres/initdb/99zzz-memberships-v2.sql:/migrations/99zzz-memberships-v2.sql:ro
       - ../postgres/initdb/99zzzz-tenant-models-v2.sql:/migrations/99zzzz-tenant-models-v2.sql:ro
+      - ../postgres/initdb/99zzzzz-notification-delivery-v2.sql:/migrations/99zzzzz-notification-delivery-v2.sql:ro
     command:
       - sh
       - -ec
@@ -93,6 +94,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/99zz-connectors-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/99zzz-memberships-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/99zzzz-tenant-models-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/99zzzzz-notification-delivery-v2.sql
         psql -v ON_ERROR_STOP=1 \
           -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
         SELECT format(

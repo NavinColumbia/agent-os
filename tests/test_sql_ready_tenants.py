@@ -7,6 +7,7 @@ from sqlalchemy import create_engine, insert
 
 from agent_os.infrastructure.dbos_lifecycle import commands, metadata
 from agent_os.infrastructure.sql_ready_tenants import SQLReadyTenantSource
+from agent_os.infrastructure.sql_notifications import notification_deliveries, notification_metadata
 from agent_os.infrastructure.sql_workflow_graph import (
     graph_metadata,
     management_watches,
@@ -22,6 +23,7 @@ def test_ready_tenant_discovery_unifies_queues_excludes_future_work_and_rotates(
     engine = create_engine(database_url)
     metadata.create_all(engine)
     graph_metadata.create_all(engine)
+    notification_metadata.create_all(engine)
     now = datetime.now(timezone.utc)
     command_base = {
         "run_id": "run",
@@ -92,12 +94,27 @@ def test_ready_tenant_discovery_unifies_queues_excludes_future_work_and_rotates(
             "notified_level": 0,
             "created_at": now,
         })
+        connection.execute(insert(notification_deliveries), {
+            "tenant_id": "tenant-f",
+            "delivery_id": "delivery-" + "f" * 64,
+            "notification_id": "notification-f",
+            "route_id": "operator-webhook",
+            "status": "pending",
+            "attempts": 0,
+            "available_at": now - timedelta(seconds=1),
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "created_at": now,
+        })
     source = SQLReadyTenantSource(database_url)
     try:
-        assert source.list_ready_tenants(limit=10) == ("tenant-a", "tenant-b", "tenant-e")
+        assert source.list_ready_tenants(limit=10) == (
+            "tenant-a", "tenant-b", "tenant-e", "tenant-f",
+        )
         assert source.list_ready_tenants(after_tenant_id="tenant-a", limit=1) == ("tenant-b",)
         assert source.list_ready_tenants(after_tenant_id="tenant-b", limit=1) == ("tenant-e",)
-        assert source.list_ready_tenants(after_tenant_id="tenant-e", limit=1) == ("tenant-a",)
+        assert source.list_ready_tenants(after_tenant_id="tenant-e", limit=1) == ("tenant-f",)
+        assert source.list_ready_tenants(after_tenant_id="tenant-f", limit=1) == ("tenant-a",)
     finally:
         source.close()
         engine.dispose()

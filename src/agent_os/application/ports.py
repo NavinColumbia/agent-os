@@ -75,6 +75,19 @@ class ManagementWatchLease:
     last_result: Mapping[str, Any] | None
 
 
+@dataclass(frozen=True)
+class NotificationDeliveryLease:
+    """Crash-recoverable ownership of one external notification delivery."""
+
+    tenant_id: str
+    delivery_id: str
+    notification: Mapping[str, Any]
+    route: Mapping[str, Any]
+    worker_id: str
+    attempt: int
+    lease_expires_at: str
+
+
 @runtime_checkable
 class WorkflowEngine(Protocol):
     """Durable lifecycle execution used by the control API."""
@@ -526,7 +539,7 @@ class GraphNodeRuntime(Protocol):
 
 @runtime_checkable
 class NotificationStore(Protocol):
-    """Durable in-product notification publication and tenant inbox."""
+    """Durable notification truth, route policy, and external delivery outbox."""
 
     def publish_notification(self, notification: Notification) -> bool: ...
 
@@ -538,6 +551,87 @@ class NotificationStore(Protocol):
         recipient_id: str | None = None,
         limit: int = 100,
     ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def register_notification_route(
+        self,
+        *,
+        tenant_id: str,
+        definition: Mapping[str, Any],
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def list_notification_routes(
+        self, tenant_id: str,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def disable_notification_route(
+        self,
+        *,
+        tenant_id: str,
+        route_id: str,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
+
+    def claim_notification_delivery(
+        self,
+        tenant_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> NotificationDeliveryLease | None: ...
+
+    def heartbeat_notification_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> bool: ...
+
+    def complete_notification_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        result: Mapping[str, Any],
+    ) -> bool: ...
+
+    def retry_notification_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+        delay_seconds: int,
+    ) -> bool: ...
+
+    def fail_notification_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+    ) -> bool: ...
+
+    def list_notification_deliveries(
+        self, tenant_id: str, *, limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def redrive_notification_delivery(
+        self,
+        *,
+        tenant_id: str,
+        delivery_id: str,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
 
 
 @runtime_checkable

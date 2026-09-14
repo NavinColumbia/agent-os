@@ -49,6 +49,27 @@ class Notification:
             raise ValueError("notification recipients must be nonempty")
         if len(set(self.recipient_ids)) != len(self.recipient_ids):
             raise ValueError("notification recipients must be unique")
+        if len(self.recipient_ids) > 128:
+            raise ValueError("notification recipient count exceeds 128")
+        if any(len(recipient) > 256 for recipient in self.recipient_ids):
+            raise ValueError("notification recipient identity is too long")
+        if len(self.subject) > 500 or len(self.body) > 16_384:
+            raise ValueError("notification subject or body is too long")
+        if len(self.notification_id) > 128 or len(self.tenant_id) > 128:
+            raise ValueError("notification identity is too long")
+        if len(self.run_id) > 256 or len(self.source_id) > 256:
+            raise ValueError("notification run or source identity is too long")
+        if self.correlation_id is not None and len(str(self.correlation_id)) > 256:
+            raise ValueError("notification correlation identity is too long")
+        try:
+            payload_size = len(json.dumps(
+                self.payload, allow_nan=False, ensure_ascii=False,
+                separators=(",", ":"), sort_keys=True,
+            ).encode())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("notification payload must contain JSON-compatible primitives") from exc
+        if payload_size > 256 * 1024:
+            raise ValueError("notification payload exceeds 256 KiB")
         notification_fingerprint(self)
 
     def to_dict(self) -> dict[str, Any]:

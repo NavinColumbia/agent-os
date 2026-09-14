@@ -112,6 +112,13 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .access-form select { padding: .65rem; }
 .model-form { display: grid; grid-template-columns: 130px minmax(180px,1fr) minmax(180px,1fr) auto; gap: .55rem; margin-top: .8rem; }
 .model-form select { padding: .65rem; }
+.integration-card { padding: 1.2rem; }
+.integration-card h4 { margin: 0; }
+.integration-card > .muted { margin: .35rem 0 1rem; font-size: .74rem; line-height: 1.55; }
+.integration-form { display: grid; grid-template-columns: repeat(2,minmax(180px,1fr)); gap: .55rem; margin-bottom: 1rem; }
+.integration-form select { min-height: 42px; padding: .65rem; }
+.integration-form button { justify-self: start; }
+.integration-card .people { padding-top: 1rem; border-top: 1px solid var(--line); }
 .access-panel textarea { margin: .55rem 0; }
 .person .danger { margin-top: .55rem; }
 .team-block h4 { margin: 0 0 .65rem; }
@@ -174,6 +181,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
   .mission .phase { display: none; }
   .human-actions { grid-template-columns: 1fr 1fr 1fr; }
   .model-form { grid-template-columns: 1fr; }
+  .integration-form { grid-template-columns: 1fr; }
   .human-actions input { grid-column: 1 / -1; }
   .auth-card { padding: 2rem; }
 }

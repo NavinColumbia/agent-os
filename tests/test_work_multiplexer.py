@@ -83,3 +83,21 @@ def test_multiplexer_gives_management_checks_a_fair_turn_without_starving_execut
     assert worker.run_one("tenant-a").command_id == "graph"
     assert worker.run_one("tenant-a").command_id == "management"
     assert (lifecycle.calls, graph.calls, management.calls) == (1, 1, 1)
+
+
+def test_multiplexer_gives_external_delivery_a_fair_turn():
+    lifecycle = LifecycleWorker([CommandRunStatus.SUCCEEDED])
+    graph = GraphWorker([CommandRunStatus.SUCCEEDED])
+    management = ManagementWorker([CommandRunStatus.SUCCEEDED])
+    delivery = ManagementWorker([CommandRunStatus.SUCCEEDED])
+    worker = TenantWorkMultiplexer(  # type: ignore[arg-type]
+        lifecycle_worker=lifecycle,
+        graph_worker=graph,
+        management_worker=management,
+        notification_worker=delivery,
+    )
+
+    assert [worker.run_one("tenant-a").command_id for _ in range(4)] == [
+        "lifecycle", "graph", "management", "management",
+    ]
+    assert delivery.calls == 1

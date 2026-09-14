@@ -21,20 +21,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import deadlock  # noqa: E402
 import monitor   # noqa: E402
 import notify    # noqa: E402
+from aoscfg import get  # noqa: E402
+from dbpool import connection  # noqa: E402
 
 ROOT = Path.home() / "projects" / "agent-os"
-ENV = ROOT / ".env.local"
-_cfg = {l.split("=", 1)[0].strip(): l.split("=", 1)[1].strip()
-        for l in ENV.read_text().splitlines() if l.strip() and not l.startswith("#") and "=" in l}
-DB = _cfg.get("DATABASE_URL")
-TOKEN = _cfg.get("AOS_API_TOKEN", "")
+TOKEN = get("AOS_API_TOKEN", "")
 
 PROCS = [("controller", "controller.py"), ("factory", "factory.py build"),
          ("ticker", "ticker.sh"), ("watchdog", "watchdog.sh"), ("api", "api.py serve"),
@@ -79,7 +75,7 @@ def _org_trees(limit=3):
         if _orch not in sys.path:
             sys.path.insert(0, _orch)
         import store
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("""SELECT run_id, tenant_id, vision FROM orchestra_runs
                            WHERE status='running' ORDER BY created_at DESC LIMIT %s""", (limit,))
             runs = cur.fetchall()
@@ -103,7 +99,7 @@ def _recent_qa(limit=8):
     """Latest QA verdict per product — the CEO's product-quality glance: passed vs AUDIT REJECTED vs
     INCOMPLETE, and how recently. Read-only; fail-open if qa_runs isn't there yet."""
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("""SELECT DISTINCT ON (product) product, passed, rounds,
                              COALESCE(verdict->>'verdict',''), EXTRACT(EPOCH FROM now()-ts)::INT
                            FROM qa_runs ORDER BY product, ts DESC""")
@@ -120,6 +116,50 @@ def _recent_qa(limit=8):
         return []
 
 
+def _scheduler_issues(fail_window_min=60):
+    """Scheduler health from its own telemetry.
+
+    A due job can fail repeatedly while the ticker/watchdog processes stay alive. That is a silent degradation
+    of the safety loops, so turn scheduler_runs + overdue enabled schedules into dashboard/watchdog alerts.
+    Fail-open: older DBs may not have scheduler tables yet.
+    """
+    try:
+        with connection() as c, c.cursor() as cur:
+            cur.execute("""SELECT sr.name, sr.decision, count(*), max(sr.at)
+                           FROM scheduler_runs sr
+                           WHERE sr.at > now() - make_interval(mins => %s)
+                             AND sr.decision IN ('timeout','error','rejected','nonzero')
+                             AND NOT EXISTS (
+                                   SELECT 1 FROM scheduler_runs ok
+                                   WHERE ok.name=sr.name AND ok.decision='executed' AND ok.at > sr.at)
+                           GROUP BY sr.name, sr.decision
+                           ORDER BY count(*) DESC, max(sr.at) DESC""", (fail_window_min,))
+            failed = [{"name": n, "decision": d, "count": int(cn), "last": str(last)}
+                      for n, d, cn, last in cur.fetchall()]
+            cur.execute("""SELECT name,
+                                  EXTRACT(EPOCH FROM now()-next_run)::INT AS overdue_s,
+                                  interval_s
+                           FROM schedules
+                           WHERE enabled
+                             AND next_run < now() - GREATEST((interval_s || ' seconds')::interval,
+                                                             interval '10 minutes')
+                           ORDER BY next_run ASC""")
+            overdue = [{"name": n, "overdue_s": int(age or 0), "interval_s": int(iv or 0)}
+                       for n, age, iv in cur.fetchall()]
+    except Exception:
+        return []
+    issues = []
+    for r in failed:
+        level = "crit" if r["decision"] in ("timeout", "error") and r["count"] >= 2 else "warn"
+        issues.append({"level": level,
+                       "msg": f"scheduler job {r['name']} {r['decision']} x{r['count']} in {fail_window_min}m"})
+    for r in overdue:
+        mins = round(r["overdue_s"] / 60)
+        level = "crit" if r["overdue_s"] > max(r["interval_s"] * 3, 3600) else "warn"
+        issues.append({"level": level, "msg": f"scheduler job {r['name']} overdue {mins}m"})
+    return issues
+
+
 def state():
     du = shutil.disk_usage("/")
     disk_pct = round(du.used / du.total * 100)
@@ -131,7 +171,8 @@ def state():
            "backup_age_h": backup_h,
            "processes": [{"label": l, "n": _running(p)} for l, p in PROCS]}
 
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    # Operator-wide mission-control path: intentionally reads fleet-wide audit/comms/waits telemetry.
+    with connection() as c, c.cursor() as cur:
         # products in flight (from factory agent activity)
         cur.execute("""SELECT resource, count(*) steps, max(ts) last,
                           (array_agg(actor ORDER BY id DESC))[1] last_actor,
@@ -180,7 +221,9 @@ def state():
         # throughput + denials
         cur.execute("SELECT count(*) FROM audit_log WHERE ts > now() - interval '10 minutes'")
         a10 = cur.fetchone()[0]
-        cur.execute("SELECT count(*) FROM audit_log WHERE decision='deny' AND ts > now() - interval '1 hour'")
+        cur.execute("""SELECT count(*) FROM audit_log
+                       WHERE decision='deny' AND ts > now() - interval '1 hour'
+                         AND COALESCE(payload->>'_selftest','false') <> 'true'""")
         denies = cur.fetchone()[0]
         out["throughput"] = {"actions_10m": a10, "denies_1h": denies}
         # liveness heartbeats (loops that beat each cycle) -> show age on the matching process
@@ -247,6 +290,7 @@ def state():
         alerts.append({"level": "warn", "msg": f"{out['throughput']['denies_1h']} policy denials/hr"})
     for cf in confs:
         alerts.append({"level": "warn", "msg": f"conflict: {cf['agents'][0]} & {cf['agents'][1]} on {cf['resource']}"})
+    alerts.extend(_scheduler_issues())
     out["org_trees"] = _org_trees()              # live CEO -> coordinators -> workers hierarchy per running org
     out["qa"] = _recent_qa()                     # latest QA verdict per product (passed / rejected / incomplete)
     out["alerts"] = alerts or [{"level": "ok", "msg": "all systems nominal"}]
@@ -271,12 +315,11 @@ def state():
 def send_message(recipient, intent, content):
     """Two-way: operator -> agent. Logs a durable conversation row + pings the role if it's a human ask."""
     mid = f"op-{int(time.time()*1000)}"
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""INSERT INTO conversations (conversation_id, message_id, intent, sender, recipient, content)
                        VALUES (%s,%s,%s,%s,%s,%s)""",
                     (f"op-{recipient}", mid, intent or "instruct", "human:operator", recipient,
                      json.dumps({"text": content})))
-        c.commit()
     notify.send(f"→ {recipient}: {content[:120]}", title="operator → agent", tags="speech_balloon")
     return {"ok": True, "message_id": mid}
 

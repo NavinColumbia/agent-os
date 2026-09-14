@@ -1,0 +1,27 @@
+{$AOS_PUBLIC_HOST} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), geolocation=(), microphone=()"
+		Content-Security-Policy "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8099 {
+		health_uri /health
+		health_interval 15s
+		health_timeout 3s
+	}
+
+	log {
+		output file /var/log/caddy/agentos-access.json {
+			roll_size 25MiB
+			roll_keep 10
+		}
+		format json
+	}
+}

@@ -24,20 +24,18 @@ import statistics
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 RECENT_N = 5          # how many of a tenant's latest builds shape "what next"
 GOOD_SCORE = 0.8      # a build at/above this is "clean"
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS recommendations (
             id           BIGSERIAL PRIMARY KEY,
             tenant_id    TEXT,
@@ -49,17 +47,16 @@ def _ensure():
             evidence     JSONB DEFAULT '{}',
             dismissed_at TIMESTAMPTZ,
             created_at   TIMESTAMPTZ DEFAULT now())""")
-        c.commit()
 
 
 def _outcomes_for_kind(kind):
     """Finished builds of this kind -> (rounds[], shipped[bool], scores[]). Empty if no table/no data."""
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("""SELECT rounds, shipped, final_score FROM build_outcomes
                            WHERE kind = %s""", (kind,))
             rows = cur.fetchall()
-    except psycopg.Error:
+    except Exception:
         return [], [], []          # table doesn't exist yet -> honest empty
     rounds = [int(r[0]) for r in rows if r[0] is not None]
     shipped = [bool(r[1]) for r in rows if r[1] is not None]
@@ -68,22 +65,22 @@ def _outcomes_for_kind(kind):
 
 
 def _tenant_products(tid):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s", (tid,))
         return [r[0] for r in cur.fetchall()]
 
 
-def _recent_outcomes(products):
+def _recent_outcomes(tid, products):
     """The tenant's latest finished builds (newest first), across their products. Empty if no table/data."""
     if not products:
         return []
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute("""SELECT product, kind, rounds, final_score, shipped, at
                            FROM build_outcomes WHERE product = ANY(%s)
                            ORDER BY at DESC LIMIT %s""", (products, RECENT_N))
             rows = cur.fetchall()
-    except psycopg.Error:
+    except Exception:
         return []
     return [{"product": r[0], "kind": r[1], "rounds": r[2],
              "final_score": float(r[3]) if r[3] is not None else None,
@@ -183,10 +180,10 @@ def recommend_next(tenant_id, org_id=None):
     """1-3 concrete next actions from this tenant's recent outcomes, persisted for keep/dismiss feedback."""
     _ensure()
     import json
-    recent = _recent_outcomes(_tenant_products(tenant_id))
+    recent = _recent_outcomes(tenant_id, _tenant_products(tenant_id))
     actions = _next_actions(recent)
     out = []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         for a in actions:
             cur.execute("""INSERT INTO recommendations
                            (tenant_id, org_id, kind, title, body, score, evidence)
@@ -195,31 +192,31 @@ def recommend_next(tenant_id, org_id=None):
                          json.dumps(a.get("evidence", {}))))
             rec_id = cur.fetchone()[0]
             out.append({"id": rec_id, "title": a["title"], "body": a["body"], "score": a["score"]})
-        c.commit()
     audit.append(actor="recommend", action="RecommendNext", resource=tenant_id, decision="created",
-                 payload={"count": len(out)})
+                 payload={"count": len(out)}, tenant_id=tenant_id)
     return out
 
 
-def feedback(rec_id, useful):
+def feedback(tenant_id, rec_id, useful):
     """The learning signal: keep (useful=True) clears any dismissal; dismiss (useful=False) hides it."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         if useful:
-            cur.execute("UPDATE recommendations SET dismissed_at=NULL WHERE id=%s", (rec_id,))
+            cur.execute("""UPDATE recommendations SET dismissed_at=NULL
+                           WHERE id=%s AND tenant_id=%s""", (rec_id, tenant_id))
         else:
-            cur.execute("UPDATE recommendations SET dismissed_at=now() WHERE id=%s", (rec_id,))
+            cur.execute("""UPDATE recommendations SET dismissed_at=now()
+                           WHERE id=%s AND tenant_id=%s""", (rec_id, tenant_id))
         n = cur.rowcount
-        c.commit()
     audit.append(actor="recommend", action="RecommendFeedback", resource=str(rec_id),
-                 decision="kept" if useful else "dismissed")
+                 decision="kept" if useful else "dismissed", tenant_id=tenant_id)
     return {"id": rec_id, "useful": bool(useful), "updated": n}
 
 
 def recent(tenant_id):
     """A tenant's live (non-dismissed) recommendations, newest first."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("""SELECT id, kind, title, body, score, created_at FROM recommendations
                        WHERE tenant_id=%s AND dismissed_at IS NULL ORDER BY created_at DESC, id DESC""",
                     (tenant_id,))
@@ -230,14 +227,13 @@ def recent(tenant_id):
 
 def _selftest():
     import billing  # noqa: E402
-    import psycopg as pg
     reg = billing.signup("billing.signup", "free")
     tid = reg["tenant_id"]
     prod = tid.replace("t-", "")[:6] + "-rec"
     _ensure()
     ok = False
     try:
-        with pg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                         (prod, tid))
             # Seed lib outcomes so there IS data: mostly failing / low-score so advice is concrete.
@@ -246,7 +242,6 @@ def _selftest():
             for p, k, rnd, sc, sh in seed:
                 cur.execute("""INSERT INTO build_outcomes (product, kind, rounds, final_score, shipped, cost_usd)
                                VALUES (%s,%s,%s,%s,%s,%s)""", (p, k, rnd, sc, sh, 1.5))
-            c.commit()
 
         # 1) strategy from real history
         strat = recommend_strategy("lib")
@@ -263,10 +258,12 @@ def _selftest():
         before = len(live)
 
         # 3) feedback dismisses one -> it leaves recent()
-        feedback(recs[0]["id"], useful=False)
+        feedback(tid, recs[0]["id"], useful=False)
         live2 = recent(tid)
         assert recs[0]["id"] not in {r["id"] for r in live2}, "dismissed rec must leave recent()"
         assert len(live2) == before - 1, "exactly one rec should drop out"
+        foreign = feedback("t-not-mine", recs[-1]["id"], useful=False)
+        assert foreign["updated"] == 0, "foreign tenant must not update another tenant's recommendation"
 
         # 4) honest default for a kind with NO data
         empty = recommend_strategy("web")
@@ -281,12 +278,11 @@ def _selftest():
               f"web(no data)={empty['recommendation']!r}")
         print("PASS: recommender learns from build_outcomes — strategy + next-actions + feedback ✅")
     finally:
-        with pg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM build_outcomes WHERE product=%s", (prod,))
             cur.execute("DELETE FROM recommendations WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 
@@ -297,7 +293,7 @@ def _main(a):
     elif a[0] == "json" and len(a) > 1:
         tid = a[1]
         prods = _tenant_products(tid)
-        recent_o = _recent_outcomes(prods)
+        recent_o = _recent_outcomes(tid, prods)
         kinds = sorted({r["kind"] for r in recent_o if r.get("kind")}) or ["lib"]
         print(json.dumps({
             "tenant": tid,

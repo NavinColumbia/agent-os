@@ -27,6 +27,7 @@ Run with the agent-os venv python.
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -75,12 +76,15 @@ PARKED_STATES = ("blocked",)
 def rank_findings(rows):
     """Pure (unit-tested): [(id, title, status, created_at_days_old)] -> ranked dicts, worst first."""
     out = []
-    for tid, title, status, age_days in rows:
+    for row in rows:
+        tid, title, status, age_days = row[:4]
+        tenant = row[4] if len(row) > 4 else "platform"
         sev = _severity(title)
         parked = str(status or "").lower() in PARKED_STATES
         out.append({
             "id": tid, "severity": NAMES[sev], "_rank": sev,
             "area": _area(title), "title": _clean(title), "status": status,
+            "tenant": tenant or "platform",
             "age_days": int(age_days), "parked": parked,
             "overdue": (not parked) and age_days > ESCALATE_AFTER_DAYS[sev],
         })
@@ -88,21 +92,36 @@ def rank_findings(rows):
     return out
 
 
-def open_findings(limit=200):
-    """The live open backlog, worst first. Empty list if the DB is unavailable (never raises)."""
+def open_findings(limit=200, strict=False):
+    """The live open backlog, worst first.
+
+    Interactive reports remain fail-soft. Scheduled triage passes ``strict=True`` so database blindness is
+    recorded as a failed schedule instead of a false-green empty board.
+    """
     try:
         import aoscfg
         import psycopg
         with psycopg.connect(aoscfg.DB) as c, c.cursor() as cur:
             cur.execute(
                 """SELECT id, title, status,
-                          extract(epoch from (now() - created_at)) / 86400.0
+                          extract(epoch from (now() - created_at)) / 86400.0,
+                          tenant
                      FROM task_board
                     WHERE status = ANY(%s) AND source LIKE %s
-                    ORDER BY created_at DESC
+                    ORDER BY CASE
+                               WHEN title ~* '^\\s*\\[critical\\]' THEN 0
+                               WHEN title ~* '^\\s*\\[high\\]' THEN 1
+                               WHEN title ~* '^\\s*\\[(med|medium)\\]' THEN 2
+                               WHEN title ~* '^\\s*\\[low\\]' THEN 3
+                               ELSE 4
+                             END,
+                             created_at ASC,
+                             id ASC
                     LIMIT %s""", (list(OPEN_STATES), FINDING_SOURCES, limit))
             return rank_findings(cur.fetchall())
     except Exception:
+        if strict:
+            raise
         return []
 
 
@@ -140,23 +159,48 @@ def _note(tid, text):
         return False
 
 
-def _already_escalated(tid, notes_cache):
-    return f"[escalated" in (notes_cache.get(tid) or "")
+_ESCALATED_AT = re.compile(r"\[escalated\s+(?P<at>\d{4}-\d\d-\d\dT[^\]]+)\]", re.I)
+
+
+def _already_escalated(tid, notes_cache, now=None):
+    """Whether an accepted escalation is still in cooldown.
+
+    Old notes used the marker ``[escalated]`` without a timestamp.  Preserve those as accepted rather than
+    suddenly replaying a historical backlog after an upgrade.  New notes carry an ISO timestamp and become
+    eligible again after COOLDOWN_DAYS.  A failed delivery never writes either marker.
+    """
+    notes = notes_cache.get(tid) or ""
+    stamps = list(_ESCALATED_AT.finditer(notes))
+    if not stamps:
+        return "[escalated]" in notes.lower()
+    try:
+        sent_at = datetime.fromisoformat(stamps[-1].group("at").replace("Z", "+00:00"))
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        return (current - sent_at).total_seconds() < COOLDOWN_DAYS * 86400
+    except (TypeError, ValueError, OverflowError):
+        # An unparseable acceptance marker is evidence that a prior version acted.  Fail quiet instead of
+        # turning malformed historical data into a page storm.
+        return True
+
+
+def _load_notes(items):
+    import aoscfg
+    import psycopg
+    with psycopg.connect(aoscfg.DB) as c, c.cursor() as cur:
+        cur.execute("SELECT id, coalesce(notes,'') FROM task_board WHERE id = ANY(%s)",
+                    ([i["id"] for i in items] or [0],))
+        return dict(cur.fetchall())
 
 
 def sweep(notify_fn=None, dry=False):
-    """Escalate overdue critical/high findings to the CEO. Returns a summary dict. Fail-open."""
-    items = [i for i in open_findings() if i["overdue"] and i["_rank"] <= 1]
-    notes = {}
+    """Escalate overdue critical/high findings to the CEO. Scheduler data failures are explicit."""
+    items = [i for i in open_findings(strict=True) if i["overdue"] and i["_rank"] <= 1]
     try:
-        import aoscfg
-        import psycopg
-        with psycopg.connect(aoscfg.DB) as c, c.cursor() as cur:
-            cur.execute("SELECT id, coalesce(notes,'') FROM task_board WHERE id = ANY(%s)",
-                        ([i["id"] for i in items] or [0],))
-            notes = dict(cur.fetchall())
-    except Exception:
-        pass
+        notes = _load_notes(items)
+    except Exception as exc:
+        raise RuntimeError(f"findings notes unavailable: {exc}") from exc
 
     fresh = [i for i in items if not _already_escalated(i["id"], notes)]
     if not fresh:
@@ -164,24 +208,33 @@ def sweep(notify_fn=None, dry=False):
     if dry:
         return {"overdue": len(items), "escalated": 0, "would_escalate": [i["id"] for i in fresh]}
 
-    body = "\n".join(
-        f"#{i['id']} {i['severity'].upper()} ({i['age_days']}d unlooked-at): {i['title'][:110]}"
-        for i in fresh)
-    text = (f"{len(fresh)} finding(s) past their review-by date and never triaged:\n{body}\n\n"
-            f"Close with evidence: taskboard.py status <id> done --note \"<repro re-run + result>\"")
-    sent = False
-    try:
-        send = notify_fn
-        if send is None:
-            import notify as _n
-            send = lambda t: _n.send(t, title="agent-os: findings overdue", tags="rotating_light")
-        sent = bool(send(text))
-    except Exception:
-        sent = False
+    accepted = []
+    accepted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for i in fresh:
-        _note(i["id"], f"[escalated] {i['age_days']}d open, never triaged — surfaced to the CEO")
-    return {"overdue": len(items), "escalated": len(fresh), "notified": sent,
-            "ids": [i["id"] for i in fresh]}
+        text = (f"Finding #{i['id']} is past its review-by date: {i['severity'].upper()} "
+                f"({i['age_days']}d unlooked-at): {i['title'][:180]}\n\n"
+                "Close it only with reproduction evidence and the verification result.")
+        try:
+            if notify_fn is not None:
+                delivered = bool(notify_fn(text))
+            else:
+                import notifications
+                # One tenant-scoped semantic outbox record per finding generation.  The operator pager only
+                # receives notification routing metadata; tenant finding content stays in that tenant's feed.
+                previous = notes.get(i["id"]) or ""
+                generation = len(_ESCALATED_AT.findall(previous)) + (1 if "[escalated]" in previous.lower() else 0)
+                context = f"finding-escalation:{i['id']}:{generation}"
+                result = notifications.send(i.get("tenant") or "platform", "findings",
+                                            f"Finding #{i['id']} needs review", text,
+                                            level="urgent", url="/#findings", context_key=context)
+                delivered = isinstance(result, dict) and bool(result.get("id"))
+        except Exception:
+            delivered = False
+        if delivered and _note(i["id"], f"[escalated {accepted_at}] {i['age_days']}d open, never triaged — surfaced to the CEO"):
+            accepted.append(i["id"])
+    return {"overdue": len(items), "attempted": len(fresh), "escalated": len(accepted),
+            "notified": bool(accepted), "ids": accepted,
+            "failed_ids": [i["id"] for i in fresh if i["id"] not in accepted]}
 
 
 def _selftest():

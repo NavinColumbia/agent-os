@@ -2,7 +2,7 @@
 """tenantproviders.py — multi-provider BYO keys PER TENANT: work with whatever model accounts a user has.
 
 (Distinct from providers.py, which is the single global engine config.) A user shouldn't be forced to own
-a Claude key — they might have only Codex/OpenAI, or both and want to split. This is the per-tenant
+a Claude key — Codex/OpenAI is the default path, and they may connect Claude or split both. This is the per-tenant
 registry: which providers they've connected (keys stored encrypted in the vault, never here), an ordered
 preference, and resolve() — which the build flow calls to pick the engine + key. No keys -> platform default.
 
@@ -17,6 +17,7 @@ routes a tenant to Codex-as-primary when that's their connected provider.
 Run with the agent-os venv python.
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -24,26 +25,23 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit   # noqa: E402
 import vault   # noqa: E402
-
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 CATALOG = [
     {"slug": "anthropic", "name": "Anthropic Claude", "engine": "claude", "env_key": "ANTHROPIC_API_KEY",
-     "blurb": "Claude models via claude -p. Default engine.", "key_hint": "sk-ant-…"},
+     "blurb": "Claude models via claude -p. Optional provider.", "key_hint": "sk-ant-…"},
     {"slug": "openai", "name": "OpenAI / Codex", "engine": "codex", "env_key": "OPENAI_API_KEY",
-     "blurb": "GPT/Codex via the Codex CLI. Use this if you don't have a Claude key.", "key_hint": "sk-…"},
+     "blurb": "GPT/Codex via the Codex CLI. Default engine.", "key_hint": "sk-…"},
 ]
 _BY_SLUG = {p["slug"]: p for p in CATALOG}
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS tenant_providers (
             tenant_id TEXT NOT NULL, provider TEXT NOT NULL, has_key BOOLEAN NOT NULL DEFAULT false,
             priority INT NOT NULL DEFAULT 5, added_at TIMESTAMPTZ DEFAULT now(),
@@ -51,7 +49,6 @@ def _ensure():
         # auth_mode: 'api_key' (BYO metered key) or 'subscription' (run on the host CLI's logged-in
         # Claude/ChatGPT account — no per-token billing). Added idempotently for existing tables.
         cur.execute("ALTER TABLE tenant_providers ADD COLUMN IF NOT EXISTS auth_mode TEXT DEFAULT 'api_key'")
-        c.commit()
 
 
 def _secret_name(provider):
@@ -180,7 +177,7 @@ def connect(tid, provider, mode="api_key", key=None):
     _ensure()
     if mode == "api_key":
         vault.put_secret(_secret_name(provider), f"tenant:{tid}", "prod", ["builder", "factory"], key)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT COALESCE(min(priority),5) FROM tenant_providers WHERE tenant_id=%s AND has_key", (tid,))
         top = cur.fetchone()[0]
         cur.execute("""INSERT INTO tenant_providers (tenant_id, provider, has_key, priority, auth_mode)
@@ -189,7 +186,7 @@ def connect(tid, provider, mode="api_key", key=None):
                     (tid, provider, max(1, top), mode))
         c.commit()
     audit.append(actor="tenantproviders", action="ProviderConnected", resource=tid, decision="connected",
-                 payload={"provider": provider, "mode": mode})
+                 payload={"provider": provider, "mode": mode}, tenant_id=tid)
     return {"ok": True, "provider": provider, "engine": _BY_SLUG[provider]["engine"], "mode": mode}
 
 
@@ -200,61 +197,114 @@ def add_key(tid, provider, key):
 
 def remove_key(tid, provider):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("UPDATE tenant_providers SET has_key=false WHERE tenant_id=%s AND provider=%s", (tid, provider))
-        c.commit()
     audit.append(actor="tenantproviders", action="ProviderDisconnected", resource=tid, decision="removed",
-                 payload={"provider": provider})
+                 payload={"provider": provider}, tenant_id=tid)
     return {"ok": True, "provider": provider}
 
 
 def set_priority(tid, ordered):
     """ordered = provider slugs best-first; lower number = higher preference (how to 'split' between them)."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         for i, p in enumerate(ordered):
             cur.execute("""INSERT INTO tenant_providers (tenant_id, provider, priority) VALUES (%s,%s,%s)
                            ON CONFLICT (tenant_id, provider) DO UPDATE SET priority=EXCLUDED.priority""",
                         (tid, p, i + 1))
-        c.commit()
     return {"ok": True, "order": ordered}
 
 
 def list_providers(tid):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT provider, has_key, priority, auth_mode FROM tenant_providers WHERE tenant_id=%s", (tid,))
         state = {p: (hk, pr, am) for p, hk, pr, am in cur.fetchall()}
+    default = default_provider()
     out = []
     for p in CATALOG:
         hk, pr, am = state.get(p["slug"], (False, 5, None))
+        default_connected = bool(default.get("ok") and default.get("provider") == p["slug"])
+        connected = bool(hk) or default_connected
+        mode = am or ("default_cli" if default_connected else None)
         out.append({**{k: p[k] for k in ("slug", "name", "engine", "blurb", "key_hint")},
-                    "connected": bool(hk), "priority": pr, "auth_mode": am,
+                    "connected": connected, "priority": pr, "auth_mode": mode,
+                    "default_connected": default_connected,
                     "modes": ["subscription", "api_key"]})   # both ways to connect
     out.sort(key=lambda x: (not x["connected"], x["priority"]))
     return out
 
 
+def _default_provider_slug():
+    engine = _default_engine()
+    for p in CATALOG:
+        if p["engine"] == engine:
+            return p["slug"]
+    return None
+
+
+def default_provider():
+    """Operator default model path for self-hosted first-run.
+
+    BYO tenant providers still win. When none are configured, agent-os should not dead-end a first-time CEO
+    behind "Connect a model" if this host already has the default CLI signed in. This is explicit in the
+    returned auth_mode (`default_cli`) so callers can distinguish it from a tenant-owned key/subscription.
+    """
+    slug = _default_provider_slug()
+    if not slug:
+        return {"ok": False, "provider": None, "engine": _default_engine(), "auth_mode": None}
+    check = _cli_logged_in(slug)
+    if not check.get("ok"):
+        return {"ok": False, "provider": slug, "engine": _BY_SLUG[slug]["engine"],
+                "auth_mode": "default_cli", "error": check.get("error")}
+    return {"ok": True, "provider": slug, "engine": _BY_SLUG[slug]["engine"],
+            "auth_mode": "default_cli", "key": None}
+
+
+def _resolve_configured(tid, provider, auth_mode):
+    """Resolve one configured row only when its credential is usable right now."""
+    meta = _BY_SLUG.get(provider)
+    if meta is None:
+        return None
+    auth_mode = auth_mode or "api_key"
+    if auth_mode == "subscription":
+        check = _cli_logged_in(provider)
+        if not check.get("ok"):
+            return None
+        return {"engine": meta["engine"], "provider": provider, "key": None,
+                "auth_mode": "subscription"}
+    try:
+        v = vault.get_secret(_secret_name(provider), f"tenant:{tid}", "prod", "builder", tenant_id=tid)
+        key = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
+    except Exception:
+        key = None
+    if not key:
+        return None
+    return {"engine": meta["engine"], "provider": provider, "key": key,
+            "auth_mode": "api_key"}
+
+
 def resolve(tid):
-    """The engine + key/auth the build flow should use: highest-preference connected provider, else default.
-    Subscription-mode providers carry no key (the CLI runs on its own logged-in account)."""
+    """Choose the first *currently usable* configured provider, then the healthy host default.
+
+    Persisted ``has_key`` means the connection was valid when created; it is not a permanent health fact.
+    Subscription OAuth can expire and vault secrets can disappear.  Skipping an unusable row prevents a stale
+    first preference from shadowing a healthy second provider and making preflight lie.
+    """
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""SELECT provider, auth_mode FROM tenant_providers WHERE tenant_id=%s AND has_key
-                       ORDER BY priority, added_at LIMIT 1""", (tid,))
-        row = cur.fetchone()
-    if not row:
-        return {"engine": "claude", "provider": None, "key": None, "auth_mode": None}
-    provider, auth_mode = row[0], row[1] or "api_key"
-    meta = _BY_SLUG.get(provider, _BY_SLUG["anthropic"])
-    key = None
-    if auth_mode == "api_key":                            # subscription -> no key, run on the CLI login
-        try:
-            v = vault.get_secret(_secret_name(provider), f"tenant:{tid}", "prod", "builder", tenant_id=tid)
-            key = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
-        except Exception:
-            key = None
-    return {"engine": meta["engine"], "provider": provider, "key": key, "auth_mode": auth_mode}
+                       ORDER BY priority, added_at""", (tid,))
+        rows = cur.fetchall()
+    for provider, auth_mode in rows:
+        resolved = _resolve_configured(tid, provider, auth_mode)
+        if resolved:
+            return resolved
+    d = default_provider()
+    if d.get("ok"):
+        return {"engine": d["engine"], "provider": d["provider"], "key": None,
+                "auth_mode": d["auth_mode"], "default_connected": True}
+    return {"engine": _default_engine(), "provider": None, "key": None, "auth_mode": None}
 
 
 def resolve_provider(tid, provider):
@@ -268,26 +318,22 @@ def resolve_provider(tid, provider):
     if provider not in _BY_SLUG:
         return {"connected": False, "provider": provider, "engine": None, "key": None, "auth_mode": None}
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""SELECT auth_mode FROM tenant_providers
                        WHERE tenant_id=%s AND provider=%s AND has_key""", (tid, provider))
         row = cur.fetchone()
     meta = _BY_SLUG[provider]
+    if row:
+        resolved = _resolve_configured(tid, provider, row[0])
+        if resolved:
+            return {"connected": True, **resolved}
     if not row:
-        return {"connected": False, "provider": provider, "engine": meta["engine"], "key": None, "auth_mode": None}
-    auth_mode = row[0] or "api_key"
-    key = None
-    if auth_mode == "api_key":
-        try:
-            v = vault.get_secret(_secret_name(provider), f"tenant:{tid}", "prod", "builder", tenant_id=tid)
-            key = v if isinstance(v, str) else (v.get("value") if isinstance(v, dict) else None)
-        except Exception:
-            key = None
-        if not key:
-            return {"connected": False, "provider": provider, "engine": meta["engine"], "key": None,
-                    "auth_mode": auth_mode}
-    return {"connected": True, "provider": provider, "engine": meta["engine"], "key": key,
-            "auth_mode": auth_mode}
+        d = default_provider()
+        if d.get("ok") and d.get("provider") == provider:
+            return {"connected": True, "provider": provider, "engine": meta["engine"], "key": None,
+                    "auth_mode": "default_cli", "default_connected": True}
+    return {"connected": False, "provider": provider, "engine": meta["engine"], "key": None,
+            "auth_mode": (row[0] or "api_key") if row else None}
 
 
 def build_kwargs(tid):
@@ -296,6 +342,10 @@ def build_kwargs(tid):
     if r["engine"] == "codex":
         return {"engine": "codex", "provider_key": r["key"], "api_key": None}
     return {"engine": "claude", "provider_key": None, "api_key": r["key"]}
+
+
+def _default_engine():
+    return (os.environ.get("AOS_DEFAULT_ENGINE", "codex").strip().lower() or "codex")
 
 
 def _selftest():
@@ -308,7 +358,7 @@ def _selftest():
     _cli_logged_in = lambda provider: {"error": "this machine's CLI isn't signed in — run `claude login`"}
     tid = billing.signup("tprov-selftest", "free")["tenant_id"]
     try:
-        d0 = resolve(tid); default_ok = d0["engine"] == "claude" and d0["provider"] is None
+        d0 = resolve(tid); default_ok = d0["engine"] == _default_engine() and d0["provider"] is None
         # HONESTY GATE 1: an api_key that the provider REJECTS must NOT connect (nothing stored/flipped).
         bad_key = connect(tid, "openai", "api_key", "sk-obviously-bad")
         bad_key_blocked = "error" in bad_key and not any(p["connected"] for p in list_providers(tid))
@@ -325,20 +375,27 @@ def _selftest():
         connect(tid, "anthropic", "subscription"); set_priority(tid, ["anthropic", "openai"])
         r2 = resolve(tid); sub_ok = r2["engine"] == "claude" and r2["auth_mode"] == "subscription" and r2["key"] is None
         bk2 = build_kwargs(tid); bk2_ok = bk2["engine"] == "claude" and not bk2["api_key"]   # runs on CLI login
+        # A persisted subscription can expire later. It must not shadow the healthy second provider.
+        _cli_logged_in = lambda provider: ({"error": "expired"} if provider == "anthropic" else {"ok": True})
+        fallback = resolve(tid)
+        stale_subscription_falls_through = (fallback["engine"] == "codex" and
+                                            fallback["provider"] == "openai" and bool(fallback["key"]))
+        _cli_logged_in = lambda provider: {"ok": True}
         lst = list_providers(tid); both = sum(1 for p in lst if p["connected"]) == 2
         # When the host CLI is already signed in, the real-login trigger must NO-OP (never relaunch OAuth).
         start_noop = start_subscription_login("anthropic").get("already") is True
-        ok = default_ok and bad_key_blocked and no_cli_blocked and codex_ok and bk_ok and sub_ok and bk2_ok and both and start_noop
+        ok = (default_ok and bad_key_blocked and no_cli_blocked and codex_ok and bk_ok and sub_ok and bk2_ok
+              and stale_subscription_falls_through and both and start_noop)
         print(f"default={d0['engine']} bad-key-blocked={bad_key_blocked} no-cli-blocked={no_cli_blocked} start-noop={start_noop} "
               f"codex-key->{r1['engine']} sub-claude->{r2['auth_mode']}(key={r2['key']}) "
+              f"stale-subscription-fallback={stale_subscription_falls_through} "
               f"bk-sub={bk2['engine']}/{bk2['api_key']} connected={sum(1 for p in lst if p['connected'])}")
         print("PASS: multi-provider + verify-before-connect (reject bad key / require host CLI sign-in / split) ✅" if ok else "FAIL")
     finally:
         _validate_api_key, _cli_logged_in = _real_vak, _real_cli
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM tenant_providers WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

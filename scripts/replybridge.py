@@ -23,10 +23,14 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit          # noqa: E402
 import loopcontroller as lc  # noqa: E402
+import singleton_exec  # noqa: E402
 
 INBOX = Path.home() / "projects" / "agent-os" / "bridge" / "inbox"
 DONE = INBOX.parent / "processed"
-POLL_S = int(os.environ.get("AOS_REPLYBRIDGE_POLL_S", "5"))
+try:
+    POLL_S = max(1, min(60, int(os.environ.get("AOS_REPLYBRIDGE_POLL_S", "5"))))
+except ValueError:
+    POLL_S = 5
 # a reply is FOR a build thread when its task is "ceo", "ceo-<thread_id>", or just "<thread_id>"
 _CEO_TASK = re.compile(r"^(?:ceo[-_]?)?(\d+)?$", re.I)
 
@@ -47,9 +51,8 @@ def _resolve_thread(task, body):
         t = _tenant_for_thread(int(tid))
         return (t, int(tid)) if t else None
     # bare 'ceo': find the single active (awaiting a human answer) thread across tenants; ambiguous -> skip
-    import psycopg
-    from aoscfg import DB
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    from dbpool import connection
+    with connection() as c, c.cursor() as cur:
         cur.execute("""SELECT thread_id, tenant_id FROM controller_state
                        WHERE awaiting IN ('user_feedback','user_approval','credentials')
                        ORDER BY thread_id DESC LIMIT 2""")
@@ -93,10 +96,15 @@ def process_inbox() -> int:
 
 
 def serve():
+    command = [sys.executable, str(Path(__file__).resolve()), "serve"]
+    if not singleton_exec.require("replybridge", command=command):
+        print("[replybridge] another exact generation owns the service", flush=True)
+        return
     print(f"[replybridge] watching {INBOX} for ceo-* replies -> loopcontroller.say (poll {POLL_S}s)", flush=True)
     while True:
         try:
             process_inbox()
+            singleton_exec.mark_ready("replybridge", "reply inbox sweep completed")
         except Exception as e:
             print(f"[replybridge] tick error (continuing): {e}", flush=True)
         time.sleep(POLL_S)

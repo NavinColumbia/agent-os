@@ -20,15 +20,11 @@ import json
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402,F401  (convention parity with the other surfaces)
 
-DB = next((l.split("=", 1)[1].strip()
-           for l in __import__("aoscfg").ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from dbpool import connection, tenant_connection  # noqa: E402
 
 # How we recognise each gate in the recorded stage/role names (case-insensitive).
 TEST_STAGES = ("QA", "TEST")
@@ -94,7 +90,7 @@ def _verdict_from_rows(product, rows):
 
 def verdict(tid, product):
     """Plain-language trust verdict for ONE of the tenant's own products. Ownership-checked."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         if not _owns(cur, tid, product):
             return {"error": "not your product"}
         cur.execute("SELECT stage, role, rc FROM traces WHERE product=%s", (product,))
@@ -104,7 +100,7 @@ def verdict(tid, product):
 
 def summary(tid):
     """One-liner verdict for EVERY product the tenant owns (for the cockpit list)."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s ORDER BY product", (tid,))
         prods = [r[0] for r in cur.fetchall()]
         out = []
@@ -123,14 +119,13 @@ def _selftest():
     prod = tid.replace("t-", "")[:6] + "-qv"
     ok = False
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                         (prod, tid))
             for stage, role in (("QA", "qa-security"), ("SECURITY", "qa-security")):
                 cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, rc, prompt, output, model)
                                VALUES (%s,%s,%s,%s,'agent',0,'p','o','m')""",
                             (f"run-{prod}", prod, stage, role))
-            c.commit()
 
         v = verdict(tid, prod)
         guard = verdict(tid, "someone-elses-product-" + prod)
@@ -146,11 +141,10 @@ def _selftest():
         print("PASS: qualityview gives a plain-language, ownership-checked trust verdict ✅"
               if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM traces WHERE product=%s", (prod,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

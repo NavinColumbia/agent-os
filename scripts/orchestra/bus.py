@@ -31,19 +31,12 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-import psycopg
-
 # factory.py (the LLM call) + siblings live in the parent scripts/ dir; put it on the path so actors'
 # handlers can `import factory` and make their decide-on-event AI calls.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# --- DB wiring (same convention as orchestrator.py / commfabric.py) ----------------------------------------
-from aoscfg import ENV
-try:
-    DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-               if l.strip().startswith("DATABASE_URL=")), None)
-except Exception:
-    DB = None
+from aoscfg import DB  # noqa: E402
+from dbpool import connection  # noqa: E402
 
 # The full event vocabulary an actor can emit (§ execution model). Each emission is the actor making an AI
 # decision about its OWN state; the bus just routes it. 'broadcast' is the fan-out kind used for corrections.
@@ -55,6 +48,8 @@ KINDS = {
     "finding",         # any -> up: a discovered fact worth sharing
     "question",        # any -> peer/up: a clarification request
     "need_agent",      # child/supervisor -> up: I need a new agent spawned for X
+    "resource_request",# child/supervisor -> up: I need a real capability/credential/infra/resource provisioned
+    "process_change",  # child/supervisor -> up: I propose changing the workflow/SDLC/org process itself
     "need_context",    # any -> up/peer: I'm missing context to proceed
     "escalate",        # supervisor -> controller: beyond my capability, kick it upstairs
     "resolve",         # supervisor/controller -> down: here's the unblock / next task / correction
@@ -66,6 +61,8 @@ KINDS = {
     "tool_result",     # jobrunner -> the tool-worker ITSELF: a dispatched tool finished (the worker's next
                        # step reports its findings+done up and finishes). Event-based so ONLY the pool ever
                        # writes an actor row — the job thread never touches actor state (avoids a lock race).
+    "internal_review_required",  # fixer -> dev lead -> QA manager: disputed evidence needs adjudication
+    "finding_resolution",        # QA manager -> durable run: exact disposition of the disputed finding
 }
 
 
@@ -151,7 +148,7 @@ class MessageBus:
     # --- persistence (audit) -------------------------------------------------------------------------------
     def _ensure(self):
         try:
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with connection() as c, c.cursor() as cur:
                 cur.execute(f"""CREATE TABLE IF NOT EXISTS {self.table} (
                     id          TEXT PRIMARY KEY,
                     corr_id     TEXT,
@@ -162,7 +159,6 @@ class MessageBus:
                     in_reply_to TEXT,
                     ts          TIMESTAMPTZ NOT NULL DEFAULT now())""")
                 cur.execute(f"CREATE INDEX IF NOT EXISTS {self.table}_corr_idx ON {self.table} (corr_id)")
-                c.commit()
         except Exception:
             self.persist = False    # DB unavailable -> degrade to journal-only, never crash the bus
 
@@ -171,14 +167,13 @@ class MessageBus:
         if not self.persist:
             return
         try:
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with connection() as c, c.cursor() as cur:
                 cur.execute(f"""INSERT INTO {self.table}
                                 (id, corr_id, frm, to_actor, kind, payload, in_reply_to, ts)
                                 VALUES (%s,%s,%s,%s,%s,%s,%s, to_timestamp(%s))
                                 ON CONFLICT (id) DO NOTHING""",
                             (msg.id, msg.corr_id, msg.frm, msg.to, msg.kind,
                              json.dumps(msg.payload), msg.in_reply_to, msg.ts))
-                c.commit()
         except Exception:
             pass                    # audit is best-effort; the journal already has it
 
@@ -187,7 +182,7 @@ class MessageBus:
         DB isn't reachable, so callers get a consistent view either way."""
         if self.persist:
             try:
-                with psycopg.connect(DB) as c, c.cursor() as cur:
+                with connection() as c, c.cursor() as cur:
                     if corr_id:
                         cur.execute(f"""SELECT id, corr_id, frm, to_actor, kind, payload, ts FROM {self.table}
                                         WHERE corr_id=%s ORDER BY ts, id""", (corr_id,))
@@ -378,9 +373,8 @@ def _selftest():
     # cleanup: remove only THIS run's rows.
     if bus.persist:
         try:
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with connection() as c, c.cursor() as cur:
                 cur.execute(f"DELETE FROM {bus.table} WHERE corr_id = ANY(%s)", (list(corr_ids),))
-                c.commit()
         except Exception:
             pass
 

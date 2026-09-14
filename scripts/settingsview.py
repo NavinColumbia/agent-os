@@ -17,8 +17,6 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit          # noqa: E402
@@ -26,8 +24,7 @@ import consent        # noqa: E402
 import billing        # noqa: E402
 import vault          # noqa: E402
 import notifications  # noqa: E402  (reuse its notification_prefs table + _ensure)
-
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 # the notification categories surfaced on the settings screen (mirrors notifications.py taxonomy)
 PREF_CATEGORIES = ("build", "billing", "changelog", "incident", "security")
@@ -37,7 +34,7 @@ BYO_KEY_NAME = "byo_llm_key"                                     # vault secret 
 
 def _profile(tid):
     """tenant_id + plan + suspended + name (name omitted if the tenants row has none)."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT plan, suspended, name FROM tenants WHERE tenant_id=%s", (tid,))
         row = cur.fetchone()
     if not row:
@@ -64,7 +61,7 @@ def _byo_key_set(tid):
 def _notification_prefs(tid):
     """Per-category prefs for PREF_CATEGORIES, falling back to PREF_DEFAULT for any with no row."""
     notifications._ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT category, in_app, email, push FROM notification_prefs WHERE tenant_id=%s", (tid,))
         rows = {r[0]: {"in_app": r[1], "email": r[2], "push": r[3]} for r in cur.fetchall()}
     out = []
@@ -87,15 +84,15 @@ def settings(tid):
 def set_pref(tid, category, in_app, email, push):
     """Upsert a single category's notification preference. Audited."""
     notifications._ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO notification_prefs (tenant_id, category, in_app, email, push)
                        VALUES (%s,%s,%s,%s,%s)
                        ON CONFLICT (tenant_id, category)
                        DO UPDATE SET in_app=EXCLUDED.in_app, email=EXCLUDED.email, push=EXCLUDED.push""",
                     (tid, category, bool(in_app), bool(email), bool(push)))
-        c.commit()
     audit.append(actor="settings", action="SetNotificationPref", resource=tid, decision="updated",
-                 payload={"category": category, "in_app": bool(in_app), "email": bool(email), "push": bool(push)})
+                 payload={"category": category, "in_app": bool(in_app), "email": bool(email), "push": bool(push)},
+                 tenant_id=tid)
     return {"category": category, "in_app": bool(in_app), "email": bool(email), "push": bool(push)}
 
 
@@ -134,12 +131,11 @@ def _selftest():
         print("PASS: settings view composes profile/consent/byo-key/prefs + writes reflect ✅" if ok else "FAIL")
     finally:
         vault.delete_secrets_for_products([f"tenant:{tid}"])      # purge the selftest BYO key
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM notification_prefs WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

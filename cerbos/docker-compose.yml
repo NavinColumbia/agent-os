@@ -10,4 +10,10 @@ services:
     ports:
       - "127.0.0.1:3592:3592"
       - "127.0.0.1:3593:3593"
+    mem_limit: ${AOS_CERBOS_MEMORY_LIMIT:-512m}
+    memswap_limit: ${AOS_CERBOS_MEMORY_SWAP_LIMIT:-768m}
+    mem_reservation: ${AOS_CERBOS_MEMORY_RESERVATION:-64m}
+    cpus: ${AOS_CERBOS_CPUS:-1.0}
+    pids_limit: ${AOS_CERBOS_PIDS_LIMIT:-128}
+    init: true
     restart: unless-stopped

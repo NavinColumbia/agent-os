@@ -23,15 +23,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import billing      # noqa: E402
 import killswitch   # noqa: E402
 import tenancy      # noqa: E402
+import workstreamview  # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 PIPELINE = ["SPEC", "BUILD", "QA", "REVIEW", "LAUNCH"]   # the governed line, for progress rendering
 
 
@@ -108,7 +107,7 @@ def _product_view(cur, product):
 def cockpit(tid, org_id=0):
     """The whole tenant-scoped payload: per-product progress/spend/workers + comms + budget + queue.
     When org_id is set, scopes to the active org's products ('This org' nav); 0 = the whole tenant."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         prods = _products(cur, tid, org_id)
         products = [_product_view(cur, p) for p in prods]
         # communications among THIS tenant's agents (agents currently/recently on their products)
@@ -132,27 +131,37 @@ def cockpit(tid, org_id=0):
             cur.execute("""SELECT status, count(*) FROM tasks WHERE assignee = ANY(%s) GROUP BY status""",
                         (agents,))
             qd = {s: n for s, n in cur.fetchall()}
+    workstreams = workstreamview.active_workstreams(tid, org_id)
+    known_products = {p["product"] for p in products}
+    unmaterialized = [w for w in workstreams if not w.get("product") or w.get("product") not in known_products]
+    running_unmaterialized = sum(1 for w in unmaterialized if w.get("running"))
+    awaiting_unmaterialized = sum(1 for w in unmaterialized if w.get("awaiting") and not w.get("running"))
     spend = round(sum(p["cost_usd"] for p in products), 4)
     tokens = sum(p["tokens"] for p in products)
     q = billing.quota(tid)
     return {
         "tenant": tid,
         "summary": {"products": len(products), "launched": sum(1 for p in products if p["ready"]),
-                    "building": sum(1 for p in products if p["result"] == "building"),
+                    "building": sum(1 for p in products if p["result"] == "building") + running_unmaterialized,
                     "failed": sum(1 for p in products if p["failed"]),
                     "live_workers": sum(len(p["workers"]) for p in products),
-                    "spend_usd": spend, "tokens": tokens},
+                    "spend_usd": spend, "tokens": tokens,
+                    "workstreams": len(workstreams),
+                    "in_flight_workstreams": sum(1 for w in workstreams if w.get("running"))},
         "budget": {"plan": q["plan"], "builds": q["builds"], "tokens_quota": q["tokens"],
                    "within_quota": q["within_quota"], "spend_usd": spend},
         "products": products,
+        "workstreams": workstreams,
         "communications": comms,
-        "queue": {"pending": qd.get("pending", 0), "active": qd.get("active", 0), "dead": qd.get("dead", 0)},
+        "queue": {"pending": qd.get("pending", 0) + awaiting_unmaterialized,
+                  "active": qd.get("active", 0) + running_unmaterialized,
+                  "dead": qd.get("dead", 0)},
     }
 
 
 def control(tid, product, action):
     """Tenant control: pause/resume one of THEIR products at runtime. Ownership-checked."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM tenant_products WHERE tenant_id=%s AND product=%s", (tid, product))
         if not cur.fetchone():
             return {"error": "not your product"}
@@ -184,8 +193,7 @@ def health(tid, org_id=0):
     """Tenant org-health: blocked waits, deadlock cycles, conflicts, dead-letter + stuck tasks — all
     scoped to the tenant's own agents. Every table read is guarded; never crashes (returns [] on error)."""
     out = {"blocked": [], "deadlocks": [], "conflicts": [], "dead_letter": 0, "stuck": 0, "ok": True}
-    import dbpool                                                # C2: cockpit health is auto-polled every 6s
-    with dbpool.connection(autocommit=True) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         try:
             prods, agents = _tenant_agents(cur, tid, org_id)
         except Exception:
@@ -221,7 +229,8 @@ def health(tid, org_id=0):
         # conflicts: overlapping resource claims, filtered to their products
         try:
             import directory
-            out["conflicts"] = [cf for cf in directory.conflicts() if cf.get("product") in set(prods)]
+            out["conflicts"] = [cf for cf in directory.conflicts(tenant_id=tid)
+                                if cf.get("product") in set(prods)]
         except Exception:
             out["conflicts"] = []
 
@@ -310,7 +319,7 @@ def comms_graph(tid, org_id=0):
     THIS tenant's agents (same aggregation dashboard.py uses, but scoped). When org_id is set, scoped
     to the active org's agents. Nodes capped ~20."""
     nodes, edges = {}, []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         try:
             _, agents = _tenant_agents(cur, tid, org_id)
         except Exception:
@@ -375,6 +384,8 @@ async function load(){
  const kpis=[['Products',s.products],['Launched',s.launched],['Building',s.building],['Failed',s.failed],['Live workers',s.live_workers],['Spend $',s.spend_usd],['Plan',b.plan]];
  let h='<div class=kpis>'+kpis.map(k=>`<div class=kpi><b>${k[1]}</b><span>${k[0]}</span></div>`).join('')+'</div>';
  h+=`<div class=card><h2>Budget</h2><div class=prow><span>Plan <b>${b.plan}</b></span><span class=meta>builds ${b.builds}</span><span class=meta>tokens ${b.tokens_quota}</span><span class=meta>spend $${b.spend_usd}</span><span class="pill ${b.within_quota?'ok':'bad'}">${b.within_quota?'within quota':'over quota'}</span></div></div>`;
+ const ws=(d.workstreams||[]).filter(w=>!w.product||!d.products.find(p=>p.product===w.product));
+ h+='<div class=card><h2>Active workstreams</h2>'+(ws.length?ws.map(w=>`<div class=prod><div class=prow><b>${w.product||('workstream '+w.thread_id)}</b><span class="pill ${w.running?'ok':''}">${w.running?'running':(w.awaiting||'working')}</span><span class=meta>${w.phase||''}${w.status?' · '+w.status:''}</span></div></div>`).join(''):'<div class=muted>no controller workstreams in flight</div>')+'</div>';
  h+='<div class=card><h2>Projects · task progress</h2>'+(d.products.length?d.products.map(p=>{
    const stages=p.stages.map(st=>`<div class="st ${stClass(st)}" title="${st.stage}"></div>`).join('');
    const pill=p.ready?'ok':(p.failed?'bad':'');
@@ -438,7 +449,7 @@ def _selftest():
     reg = billing.signup("cockpit-selftest", "free")     # a REAL tenant (tenant_products has an FK to tenants)
     tid = reg["tenant_id"]
     prod = tid.replace("t-", "")[:6] + "-demo"
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (prod, tid))
         # two pipeline stages with real cost so spend + progress are non-trivial
         for st, cost in (("SPEC", 0.16), ("BUILD", 1.2)):
@@ -448,7 +459,6 @@ def _selftest():
         cur.execute("""INSERT INTO directory (agent_id, role, status, product, task, updated_at)
                        VALUES (%s,'builder','active',%s,'building it', now())
                        ON CONFLICT (agent_id) DO UPDATE SET updated_at=now()""", (f"builder@{prod}", prod))
-        c.commit()
     try:
         v = cockpit(tid)
         ctl = control(tid, prod, "pause")
@@ -464,12 +474,11 @@ def _selftest():
         print("PASS: cockpit aggregates workers+comms+progress+budget+controls ✅" if ok else "FAIL")
         ok = ok and _selftest_health()
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM traces WHERE product=%s", (prod,))
             cur.execute("DELETE FROM directory WHERE product=%s", (prod,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
         killswitch.resume(prod)
     sys.exit(0 if ok else 1)
 
@@ -482,7 +491,7 @@ def _selftest_health():
     agent = f"builder@{prod}"; peer = f"reviewer@{prod}"
     ok = False
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (prod, tid))
             cur.execute("""INSERT INTO directory (agent_id, role, status, product, task, updated_at)
                            VALUES (%s,'builder','active',%s,'building it', now())
@@ -491,7 +500,6 @@ def _selftest_health():
                 cur.execute("""INSERT INTO conversations (conversation_id, message_id, intent, sender, recipient, content, turn)
                                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                             (f"cv-{prod}", f"m-{prod}-{i}", intent, s, r, json.dumps({"text": "hi"}), i))
-            c.commit()
 
         h = health(tid)
         cs = company_summary(tid)
@@ -506,12 +514,11 @@ def _selftest_health():
               f"graph_nodes={len(g['nodes'])} graph_edges={len(g['edges'])}")
         print("PASS: cockpit org-health + company verdict + comms-graph (tenant-scoped) ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM conversations WHERE conversation_id=%s", (f"cv-{prod}",))
             cur.execute("DELETE FROM directory WHERE product=%s", (prod,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     return ok
 
 

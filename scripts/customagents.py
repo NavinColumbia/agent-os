@@ -18,7 +18,7 @@ Two TIERS share this surface, and the split is structural, not cosmetic:
     to ALLOWED_ROLES, ownership-checked on every mutation. list_agents() tags these editable.
 tiers(tid) returns both in one read for the Agents view.
 
-    customagents.py run <id>        # execute one agent (the scheduler calls this)
+    customagents.py run <tenant_id> <id>   # execute one tenant-owned agent (the scheduler calls this)
     customagents.py list <tid>      # a tenant's defined agents
     customagents.py tiers <tid>     # system (read-only) + custom (editable) tiers as one payload
     customagents.py selftest        # offline-ish check (no real LLM spend; factory.agent monkeypatched)
@@ -30,8 +30,6 @@ import sys
 import time
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit             # noqa: E402
@@ -42,7 +40,7 @@ import sanitize          # noqa: E402
 import scheduler         # noqa: E402
 import tenantproviders   # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 # Only GOVERNED roles a tenant may stand up — each has a manifest (must_never / allowed_paths) that
 # constrains the agent. A tenant can NOT invent a role or pick a privileged one (builder/tech-lead/etc.).
@@ -53,7 +51,7 @@ from aoscfg import VENV_PY
 
 def _ensure():
     """Mirror 32-customagents.sql so the API works even before a migration is applied."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS custom_agents (
             id BIGSERIAL PRIMARY KEY, tenant_id TEXT, name TEXT, role TEXT DEFAULT 'research-growth',
             instructions TEXT, trigger TEXT DEFAULT 'manual', interval_s INT, output TEXT DEFAULT 'report',
@@ -62,7 +60,6 @@ def _ensure():
         cur.execute("""CREATE TABLE IF NOT EXISTS custom_agent_runs (
             id BIGSERIAL PRIMARY KEY, agent_id BIGINT, tenant_id TEXT, started_at TIMESTAMPTZ DEFAULT now(),
             rc INT, cost_usd NUMERIC DEFAULT 0, output_ref TEXT, summary TEXT)""")
-        c.commit()
 
 
 def _slug(s):
@@ -73,10 +70,24 @@ def _tid_short(tid):
     return (tid or "tenant").split("-")[-1][:8] or "tenant"
 
 
-def _load(agent_id):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+def _load_admin(agent_id):
+    """Legacy/admin load by id only. Tenant-facing paths should use _load(tid, id)."""
+    with connection() as c, c.cursor() as cur:
         cur.execute("""SELECT id, tenant_id, name, role, instructions, trigger, interval_s, output,
                               product, enabled FROM custom_agents WHERE id=%s""", (agent_id,))
+        r = cur.fetchone()
+    if not r:
+        return None
+    keys = ("id", "tenant_id", "name", "role", "instructions", "trigger", "interval_s", "output",
+            "product", "enabled")
+    return dict(zip(keys, r))
+
+
+def _load(tid, agent_id):
+    with tenant_connection(tid) as c, c.cursor() as cur:
+        cur.execute("""SELECT id, tenant_id, name, role, instructions, trigger, interval_s, output,
+                              product, enabled FROM custom_agents WHERE id=%s AND tenant_id=%s""",
+                    (agent_id, tid))
         r = cur.fetchone()
     if not r:
         return None
@@ -96,29 +107,27 @@ def define(tid, name, instructions, role="research-growth", trigger="manual", in
     flags = sanitize.scan(instructions)          # untrusted tenant text — flag obvious injection attempts
     if flags:
         audit.append(actor="sanitize", action="InjectionDetected", resource=tid,
-                     decision="flagged", payload={"agent": name, "patterns": flags[:3]})
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+                     decision="flagged", payload={"agent": name, "patterns": flags[:3]},
+                     tenant_id=tid)
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO custom_agents (tenant_id, name, role, instructions, trigger,
                           interval_s, output, product)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                     (tid, name, role, instructions, trigger, interval_s, output, product))
         agent_id = cur.fetchone()[0]
-        c.commit()
     if trigger == "recurring" and interval_s:
         scheduler.register(f"ca-{agent_id}",
-                           f"{VENV_PY} {SCRIPTS / 'customagents.py'} run {agent_id}", int(interval_s))
+                           f"{VENV_PY} {SCRIPTS / 'customagents.py'} run {tid} {agent_id}", int(interval_s))
     audit.append(actor="customagents", action="AgentDefined", resource=tid, decision="created",
                  payload={"agent_id": agent_id, "name": name, "role": role, "trigger": trigger,
-                          "injection_flags": len(flags)})
+                          "injection_flags": len(flags)}, tenant_id=tid)
     return {"agent_id": agent_id}
 
 
-def run(agent_id):
+def _run_loaded(a):
     """Execute one custom agent through the governed factory on the TENANT's provider key, write its
     findings into the tenant's product workspace, notify the tenant, and record the run."""
-    a = _load(agent_id)
-    if not a:
-        return {"error": f"no such custom agent {agent_id}"}
+    agent_id = a["id"]
     tid, name, role, output = a["tenant_id"], a["name"], a["role"], a["output"]
     if not a["enabled"]:
         return {"agent_id": agent_id, "skipped": "disabled"}
@@ -126,7 +135,10 @@ def run(agent_id):
     # per-tenant workspace repo (their own products dir, or a shared "<tid>-agents" workspace)
     repo_name = a["product"] or f"{_tid_short(tid)}-agents"
     repo = factory.PRODUCTS / repo_name
-    (repo / "agents").mkdir(parents=True, exist_ok=True)
+    # ``docs/**`` is the one writable report surface shared by every governed custom-agent role.
+    # The historical ``agents/**`` target sat outside all four manifests, so a compliant model could finish
+    # good work under ``tasks/**`` while the product recorded a missing download pointer.
+    (repo / "docs" / "agents").mkdir(parents=True, exist_ok=True)
 
     # route to the tenant's connected provider (Claude/Codex, BYO key or subscription)
     bk = tenantproviders.build_kwargs(tid)
@@ -148,7 +160,7 @@ def run(agent_id):
         report_ref = str(repo)
         summary = f"{name}: build {r.get('result', 'UNKNOWN')} for {repo_name}"
     else:
-        out_file = repo / "agents" / f"{_slug(name)}-{ts}.md"
+        out_file = repo / "docs" / "agents" / f"{_slug(name)}-{ts}.md"
         task = (
             f"You are running as a tenant's standing '{name}' agent. Do the work described in the "
             f"instructions below and WRITE YOUR FINDINGS to the file {out_file} (create it). Begin the "
@@ -160,6 +172,10 @@ def run(agent_id):
         rc = r.get("rc", 1)
         report_ref = str(out_file) if out_file.exists() else None
         summary = (r.get("out") or "")[:1500] or f"{name}: run complete (rc={rc})"
+        if rc == 0 and report_ref is None:
+            rc = 1
+            summary = (f"{name}: model process completed but did not create the required governed report "
+                       f"at {out_file}. Output: {summary}")[:1500]
 
     cost = float(r.get("cost_usd") or 0)
     status = "ok" if rc == 0 else "failed"
@@ -168,25 +184,48 @@ def run(agent_id):
     notifications.send(tid, "changelog", f"{name}: new update", summary[:1500],
                        level="passive", url=f"/download/{repo_name}")
 
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("UPDATE custom_agents SET last_run=now(), last_status=%s WHERE id=%s",
                     (status, agent_id))
         cur.execute("""INSERT INTO custom_agent_runs (agent_id, tenant_id, rc, cost_usd, output_ref, summary)
                        VALUES (%s,%s,%s,%s,%s,%s)""",
                     (agent_id, tid, rc, cost, report_ref, summary[:4000]))
-        c.commit()
     audit.append(actor="customagents", action="AgentRun", resource=tid, decision=status,
                  payload={"agent_id": agent_id, "name": name, "rc": rc, "cost_usd": cost,
-                          "elapsed_s": round(time.time() - started, 1)})
-    return {"agent_id": agent_id, "report": report_ref}
+                          "elapsed_s": round(time.time() - started, 1)}, tenant_id=tid)
+    return {"agent_id": agent_id, "report": report_ref, "status": status, "rc": int(rc)}
+
+
+def run(agent_id):
+    """Legacy/admin scheduler entry point. New recurring jobs call run_for_tenant(tid, id)."""
+    a = _load_admin(agent_id)
+    if not a:
+        return {"error": f"no such custom agent {agent_id}"}
+    return _run_loaded(a)
+
+
+def run_for_tenant(tid, agent_id):
+    a = _load(tid, agent_id)
+    if not a:
+        return {"error": "not found or not owned by this tenant"}
+    return _run_loaded(a)
 
 
 def run_now(tid, agent_id):
     """Tenant-triggered run, ownership-checked (an agent only runs for the tenant that owns it)."""
-    a = _load(agent_id)
-    if not a or a["tenant_id"] != tid:
-        return {"error": "not found or not owned by this tenant"}
-    return run(agent_id)
+    return run_for_tenant(tid, agent_id)
+
+
+def _cli_exit_code(result):
+    """A completed wrapper process is not success unless the governed agent work succeeded."""
+    if not isinstance(result, dict) or result.get("error"):
+        return 1
+    if result.get("skipped") == "disabled":
+        return 0
+    try:
+        return 0 if result.get("status") == "ok" and int(result.get("rc", 1)) == 0 else 1
+    except (TypeError, ValueError):
+        return 1
 
 
 def system_agents():
@@ -220,7 +259,7 @@ def list_agents(tid):
     """Tier-B CUSTOM agents — the tenant's OWN standing agents (rows they own). Tagged `editable: True`
     to distinguish them from the read-only system tier in the same Agents view."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""SELECT id, name, role, trigger, interval_s, output, enabled, last_run, last_status
                        FROM custom_agents WHERE tenant_id=%s ORDER BY id""", (tid,))
         rows = cur.fetchall()
@@ -236,13 +275,12 @@ def tiers(tid):
 
 
 def toggle(tid, agent_id, enabled):
-    a = _load(agent_id)
-    if not a or a["tenant_id"] != tid:
+    a = _load(tid, agent_id)
+    if not a:
         return {"error": "not found or not owned by this tenant"}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("UPDATE custom_agents SET enabled=%s WHERE id=%s AND tenant_id=%s",
                     (bool(enabled), agent_id, tid))
-        c.commit()
     # #12: a disabled recurring agent must also stop firing in the scheduler (pause, don't delete the
     # schedule so re-enabling resumes it). Best-effort: harmless no-op for non-recurring agents.
     se = getattr(scheduler, "set_enabled", None)
@@ -252,13 +290,14 @@ def toggle(tid, agent_id, enabled):
         except Exception:
             pass
     audit.append(actor="customagents", action="AgentToggled", resource=tid,
-                 decision="enabled" if enabled else "disabled", payload={"agent_id": agent_id})
+                 decision="enabled" if enabled else "disabled", payload={"agent_id": agent_id},
+                 tenant_id=tid)
     return {"agent_id": agent_id, "enabled": bool(enabled)}
 
 
 def delete(tid, agent_id):
-    a = _load(agent_id)
-    if not a or a["tenant_id"] != tid:
+    a = _load(tid, agent_id)
+    if not a:
         return {"error": "not found or not owned by this tenant"}
     # best-effort scheduler de-register if the scheduler exposes one; else just drop the row
     for fn in ("deregister", "unregister", "remove"):
@@ -269,11 +308,10 @@ def delete(tid, agent_id):
             except Exception:
                 pass
             break
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("DELETE FROM custom_agents WHERE id=%s AND tenant_id=%s", (agent_id, tid))
-        c.commit()
     audit.append(actor="customagents", action="AgentDeleted", resource=tid, decision="deleted",
-                 payload={"agent_id": agent_id})
+                 payload={"agent_id": agent_id}, tenant_id=tid)
     return {"agent_id": agent_id, "deleted": True}
 
 
@@ -325,7 +363,7 @@ def _selftest():
                            and t["system"] == sys_agents)
         tier_ok = sys_readonly and sole_spawner and no_privileged_custom and custom_editable
 
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM custom_agent_runs WHERE agent_id=%s", (agent_id,))
             run_rows = cur.fetchone()[0]
             cur.execute("SELECT last_status FROM custom_agents WHERE id=%s", (agent_id,))
@@ -344,22 +382,27 @@ def _selftest():
               if ok else "FAIL")
     finally:
         factory.agent = real_agent
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             if agent_id is not None:
                 cur.execute("DELETE FROM custom_agent_runs WHERE agent_id=%s", (agent_id,))
             cur.execute("DELETE FROM custom_agents WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM notifications WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 
 def _main(a):
     if not a:
-        sys.exit("usage: customagents.py run <id> | list <tid> | tiers <tid> | selftest")
+        sys.exit("usage: customagents.py run <tenant_id> <id> | run <id> | list <tid> | tiers <tid> | selftest")
     if a[0] == "run" and len(a) > 1:
-        print(json.dumps(run(int(a[1]))))
+        if len(a) > 2:
+            result = run_for_tenant(a[1], int(a[2]))
+        else:
+            result = run(int(a[1]))
+        print(json.dumps(result))
+        if _cli_exit_code(result):
+            raise SystemExit(1)
     elif a[0] == "list" and len(a) > 1:
         print(json.dumps(list_agents(a[1]), indent=2))
     elif a[0] == "tiers" and len(a) > 1:
@@ -367,7 +410,7 @@ def _main(a):
     elif a[0] == "selftest":
         _selftest()
     else:
-        sys.exit("usage: customagents.py run <id> | list <tid> | tiers <tid> | selftest")
+        sys.exit("usage: customagents.py run <tenant_id> <id> | run <id> | list <tid> | tiers <tid> | selftest")
 
 
 if __name__ == "__main__":

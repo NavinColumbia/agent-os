@@ -99,6 +99,81 @@ def test_graph_events_commit_state_and_actions_together_with_full_history_dedup(
         ))
 
 
+def test_workflow_revision_updates_indexed_version_and_executes_replacement(engine):
+    original = graph()
+    replacement = replace(
+        original,
+        version=2,
+        supersedes_version=1,
+        name="Adaptive delivery revision two",
+    )
+    engine.register_workflow(original)
+    engine.register_workflow(replacement)
+    started = engine.start_graph_run(
+        "tenant-a", "delivery", 1, run_id="revised-run", request_id="revised-start",
+    )
+
+    revised = engine.submit_graph_event("tenant-a", "revised-run", WorkflowEvent(
+        "revise",
+        WorkflowEventKind.RUN_REVISED,
+        started.state.version,
+        {
+            "replacement_workflow": replacement.to_dict(),
+            "mission_program": {"revision": 2},
+            "evidence_ids": ["revision-evidence"],
+            "reason": "Repair the live delivery graph.",
+        },
+    ))
+    assert revised.state.workflow_version == 2
+    replacement_token = revised.state.ready()[0]
+
+    running = engine.submit_graph_event("tenant-a", "revised-run", WorkflowEvent(
+        "revised-begin",
+        WorkflowEventKind.NODE_BEGAN,
+        revised.state.version,
+        {"token_id": replacement_token.token_id},
+    ))
+    completed = engine.submit_graph_event("tenant-a", "revised-run", WorkflowEvent(
+        "revised-complete",
+        WorkflowEventKind.NODE_COMPLETED,
+        running.state.version,
+        {
+            "token_id": replacement_token.token_id,
+            "satisfied_conditions": ["clear"],
+            "evidence_ids": ["revised-node-evidence"],
+        },
+    ))
+
+    assert completed.state.workflow_version == 2
+    assert completed.state.ready()[0].node_id == "done"
+
+
+def test_operator_can_retry_exact_failed_node_after_repair(engine):
+    engine.register_workflow(graph())
+    started = engine.start_graph_run(
+        "tenant-a", "delivery", 1, run_id="recover-run", request_id="recover-start",
+    )
+    token_id = started.state.ready()[0].token_id
+    running = engine.submit_graph_event("tenant-a", "recover-run", WorkflowEvent(
+        "recover-begin", WorkflowEventKind.NODE_BEGAN, 0, {"token_id": token_id},
+    ))
+    failed = engine.submit_graph_event("tenant-a", "recover-run", WorkflowEvent(
+        "recover-fail", WorkflowEventKind.NODE_FAILED, running.state.version,
+        {"token_id": token_id, "reason": "context boundary", "retryable": False},
+    ))
+    assert failed.state.status.value == "failed"
+
+    recovered = engine.submit_graph_event("tenant-a", "recover-run", WorkflowEvent(
+        "recover-request", WorkflowEventKind.NODE_RETRY_REQUESTED, failed.state.version,
+        {"token_id": token_id, "reason": "Context compaction was repaired."},
+    ))
+
+    assert recovered.state.status.value == "active"
+    assert recovered.state.failure is None
+    assert recovered.state.ready()[0].token_id == token_id
+    assert recovered.actions[0].payload["operator_recovery"] is True
+
+
 def test_graph_action_outbox_is_tenant_fenced_recoverable_and_lease_owned(engine):
     engine.register_workflow(graph())
     started = engine.start_graph_run(

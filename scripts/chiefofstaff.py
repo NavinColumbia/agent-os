@@ -14,15 +14,18 @@ concern). It reads like a chief-of-staff, not a dashboard dump.
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from dbpool import connection, tenant_connection  # noqa: E402
 
 
 def _facts(tid, org_id=0):
     """Gather THIS company's real state from the modules that already compute it. Every value is grounded;
     a missing source degrades to a note, never a fabricated number."""
-    f = {"awaiting": [], "health": None, "verdict": None, "portfolio": None, "spend": None}
+    f = {"awaiting": [], "health": None, "verdict": None, "portfolio": None, "spend": None,
+         "workstreams": []}
     try:
         import approvals
         inbox = (approvals.inbox(tid) or {}).get("items", [])     # inbox() returns {items:[...], count:N}
@@ -36,10 +39,12 @@ def _facts(tid, org_id=0):
     except Exception:
         pass
     try:
-        import portfolio
-        import psycopg
-        import trace
-        with psycopg.connect(trace.DB) as c, c.cursor() as cur:                 # scope portfolio to THIS tenant
+        import workstreamview
+        f["workstreams"] = workstreamview.active_workstreams(tid, org_id)[:8]
+    except Exception:
+        pass
+    try:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute("""SELECT count(DISTINCT product), coalesce(sum(cost_usd),0)
                            FROM traces WHERE product IN (SELECT product FROM tenant_products WHERE tenant_id=%s)
                              AND ts > now()-interval '30 days'""", (tid,))
@@ -49,6 +54,18 @@ def _facts(tid, org_id=0):
     except Exception:
         pass
     return f
+
+
+def _active_workstream_lines(facts):
+    out = []
+    for w in facts.get("workstreams") or []:
+        if not (w.get("running") or w.get("awaiting")):
+            continue
+        label = w.get("product") or w.get("label") or f"workstream {w.get('thread_id')}"
+        phase = w.get("phase") or "work"
+        state = "running" if w.get("running") else f"awaiting {w.get('awaiting')}"
+        out.append(f"{label}: {phase} {state}")
+    return out
 
 
 _BRIEF_SYS = (
@@ -67,8 +84,7 @@ def _cache_get(tid, org_id=0, ttl_s=1800):
     model call; without this the cockpit recomputes it on every load. Fail-open (None on any error, incl.
     a missing table on first-ever call). Hot path -> pooled read."""
     try:
-        import dbpool
-        with dbpool.connection(autocommit=True) as c, c.cursor() as cur:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute("""SELECT data FROM brief_cache WHERE tenant_id=%s AND org_id=%s
                            AND computed_at > now() - make_interval(secs => %s)""",
                         (tid, int(org_id or 0), int(ttl_s)))
@@ -81,20 +97,22 @@ def _cache_get(tid, org_id=0, ttl_s=1800):
     return None
 
 
+def _ensure_cache():
+    with connection() as c, c.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS brief_cache (
+            tenant_id TEXT NOT NULL, org_id INT NOT NULL DEFAULT 0, data JSONB NOT NULL,
+            computed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (tenant_id, org_id))""")
+
+
 def _cache_put(tid, org_id, data):
     """Store a freshly-computed brief for reuse. Idempotent per (tenant, org). Never raises."""
     try:
-        import psycopg
-        import trace
-        with psycopg.connect(trace.DB) as c, c.cursor() as cur:
-            cur.execute("""CREATE TABLE IF NOT EXISTS brief_cache (
-                tenant_id TEXT NOT NULL, org_id INT NOT NULL DEFAULT 0, data JSONB NOT NULL,
-                computed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (tenant_id, org_id))""")
+        _ensure_cache()
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute("""INSERT INTO brief_cache (tenant_id, org_id, data, computed_at)
                            VALUES (%s,%s,%s,now()) ON CONFLICT (tenant_id, org_id)
                            DO UPDATE SET data=EXCLUDED.data, computed_at=now()""",
                         (tid, int(org_id or 0), json.dumps(data, default=str)))
-            c.commit()
     except Exception:
         pass
 
@@ -112,6 +130,17 @@ def brief(tid, org_id=0, api_key=None, use_cache=True):
                 import approvals
                 items = (approvals.inbox(tid) or {}).get("items", [])   # inbox() -> {items:[...], count:N}
                 cached["needs_you"] = [t for t in ((i.get("title") or i.get("summary")) for i in items) if t][:5]
+            except Exception:
+                pass
+            try:
+                facts = _facts(tid, org_id)
+                active = _active_workstream_lines(facts)
+                if active:
+                    cached["_facts"] = facts
+                    cached["headline"] = f"Your team is working on {len(active)} active workstream(s)."
+                    existing = cached.get("team_did") if isinstance(cached.get("team_did"), list) else []
+                    cached["team_did"] = (active + existing)[:5]
+                    cached["suggestion"] = "Open Activity or Cockpit to monitor the active workstream."
             except Exception:
                 pass
             return cached
@@ -132,15 +161,23 @@ def brief(tid, org_id=0, api_key=None, use_cache=True):
             return data
     except Exception:
         pass
-    # grounded fallback (no model): still a real brief, not a blank
+    return _fallback_brief(facts)
+
+
+def _fallback_brief(facts):
+    """Grounded, zero-model brief for batch delivery and provider outages."""
     verdict = (facts.get("verdict") or {}).get("verdict") if isinstance(facts.get("verdict"), dict) else facts.get("verdict")
+    active = _active_workstream_lines(facts)
     return {
-        "headline": f"Company status: {verdict or 'steady'}. {len(facts['awaiting'])} decision(s) await you.",
+        "headline": (f"Your team is working on {len(active)} active workstream(s)."
+                     if active else
+                     f"Company status: {verdict or 'steady'}. {len(facts['awaiting'])} decision(s) await you."),
         "needs_you": [a.get("title") for a in facts["awaiting"] if a.get("title")][:5],
-        "team_did": ([f"Worked across {facts['portfolio']['products_touched_30d']} product(s) in 30 days"]
-                     if facts.get("portfolio") else []),
+        "team_did": (active + ([f"Worked across {facts['portfolio']['products_touched_30d']} product(s) in 30 days"]
+                               if facts.get("portfolio") else []))[:5],
         "watch": ([] if (verdict in (None, "healthy")) else [f"Company health is '{verdict}' — review needed"]),
-        "suggestion": "Open the Assistant to direct your next build." if not facts["awaiting"]
+        "suggestion": "Open Activity or Cockpit to monitor the active workstream." if active else
+                      "Open the Assistant to direct your next build." if not facts["awaiting"]
                       else "Clear the decisions waiting on you, then keep building.",
         "_facts": facts, "_fallback": True,
     }
@@ -158,35 +195,71 @@ def _fmt(b):
     return "\n".join(lines)[:400]
 
 
-def push_daily(limit=200):
-    """The PROACTIVE morning brief (REBUILD-PLAN B1): for each ACTIVE tenant, compose the chief-of-staff
-    brief and deliver it into their console notifications (+ push if they've connected one). Scheduled
-    daily. Bounded + best-effort — one tenant's failure never blocks the rest, and a session cap just
-    means fewer briefs that day (not a crash). Returns how many were delivered."""
-    import psycopg
-    import trace
-    sent = 0
+def _daily_tenants(context_key, limit):
+    """Select a fair bounded page of genuinely active, not-yet-briefed tenants.
+
+    Test/demo signups with no recent work are not an audience for a daily model campaign. A tenant is active
+    when controller work, a human request, or product traces changed in the last 30 days. The notification
+    ledger itself is the durable cursor: already-delivered tenants disappear from subsequent five-minute
+    batches, so the tail cannot be starved by a fixed LIMIT prefix.
+    """
     try:
-        with psycopg.connect(trace.DB) as c, c.cursor() as cur:
-            cur.execute("""SELECT tenant_id FROM tenants
-                           WHERE coalesce(suspended,false)=false
-                           ORDER BY tenant_id LIMIT %s""", (limit,))
-            tenants = [r[0] for r in cur.fetchall()]
-    except Exception:
-        tenants = []
+        with connection() as c, c.cursor() as cur:
+            cur.execute("""SELECT t.tenant_id FROM tenants t
+                           WHERE coalesce(t.suspended,false)=false
+                             AND NOT EXISTS (
+                                   SELECT 1 FROM notifications n
+                                    WHERE n.tenant_id=t.tenant_id AND n.context_key=%s)
+                             AND (
+                               EXISTS (SELECT 1 FROM controller_state s
+                                        WHERE s.tenant_id=t.tenant_id
+                                          AND s.updated_at>now()-interval '30 days')
+                               OR EXISTS (SELECT 1 FROM agent_requests r
+                                           WHERE r.tenant_id=t.tenant_id
+                                             AND r.created_at>now()-interval '30 days')
+                               OR EXISTS (SELECT 1 FROM tenant_products tp JOIN traces tr
+                                            ON tr.product=tp.product
+                                           WHERE tp.tenant_id=t.tenant_id
+                                             AND tr.ts>now()-interval '30 days'))
+                           ORDER BY t.tenant_id LIMIT %s""", (context_key, max(1, min(200, int(limit)))))
+            return [r[0] for r in cur.fetchall()]
+    except Exception as exc:
+        # A scheduled executive-communications job must not turn database blindness into a false-green
+        # "zero tenants" run.  Let the process exit non-zero so scheduler/management can recover/escalate.
+        raise RuntimeError(f"daily tenant discovery unavailable: {exc}") from exc
+
+
+def push_daily(limit=25):
+    """Deliver one daily brief through bounded, durable batches.
+
+    This scheduled path intentionally does not call a model once per tenant.  A previous 200-tenant model
+    loop could not finish inside the scheduler lease, retried the same prefix, and never reached later CEOs.
+    The on-demand ``brief()`` remains richly model-composed; daily delivery uses the same live facts with the
+    grounded fallback renderer and a dated idempotency key. Running this every five minutes drains any size
+    active population while sending each tenant at most once per UTC day.
+    """
+    sent = skipped = duplicates = 0
+    context_key = f"chief-of-staff-daily:{datetime.now(timezone.utc).date().isoformat()}"
+    tenants = _daily_tenants(context_key, limit)
     for tid in tenants:
         try:
-            b = brief(tid, 0)
+            b = _fallback_brief(_facts(tid, 0))
             body = _fmt(b)
             if not body:
+                skipped += 1
                 continue                              # nothing worth interrupting the CEO for today
             import notifications
-            notifications.send(tid, "digest", b.get("headline", "Your daily brief"), body,
-                               level="standard", url="/#cockpit")
-            sent += 1
+            delivery = notifications.send(tid, "digest", b.get("headline", "Your daily brief"), body,
+                                          level="standard", url="/#cockpit", context_key=context_key)
+            if isinstance(delivery, dict) and delivery.get("duplicate"):
+                duplicates += 1
+            else:
+                sent += 1
         except Exception:
             continue
-    return {"briefs_sent": sent, "tenants": len(tenants)}
+    return {"briefs_sent": sent, "duplicates": duplicates,
+            "tenants_considered": len(tenants), "empty_skipped": skipped,
+            "context_key": context_key}
 
 
 def _selftest():
@@ -221,13 +294,20 @@ def _selftest():
         chk(isinstance(_facts(tid, 0), dict) and "awaiting" in _facts(tid, 0),
             "_facts gathers real state without fabricating (empty tenant -> empty, not invented)")
 
-        # (d) daily push is scheduled (the proactive morning brief) + _fmt renders a body
+        # (d) cache writes are tenant-owned data writes, not request-path DDL under the app role.
+        _cache_put(tid, 0, {"headline": "Cached brief", "needs_you": [], "team_did": [],
+                            "watch": [], "suggestion": "Keep moving"})
+        cached = _cache_get(tid, 0)
+        chk(cached and cached.get("_cached") and cached.get("headline") == "Cached brief",
+            "brief cache writes and reads a structured tenant-owned brief")
+
+        # (e) daily push is scheduled (the proactive morning brief) + _fmt renders a body
         import scheduler
         scheduled = any(n == "chiefofstaff-daily" for n, _, _ in scheduler.DEFAULT_SCHEDULES)
         chk(scheduled and _fmt({"needs_you": ["Approve X"], "suggestion": "Ship it"}),
             "daily brief is scheduled (chiefofstaff-daily) + renders a notification body")
 
-        # (e) REGRESSION GUARD: a tenant with a REAL pending decision must surface it in 'awaiting'. The
+        # (f) REGRESSION GUARD: a tenant with a REAL pending decision must surface it in 'awaiting'. The
         #     inbox-shape bug (approvals.inbox() returns {items:[...],count:N}, not a list) made this
         #     silently EMPTY, so the CEO's brief never showed a single decision. A provider connected but
         #     no consent always yields a 'consent required' inbox item -> awaiting must be non-empty.
@@ -239,9 +319,9 @@ def _selftest():
         chk(len(gfacts["awaiting"]) > 0 and any(a.get("title") for a in gfacts["awaiting"]),
             "a tenant with a pending decision surfaces it in awaiting (guards the inbox {items} shape bug)")
         try:
-            import psycopg
-            import trace
-            with psycopg.connect(trace.DB) as c, c.cursor() as cur:
+            with tenant_connection(tid) as c, c.cursor() as cur:
+                cur.execute("DELETE FROM brief_cache WHERE tenant_id=%s", (tid,))
+            with connection() as c, c.cursor() as cur:
                 cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (gtid,)); c.commit()
         except Exception:
             pass

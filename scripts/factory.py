@@ -11,28 +11,34 @@ Every step is audited.
   factory.py build <product> "<charter>"         # run a product end-to-end through the line
   factory.py fleet <specs.json> [workers]        # build SEVERAL products concurrently (the factory)
   factory.py selftest                            # offline check (prompt assembly, no model calls)
-Run with the agent-os venv python. Needs the `claude` CLI authenticated; pytest in the venv.
+Run with the agent-os venv python. Defaults to Codex (`AOS_DEFAULT_ENGINE=codex`); set
+`AOS_DEFAULT_ENGINE=claude` for Claude-first. A canary-gated, platform-internal Hermes specialist engine is
+available with `AOS_HERMES_ENABLED=1`; it falls back to Codex when unavailable. Needs the selected CLI
+authenticated; pytest in the venv.
 """
 import contextlib
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-
-import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
 import governance  # noqa: E402  — central spawn/write/action enforcement (reads the role manifests)
 import killswitch  # noqa: E402
+import process_assurance  # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
 
-from aoscfg import ENV as _ENV, DB as _DB
+from aoscfg import (CONTROL_PLANE_ROOT, ENV as _ENV, DB as _DB,
+                    PRODUCTS_ROOT, VENV_PY)
 
 
 import threading
@@ -46,6 +52,31 @@ _ctx = threading.local()   # per-build context (run/product/stage) so concurrent
 _QA_CTX = {}
 
 
+def _emit_progress(stage, event, detail=None):
+    """Publish a substantive build checkpoint to an enclosing durable controller worker.
+
+    The callback is deliberately process/thread local and optional: standalone factory use keeps the old
+    contract.  Controller-owned builds use it to renew ``controller_jobs.progress_at`` only at real stage or
+    component transitions, so a fresh heartbeat cannot disguise a live-but-stuck build and a genuinely
+    progressing hour-long build is never killed by wall-clock age alone.
+    """
+    callback = getattr(_ctx, "progress_callback", None)
+    if not callback:
+        return False
+    try:
+        callback(str(stage or "build"), str(event or "progress"), detail)
+        return True
+    except Exception:
+        # Progress projection is observability, never permission to fail product work.
+        return False
+
+
+def _context_value(name, default=None):
+    """Resolve thread-local build context, then the dedicated standalone-QA process context."""
+    value = getattr(_ctx, name, None)
+    return value if value is not None else _QA_CTX.get(name, default)
+
+
 def _trace(kind, role, prompt, output, rc, elapsed=None, cost_usd=0.0, tokens_in=0, tokens_out=0, model=None):
     """Persist a step's full I/O + real economics + the model used, for debugging/replay/reproducibility."""
     run = getattr(_ctx, "run", None) or _QA_CTX.get("run")
@@ -55,16 +86,32 @@ def _trace(kind, role, prompt, output, rc, elapsed=None, cost_usd=0.0, tokens_in
     stage = getattr(_ctx, "stage", None) or _QA_CTX.get("stage")
     try:
         import redact
-        with psycopg.connect(_DB) as c, c.cursor() as cur:
+        tenant_id = _context_value("tenant") or _tenant_for_product(product)
+        conn = tenant_connection(tenant_id) if tenant_id else connection()
+        with conn as c, c.cursor() as cur:
             cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, prompt, output, rc,
-                             elapsed_s, cost_usd, tokens_in, tokens_out, model)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                             elapsed_s, cost_usd, tokens_in, tokens_out, model, test_run, tenant_id)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (run, product, stage, role, kind,
                          redact.scrub((prompt or "")[:20000]), redact.scrub((output or "")[:20000]), rc,
-                         elapsed, cost_usd, tokens_in, tokens_out, model))
+                         elapsed, cost_usd, tokens_in, tokens_out, model,
+                         os.environ.get("AOS_SELFTEST", "").strip().lower() in {"1", "true", "yes", "on"},
+                         tenant_id))
             c.commit()
     except Exception:
         pass
+
+
+def _tenant_for_product(product):
+    """Best-effort product ownership lookup for tenant-scoped audit rows."""
+    try:
+        with connection() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM tenant_products WHERE product=%s ORDER BY created_at DESC LIMIT 1",
+                        (product,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
 
 
 @contextlib.contextmanager
@@ -90,7 +137,8 @@ def _qa_trace_ctx(product):
     _ctx.run, _ctx.product, _ctx.stage = run, product, "QA"
     # Mirror into the process-wide fallback so QA's ThreadPoolExecutor workers — where the model calls actually
     # happen — resolve a context too. Without this the thread-local above covers only the main thread.
-    _QA_CTX.update({"run": run, "product": product, "stage": "QA"})
+    _QA_CTX.update({"run": run, "product": product, "stage": "QA",
+                    "tenant": _tenant_for_product(product)})
     try:
         yield True
     finally:
@@ -103,32 +151,49 @@ def _stage_done(run, stage):
     """Crash-resume checkpoint: a stage is already complete if its agent step is recorded done in the
     traces we persist anyway. Re-running a crashed build skips finished stages — no DBOS needed for this."""
     try:
-        with psycopg.connect(_DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("""SELECT 1 FROM traces WHERE run_id=%s AND stage=%s AND kind='agent' AND rc=0
+                             AND NOT test_run
                            LIMIT 1""", (run, stage))
             return cur.fetchone() is not None
     except Exception:
         return False
 
 
-def _log_comm(cid, sender, recipient, intent, content):
+def _log_comm(cid, sender, recipient, intent, content, tenant_id=None):
     """Record a durable handoff in the conversation fabric so the dashboard's comms graph + message
     queue reflect REAL agent-to-agent communication (not just the audit stream). Best-effort."""
     try:
-        with psycopg.connect(_DB) as c, c.cursor() as cur:
-            cur.execute("""INSERT INTO conversations (conversation_id, message_id, intent, sender, recipient, content)
-                           VALUES (%s,%s,%s,%s,%s,%s)""",
+        conn = tenant_connection(tenant_id) if tenant_id else connection()
+        with conn as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO conversations
+                             (conversation_id, message_id, intent, sender, recipient, content, tenant_id)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                         (cid, f"{sender}->{recipient}-{int(time.time()*1000)}", intent, sender, recipient,
-                         json.dumps(content)))
-            c.commit()
+                         json.dumps(content), tenant_id))
     except Exception:
         pass
 
-ROLES = Path.home() / "projects" / "control-plane" / "roles"
-PRODUCTS = Path.home() / "projects" / "products"
-from aoscfg import VENV_PY
+ROLES = CONTROL_PLANE_ROOT / "roles"
+PRODUCTS = PRODUCTS_ROOT
 MAX_FIX = 3  # bounded QA->BUILD re-flow attempts
 MAX_REVIEW = int(os.environ.get("AOS_MAX_REVIEW", "1"))  # bounded REVIEW->BUILD->re-QA->re-review cycles
+
+
+def _bounded_int_env(name, default, minimum, maximum):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = int(default)
+    return min(int(maximum), max(int(minimum), value))
+
+
+RESUME_CANDIDATE_PAGE = _bounded_int_env(
+    "AOS_FACTORY_RESUME_CANDIDATE_PAGE", 100, 1, 100)
+RESUME_CLAIM_PAGE = _bounded_int_env(
+    "AOS_FACTORY_RESUME_CLAIM_PAGE", 100, 1, 100)
+RESUME_CLAIM_LEASE_S = _bounded_int_env(
+    "AOS_FACTORY_RESUME_CLAIM_LEASE_S", 900, 60, 86400)
 # Global backpressure: no matter how many builds run concurrently, total live agent subprocesses are
 # capped here (each ~430MB) so a big fleet can't exhaust RAM or hammer the API into rate-limits.
 _AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8")))
@@ -141,6 +206,7 @@ _AGENT_SEM = threading.BoundedSemaphore(int(os.environ.get("AOS_MAX_AGENTS", "8"
 BUILD_MODEL = os.environ.get("AOS_BUILD_MODEL", "claude-opus-4-8")
 CHEAP_MODEL = os.environ.get("AOS_CHEAP_MODEL", "claude-haiku-4-5-20251001")
 FALLBACK_MODEL = os.environ.get("AOS_FALLBACK_MODEL", "claude-sonnet-4-6")
+DEFAULT_ENGINE = os.environ.get("AOS_DEFAULT_ENGINE", "codex").strip().lower() or "codex"
 # The frontier model — most capable but credit-expensive; opt-in only (never handed out as the fleet default).
 FRONTIER_MODEL = os.environ.get("AOS_FRONTIER_MODEL", "claude-fable-5")
 
@@ -288,21 +354,51 @@ _TRANSIENT = ("overloaded", "rate limit", "rate_limit", "429", "529", "503", "ti
 # --fallback-model only covers overload, so a capped model just keeps failing. Detect it and SWITCH models.
 _MODEL_EXHAUSTED = ("reached your", "usage-credits", "usage limit", "switch models with", "run /model",
                     "upgrade to continue", "out of credits")
+_PROVIDER_AUTH_UNAVAILABLE = ("failed to authenticate", "oauth session expired", "authentication failed",
+                              "not logged in", "login required", "invalid authentication")
 # Cross-provider failover: when Claude/Anthropic is degraded or down (retries exhausted on transient
 # errors), the SAME task is retried once on OpenAI Codex so the factory keeps moving. Set to "none" to
-# disable. CODEX_MODEL is just the label recorded in the trace (Codex uses its own configured model).
+# disable. Pin both Codex tiers explicitly: otherwise every supposedly-light QA/navigation turn silently
+# inherits the host config's flagship model.
 FALLBACK_ENGINE = os.environ.get("AOS_FALLBACK_ENGINE", "codex").lower()
-CODEX_MODEL = os.environ.get("AOS_CODEX_MODEL", "codex")
+# A platform-owned primary Codex call may use the already configured Claude login when OpenAI is unavailable.
+# This is deliberately symmetric with Claude -> Codex failover below. Tenant/BYO work never crosses to host
+# credentials: the call-site checks the active tenant and explicit provider keys before taking this path.
+CODEX_FALLBACK_ENGINE = os.environ.get("AOS_CODEX_FALLBACK_ENGINE", "claude").strip().lower()
+CODEX_MODEL = os.environ.get("AOS_CODEX_MODEL", "gpt-5.6-sol").strip() or "gpt-5.6-sol"
+CODEX_LIGHT_MODEL = (os.environ.get("AOS_CODEX_LIGHT_MODEL", "gpt-5.6-luna").strip()
+                     or "gpt-5.6-luna")
+CODEX_REASONING_EFFORT = (os.environ.get("AOS_CODEX_REASONING_EFFORT", "xhigh").strip() or "xhigh")
+CODEX_LIGHT_REASONING_EFFORT = (
+    os.environ.get("AOS_CODEX_LIGHT_REASONING_EFFORT", "low").strip() or "low")
+HERMES_MODEL = os.environ.get("AOS_HERMES_MODEL", "").strip()
+HERMES_FALLBACK_ENGINE = os.environ.get("AOS_HERMES_FALLBACK_ENGINE", "codex").strip().lower()
 # Codex reports TOKENS, not USD, so its spend used to be recorded as $0 — meaning a PLATFORM failover to
-# Codex burned real OpenAI money that never counted against the budget cap (cost-runaway risk). Convert
-# tokens -> USD with an estimate (USD per 1M tokens, input/output); override via env if the real rate differs.
-CODEX_PRICE = (float(os.environ.get("AOS_CODEX_PRICE_IN", "2.5")),
-               float(os.environ.get("AOS_CODEX_PRICE_OUT", "10.0")))
+# Codex burned real OpenAI money that never counted against the budget cap. Defaults follow the official GPT-5.6
+# catalog; global overrides remain backward compatible and per-tier overrides support an honest mixed ledger.
+_CODEX_PRICE_DEFAULTS = {
+    "gpt-5.6-sol": (5.0, 30.0),
+    "gpt-5.6-terra": (2.0, 12.0),
+    "gpt-5.6-luna": (0.2, 1.2),
+}
 
 
-def _codex_cost(tin, tout):
+def _codex_prices(model):
+    model = str(model or CODEX_MODEL)
+    defaults = _CODEX_PRICE_DEFAULTS.get(model, _CODEX_PRICE_DEFAULTS["gpt-5.6-sol"])
+    tier = model.rsplit("-", 1)[-1].upper() if model in _CODEX_PRICE_DEFAULTS else "DEFAULT"
+    in_key, out_key = f"AOS_CODEX_{tier}_PRICE_IN", f"AOS_CODEX_{tier}_PRICE_OUT"
+    return (float(os.environ.get("AOS_CODEX_PRICE_IN", os.environ.get(in_key, defaults[0]))),
+            float(os.environ.get("AOS_CODEX_PRICE_OUT", os.environ.get(out_key, defaults[1]))))
+
+
+CODEX_PRICE = _codex_prices(CODEX_MODEL)
+
+
+def _codex_cost(tin, tout, model=None):
     """Estimated USD for a Codex turn from its token counts, so Codex spend is counted, not recorded as $0."""
-    return (int(tin or 0) * CODEX_PRICE[0] + int(tout or 0) * CODEX_PRICE[1]) / 1_000_000
+    price = _codex_prices(model or CODEX_MODEL)
+    return (int(tin or 0) * price[0] + int(tout or 0) * price[1]) / 1_000_000
 # Per-factory BUDGET control (a tenant tunes these to their wallet). AOS_BUDGET_USD is a soft cap on total
 # spend for this process: once reached, agent() refuses to spawn new work and escalates instead of running
 # away. DEFAULT is a HIGH RUNAWAY BACKSTOP ($1000 ~= ~2250 heavy agent calls), not unlimited — an UNATTENDED
@@ -452,7 +548,50 @@ def _estimate_runtime(role, task, env):
     return mins, rets
 
 
-CONTROL_PLANE = Path.home() / "projects" / "control-plane"
+CONTROL_PLANE = CONTROL_PLANE_ROOT
+_SPEND_RESERVATION_DENIED_RC = 75
+
+
+def _model_call_reserve_usd(role, model, prompt):
+    """Conservative admission envelope; actual cost replaces it before the completed trace is written."""
+    role_name = str(role or "").lower()
+    model_name = str(model or "").lower()
+    if "luna" in model_name or "haiku" in model_name:
+        return 0.25
+    if role_name == "qa-security":
+        return 1.50
+    # Bounded isolated evidence reviewers cannot inspect a repository or recursively gather context.
+    if role_name == "reviewer" and "EVIDENCE CAPSULE" in str(prompt or ""):
+        return 1.50
+    return 10.0
+
+
+def _reserve_model_call(role, model, prompt):
+    product = _context_value("product")
+    if not product:
+        return {"ok": True, "token": None}
+    try:
+        import appguard
+        return appguard.reserve_call(
+            product, _model_call_reserve_usd(role, model, prompt),
+            owner=f"factory:{role}:{os.getpid()}")
+    except Exception as exc:
+        # A reservation service outage means the exact cap cannot be proven. Fail closed for paid work; this
+        # is a financial authority boundary, not an ordinary observability hiccup.
+        return {"ok": False, "token": None,
+                "reason": f"spend reservation unavailable: {type(exc).__name__}"}
+
+
+def _settle_model_call(reservation, actual_cost=0.0, *, trace_grace_s=5):
+    token = (reservation or {}).get("token")
+    if not token:
+        return
+    try:
+        import appguard
+        appguard.settle_call(token, actual_cost, trace_grace_s=trace_grace_s)
+    except Exception:
+        # The reservation has its own finite lease; failure to shorten it is conservative, never overspend.
+        pass
 
 
 def _changed_paths(repo):
@@ -521,6 +660,11 @@ def _govern_writes(role, repo):
 
 
 def _run_once(role, repo, prompt, timeout, env, model, tools=None):
+    if os.environ.get("AOS_DISABLE_EXTERNAL_MODEL_EXEC", "").strip().lower() in {"1", "true", "yes", "on"}:
+        raise RuntimeError(
+            "external model execution is disabled for this process; use a deterministic runner or "
+            "explicitly opt in for a scoped live test"
+        )
     cmd = ["claude", "-p", prompt, "--permission-mode", "acceptEdits", "--output-format", "json",
            "--model", model, "--fallback-model", FALLBACK_MODEL]   # pin + auto-fallback on overload
     # Grant the agent the tools its job needs. File edits already flow via acceptEdits; non-edit tools
@@ -545,6 +689,13 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
         genv["CLAUDE_CONFIG_DIR"] = _cfg
     if mpath.exists():
         genv["CP_MANIFEST"] = str(mpath); genv["CP"] = str(CONTROL_PLANE)
+    # Reserve before creating any per-call temp state. A denied paid call must be a true no-op: no provider
+    # process and no orphaned MCP file waiting for a cleanup path that will never run.
+    reservation = _reserve_model_call(role, model, prompt)
+    if not reservation.get("ok"):
+        detail = reservation.get("reason") or "paid call would exceed the app spend cap"
+        return (_SPEND_RESERVATION_DENIED_RC, f"app spend reservation denied: {detail}",
+                0.0, 0, 0, model)
     # MCP (A4): connect the MCP servers the role's manifest declares so its governed mcp__* tools actually
     # exist. Additive + fail-safe — a role with no `mcp_servers` gets no flag (byte-for-byte unchanged); the
     # temp config is always cleaned up (no /tmp leak). --strict-mcp-config ignores any ambient MCP config.
@@ -556,13 +707,18 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
         json.dump(_mcpcfg, _mcpf); _mcpf.close()
         cmd += ["--mcp-config", _mcpf.name, "--strict-mcp-config"]
     try:
-        # CROSS-PROCESS GATE (deeper F12 fix): hold one of a global N-slot pool for the duration of the claude
-        # call, so TOTAL concurrent claude calls across ALL processes (build/QA/jobd/console/…) is capped —
-        # the per-process semaphore above can't do that. Fail-open: if no slot frees in time it runs ungated
-        # (brief over-subscription beats a deadlocked fleet).
+        # One host-sized, durable cross-process population cap covers BOTH Claude and Codex children. The
+        # lease outlives this call's subprocess timeout and release is ownership-fenced after expiry/reclaim.
         import claude_gate
-        with claude_gate.slot(f"{role}:{os.getpid()}"):
-            p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=genv)
+        with claude_gate.agent_slot(claude_gate.process_holder("claude", role),
+                                    lease_s=max(60, int(timeout) + 60)) as lease:
+            import clauded
+            p = clauded.run_owned(cmd, owner=f"factory:{role}:{os.getpid()}", cwd=repo,
+                                  capture_output=True, text=True, timeout=timeout, env=genv,
+                                  lease=lease)
+    except Exception:
+        _settle_model_call(reservation, 0.0, trace_grace_s=0)
+        raise
     finally:
         if _mcpf:
             try:
@@ -581,10 +737,31 @@ def _run_once(role, repo, prompt, timeout, env, model, tools=None):
         used = model   # record the PINNED model (reproducibility anchor); CLI may use cheaper models internally
     except Exception:
         pass
+    _settle_model_call(reservation, cost)
     return p.returncode, out_text, cost, tin, tout, used
 
 
-def _run_once_codex(role, repo, prompt, timeout, env):
+def _codex_sandbox(role: str) -> str:
+    """Translate manifest tool authority into an OS-enforced Codex filesystem boundary.
+
+    Codex does not consume Claude's per-tool deny list.  A role denied every write-capable tool must therefore
+    run in the read-only sandbox; relying on a prompt or a post-run git diff is not enforcement (and generated
+    product directories are intentionally not always git checkouts).
+    """
+    try:
+        manifest = governance.load_manifest(role)
+        if not manifest:
+            return "read-only"
+        flags = governance.flags(role)
+        declared = set(manifest.get("tools") or [])
+        may_write = (bool(flags.get("can_modify_code")) or bool(flags.get("can_modify_registry"))
+                     or bool(declared & {"Edit", "Write", "NotebookEdit"}))
+        return "workspace-write" if may_write else "read-only"
+    except Exception:
+        return "read-only"                       # unknown governance state is least privilege
+
+
+def _run_once_codex(role, repo, prompt, timeout, env, model=None, reasoning_effort=None):
     """Fallback engine: run the SAME task via OpenAI Codex (`codex exec`) when Claude is unavailable.
     Returns the SAME tuple shape as _run_once. Codex reports tokens (not USD) in its `turn.completed`
     JSONL events, so we convert them to an estimated USD (_codex_cost) — otherwise the spend records as $0
@@ -592,15 +769,50 @@ def _run_once_codex(role, repo, prompt, timeout, env):
     which engine produced the stage. Uses the platform's Codex auth (workspace-write sandbox = it may
     edit files in the repo, like the Claude path). Honest note: a BYO-key tenant is NOT failed over here
     (the caller gates that) so we never silently spend platform OpenAI on a tenant's behalf."""
+    if os.environ.get("AOS_DISABLE_EXTERNAL_MODEL_EXEC", "").strip().lower() in {"1", "true", "yes", "on"}:
+        raise RuntimeError(
+            "external model execution is disabled for this process; use a deterministic runner or "
+            "explicitly opt in for a scoped live test"
+        )
     tmp = Path(tempfile.mkdtemp(prefix="codexrun-"))
     out_file = tmp / "last.txt"
-    cmd = ["codex", "exec", "--skip-git-repo-check", "-s", "workspace-write", "--json",
-           "-o", str(out_file), prompt]
+    jsonl_file = tmp / "events.jsonl"
+    stderr_file = tmp / "stderr.txt"
+    selected_model = str(model or CODEX_MODEL)
+    selected_effort = str(reasoning_effort or CODEX_REASONING_EFFORT)
+    reservation = _reserve_model_call(role, selected_model, prompt)
+    if not reservation.get("ok"):
+        detail = reservation.get("reason") or "paid call would exceed the app spend cap"
+        return (_SPEND_RESERVATION_DENIED_RC, f"app spend reservation denied: {detail}",
+                0.0, 0, 0, selected_model)
+    cmd = ["codex", "exec", "--skip-git-repo-check", "-s", _codex_sandbox(role),
+           "-m", selected_model, "-c", f'model_reasoning_effort="{selected_effort}"', "--json",
+           "-o", str(out_file), "-"]
     try:
-        p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout, env=env)
+        import claude_gate
+        with claude_gate.agent_slot(claude_gate.process_holder("codex", role),
+                                    lease_s=max(60, int(timeout) + 60)) as lease:
+            # Codex is a platform-owned batch child just like Claude. Route it through the exact
+            # boot-id/start-ticks registry so a killed QA/controller parent cannot leave an
+            # unowned `codex exec` (or its descendants) consuming WSL resources indefinitely.
+            import clauded
+            # Capture JSONL in regular files, not subprocess pipes. Some Codex generations briefly leave a
+            # helper holding an inherited stdout descriptor after the CLI root has exited. With PIPEs,
+            # ``communicate`` interpreted that harmless drain lag as an early timeout (for example, reporting
+            # "timeout after 90s" after 11s) and discarded a completed model result. Regular files have no
+            # pipe-EOF dependency; the exact process lease and outer timeout still fence the batch child.
+            with jsonl_file.open("w", encoding="utf-8") as stdout_stream, \
+                    stderr_file.open("w", encoding="utf-8") as stderr_stream:
+                p = clauded.run_owned(cmd, owner=f"factory-codex:{role}:{os.getpid()}",
+                                      lease=lease, cwd=repo, stdout=stdout_stream, stderr=stderr_stream,
+                                      text=True, input=prompt, timeout=timeout, env=env)
         _govern_writes(role, repo)                  # Codex ignores claude hooks -> this backstop is PRIMARY here
+        stdout_text = jsonl_file.read_text(encoding="utf-8", errors="replace")
+        stderr_text = stderr_file.read_text(encoding="utf-8", errors="replace")
+        if not stdout_text and getattr(p, "stdout", None):  # compatibility with deterministic test doubles
+            stdout_text = p.stdout or ""
         tin = tout = 0
-        for line in (p.stdout or "").splitlines():
+        for line in stdout_text.splitlines():
             try:
                 o = json.loads(line)
                 if o.get("type") == "turn.completed":
@@ -608,35 +820,113 @@ def _run_once_codex(role, repo, prompt, timeout, env):
                     tin += int(u.get("input_tokens", 0)); tout += int(u.get("output_tokens", 0))
             except Exception:
                 pass
-        out_text = out_file.read_text().strip() if out_file.exists() else (p.stdout or "")
-        return p.returncode, out_text, _codex_cost(tin, tout), tin, tout, CODEX_MODEL   # real spend, not $0
+        out_text = out_file.read_text().strip() if out_file.exists() else (stdout_text or stderr_text)
+        cost = _codex_cost(tin, tout, selected_model)
+        _settle_model_call(reservation, cost)
+        return p.returncode, out_text, cost, tin, tout, selected_model
+    except Exception:
+        _settle_model_call(reservation, 0.0, trace_grace_s=0)
+        raise
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _agent_codex(role, repo, prompt, codex_key, timeout=600):
+def _agent_codex(role, repo, prompt, codex_key, timeout=600, retries=1, model=None,
+                 reasoning_effort=None):
     """Run an agent on Codex as the PRIMARY engine (for tenants who only have an OpenAI/Codex key).
     Bounded retries, the tenant's key in the env, same trace/spend/audit bookkeeping as the Claude path."""
+    timeout = 600 if timeout is None else max(1, int(timeout))
+    retries = 1 if retries is None else max(0, int(retries))
     cenv = {**os.environ}
     if codex_key:
         cenv["OPENAI_API_KEY"] = codex_key
     last_out = ""
-    for attempt in range(2):
+    attempts = retries + 1
+    for attempt in range(attempts):
+        attempt_timeout = timeout
+        attempt_started = time.monotonic()
         try:
             with _AGENT_SEM:
-                rc, out_text, cost, tin, tout, used = _run_once_codex(role, repo, prompt, timeout, cenv)
+                rc, out_text, cost, tin, tout, used = _run_once_codex(
+                    role, repo, prompt, attempt_timeout, cenv, model=model,
+                    reasoning_effort=reasoning_effort)
         except subprocess.TimeoutExpired:
-            timeout = min(900, int(timeout * 1.5)); last_out = "timeout"; continue
+            elapsed = time.monotonic() - attempt_started
+            last_out = f"timeout after {attempt_timeout}s"
+            _trace("agent", role, prompt, last_out, -1, elapsed, model=str(model or CODEX_MODEL))
+            audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                         decision="timeout", payload={"engine": "codex", "rc": -1,
+                         "attempt": attempt + 1, "timeout_s": attempt_timeout,
+                         "elapsed_s": round(elapsed, 3), "model": str(model or CODEX_MODEL),
+                         "reasoning_effort": reasoning_effort})
+            timeout = min(900, int(attempt_timeout * 1.5))
+            continue
+        elapsed = time.monotonic() - attempt_started
+        if rc == _SPEND_RESERVATION_DENIED_RC:
+            return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True,
+                    "reason": "app spend reservation denied", "blocker": out_text,
+                    "provider_unavailable": False, "engine": "codex"}
         _add_spend(cost)
         audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
-                     decision="executed", payload={"engine": "codex", "rc": rc, "attempt": attempt + 1})
-        _trace("agent", role, prompt, out_text, rc, 0.0, cost, tin, tout, used)
+                     decision="executed", payload={"engine": "codex", "rc": rc, "attempt": attempt + 1,
+                                                     "model": used,
+                                                     "reasoning_effort": reasoning_effort,
+                                                     "elapsed_s": round(elapsed, 3)})
+        _trace("agent", role, prompt, out_text, rc, elapsed, cost, tin, tout, used)
         if rc == 0 and out_text.strip():
             return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost, "tokens_in": tin,
-                    "tokens_out": tout, "attempts": attempt + 1, "model": used}
+                    "tokens_out": tout, "attempts": attempt + 1, "model": used, "engine": "codex",
+                    "elapsed_s": elapsed}
         last_out = out_text
-        time.sleep(4 * (attempt + 1))
-    return {"rc": 1, "out": (last_out or "")[-1500:], "out_full": last_out or "", "failed": True, "reason": "codex exhausted"}
+        if attempt + 1 < attempts:
+            time.sleep(4 * (attempt + 1))
+    lower = (last_out or "").lower()
+    exhausted = any(token in lower for token in _MODEL_EXHAUSTED)
+    auth_unavailable = any(token in lower for token in _PROVIDER_AUTH_UNAVAILABLE)
+    provider_unavailable = exhausted or auth_unavailable
+    if exhausted:
+        reason = "codex provider usage exhausted"
+    elif auth_unavailable:
+        reason = "codex provider authentication unavailable"
+    else:
+        reason = "codex execution failed"
+    return {"rc": 1, "out": (last_out or "")[-1500:], "out_full": last_out or "", "failed": True,
+            "reason": reason, "provider_unavailable": provider_unavailable,
+            "provider_exhausted": exhausted, "provider_auth_unavailable": auth_unavailable,
+            "engine": "codex"}
+
+
+def _agent_hermes(role, repo, prompt, *, timeout=None, model=None):
+    """Run one canary-gated platform specialist through Hermes with normal spend/audit/trace accounting."""
+    import hermes_bridge
+    selected_model = str(model or HERMES_MODEL or "hermes-default")
+    reservation = _reserve_model_call(role, selected_model, prompt)
+    if not reservation.get("ok"):
+        detail = reservation.get("reason") or "paid call would exceed the app spend cap"
+        return {"rc": _SPEND_RESERVATION_DENIED_RC, "out": detail, "out_full": detail,
+                "failed": True, "reason": "app spend reservation denied", "blocker": detail,
+                "provider_unavailable": False, "engine": "hermes"}
+    started = time.monotonic()
+    try:
+        with _AGENT_SEM:
+            result = hermes_bridge.run(
+                role, repo, prompt, tenant_id=_context_value("tenant"), timeout=timeout,
+                model=None if selected_model == "hermes-default" else selected_model)
+    except Exception:
+        _settle_model_call(reservation, 0.0, trace_grace_s=0)
+        raise
+    cost = float(result.get("cost_usd") or 0.0)
+    _settle_model_call(reservation, cost)
+    _add_spend(cost)
+    elapsed = float(result.get("elapsed_s") or (time.monotonic() - started))
+    audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
+                 decision="executed" if result.get("rc") == 0 else "provider-unavailable",
+                 payload={"engine": "hermes", "rc": result.get("rc"), "model": result.get("model"),
+                          "elapsed_s": round(elapsed, 3), "session_id": result.get("session_id")})
+    _trace("agent", role, prompt, result.get("out_full") or result.get("out") or "",
+           result.get("rc", 1), elapsed, cost, result.get("tokens_in", 0),
+           result.get("tokens_out", 0), result.get("model") or selected_model)
+    return result
 
 
 def _codex_fallback_env():
@@ -680,7 +970,9 @@ def _codex_fallback_env():
 
 
 def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = None, model: str = None,
-          tools: list = None, spawner: str = None, light: bool = False) -> dict:
+          tools: list = None, spawner: str = None, light: bool = False,
+          compact: bool = False, codex_model: str = None,
+          reasoning_effort: str = None, hermes_model: str = None) -> dict:
     """Run one role-specialized agent (headless claude), RESILIENTLY. Timeout + retry from the CALLEE's
     own estimate (pre-flight handshake). Model is pinned (reproducible) with --fallback-model on overload;
     low-stakes stages pass a cheaper model. A timeout no longer kills the stage (retry w/ backoff),
@@ -694,7 +986,11 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     overhead here), and (c) SKIPS the estimate handshake (fixed short timeout, no retries) so there's only
     ONE model round-trip. All the governance/consent/provider/budget/killswitch gates below still apply —
     light only changes model + prompt weight + the pre-flight, never the safety chokepoints. Heavy work
-    (research/build/spec/review) leaves light=False and keeps the strong model + full charter."""
+    (research/build/spec/review) leaves light=False and keeps the strong model + full charter.
+
+    SELF-CONTAINED STRONG PATH (compact=True): keep the normal strong model/reasoning, but omit the generic
+    role charter when the caller already supplies a complete evidence contract. This is for structured judges,
+    not chat: it removes duplicated instructions without weakening the model or the caller's safety rules."""
     model = model or (CHEAP_MODEL if light else _default_build_model())
     _apply_scale()                                    # dial capability (agents/rigor/depth) to the wallet
     # GOVERNANCE (can_spawn gate): the factory spawns this sub-agent ON BEHALF of the orchestrating role.
@@ -733,7 +1029,7 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     # set no tenant -> not gated (higher layers bound the build line; bricking every agent on a missing-tenant
     # gap is the wrong trade — mirrors the spawn-gate fail-open above). Fail OPEN on consent-infra error (a DB
     # hiccup shouldn't wedge the fleet); a clean, readable 'no consent on file' for a known tenant fails CLOSED.
-    _tenant = getattr(_ctx, "tenant", None)
+    _tenant = _context_value("tenant")
     if _tenant:
         try:
             import consent
@@ -770,11 +1066,11 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     if BUDGET_USD and spent_usd() >= BUDGET_USD:      # BUDGET cap: stop spawning new work, escalate
         return {"rc": -1, "failed": True, "out": "budget exhausted",
                 "blocker": f"factory budget ${BUDGET_USD:.2f} exhausted (${spent_usd():.2f} spent) — raise AOS_BUDGET_USD or split the work"}
-    _halt = killswitch.is_halted(getattr(_ctx, "product", None) or "global")  # runtime human-oversight stop
+    _halt = killswitch.is_halted(_context_value("product") or "global")  # runtime human-oversight stop
     if _halt.get("halted"):                           # operator / EU-AI-Act kill-switch: refuse next spawn
         return {"rc": -1, "failed": True, "out": "halted",
                 "blocker": f"fleet HALTED by operator (scope={_halt.get('scope')}): {_halt.get('reason')} — resume with killswitch.py resume"}
-    _prod = getattr(_ctx, "product", None)            # MONEY CIRCUIT-BREAKER (C4): the per-app spend/loss cap
+    _prod = _context_value("product")                 # MONEY CIRCUIT-BREAKER (C4): the per-app spend/loss cap
     if _prod:                                          # must FIRE mid-build, not just an hourly sweep after the fact
         try:
             import appguard
@@ -791,9 +1087,9 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
     # for the product -> it allows (this only bites tenants who opted into a hard cap). On a governor-infra
     # error we fail OPEN: the soft USD cap above + the killswitch still bound spend, and blocking every
     # build because the budgets DB hiccuped would break the whole factory's liveness.
-    product = getattr(_ctx, "product", None)
+    product = _context_value("product")
     if product:
-        est_tokens = len(role_brief(role)) // 4 + len(task) // 4 + 8000  # prompt-in estimate + output allowance
+        est_tokens = (0 if compact else len(role_brief(role))) // 4 + len(task) // 4 + 8000
         try:
             import budget as _budget
             allowed = _budget.allow_spend(product, est_tokens)
@@ -813,6 +1109,11 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
         # one-line identity + a "be quick" instruction — a clarifying reply must feel near-instant.
         prompt = (f"You are the {role}, replying live in a chat with a non-technical CEO. Be warm, concise, and "
                   f"helpful; answer directly without preamble.\n\n{task}")
+    elif compact:
+        # Strong structured adjudication with a self-contained task contract. Do not append the generic
+        # "create/edit files" footer: read-only reviewers previously received that direct contradiction.
+        prompt = (f"You are a rigorous {role}. Follow the task's evidence, permission, and output contract "
+                  f"exactly.\n\n{task}")
     else:
         # MEMORY SPINE (REBUILD-PLAN A3): the brief carries the elite role charter PLUS this company's
         # memory (decisions/preferences/history) + this role's hard-won lessons — so a spawned agent is not
@@ -831,10 +1132,56 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
             cap = ""
         prompt = f"{role_brief(role)}{cap}{mem}\n\nTASK:\n{task}\n\nWork now; create/edit files directly."
     # MULTI-PROVIDER: a tenant may have ONLY a Codex/OpenAI key (no Claude). Route them to Codex as the
-    # PRIMARY engine (not just failover), on their own key. Default stays Claude.
-    engine = (getattr(_ctx, "engine", None) or "claude").lower()
+    # PRIMARY engine (not just failover), on their own key. Platform/internal work defaults Codex-first
+    # because this stack is operated from Codex; set AOS_DEFAULT_ENGINE=claude to force the old policy.
+    engine = (getattr(_ctx, "engine", None) or DEFAULT_ENGINE).lower()
+    if engine == "hermes":
+        # The local Hermes profile owns host credentials. Until Agent OS provisions isolated per-tenant Hermes
+        # profiles, never let a resolved tenant provider accidentally cross onto that platform account.
+        if _tenant:
+            return {"rc": -1, "failed": True, "out": "Hermes tenant isolation required",
+                    "out_full": "Hermes host credentials are not isolated for tenant work",
+                    "reason": "Hermes host credentials are not isolated for tenant work",
+                    "provider_unavailable": False, "engine": "hermes"}
+        hermes_result = _agent_hermes(role, repo, prompt, timeout=timeout, model=hermes_model)
+        if hermes_result.get("rc") == 0:
+            return hermes_result
+        if HERMES_FALLBACK_ENGINE != "codex" or not shutil.which("codex"):
+            return hermes_result
+        audit.append(actor=f"factory:{role}", action="AgentProviderSwitch", resource=Path(repo).name,
+                     decision="provider-unavailable",
+                     payload={"from": "hermes", "to": "codex", "reason": hermes_result.get("reason")})
+        codex_result = _agent_codex(
+            role, repo, prompt, getattr(_ctx, "codex_key", None), timeout=timeout, retries=retries,
+            model=codex_model or (CODEX_LIGHT_MODEL if light else CODEX_MODEL),
+            reasoning_effort=(reasoning_effort or (
+                CODEX_LIGHT_REASONING_EFFORT if light else CODEX_REASONING_EFFORT)))
+        codex_result.update({"failover": True, "failover_source": "hermes"})
+        return codex_result
     if engine == "codex" and shutil.which("codex"):
-        return _agent_codex(role, repo, prompt, getattr(_ctx, "codex_key", None))
+        selected_codex_model = codex_model or (CODEX_LIGHT_MODEL if light else CODEX_MODEL)
+        codex_effort = reasoning_effort or (
+            CODEX_LIGHT_REASONING_EFFORT if light else CODEX_REASONING_EFFORT)
+        codex_result = _agent_codex(role, repo, prompt, getattr(_ctx, "codex_key", None),
+                                    timeout=timeout, retries=retries, model=selected_codex_model,
+                                    reasoning_effort=codex_effort)
+        platform_failover = (
+            codex_result.get("provider_unavailable")
+            and CODEX_FALLBACK_ENGINE == "claude"
+            and not _tenant
+            and not getattr(_ctx, "codex_key", None)
+            and not getattr(_ctx, "api_key", None)
+            and shutil.which("claude")
+        )
+        if not platform_failover:
+            return codex_result
+        # Do not pass a caller-supplied OpenAI model name to Claude. The alternate provider uses the same
+        # normal light/heavy policy it would have received as the primary engine.
+        model = CHEAP_MODEL if light else _default_build_model()
+        engine = "claude"
+        audit.append(actor=f"factory:{role}", action="AgentProviderSwitch", resource=Path(repo).name,
+                     decision="provider-unavailable",
+                     payload={"from": "codex", "to": "claude", "reason": codex_result.get("reason")})
     env = None
     key = getattr(_ctx, "api_key", None)
     if key:
@@ -848,9 +1195,14 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
         # _AGENT_SEM slot — a chat reply must not queue behind heavy build agents (that's the latency we kill).
         api_timeout = timeout or int(os.environ.get("AOS_CHAT_TIMEOUT", "90"))
         try:
-            rc, out_text, cost, tin, tout, used = _api_once(prompt, model, key, api_timeout)
+            rc, out_text, cost, tin, tout, used = _reserved_api_once(
+                role, prompt, model, key, api_timeout)
         except Exception:
             rc, out_text, cost, tin, tout, used = 1, "", 0.0, 0, 0, model   # unexpected -> CLI path below
+        if rc == _SPEND_RESERVATION_DENIED_RC:
+            return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True,
+                    "reason": "app spend reservation denied", "blocker": out_text,
+                    "provider_unavailable": False, "engine": "api"}
         if "Invalid API key" in (out_text or ""):    # bad BYO key -> surface exactly like the CLI path
             _trace("agent", role, prompt, out_text, rc, None, cost, tin, tout, used)
             return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True, "reason": "invalid BYO key"}
@@ -911,6 +1263,10 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
         audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
                      decision="executed", payload={"rc": rc, "attempt": attempt + 1, "cost_usd": cost, "model": used})
         _trace("agent", role, prompt, out_text, rc, dt, cost, tin, tout, used)
+        if rc == _SPEND_RESERVATION_DENIED_RC:
+            return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True,
+                    "reason": "app spend reservation denied", "blocker": out_text,
+                    "provider_unavailable": False, "engine": engine}
         if key and "Invalid API key" in out_text:       # bad BYO key — don't waste retries
             return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True, "reason": "invalid BYO key"}
         if rc == 0 and out_text.strip():
@@ -966,7 +1322,11 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
         print(f"[factory] Claude exhausted on transient errors — failing over to Codex for {role}", flush=True)
         try:
             with _AGENT_SEM:
-                rc, out_text, cost, tin, tout, used = _run_once_codex(role, repo, prompt, timeout, codex_env)
+                rc, out_text, cost, tin, tout, used = _run_once_codex(
+                    role, repo, prompt, timeout, codex_env,
+                    model=codex_model or (CODEX_LIGHT_MODEL if light else CODEX_MODEL),
+                    reasoning_effort=(reasoning_effort or (
+                        CODEX_LIGHT_REASONING_EFFORT if light else CODEX_REASONING_EFFORT)))
             _trace("agent", role, prompt, out_text, rc, 0.0, cost, tin, tout, used)
             audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
                          decision="executed-failover",
@@ -979,7 +1339,8 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                 except Exception:
                     pass
                 return {"rc": 0, "out": out_text[-1500:], "out_full": out_text, "cost_usd": cost, "tokens_in": tin,
-                        "tokens_out": tout, "attempts": retries + 1, "model": used, "engine": "codex"}
+                        "tokens_out": tout, "attempts": retries + 1, "model": used, "engine": "codex",
+                        "failover": True, "failover_source": codex_source}
             last = {"rc": rc, "out": out_text}
         except subprocess.TimeoutExpired:
             last = {"rc": -1, "out": "codex fallback timeout"}
@@ -991,8 +1352,17 @@ def agent(role: str, repo: str, task: str, timeout: int = None, retries: int = N
                     title="factory", priority="high", tags="warning")
     except Exception:
         pass
+    lower = (last.get("out") or "").lower()
+    exhausted = any(token in lower for token in _MODEL_EXHAUSTED)
+    auth_unavailable = any(token in lower for token in _PROVIDER_AUTH_UNAVAILABLE)
+    provider_unavailable = exhausted or auth_unavailable
+    reason = ("claude provider usage exhausted" if exhausted else
+              "claude provider authentication unavailable" if auth_unavailable else
+              "agent execution failed")
     return {"rc": last["rc"], "out": (last["out"] or "")[-1500:], "out_full": last["out"] or "",
-            "failed": True, "attempts": retries + 1}
+            "failed": True, "attempts": retries + 1, "reason": reason,
+            "provider_unavailable": provider_unavailable, "provider_exhausted": exhausted,
+            "provider_auth_unavailable": auth_unavailable, "engine": engine}
 
 
 def _chat_gates(spawner_role, role, repo, task):
@@ -1018,7 +1388,7 @@ def _chat_gates(spawner_role, role, repo, task):
                          decision="spawn-gate-failopen", payload={"spawner": spawner_role, "error": str(e)[:200]})
         except Exception:
             pass
-    _tenant = getattr(_ctx, "tenant", None)
+    _tenant = _context_value("tenant")
     if _tenant:
         try:
             import consent
@@ -1044,11 +1414,21 @@ def _chat_gates(spawner_role, role, repo, task):
     if BUDGET_USD and spent_usd() >= BUDGET_USD:
         return {"rc": -1, "failed": True, "out": "budget exhausted",
                 "blocker": f"factory budget ${BUDGET_USD:.2f} exhausted (${spent_usd():.2f} spent) — raise AOS_BUDGET_USD or split the work"}
-    _halt = killswitch.is_halted(getattr(_ctx, "product", None) or "global")
+    _halt = killswitch.is_halted(_context_value("product") or "global")
     if _halt.get("halted"):
         return {"rc": -1, "failed": True, "out": "halted",
                 "blocker": f"fleet HALTED by operator (scope={_halt.get('scope')}): {_halt.get('reason')} — resume with killswitch.py resume"}
-    product = getattr(_ctx, "product", None)
+    product = _context_value("product")
+    if product:
+        try:
+            import appguard
+            app_block = appguard.blocks(product)
+        except Exception:
+            app_block = None
+        if app_block:
+            return {"rc": -1, "failed": True, "out": "app circuit-breaker",
+                    "blocker": f"'{product}' hit its spend circuit-breaker ({app_block}) — auto-paused; "
+                               "raise the cap or resume it in Approvals before more spend"}
     if product:
         est_tokens = len(task) // 4 + 8000
         try:
@@ -1134,6 +1514,22 @@ def _api_once(prompt, model, api_key, timeout):
     return 0, text, _api_cost(used, tin, tout, cache_r, cache_c), tin + cache_r + cache_c, tout, used
 
 
+def _reserved_api_once(role, prompt, model, api_key, timeout):
+    """Admission-controlled warm API call with the same tuple contract as ``_api_once``."""
+    reservation = _reserve_model_call(role, model, prompt)
+    if not reservation.get("ok"):
+        detail = reservation.get("reason") or "paid call would exceed the app spend cap"
+        return (_SPEND_RESERVATION_DENIED_RC, f"app spend reservation denied: {detail}",
+                0.0, 0, 0, model)
+    try:
+        result = _api_once(prompt, model, api_key, timeout)
+    except Exception:
+        _settle_model_call(reservation, 0.0, trace_grace_s=0)
+        raise
+    _settle_model_call(reservation, result[2])
+    return result
+
+
 def _stream_api(role, prompt, model, on_delta, api_key, timeout, cancel=None):
     """Stream a light turn straight from the Messages API over the warm HTTP client. Invokes on_delta(text)
     per token; returns (rc, full_text, cost, tin, tout, used, cancelled). CANCELLATION is real: if `cancel()`
@@ -1178,7 +1574,24 @@ def _stream_api(role, prompt, model, on_delta, api_key, timeout, cancel=None):
     return rc, "".join(parts), cost, tin + cache_r + cache_c, tout, used, cancelled
 
 
-def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=None, cancel=None, light=False):
+def _reserved_stream_api(role, prompt, model, on_delta, api_key, timeout, cancel=None):
+    """Admission-controlled warm streaming call with the same tuple contract as ``_stream_api``."""
+    reservation = _reserve_model_call(role, model, prompt)
+    if not reservation.get("ok"):
+        detail = reservation.get("reason") or "paid call would exceed the app spend cap"
+        return (_SPEND_RESERVATION_DENIED_RC, f"app spend reservation denied: {detail}",
+                0.0, 0, 0, model, False)
+    try:
+        result = _stream_api(role, prompt, model, on_delta, api_key, timeout, cancel)
+    except Exception:
+        _settle_model_call(reservation, 0.0, trace_grace_s=0)
+        raise
+    _settle_model_call(reservation, result[2])
+    return result
+
+
+def _run_once_stream_provider(role, repo, prompt, timeout, env, model, on_delta, tools=None, cancel=None,
+                              light=False):
     """Like _run_once but with `--output-format stream-json`: invokes on_delta(text) for each user-visible
     text token as it arrives, then returns (rc, full_text, cost, tin, tout, used, cancelled). Extended
     THINKING is disabled (MAX_THINKING_TOKENS=0) so the FIRST visible token isn't stuck behind a hidden
@@ -1218,7 +1631,23 @@ def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=No
     parts, result_text, cost, tin, tout, used, rc, cancelled = [], "", 0.0, 0, 0, model, 0, False
     p = subprocess.Popen(cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          text=True, bufsize=1, env=genv)
-    timer = threading.Timer(timeout, p.kill); timer.start()   # hard wall-clock cap (mirrors _run_once timeout)
+    import clauded
+    _owned_claude = clauded.register_owned(p.pid, f"factory-stream:{role}:{os.getpid()}")
+    if _owned_claude is None:
+        p.kill()
+        p.wait()
+        raise clauded.OwnershipUnavailable(
+            f"could not register exact ownership for streaming child {p.pid}")
+
+    def terminate_owned_stream():
+        # Claude can have MCP/shell descendants. Clean the exact registered ancestry before killing the root,
+        # otherwise those children are reparented and a timed-out chat can keep consuming host resources.
+        clauded._signal_registered_descendants(_owned_claude)
+        if p.poll() is None:
+            p.kill()
+
+    timer = threading.Timer(timeout, terminate_owned_stream)
+    timer.start()   # hard wall-clock cap (mirrors _run_once timeout)
     try:
         for line in p.stdout:
             if cancel and cancel():                          # cooperative cancel between tokens
@@ -1254,14 +1683,37 @@ def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=No
     finally:
         timer.cancel()
         if cancelled:
-            p.kill()                                          # ACTUALLY terminate — no late tokens, no late reply
-        rc2 = p.wait()
+            terminate_owned_stream()                         # no late tokens and no surviving MCP descendants
+        try:
+            rc2 = p.wait()
+        except Exception:
+            terminate_owned_stream()
+            raise
+        finally:
+            clauded.unregister_owned(_owned_claude)
         if rc == 0 and not cancelled:
             rc = rc2
     if not cancelled:
         _govern_writes(role, repo)
     full = "".join(parts) or result_text     # streamed deltas are authoritative; fall back to the result text
     return rc, full, cost, tin, tout, used, cancelled
+
+
+def _run_once_stream(role, repo, prompt, timeout, env, model, on_delta, tools=None, cancel=None, light=False):
+    """Admission-controlled CLI stream; reservation lifetime exactly encloses the provider process."""
+    reservation = _reserve_model_call(role, model, prompt)
+    if not reservation.get("ok"):
+        detail = reservation.get("reason") or "paid call would exceed the app spend cap"
+        return (_SPEND_RESERVATION_DENIED_RC, f"app spend reservation denied: {detail}",
+                0.0, 0, 0, model, False)
+    try:
+        result = _run_once_stream_provider(
+            role, repo, prompt, timeout, env, model, on_delta, tools, cancel, light)
+    except Exception:
+        _settle_model_call(reservation, 0.0, trace_grace_s=0)
+        raise
+    _settle_model_call(reservation, result[2])
+    return result
 
 
 def _cancelled_result():
@@ -1302,8 +1754,13 @@ def agent_stream(role: str, repo: str, task: str, on_delta, timeout: int = None,
     # Falls through to the CLI stream ONLY when nothing was emitted yet, so on_delta never sees duplicate tokens.
     if key and _anthropic_available():
         t0 = time.time()
-        rc, out_text, cost, tin, tout, used, cancelled = _stream_api(role, prompt, model, on_delta, key, timeout, cancel)
+        rc, out_text, cost, tin, tout, used, cancelled = _reserved_stream_api(
+            role, prompt, model, on_delta, key, timeout, cancel)
         dt = round(time.time() - t0, 1)
+        if rc == _SPEND_RESERVATION_DENIED_RC:
+            return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True,
+                    "reason": "app spend reservation denied", "blocker": out_text,
+                    "provider_unavailable": False, "engine": "api"}
         if cancelled:
             audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
                          decision="cancelled", payload={"engine": "api", "stream": True})
@@ -1332,6 +1789,10 @@ def agent_stream(role: str, repo: str, task: str, on_delta, timeout: int = None,
     except Exception as e:
         return {"rc": -1, "failed": True, "out": "", "reason": f"stream error: {str(e)[:160]}"}
     dt = round(time.time() - t0, 1)
+    if rc == _SPEND_RESERVATION_DENIED_RC:
+        return {"rc": rc, "out": out_text[-1500:], "out_full": out_text, "failed": True,
+                "reason": "app spend reservation denied", "blocker": out_text,
+                "provider_unavailable": False, "engine": "claude"}
     if cancelled:
         audit.append(actor=f"factory:{role}", action="AgentRun", resource=Path(repo).name,
                      decision="cancelled", payload={"engine": "claude", "stream": True})
@@ -1503,7 +1964,7 @@ def run_js_tests(repo: str, subdir: str = "") -> tuple[bool, str]:
     # the relative paths come from rglob of attacker-controlled names, so shlex.quote each token and the repo
     # path, and drop the nested `sh -c` so nothing is re-parsed by an inner shell.
     import shlex
-    node_path = shlex.quote(str(Path.home() / "projects" / "products" / "noupload" / "node_modules"))
+    node_path = shlex.quote(str(PRODUCTS / "noupload" / "node_modules"))
     cmds = " && ".join(f"NODE_PATH={node_path} node {shlex.quote(str(f.relative_to(root)))}" for f in files)
     ok, out = _exec_tests(repo, f"cd {shlex.quote(str(repo))} && {cmds}", action="JsTests")
     audit.append(actor="factory:qa-security", action="JsTests", resource=root.name,
@@ -1545,7 +2006,7 @@ def run_web_qa(repo: str) -> tuple[bool, str]:
         return False, "no index.html found in the build"
     try:
         shot = f"/tmp/webqa-{Path(repo).name}.png"
-        env = {**os.environ, "NODE_PATH": str(Path.home() / "projects" / "products" / "noupload" / "node_modules")}
+        env = {**os.environ, "NODE_PATH": str(PRODUCTS / "noupload" / "node_modules")}
         p = subprocess.run(["node", str(SCRIPTS / "web_smoke.cjs"), url, shot],
                            capture_output=True, text=True, timeout=120, env=env)
         audit.append(actor="factory:qa-security", action="WebSmoke", resource=Path(repo).name,
@@ -1730,10 +2191,11 @@ def _is_ui_target(kind: str) -> bool:
 
 def qa_verdict_ok(v: dict) -> bool:
     """The ship condition, verbatim what gate_check._v_qa_verdict enforces on the LAUNCH artifact:
-    passed==true AND blocking_open==0 AND stories>0. Fail-closed on any missing/garbled fact."""
+    passed==true AND blocking_open==0 AND open_bugs==0 AND stories>0. Fail-closed on any missing/garbled fact."""
     try:
         return (isinstance(v, dict) and v.get("passed") is True
-                and int(v.get("blocking_open")) == 0 and int(v.get("stories")) > 0)
+                and int(v.get("blocking_open")) == 0 and int(v.get("open_bugs") or 0) == 0
+                and int(v.get("stories")) > 0)
     except (TypeError, ValueError):
         return False
 
@@ -1770,19 +2232,49 @@ def run_agentic_web_qa(repo: str, product: str, vision: str, summary: str,
                     "verdict": "no index.html to serve — the agentic explorer has nothing to drive"}
     try:
         report = qa_run_mod.qa_run(url, vision, None, "0", summary, product=product, repo=str(repo),
-                                   restart_cmd=None, on_event=_qa_heartbeat)
+                                   restart_cmd=None, on_event=_qa_heartbeat,
+                                   thread_id=(getattr(_ctx, "thread_id", None)
+                                              or os.environ.get("AOS_CONTROLLER_THREAD_ID")),
+                                   tenant_id=(getattr(_ctx, "tenant", None)
+                                              or _tenant_for_product(product)))
     except Exception as e:
         return {"passed": False, "stories": 0, "blocking_open": 0, "verdict_json": None,
                 "verdict": f"agentic QA crashed: {str(e)[:200]} — unverifiable builds do not ship"}
     finally:
         if httpd:
             httpd.shutdown()
+    # qa_run defaults to the durable agentic QA org, which returns an envelope with
+    # the gate report nested under "report". The procedural rollback path returns
+    # the report directly.
+    if isinstance(report, dict) and isinstance(report.get("report"), dict):
+        report = report["report"]
     out = {"passed": bool(report.get("passed")), "stories": int(report.get("total_stories") or 0),
-           "blocking_open": int(report.get("blocking_open") or 0), "verdict": report.get("verdict"),
-           "verdict_json": report.get("verdict_json"), "detail": report.get("md")}
+           "blocking_open": int(report.get("blocking_open") or 0),
+           "open_bugs": int(report.get("open_bugs") or 0), "verdict": report.get("verdict"),
+           "verdict_json": report.get("verdict_json"), "detail": report.get("md"),
+           "safety_limited": bool(report.get("safety_limited")),
+           "deferred_stories": int(report.get("deferred_stories") or 0),
+           "timed_out": bool(report.get("timed_out")),
+           "cleanup_incomplete": int(report.get("cleanup_incomplete") or 0),
+           "cleanup_threads_incomplete": int(report.get("cleanup_threads_incomplete") or 0),
+           "cleanup_processes_incomplete": int(report.get("cleanup_processes_incomplete") or 0),
+           "cleanup_process_contained": bool(report.get("cleanup_process_contained")),
+           "explorers_done": report.get("explorers_done"),
+           "explorers_total": report.get("explorers_total"),
+           "stories_done": report.get("stories_done"),
+           "stories_total": report.get("stories_total"),
+           "qa_campaign_run_id": report.get("qa_campaign_run_id"),
+           "qa_campaign_key": report.get("qa_campaign_key"),
+           "evidence_policy_revision": report.get("evidence_policy_revision"),
+           "internal_management_wait": bool(report.get("internal_management_wait")),
+           "internal_review_states": report.get("internal_review_states") or {},
+           "internal_review_ids": report.get("internal_review_ids") or [],
+           "qa_review_case_ids": report.get("qa_review_case_ids") or [],
+           "authority_decision_ids": report.get("authority_decision_ids") or []}
     audit.append(actor="factory:qa-security", action="AgenticWebQA", resource=Path(repo).name,
                  decision="passed" if qa_verdict_ok(out) else "failed",
                  payload={"stories": out["stories"], "blocking_open": out["blocking_open"],
+                          "open_bugs": out["open_bugs"],
                           "rounds": report.get("rounds")})
     return out
 
@@ -1862,13 +2354,15 @@ def run_independent_qa(repo: str, product: str, vision: str, kind: str = "lib") 
     report = qa_report_mod.build_report(run)
     vpath = qa_run_mod.write_verdict(str(repo), report, product=product, producer="independent-qa")
     out = {"passed": bool(report.get("passed")), "stories": int(report.get("total_stories") or 0),
-           "blocking_open": int(report.get("blocking_open") or 0), "verdict": report.get("verdict"),
+           "blocking_open": int(report.get("blocking_open") or 0),
+           "open_bugs": int(report.get("open_bugs") or 0), "verdict": report.get("verdict"),
            "verdict_json": vpath, "detail": report.get("md"),
            "not_covered": (data or {}).get("not_covered")}
     audit.append(actor="factory:qa-security", action="IndependentQA", resource=Path(repo).name,
                  decision="passed" if qa_verdict_ok(out) else "failed",
                  payload={"kind": kind, "stories": out["stories"],
-                          "blocking_open": out["blocking_open"]})
+                          "blocking_open": out["blocking_open"],
+                          "open_bugs": out["open_bugs"]})
     return out
 
 
@@ -1898,7 +2392,8 @@ def _honest_untestable_verdict(repo: Path, product: str, platform: str) -> dict:
     report = qa_report_mod.build_report(run)
     vpath = qa_run_mod.write_verdict(str(repo), report, product=product, producer=f"untestable-{platform}")
     return {"passed": False, "stories": int(report.get("total_stories") or 0),
-            "blocking_open": int(report.get("blocking_open") or 1), "verdict": report.get("verdict"),
+            "blocking_open": int(report.get("blocking_open") or 1),
+            "open_bugs": int(report.get("open_bugs") or 0), "verdict": report.get("verdict"),
             "verdict_json": vpath, "detail": report.get("md"), "untestable_here": platform}
 
 
@@ -1965,16 +2460,21 @@ def _review_verdict(repo, text: str = "") -> str:
 
 
 def build_product(product: str, charter: str, kind: str = "lib", api_key: str = None,
-                  engine: str = None, provider_key: str = None) -> dict:
+                  engine: str = None, provider_key: str = None, tenant_id: str = None) -> dict:
     """Drive one product end-to-end through the governed line with real agents + a real QA fix loop.
     kind='lib' -> Python library QA'd by pytest; kind='web' -> static web app QA'd by a real browser.
     api_key (BYO): if set, every agent runs on the tenant's own key — they pay their own inference.
-    engine ('claude'|'codex'): which provider to run on; provider_key = that provider's BYO key. A tenant
-    with only a Codex/OpenAI key builds on Codex; default is Claude."""
+    engine ('claude'|'codex'|'hermes'): which provider to run on; provider_key = that provider's BYO key. Hermes
+    is currently platform-internal/read-only and falls back to Codex; it cannot be selected for tenant builds. A tenant
+    with only a Codex/OpenAI key builds on Codex; platform/internal default is AOS_DEFAULT_ENGINE (Codex-first)."""
     _apply_scale()                                   # scale agents/rigor/depth to the wallet BEFORE the line runs
+    tenant_id = tenant_id or _tenant_for_product(product)
     _ctx.api_key = api_key
-    _ctx.engine = (engine or "claude").lower()
-    _ctx.codex_key = provider_key if (engine or "").lower() == "codex" else None
+    _ctx.engine = (engine or DEFAULT_ENGINE).lower()
+    _ctx.codex_key = provider_key if _ctx.engine == "codex" else None
+    _ctx.tenant = tenant_id or None                  # provider/consent backstop must know tenant work is tenant work
+    if not tenant_id:
+        _ctx.org = None
     web = kind == "web"
     service = kind == "service"
     ext = kind == "extension"
@@ -2016,6 +2516,7 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         # QA always re-runs — it's the idempotent gate that re-derives the pass/fail the LAUNCH gate needs.
         if name != "QA" and _stage_done(cid, name):
             print(f"\n[factory] === {name} === (RESUMED — already complete, skipping)", flush=True)
+            _emit_progress(name, "resumed", {"role": role})
             resumed = {"resumed": True, "passed": True, "rc": 0}
             # A gate stage whose pass/fail is FILE-derived (not rc-derived) must re-derive its verdict on
             # resume: _stage_done only proves an rc=0 agent trace exists, but the reviewer ALWAYS exits 0 —
@@ -2028,21 +2529,22 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
             return resumed
         print(f"\n[factory] === {name} ===", flush=True)
         _ctx.stage = name
+        _emit_progress(name, "started", {"role": role})
         aid = f"{role}@{product}"
         t0 = time.time()
         try:                                          # publish presence to the live directory
             import directory
-            directory.register(aid, role, product, name, _claims(role))
+            directory.register(aid, role, product, name, _claims(role), tenant_id=tenant_id)
         except Exception:
             pass
-        _log_comm(cid, "controller", role, "delegate", {"stage": name})        # hand-off out
+        _log_comm(cid, "controller", role, "delegate", {"stage": name}, tenant_id=tenant_id)        # hand-off out
         r = fn()
         dt = round(time.time() - t0, 1)
         ok = (r.get("passed", True) if isinstance(r, dict) else True)
-        _log_comm(cid, role, "controller", "done" if ok else "blocked", {"stage": name})  # hand-back
+        _log_comm(cid, role, "controller", "done" if ok else "blocked", {"stage": name}, tenant_id=tenant_id)  # hand-back
         try:
             import directory
-            directory.release(aid)
+            directory.release(aid, tenant_id=tenant_id)
         except Exception:
             pass
         try:                                          # per-stage latency -> observability/cost
@@ -2052,6 +2554,7 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
         except Exception:
             pass
         log["stages"].append({name: r, "_elapsed_s": dt})
+        _emit_progress(name, "completed", {"role": role, "passed": bool(ok), "elapsed_s": dt})
         print(f"[factory] {name}: {r} ({dt}s)", flush=True)
         return r
 
@@ -2357,7 +2860,8 @@ def build_product(product: str, charter: str, kind: str = "lib", api_key: str = 
     else:
         log["result"] = "BLOCKED_AT_QA"   # the line refuses to ship red code
     audit.append(actor="factory:controller", action="ProductComplete", resource=product,
-                 decision=log["result"], payload={"stages": len(log["stages"])})
+                 decision=log["result"], payload={"stages": len(log["stages"])},
+                 tenant_id=_tenant_for_product(product))
     try:                                              # record in the lifecycle registry (kind/version/deps/readme)
         import appregistry
         appregistry.register(product, repo)
@@ -2414,49 +2918,339 @@ def _detect_kind(repo: Path) -> str:
     return "lib"
 
 
-def _build_process_alive(product: str) -> bool:
-    """GROUND-TRUTH liveness for the resume sweep: is a `factory.py build <product>` process running RIGHT
-    NOW? Trace/audit idleness is a heuristic (a legitimately long agentic-QA exploration can go quiet for
-    longer than any idle threshold — that false 'stall' once resumed a build whose original process was
-    still alive, giving TWO concurrent writers of docs/QA-VERDICT.json). Fail-closed for the sweep: if we
-    cannot determine liveness, report alive=True so we never double-launch on a broken probe."""
+def _ensure_resume_claims():
+    """Keep upgraded installs usable; migration 72 is the canonical fresh-install schema."""
+    with connection() as c, c.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS factory_resume_claims (
+            claim_token TEXT PRIMARY KEY,
+            product TEXT NOT NULL,
+            generation_ts TIMESTAMPTZ NOT NULL,
+            status TEXT NOT NULL DEFAULT 'claimed'
+                CHECK (status IN ('claimed','running','finished','crashed','released','degraded')),
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            lease_until TIMESTAMPTZ NOT NULL,
+            worker_pid BIGINT,
+            worker_start_ticks BIGINT,
+            worker_boot_id TEXT,
+            finished_at TIMESTAMPTZ,
+            detail TEXT)""")
+        cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS factory_resume_one_active_product_idx
+                       ON factory_resume_claims(product)
+                       WHERE status IN ('claimed','running')""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS factory_resume_claims_lease_idx
+                       ON factory_resume_claims(lease_until)
+                       WHERE status IN ('claimed','running')""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS factory_resume_sweep_state (
+            singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+            cursor_generation_ts TIMESTAMPTZ,
+            cursor_run_id TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        cur.execute("""INSERT INTO factory_resume_sweep_state(singleton)
+                       VALUES (true) ON CONFLICT (singleton) DO NOTHING""")
+
+
+def _factory_build_product(snapshot):
+    """Return the exact product argv of one trusted factory build process, else None.
+
+    This is observation only, but still uses argument boundaries and the repository's
+    exact factory.py path. A shell/editor command containing a similar substring is not
+    ownership evidence.
+    """
+    if snapshot is None or snapshot.state == "Z" or snapshot.uid != os.getuid():
+        return None
     try:
-        r = subprocess.run(["pgrep", "-f", f"factory.py build {product} "], capture_output=True, timeout=10)
-        if r.returncode == 0:
-            return True
-        # exact-arg fallback: the product may be the last argv (no trailing space in the cmdline)
-        r2 = subprocess.run(["pgrep", "-f", f"factory.py build {product}$"], capture_output=True, timeout=10)
-        return r2.returncode == 0
-    except Exception:
+        argv = snapshot.cmdline.split()
+        if len(argv) < 4:
+            return None
+        interpreter = Path(os.path.abspath(argv[0]))
+        trusted = {Path(os.path.abspath(sys.executable)), Path(os.path.abspath(VENV_PY))}
+        if interpreter not in trusted:
+            return None
+        if Path(argv[1]).resolve() == (SCRIPTS / "factory.py").resolve() and argv[2] == "build":
+            return argv[3]
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _build_process_alive(product: str, snapshots=None, *, scan_reliable=None) -> bool:
+    """Check a finite snapshot for an exact ``factory.py build <product>`` argv.
+
+    No substring pgrep loop and no bare PID is involved. A caller can share one /proc
+    snapshot across a whole candidate page. If the scan cannot even observe this
+    process generation, fail closed and suppress launches.
+    """
+    if snapshots is None:
+        snapshots = process_assurance.scan_snapshots()
+    if scan_reliable is None:
+        own = snapshots.get(os.getpid())
+        scan_reliable = own is not None and process_assurance.same_process(
+            own.identity, process_assurance.read_snapshot(os.getpid()))
+    if not scan_reliable:
         return True
+    return any(_factory_build_product(snap) == product for snap in snapshots.values())
 
 
-def find_incomplete_builds(max_age_min: int = 20):
+def _find_incomplete_build_candidates(max_age_min: int = 20,
+                                      candidate_limit: int = RESUME_CANDIDATE_PAGE):
+    """Fetch one bounded, oldest-first page before performing any host process probe."""
+    _ensure_resume_claims()
+    page = min(RESUME_CANDIDATE_PAGE, max(1, int(candidate_limit)))
+    with connection() as c, c.cursor() as cur:
+        cur.execute("""SELECT cursor_generation_ts,cursor_run_id
+                         FROM factory_resume_sweep_state WHERE singleton=true FOR UPDATE""")
+        cursor_generation, cursor_run_id = cur.fetchone()
+        cur.execute("""
+            WITH incomplete AS (
+                SELECT t.run_id, max(t.ts) AS generation_ts
+                 FROM traces t
+                 WHERE t.run_id LIKE 'build-%%' AND NOT t.test_run
+                   AND NOT EXISTS (
+                       SELECT 1 FROM factory_resume_claims frc
+                        WHERE frc.product=substring(t.run_id from 7)
+                          AND frc.status IN ('claimed','running'))
+                 GROUP BY t.run_id
+                HAVING bool_or(t.stage='BUILD' AND t.kind='agent' AND t.rc=0)
+                   AND max(t.ts) < now() - (%s || ' minutes')::interval
+                   AND NOT EXISTS (
+                       SELECT 1 FROM audit_log a
+                        WHERE a.action='ProductComplete'
+                          AND a.resource=substring(t.run_id from 7))
+            )
+            SELECT i.run_id, i.generation_ts
+              FROM incomplete i
+             ORDER BY CASE
+                        WHEN %s::timestamptz IS NULL
+                          OR (i.generation_ts,i.run_id)>(%s::timestamptz,%s::text)
+                        THEN 0 ELSE 1 END,
+                      i.generation_ts,i.run_id
+             LIMIT %s
+        """, (max_age_min, cursor_generation, cursor_generation, cursor_run_id, page))
+        page_rows = cur.fetchall()
+        if page_rows:
+            cur.execute("""UPDATE factory_resume_sweep_state
+                              SET cursor_generation_ts=%s,cursor_run_id=%s,updated_at=now()
+                            WHERE singleton=true""", (page_rows[-1][1], page_rows[-1][0]))
+            if cur.rowcount != 1:
+                raise RuntimeError("factory resume fairness cursor lost")
+
+    # The candidate SQL has completed and returned a hard-capped page before the
+    # single finite process-table snapshot. This is O(host processes + page), not
+    # two pgrep subprocesses per row, and the unqueried tail is never probed.
+    snapshots = process_assurance.scan_snapshots()
+    own = snapshots.get(os.getpid())
+    reliable = own is not None and process_assurance.same_process(
+        own.identity, process_assurance.read_snapshot(os.getpid()))
+    out = []
+    for run_id, generation_ts in page_rows:
+        product = run_id[len("build-"):]
+        if _build_process_alive(product, snapshots, scan_reliable=reliable):
+            continue
+        out.append((product, _detect_kind(PRODUCTS / product), generation_ts))
+    return out
+
+
+def find_incomplete_builds(max_age_min: int = 20,
+                           candidate_limit: int = RESUME_CANDIDATE_PAGE):
     """Builds that were INTERRUPTED, not finished: BUILD checkpointed (rc=0) but the line never reached a
     terminal verdict (no 'ProductComplete' audit — that row is written for BOTH launched AND blocked-at-QA,
     so a genuinely-blocked build is NOT considered interrupted and won't be re-resumed forever), idle
     for >= max_age_min, AND with no live build process (trace idleness alone once false-positived on a
     long agentic-QA run and spawned a duplicate line). Returns [(product, kind), ...]."""
-    out = []
-    with psycopg.connect(_DB) as c, c.cursor() as cur:
-        cur.execute("""
-            SELECT t.run_id
-              FROM traces t
-              LEFT JOIN audit_log a
-                     ON a.action='ProductComplete' AND a.resource = substring(t.run_id from 7)
-             WHERE t.run_id LIKE 'build-%%'
-             GROUP BY t.run_id
-            HAVING bool_or(t.stage='BUILD' AND t.kind='agent' AND t.rc=0)   -- BUILD finished
-               AND count(a.id) = 0                                          -- but no terminal verdict
-               AND max(t.ts) < now() - (%s || ' minutes')::interval         -- and gone idle
-             ORDER BY max(t.ts)
-        """, (max_age_min,))
-        for (run_id,) in cur.fetchall():
-            product = run_id[len("build-"):]
-            if _build_process_alive(product):             # still running — NOT interrupted, never duplicate
-                continue
-            out.append((product, _detect_kind(PRODUCTS / product)))
-    return out
+    return [(product, kind) for product, kind, _generation in
+            _find_incomplete_build_candidates(max_age_min, candidate_limit)]
+
+
+def _resume_identity_state(row):
+    """Classify a claimed child without ever treating a bare PID as ownership."""
+    pid, start_ticks, boot_id = row
+    if pid is None or start_ticks is None or not boot_id:
+        return "unregistered"
+    expected = process_assurance.ProcessIdentity(int(pid), int(start_ticks), str(boot_id))
+    observed = process_assurance.read_snapshot(expected.pid)
+    if process_assurance.same_process(expected, observed):
+        return "live"
+    if observed is not None:
+        return "reused"
+    # read_snapshot also returns None for a transient permission/read failure. An
+    # extant proc directory is not proof of death, so recovery fails closed.
+    try:
+        return "unknown" if (Path("/proc") / str(expected.pid)).exists() else "dead"
+    except OSError:
+        return "unknown"
+
+
+def _reconcile_resume_claims(limit: int = RESUME_CLAIM_PAGE):
+    """Renew live exact children and release only bounded, provably stale claims."""
+    _ensure_resume_claims()
+    with connection() as c, c.cursor() as cur:
+        cur.execute("""SELECT claim_token,worker_pid,worker_start_ticks,worker_boot_id
+                         FROM factory_resume_claims
+                        WHERE status IN ('claimed','running') AND lease_until<=now()
+                        ORDER BY lease_until,claim_token
+                        LIMIT %s FOR UPDATE SKIP LOCKED""", (min(RESUME_CLAIM_PAGE, max(1, int(limit))),))
+        rows = cur.fetchall()
+        for token, pid, start_ticks, boot_id in rows:
+            state = _resume_identity_state((pid, start_ticks, boot_id))
+            if state in {"live", "unknown"}:
+                cur.execute("""UPDATE factory_resume_claims
+                                  SET lease_until=now()+(%s*interval '1 second'),
+                                      detail=%s
+                                WHERE claim_token=%s AND status IN ('claimed','running')""",
+                            (RESUME_CLAIM_LEASE_S,
+                             "lease renewed from exact live child" if state == "live"
+                             else "lease renewed: process probe inconclusive", token))
+            else:
+                cur.execute("""UPDATE factory_resume_claims
+                                  SET status='released',finished_at=now(),detail=%s
+                                WHERE claim_token=%s AND status IN ('claimed','running')""",
+                            (f"stale claim reclaimed safely ({state})", token))
+            if cur.rowcount != 1:
+                raise RuntimeError(f"resume claim {token} changed during reconciliation")
+    return len(rows)
+
+
+def _claim_resume_candidate(product, generation_ts, max_age_min):
+    """Atomically lease one exact product+trace-generation, or return None."""
+    token = f"frc-{uuid.uuid4().hex}"
+    with connection() as c, c.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                    (f"factory-resume:{product}",))
+        cur.execute("""SELECT claim_token FROM factory_resume_claims
+                        WHERE product=%s AND status IN ('claimed','running')
+                        FOR UPDATE""", (product,))
+        if cur.fetchone():
+            return None
+        run_id = f"build-{product}"
+        cur.execute("""SELECT max(t.ts)
+                         FROM traces t
+                        WHERE t.run_id=%s AND NOT t.test_run
+                       HAVING bool_or(t.stage='BUILD' AND t.kind='agent' AND t.rc=0)
+                          AND max(t.ts)=%s
+                          AND max(t.ts)<now()-(%s || ' minutes')::interval
+                          AND NOT EXISTS (
+                              SELECT 1 FROM audit_log a
+                               WHERE a.action='ProductComplete' AND a.resource=%s)""",
+                    (run_id, generation_ts, max_age_min, product))
+        if cur.fetchone() is None:
+            return None
+        # Revalidate exact process ownership while the per-product advisory lock
+        # is held. This closes the candidate-scan-to-claim window for concurrent
+        # manual sweepers without relying on a substring process match.
+        if _build_process_alive(product):
+            return None
+        cur.execute("""INSERT INTO factory_resume_claims
+                         (claim_token,product,generation_ts,lease_until)
+                       VALUES (%s,%s,%s,now()+(%s*interval '1 second'))
+                       ON CONFLICT (product) WHERE status IN ('claimed','running')
+                       DO NOTHING RETURNING claim_token""",
+                    (token, product, generation_ts, RESUME_CLAIM_LEASE_S))
+        claimed = cur.fetchone()
+        return claimed[0] if claimed else None
+
+
+def _set_resume_claim_terminal(token, status, detail):
+    with connection() as c, c.cursor() as cur:
+        cur.execute("""UPDATE factory_resume_claims
+                          SET status=%s,finished_at=now(),detail=%s
+                        WHERE claim_token=%s AND status IN ('claimed','running')""",
+                    (status, str(detail or "")[:500], token))
+        if cur.rowcount != 1:
+            raise RuntimeError(f"resume claim {token} is no longer owned")
+
+
+def _register_resume_child(token, identity):
+    with connection() as c, c.cursor() as cur:
+        cur.execute("""UPDATE factory_resume_claims
+                          SET status='running',worker_pid=%s,worker_start_ticks=%s,
+                              worker_boot_id=%s,lease_until=now()+(%s*interval '1 second'),
+                              detail='exact detached child registered'
+                        WHERE claim_token=%s AND status='claimed'""",
+                    (identity.pid, identity.start_ticks, identity.boot_id,
+                     RESUME_CLAIM_LEASE_S, token))
+        if cur.rowcount != 1:
+            raise RuntimeError(f"resume claim {token} could not register its exact child")
+
+
+def _signal_exact_resume_tree(identity, sig):
+    snapshots = process_assurance.scan_snapshots()
+    for expected in process_assurance.cleanup_plan(identity, snapshots) + [identity]:
+        if not process_assurance.same_process(
+                expected, process_assurance.read_snapshot(expected.pid)):
+            continue
+        try:
+            os.kill(expected.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _contain_unregistered_resume_child(proc, identity=None):
+    """A child that cannot be durably identity-registered is not allowed to continue."""
+    if identity is not None:
+        _signal_exact_resume_tree(identity, signal.SIGTERM)
+    elif proc.poll() is None:
+        # The unreaped Popen object still denotes this exact child generation; PID
+        # reuse cannot occur until wait observes its exit.
+        proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        if identity is not None:
+            _signal_exact_resume_tree(identity, signal.SIGKILL)
+        elif proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _finish_resume_claim_from_child(token, status, detail=""):
+    """Token- and birth-fenced terminal acknowledgement from the detached child."""
+    own = process_assurance.read_snapshot(os.getpid())
+    if own is None:
+        raise RuntimeError("cannot prove resumed child birth identity")
+    with connection() as c, c.cursor() as cur:
+        cur.execute("""UPDATE factory_resume_claims
+                          SET status=%s,finished_at=now(),detail=%s
+                        WHERE claim_token=%s AND status='running'
+                          AND worker_pid=%s AND worker_start_ticks=%s AND worker_boot_id=%s""",
+                    (status, str(detail or "")[:500], token, own.identity.pid,
+                     own.identity.start_ticks, own.identity.boot_id))
+        if cur.rowcount != 1:
+            raise RuntimeError(f"resume child no longer owns claim {token}")
+
+
+def _await_resume_child_registration(token, timeout_s=30):
+    """Do not let a detached child create side effects before exact registration.
+
+    The parent commits the product-generation claim before spawn, then records the
+    child's boot-id/start-ticks. If the parent dies in that narrow window, this
+    bounded handshake makes the unregistered child exit instead of becoming an
+    invisible writer that a future stale-claim recovery could overlap.
+    """
+    own = process_assurance.read_snapshot(os.getpid())
+    if own is None:
+        return False
+    deadline = time.monotonic() + max(1, min(60, int(timeout_s)))
+    while time.monotonic() < deadline:
+        try:
+            with connection() as c, c.cursor() as cur:
+                cur.execute("""SELECT status,worker_pid,worker_start_ticks,worker_boot_id
+                                 FROM factory_resume_claims WHERE claim_token=%s""", (token,))
+                row = cur.fetchone()
+            if row and row[0] == "running":
+                if row[1] is None or row[2] is None or not row[3]:
+                    return False
+                expected = process_assurance.ProcessIdentity(
+                    int(row[1]), int(row[2]), str(row[3]))
+                return expected == own.identity
+            if row and row[0] not in {"claimed", "running"}:
+                return False
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return False
 
 
 def resume_incomplete_builds(max_age_min: int = 20, limit: int = 3) -> dict:
@@ -2464,18 +3258,50 @@ def resume_incomplete_builds(max_age_min: int = 20, limit: int = 3) -> dict:
     that finished BUILD but never reached a terminal verdict and have gone idle, and RE-LAUNCHES each as a
     DETACHED process that resumes from its checkpoint (SPEC/BUILD skipped, continues at QA). Each resume
     runs independently so this sweep returns immediately — safe to call from the 120s-bounded scheduler."""
-    cands = find_incomplete_builds(max_age_min)[:limit]
+    _reconcile_resume_claims()
+    cands = _find_incomplete_build_candidates(max_age_min)
     resumed = []
-    for product, kind in cands:
-        f = open(f"/tmp/resume-{product}.log", "a")
+    for product, kind, generation_ts in cands[:max(0, int(limit))]:
+        token = _claim_resume_candidate(product, generation_ts, max_age_min)
+        if not token:
+            continue
+        log_dir = Path("/tmp/agentos-factory-resume")
+        log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        f = (log_dir / f"{token}.log").open("a")
         # empty charter is intentional: on resume CHARTER.md already exists so it is preserved, and SPEC/
         # BUILD are checkpoint-skipped — only QA/REVIEW/LAUNCH (which read SPEC.md) actually run.
-        subprocess.Popen([sys.executable, str(SCRIPTS / "factory.py"), "build", product, "", kind],
-                         stdout=f, stderr=f, stdin=subprocess.DEVNULL,
-                         start_new_session=True, cwd=str(SCRIPTS.parent))
+        env = {**os.environ, "AOS_FACTORY_RESUME_CLAIM_TOKEN": token,
+               "AOS_FACTORY_RESUME_GENERATION": generation_ts.isoformat()}
+        proc = identity = None
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(SCRIPTS / "factory.py"), "build", product, "", kind],
+                stdout=f, stderr=f, stdin=subprocess.DEVNULL, env=env,
+                start_new_session=True, cwd=str(SCRIPTS.parent))
+            observed = process_assurance.read_snapshot(proc.pid)
+            identity = observed.identity if observed is not None and observed.state != "Z" else None
+            if identity is None or not process_assurance.same_process(
+                    identity, process_assurance.read_snapshot(proc.pid)):
+                raise RuntimeError("detached child birth identity unavailable")
+            _register_resume_child(token, identity)
+        except Exception as exc:
+            if proc is not None:
+                _contain_unregistered_resume_child(proc, identity)
+            try:
+                _set_resume_claim_terminal(token, "degraded", f"launch not provable: {exc}")
+            except Exception:
+                pass
+            audit.append(actor="factory:resume-sweep", action="ResumeBuild", resource=product,
+                         decision="degraded", payload={"claim_token": token,
+                                                       "error": str(exc)[:300]})
+            continue
+        finally:
+            f.close()
         audit.append(actor="factory:resume-sweep", action="ResumeBuild", resource=product,
-                     decision="relaunched", payload={"kind": kind})
-        resumed.append({"product": product, "kind": kind})
+                     decision="relaunched", payload={"kind": kind, "claim_token": token,
+                                                      "generation": generation_ts.isoformat(),
+                                                      "worker_identity": identity.token()})
+        resumed.append({"product": product, "kind": kind, "claim_token": token})
     if resumed:
         try:
             import notify
@@ -2523,7 +3349,31 @@ def _main(a):
         print(agent(a[1], a[2], a[3]))
     elif a[0] == "build":
         charter = a[2] if len(a) > 2 else "Build a small, well-tested Python library."
-        build_product(a[1], charter, a[3] if len(a) > 3 else "lib")
+        resume_token = os.environ.get("AOS_FACTORY_RESUME_CLAIM_TOKEN")
+        try:
+            if resume_token and not _await_resume_child_registration(resume_token):
+                raise RuntimeError("resume child exact registration was not proved before work start")
+            build_product(a[1], charter, a[3] if len(a) > 3 else "lib")
+        except BaseException as exc:
+            if resume_token:
+                try:
+                    _finish_resume_claim_from_child(resume_token, "crashed", str(exc)[:500])
+                except Exception as ack_exc:
+                    audit.append(actor="factory:resume-child", action="FinishResumeClaim",
+                                 resource=a[1], decision="degraded",
+                                 payload={"claim_token": resume_token,
+                                          "error": str(ack_exc)[:300]})
+            raise
+        else:
+            if resume_token:
+                try:
+                    _finish_resume_claim_from_child(resume_token, "finished",
+                                                    "build reached its terminal return")
+                except Exception as ack_exc:
+                    audit.append(actor="factory:resume-child", action="FinishResumeClaim",
+                                 resource=a[1], decision="degraded",
+                                 payload={"claim_token": resume_token,
+                                          "error": str(ack_exc)[:300]})
     elif a[0] == "resume-sweep":                       # self-heal interrupted builds (scheduler-driven)
         age = int(a[1]) if len(a) > 1 else 20
         print(resume_incomplete_builds(max_age_min=age))
@@ -2585,25 +3435,37 @@ def _main(a):
         # on real story-level evidence, (b) FAIL CLOSED (blocking finding, failing artifact) when the
         # independent verifier yields no verifiable signal. All AI + audit calls stubbed — no spend.
         import tempfile as _tf
-        gate_ok = (qa_verdict_ok({"passed": True, "blocking_open": 0, "stories": 3})
-                   and not qa_verdict_ok({"passed": True, "blocking_open": 1, "stories": 3})
-                   and not qa_verdict_ok({"passed": True, "blocking_open": 0, "stories": 0})
-                   and not qa_verdict_ok({"passed": "yes", "blocking_open": 0, "stories": 3})
+        gate_ok = (qa_verdict_ok({"passed": True, "blocking_open": 0, "open_bugs": 0, "stories": 3})
+                   and not qa_verdict_ok({"passed": True, "blocking_open": 1, "open_bugs": 1, "stories": 3})
+                   and not qa_verdict_ok({"passed": True, "blocking_open": 0, "open_bugs": 1, "stories": 3})
+                   and not qa_verdict_ok({"passed": True, "blocking_open": 0, "open_bugs": 0, "stories": 0})
+                   and not qa_verdict_ok({"passed": "yes", "blocking_open": 0, "open_bugs": 0, "stories": 3})
                    and not qa_verdict_ok({}) and not qa_verdict_ok(None))
         indep_pass_ok = indep_fail_ok = artifact_ok = False
         _c1repo = Path(_tf.mkdtemp(prefix="factory-c1-"))
-        _orig_agent, _orig_audit2 = globals()["agent"], audit.append
+        # When this file executes as __main__, qa_report's `import factory` refers to a second module
+        # object.  Stubbing only globals()["agent"] therefore left its narrative helper live and made an
+        # allegedly offline selftest spend a real Codex turn.  Stub both references explicitly.
+        _qa_stack_path()
+        import importlib as _importlib
+        _qa_report_factory = _importlib.import_module("factory")
+        _orig_agent, _orig_report_agent, _orig_audit2 = (
+            globals()["agent"], _qa_report_factory.agent, audit.append)
         try:
             audit.append = lambda **k: None
             good = json.dumps({"stories": [{"id": "US-1", "title": "adds two numbers",
                                             "expected": "returns the sum", "status": "passed",
                                             "evidence": "$ pytest -q -> 4 passed"}],
                                "bugs": [], "not_covered": "sustained load"})
-            globals()["agent"] = lambda role, repo, prompt, **k: {"rc": 0, "out": good, "out_full": good}
+            _good_agent = lambda role, repo, prompt, **k: {"rc": 0, "out": good, "out_full": good}
+            globals()["agent"] = _good_agent
+            _qa_report_factory.agent = _good_agent
             v_good = run_independent_qa(str(_c1repo), "c1demo", "a tiny adder lib", "lib")
             indep_pass_ok = (qa_verdict_ok(v_good) and v_good["verdict_json"]
                              and Path(v_good["verdict_json"]).exists())
-            globals()["agent"] = lambda role, repo, prompt, **k: {"rc": 1, "failed": True, "out": ""}
+            _bad_agent = lambda role, repo, prompt, **k: {"rc": 1, "failed": True, "out": ""}
+            globals()["agent"] = _bad_agent
+            _qa_report_factory.agent = _bad_agent
             v_bad = run_independent_qa(str(_c1repo), "c1demo", "a tiny adder lib", "lib")
             indep_fail_ok = (not qa_verdict_ok(v_bad)) and int(v_bad.get("blocking_open") or 0) >= 1
             vdoc = json.loads((_c1repo / "docs" / "QA-VERDICT.json").read_text())
@@ -2612,6 +3474,7 @@ def _main(a):
             print(f"C1 gate selftest error: {e}")
         finally:
             globals()["agent"] = _orig_agent
+            _qa_report_factory.agent = _orig_report_agent
             audit.append = _orig_audit2
             shutil.rmtree(_c1repo, ignore_errors=True)
 
@@ -2623,11 +3486,13 @@ def _main(a):
             globals()["_trace"], killswitch.is_halted)
         failover_ok = fallback_env_ok = False
         _old_ctx = {k: getattr(_ctx, k, None) for k in ("tenant", "engine", "api_key", "codex_key", "product")}
+        _old_transient_retries = os.environ.get("AOS_TRANSIENT_RETRIES")
         try:
             audit.append = lambda **k: None
             globals()["_trace"] = lambda *a, **k: None
             killswitch.is_halted = lambda scope="global": {"halted": False}
             shutil.which = lambda name: "/usr/bin/codex" if name == "codex" else _orig_which(name)
+            os.environ["AOS_TRANSIENT_RETRIES"] = "0"
             _ctx.tenant = None
             _ctx.engine = "claude"
             _ctx.api_key = "sk-ant-selftest"
@@ -2636,9 +3501,9 @@ def _main(a):
             calls = []
             globals()["_run_once"] = lambda *a, **k: (1, "529 overloaded", 0.0, 0, 0, BUILD_MODEL)
 
-            def _fake_codex(role, repo, prompt, timeout, env):
+            def _fake_codex(role, repo, prompt, timeout, env, model=None, reasoning_effort=None):
                 calls.append(env.get("OPENAI_API_KEY"))
-                return 0, "CODEX_OK", 0.0, 11, 3, CODEX_MODEL
+                return 0, "CODEX_OK", 0.0, 11, 3, model or CODEX_MODEL
 
             globals()["_run_once_codex"] = _fake_codex
             rc3 = agent("builder", str(PRODUCTS), "tiny task", timeout=1, retries=0, model=BUILD_MODEL, tools=[])
@@ -2665,6 +3530,10 @@ def _main(a):
             globals()["_run_once"] = _orig_run_once; globals()["_run_once_codex"] = _orig_run_codex
             shutil.which = _orig_which; audit.append = _orig_audit3; globals()["_trace"] = _orig_trace
             killswitch.is_halted = _orig_halt
+            if _old_transient_retries is None:
+                os.environ.pop("AOS_TRANSIENT_RETRIES", None)
+            else:
+                os.environ["AOS_TRANSIENT_RETRIES"] = _old_transient_retries
             for k, v in _old_ctx.items():
                 setattr(_ctx, k, v)
 

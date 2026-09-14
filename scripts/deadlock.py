@@ -11,16 +11,13 @@ deterministically (the most-recently-blocked waiter — least work lost) to brea
 Run with the agent-os venv python.
 """
 import sys
-from pathlib import Path
 
-import psycopg
-
-from aoscfg import ENV, DB
+from dbpool import connection
 
 
 def _load_graph():
     edges, since = {}, {}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("SELECT waiter, awaited, since FROM waits")
         for waiter, awaited, ts in cur.fetchall():
             edges.setdefault(waiter, []).append(awaited)
@@ -76,13 +73,12 @@ def _main(argv):
     if not argv or argv[0] == "detect":
         sys.exit(1 if detect() else 0)
     if argv[0] == "edge":
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO waits(waiter,awaited) VALUES(%s,%s) ON CONFLICT DO NOTHING", (argv[1], argv[2]))
-            c.commit()
         print(f"edge {argv[1]} -> {argv[2]}")
     elif argv[0] == "clear":
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("TRUNCATE waits"); c.commit()
+        with connection() as c, c.cursor() as cur:
+            cur.execute("TRUNCATE waits")
         print("cleared waits")
 
 

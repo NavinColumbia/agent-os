@@ -9,8 +9,8 @@ platform/
                        selftest.sh asserts it covers every running container — it can't go stale.
   rebuild.sh         ← one command: fresh box → full stack up → migrated → seeded → self-tested green.
   migrate.sh         ← apply every Postgres migration idempotently (ordered, safe to re-run).
-  snapshot.py        ← ONE encrypted .aosnap file = your whole brain (DB + secrets + keys + provenance
-                       + repo SHAs). Carry it to any box and restore.
+  snapshot.py        ← ONE encrypted .aosnap file = your whole brain (DB + secrets + keys + provenance,
+                       product source, and repo SHAs). Carry it to any box and restore.
   terraform/         ← cloud IaC skeleton (RDS + S3 + Secrets Manager). plan-only; apply when you scale.
 ```
 
@@ -43,10 +43,17 @@ travels unless you hand them an `.aosnap` and its passphrase.
 See `../docs/CLOUD-MIGRATION.md` for the per-component mapping (this README is the *how*, that doc is
 the *what maps to what*).
 
+## Public single-host launch
+
+For the paying-customer profile (Caddy TLS, systemd supervision, Stripe/email credential preflight), use
+[`../deploy/README.md`](../deploy/README.md). `deploy/install-public.sh` runs this rebuild first and refuses
+to publish a partial or placeholder-configured installation.
+
 ## Backups (routine, not just migration)
-`snapshot.py export` is also your backup. Schedule it (`scripts/scheduler.py`) and copy each `.aosnap`
-offline. Each file is self-describing (MANIFEST.json inside) and pinned to exact git commits, so a
-restore reproduces the *code* state too, not just the data.
+`snapshot.py export` is also your backup. `scripts/scheduler.py bootstrap` registers it daily. Public
+preflight requires a writable mounted `AOSNAP_OFFSITE_DIR`, and each export atomically copies there after
+the encrypted local artifact succeeds. Each file is self-describing (MANIFEST.json inside), includes the
+product source trees, and is pinned to exact platform git commits, so restore covers code as well as data.
 
 ## Rules that still hold everywhere
 Never bind `0.0.0.0` (localhost + tailnet only), never commit `.env*`/`keys/`, secrets travel only

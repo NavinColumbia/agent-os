@@ -14,13 +14,12 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit  # noqa: E402
 import billing  # noqa: E402
+import stripebilling  # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 
 def _plans_table(current_plan):
@@ -49,28 +48,30 @@ def billing_view(tid):
         "plans": _plans_table(plan),
         # billing.py provides invoice(); reuse it rather than recomputing from PLANS+usage.
         "invoice": billing.invoice(tid),
+        "payments": stripebilling.status(tid),
     }
 
 
 def change_plan(tid, plan):
-    """SAFE in-app plan switch. Validates the plan and updates the tenant row.
+    """Start a payment-backed plan change.
 
-    NOTE: this is intentionally money-free. Real payment / Stripe checkout is
-    gated and OUT OF SCOPE here — this only flips the plan column so usage,
-    quota and invoice math reflect the chosen tier. Wiring an actual payment
-    provider would happen behind this function, not inside it.
+    Paid plans never flip a DB column from an in-app POST. They return a Stripe Checkout URL when Stripe is
+    configured, and the tenant plan changes only after a signed Stripe webhook confirms the subscription.
+    Downgrading to free is allowed immediately because it removes paid entitlement.
     """
     if plan not in billing.PLANS:
         raise ValueError(f"unknown plan {plan}; choose {list(billing.PLANS)}")
-    billing._ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("UPDATE tenants SET plan=%s WHERE tenant_id=%s", (plan, tid))
-        if cur.rowcount == 0:
-            raise ValueError(f"no such tenant {tid}")
-        c.commit()
-    audit.append(actor=f"tenant:{tid}", action="PlanChanged", resource=tid,
-                 decision="executed", payload={"plan": plan})
-    return {"ok": True, "plan": plan}
+    if plan == "free":
+        r = stripebilling.downgrade_to_free(tid, actor=f"tenant:{tid}", reason="tenant downgrade")
+        audit.append(actor=f"tenant:{tid}", action="PlanChanged", resource=tid,
+                     decision="downgraded", payload={"plan": plan}, tenant_id=tid)
+        return r
+    r = stripebilling.start_checkout(tid, plan)
+    audit.append(actor=f"tenant:{tid}", action="PlanChangeRequested", resource=tid,
+                 decision="checkout_started" if r.get("ok") else "blocked",
+                 payload={"plan": plan, "error": r.get("error"), "session_id": r.get("session_id")},
+                 tenant_id=tid)
+    return r
 
 
 def _selftest():
@@ -86,10 +87,10 @@ def _selftest():
         assert "within_quota" in v["quota"], "quota missing within_quota"
 
         r = change_plan(tid, "pro")
-        assert r == {"ok": True, "plan": "pro"}, r
+        assert r["ok"] is False and r["error"] == "stripe_not_configured", r
         v2 = billing_view(tid)
-        assert v2["plan"] == "pro", f"plan did not flip to pro: {v2['plan']}"
-        assert [r for r in v2["plans"] if r["current"]][0]["slug"] == "pro", "current flag not on pro"
+        assert v2["plan"] == "free", f"paid plan flipped without Stripe webhook: {v2['plan']}"
+        assert [r for r in v2["plans"] if r["current"]][0]["slug"] == "free", "current flag not on free"
 
         bad = False
         try:
@@ -98,12 +99,11 @@ def _selftest():
             bad = True
         assert bad, "invalid plan was not rejected"
 
-        print("PASS: billingview wraps billing into a UI payload; in-app plan switch works ✅")
+        print("PASS: billingview wraps billing into a UI payload; paid plan changes require Stripe checkout ✅")
         sys.exit(0)
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
 
 
 def _main(a):

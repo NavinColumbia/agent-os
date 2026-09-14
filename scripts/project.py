@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -40,10 +41,35 @@ MAX_COMPONENT_FIX = int(os.environ.get("AOS_MAX_COMPONENT_FIX", "3"))
 MAX_INTEGRATION_FIX = int(os.environ.get("AOS_MAX_INTEGRATION_FIX", "3"))
 # How many levels the architect tree may recurse: a component the architect marks "decompose" is itself
 # planned into a sub-DAG (sub-architect → sub-builders → sub-integrator) up to this depth. depth 0 is the
-# top, so AOS_MAX_DEPTH=2 allows 3 levels total. Total LIVE agents across the whole tree stay bounded by
-# factory._AGENT_SEM (AOS_MAX_AGENTS) no matter how deep/wide — recursion multiplies fan-out, not the cap.
+# top, so AOS_MAX_DEPTH=1 allows the root plus one decomposed subsystem. Total LIVE agents across the whole
+# tree stay bounded by factory._AGENT_SEM, but concurrency alone is insufficient: recursive plans multiply
+# total work and wall time even when only a few agents run at once. The component budget bounds that pressure.
 # (>~30 concurrent agents is RAM-bound on one box; 100s = the cloud worker-pool path, same Postgres queue.)
-MAX_DEPTH = int(os.environ.get("AOS_MAX_DEPTH", "2"))
+MAX_DEPTH = int(os.environ.get("AOS_MAX_DEPTH", "1"))
+MAX_TOTAL_COMPONENTS = int(os.environ.get("AOS_MAX_TOTAL_COMPONENTS", "16"))
+
+
+class ScopeBudgetExceeded(RuntimeError):
+    pass
+
+
+def _reserve_component_budget(budget, count, ns, depth):
+    """Atomically reserve planned components across the whole recursive project tree.
+
+    Recursive children in one DAG layer plan concurrently, so a plain counter can race past the limit. The
+    shared lock makes the budget a real admission boundary. Planning may discover that a subtree is too large,
+    but no builders for that subtree start after the reservation is refused.
+    """
+    with budget["lock"]:
+        projected = budget["planned"] + int(count)
+        if projected > budget["limit"]:
+            raise ScopeBudgetExceeded(
+                f"recursive project scope requires at least {projected} components; safe limit is "
+                f"{budget['limit']} (namespace {ns or 'root'}, depth {depth}). Simplify the plan or explicitly "
+                "raise AOS_MAX_TOTAL_COMPONENTS on a measured worker node."
+            )
+        budget["planned"] = projected
+        return projected
 
 
 # ── STACK DESCRIPTORS ─────────────────────────────────────────────────────────────────────────────────
@@ -436,7 +462,7 @@ def _finalize_deployable(repo, stack, log):
         print(f"[project] DEPLOY GAP: {log['deploy_gap']}", flush=True)
 
 
-def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stack=None):
+def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stack=None, _budget=None):
     """Drive ONE complex product end-to-end as a RECURSIVE tree: PLAN -> dependency-ordered parallel builds
     (each component either a LEAF builder OR, if the architect marked it 'decompose', a recursive sub-build
     with its own architect/builders/integrator) -> INTEGRATE this level. Blockers from any leaf or sub-tree
@@ -444,7 +470,18 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stac
     whole tree stay bounded by factory._AGENT_SEM regardless of depth/width. depth 0 = the root product.
     `stack` is the target platform/descriptor (e.g. 'web', 'python') — it decides the language, file layout
     and test runner every architect/builder/integrator prompt uses; None → Python (backward compatible)."""
+    # A detached recovery used to enter here with stack=None and silently fall back to Python, even when the
+    # controller originally started a web build. Recover the top-level choice from its immutable ProjectStart
+    # record before applying the backwards-compatible default. Recursive calls always receive the descriptor.
+    if depth == 0 and stack is None:
+        stack = _persisted_stack(product)
     stack = stack_for(stack)
+    if _budget is None:
+        _budget = {"planned": 0, "limit": max(1, MAX_TOTAL_COMPONENTS), "lock": threading.Lock()}
+    # ThreadPoolExecutor workers do not inherit threading.local state. Capture the controller's checkpoint
+    # callback once and explicitly propagate it into component workers so parallel progress renews the same
+    # durable IMPLEMENT lease instead of looking silent until the whole layer finishes.
+    progress_callback = getattr(factory._ctx, "progress_callback", None)
     repo = factory.PRODUCTS / product
     (repo / "src").mkdir(parents=True, exist_ok=True)
     (repo / "tests").mkdir(parents=True, exist_ok=True)
@@ -454,9 +491,13 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stac
     if top:
         audit.append(actor="project:controller", action="ProjectStart", resource=product, decision="executed",
                      payload={"stack": stack["id"]})
+    factory._emit_progress(f"PLAN:{ns or 'root'}", "started", {"depth": depth})
 
     p = explore_plan(product, goal, model=os.environ.get("AOS_ARCHITECT_MODEL"), ns=ns, depth=depth,
                      n=int(os.environ.get("AOS_EXPLORATION", "1")), stack=stack)
+    factory._emit_progress(f"PLAN:{ns or 'root'}", "completed",
+                           {"depth": depth, "components": len(p.get("components") or [])})
+    _reserve_component_budget(_budget, len(p["components"]), ns, depth)
     by_id = {c["id"]: c for c in p["components"]}
     layers = topo_layers(p["components"])
     log["plan"] = {"components": list(by_id), "layers": layers}
@@ -465,14 +506,25 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stac
           f"{n_decomp} to decompose further", flush=True)
 
     def build_one(comp):
+        if progress_callback:
+            factory._ctx.progress_callback = progress_callback
         cid = comp["id"]
+        factory._emit_progress(f"BUILD:{_pkg(ns, cid)}", "started", {"depth": depth})
         if comp.get("decompose") and depth < MAX_DEPTH:       # RECURSE: this component is its own subsystem
             sub = build_complex(product, comp.get("subgoal") or comp["description"], api_key,
-                                depth + 1, ns=f"{_pkg(ns, cid)}_", facade=comp, stack=stack)
-            return {"id": cid, "pkg": _pkg(ns, cid), "passed": sub["passed"],
-                    "blocker": sub.get("blocker"), "sub": {"result": sub["result"], "layers": sub.get("plan", {}).get("layers")}}
+                                depth + 1, ns=f"{_pkg(ns, cid)}_", facade=comp, stack=stack,
+                                _budget=_budget)
+            result = {"id": cid, "pkg": _pkg(ns, cid), "passed": sub["passed"],
+                      "blocker": sub.get("blocker"),
+                      "sub": {"result": sub["result"], "layers": sub.get("plan", {}).get("layers")}}
+            factory._emit_progress(f"BUILD:{_pkg(ns, cid)}", "completed",
+                                   {"depth": depth, "passed": bool(result["passed"])})
+            return result
         dep_ifaces = {d: by_id[d]["interface"] for d in comp.get("deps", [])}
-        return build_component(product, comp, dep_ifaces, api_key, ns, stack=stack)
+        result = build_component(product, comp, dep_ifaces, api_key, ns, stack=stack)
+        factory._emit_progress(f"BUILD:{_pkg(ns, cid)}", "completed",
+                               {"depth": depth, "passed": bool(result.get("passed"))})
+        return result
 
     built, workers = {}, int(os.environ.get("AOS_FLEET_WORKERS", "5"))
     for li, layer in enumerate(layers):               # BARRIER between layers (layer N needs N-1's interfaces)
@@ -485,10 +537,16 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stac
                 except Exception as e:
                     built[cid] = {"id": cid, "passed": False, "blocker": f"crashed: {e}"}
         log["phases"].append({f"layer{li}": {cid: built[cid].get("passed") for cid in layer}})
+        factory._emit_progress(f"LAYER:{ns or 'root'}:{li}", "completed",
+                               {"depth": depth, "components": len(layer),
+                                "passed": sum(bool(built[cid].get("passed")) for cid in layer)})
 
     blockers = [b["blocker"] for b in built.values() if not b.get("passed") and b.get("blocker")]
     if all(b.get("passed") for b in built.values()):
+        factory._emit_progress(f"INTEGRATE:{ns or 'root'}", "started", {"depth": depth})
         integ = integrate(product, p, ns=ns, facade=facade, stack=stack)
+        factory._emit_progress(f"INTEGRATE:{ns or 'root'}", "completed",
+                               {"depth": depth, "passed": bool(integ.get("passed"))})
         log["integration"] = integ
         if integ["passed"]:
             log["result"], log["passed"], log["blocker"] = "INTEGRATED", True, None
@@ -504,7 +562,7 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stac
         if rigor > 1:
             try:
                 import verify
-                v = verify.verify(product, rigor=rigor, api_key=api_key)
+                v = verify.verify(product, rigor=rigor, api_key=api_key, stack=(stack or {}).get("id"))
                 log["verification"] = {"rigor": rigor, "passed": v.get("passed"),
                                        "checks": [(c["check"], c["ok"]) for c in v.get("passes", [])]}
                 if not v.get("passed"):               # verification is a real gate at rigor>1
@@ -537,6 +595,49 @@ def build_complex(product, goal, api_key=None, depth=0, ns="", facade=None, stac
     return log
 
 
+def _persisted_stack(product: str):
+    """Return the authoritative original stack, preferring the controller's durable product plan.
+
+    A faulty detached resume may itself append a newer ProjectStart with the wrong default stack. Therefore
+    latest-wins is unsafe: controller plan wins, otherwise the first start fixes the project's stack identity.
+    """
+    try:
+        with psycopg.connect(factory._DB) as c, c.cursor() as cur:
+            cur.execute("""SELECT plan->>'platform' FROM controller_state
+                            WHERE product=%s AND NULLIF(plan->>'platform','') IS NOT NULL
+                            ORDER BY updated_at DESC LIMIT 1""", (product,))
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+            cur.execute("""SELECT payload->>'stack' FROM audit_log
+                            WHERE action='ProjectStart' AND resource=%s AND payload ? 'stack'
+                            ORDER BY id ASC LIMIT 1""", (product,))
+            row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _project_process_alive(product: str) -> bool:
+    """Exact argv liveness guard for detached complex builds; probe failure is fail-closed."""
+    try:
+        proc = Path("/proc")
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                argv = (entry / "cmdline").read_bytes().split(b"\0")
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            args = [a.decode(errors="replace") for a in argv if a]
+            for i, arg in enumerate(args[:-2]):
+                if arg.endswith("project.py") and args[i + 1:i + 3] == ["build", product]:
+                    return True
+        return False
+    except Exception:
+        return True
+
+
 def find_incomplete_projects(max_age_min: int = 20):
     """Complex builds INTERRUPTED, not finished: a proj-<product> with agent traces but NO terminal
     'ProjectComplete' audit (written for INTEGRATED and every BLOCKED_* outcome, so a genuinely finished
@@ -549,7 +650,17 @@ def find_incomplete_projects(max_age_min: int = 20):
               FROM traces t
               LEFT JOIN audit_log a
                      ON a.action='ProjectComplete' AND a.resource = substring(t.run_id from 6)
-             WHERE t.run_id LIKE 'proj-%%'
+             WHERE t.run_id LIKE 'proj-%%' AND NOT t.test_run
+               AND NOT EXISTS (SELECT 1 FROM kill_switch k
+                               WHERE k.scope IN ('global', substring(t.run_id from 6)))
+               -- A controller parked on fleet still OWNS this product even when its agent trace is quiet.
+               -- The former trace-only heuristic double-launched the same repo from the scheduler.
+               AND NOT EXISTS (
+                    SELECT 1 FROM controller_state cs
+                     WHERE cs.product = substring(t.run_id from 6)
+                       AND (cs.awaiting='fleet' OR EXISTS (
+                            SELECT 1 FROM controller_jobs cj
+                             WHERE cj.thread_id=cs.thread_id AND cj.status IN ('running','pending'))))
              GROUP BY t.run_id
             HAVING count(a.id) = 0                                        -- no terminal verdict
                AND max(t.ts) < now() - (%s || ' minutes')::interval       -- and gone idle
@@ -557,6 +668,8 @@ def find_incomplete_projects(max_age_min: int = 20):
         """, (max_age_min,))
         for (run_id,) in cur.fetchall():
             product = run_id[len("proj-"):]
+            if _project_process_alive(product):              # direct recovery/build still owns it
+                continue
             if (factory.PRODUCTS / product / "docs" / "PLAN.json").exists():   # resumable: has a plan
                 out.append(product)
     return out
@@ -570,13 +683,29 @@ def resume_incomplete_projects(max_age_min: int = 20, limit: int = 2) -> dict:
     cands = find_incomplete_projects(max_age_min)[:limit]
     resumed = []
     for product in cands:
-        f = open(f"/tmp/resume-proj-{product}.log", "a")
-        # 'resume' goal arg is ignored: plan() reuses docs/PLAN.json when present.
-        subprocess.Popen([sys.executable, str(SCRIPTS / "project.py"), "build", product, "resume"],
-                         stdout=f, stderr=f, stdin=subprocess.DEVNULL,
-                         start_new_session=True, cwd=str(SCRIPTS.parent))
+        # Multiple scheduler processes can overlap. Serialize the final liveness check + spawn per product;
+        # the new child is visible in /proc before this transaction unlocks, so the next contender skips it.
+        with psycopg.connect(factory._DB) as claim_conn, claim_conn.cursor() as claim_cur:
+            claim_cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                              (f"project-resume:{product}",))
+            claim_cur.execute("""SELECT EXISTS (
+                SELECT 1 FROM kill_switch WHERE scope IN ('global', %s)) OR EXISTS (
+                SELECT 1 FROM controller_state cs WHERE cs.product=%s AND
+                  (cs.awaiting='fleet' OR EXISTS (SELECT 1 FROM controller_jobs cj
+                    WHERE cj.thread_id=cs.thread_id AND cj.status IN ('running','pending'))))""",
+                              (product, product))
+            if claim_cur.fetchone()[0] or _project_process_alive(product):
+                continue
+            stack = _persisted_stack(product)
+            argv = [sys.executable, str(SCRIPTS / "project.py"), "build", product, "resume"]
+            if stack:
+                argv += ["--stack", stack]
+            f = open(f"/tmp/resume-proj-{product}.log", "a")
+            subprocess.Popen(argv, stdout=f, stderr=f, stdin=subprocess.DEVNULL,
+                             start_new_session=True, cwd=str(SCRIPTS.parent))
+            claim_conn.commit()
         audit.append(actor="project:resume-sweep", action="ResumeProject", resource=product,
-                     decision="relaunched")
+                     decision="relaunched", payload={"stack": stack or "legacy-default"})
         resumed.append(product)
     if resumed:
         try:
@@ -614,7 +743,9 @@ def _main(a):
     if not a:
         sys.exit("usage: project.py build <product> '<goal>' | selftest")
     if a[0] == "build":
-        print(build_complex(a[1], a[2] if len(a) > 2 else "Build a small multi-module Python product."))
+        stack = a[a.index("--stack") + 1] if "--stack" in a and a.index("--stack") + 1 < len(a) else None
+        print(build_complex(a[1], a[2] if len(a) > 2 else "Build a small multi-module Python product.",
+                            stack=stack))
     elif a[0] == "resume-sweep":                       # self-heal interrupted complex builds (scheduler)
         print(resume_incomplete_projects(max_age_min=int(a[1]) if len(a) > 1 else 20))
     elif a[0] == "selftest":

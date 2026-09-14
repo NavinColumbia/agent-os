@@ -22,14 +22,13 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import appregistry  # noqa: E402
 import audit        # noqa: E402
+import workstreamview  # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection
 
 TIMEOUT = 2.0
 # only these hosts are probed — never crawl arbitrary external hosts
@@ -122,17 +121,34 @@ def _live_row(product, reg):
 
 def live_status(tid):
     """Live status + best clickable url for each of the tenant's products."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         prods = _products(cur, tid)
-    if not prods:
-        return []
+    rows = []
     reg = {r["name"]: r for r in appregistry.as_rows()}
-    return [_live_row(p, reg.get(p)) for p in prods]
+    rows.extend(_live_row(p, reg.get(p)) for p in prods)
+    seen = set(prods)
+    for w in workstreamview.active_workstreams(tid):
+        product = w.get("product")
+        if product and product in seen:
+            continue
+        rows.append({
+            "product": product or w["label"],
+            "kind": w.get("job"),
+            "result": w.get("phase"),
+            "dev_url": None,
+            "prod_url": None,
+            "running": bool(w.get("running")),
+            "reachable": False,
+            "url": None,
+            "provisional": True,
+            "thread_id": w.get("thread_id"),
+        })
+    return rows
 
 
 def one(tid, product):
     """Ownership-checked single-product live status."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM tenant_products WHERE tenant_id=%s AND product=%s", (tid, product))
         if not cur.fetchone():
             return {"error": "not your product"}
@@ -150,7 +166,7 @@ def _selftest():
     dev_url = "http://127.0.0.1:5000"
     inserted_reg = False
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                         (prod, tid))
             # no register()/upsert public fn takes a raw dev_url, so INSERT into its table directly
@@ -161,7 +177,6 @@ def _selftest():
                            ON CONFLICT (name) DO UPDATE SET kind='web', status='launched', dev_url=EXCLUDED.dev_url""",
                         (prod, dev_url))
             inserted_reg = True
-            c.commit()
 
         rows = live_status(tid)
         mine = next((r for r in rows if r["product"] == prod), None)
@@ -181,12 +196,11 @@ def _selftest():
         print("PASS: livestatus surfaces per-product LIVE status + clickable url, ownership-checked ✅"
               if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             if inserted_reg:
                 cur.execute("DELETE FROM app_registry WHERE name=%s", (prod,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

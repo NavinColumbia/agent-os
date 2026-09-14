@@ -5,6 +5,7 @@ from __future__ import annotations
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIResponsesModel
+from pydantic_ai.models import Model
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.google import GoogleProvider
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -22,18 +23,25 @@ class TenantModelResolver:
         settings: TenantModelStore,
         secrets: ConnectorSecretResolver,
         *,
-        fallback_model: str,
+        fallback_model: Model | str,
+        fallback_name: str | None = None,
     ) -> None:
-        if not fallback_model.strip():
+        resolved_name = (
+            fallback_name.strip() if fallback_name is not None
+            else fallback_model.strip() if isinstance(fallback_model, str)
+            else str(getattr(fallback_model, "model_name", "")).strip()
+        )
+        if not resolved_name:
             raise ValueError("tenant model resolver requires an explicit fallback model")
         self._settings = settings
         self._secrets = secrets
-        self._fallback = fallback_model.strip()
+        self._fallback = fallback_model.strip() if isinstance(fallback_model, str) else fallback_model
+        self._fallback_name = resolved_name
 
     def __call__(self, tenant_id: str) -> ModelSelection:
         setting = self._settings.get_model_setting(tenant_id)
         if setting is None:
-            return ModelSelection(self._fallback, self._fallback)
+            return ModelSelection(self._fallback, self._fallback_name)
         provider = str(setting["provider"])
         model_name = str(setting["model_name"])
         canonical = f"{provider}:{model_name}"

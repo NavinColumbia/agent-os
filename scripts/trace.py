@@ -14,13 +14,12 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 
 def runs(limit=15):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""SELECT product, count(*) steps, min(ts), max(ts),
                           round(sum(coalesce(elapsed_s,0))) total_s,
                           count(*) FILTER (WHERE rc<>0) errs
@@ -30,7 +29,7 @@ def runs(limit=15):
 
 
 def steps(product):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""SELECT stage, role, kind, rc, elapsed_s, prompt, output, ts
                        FROM traces WHERE product=%s ORDER BY id""", (product,))
         return [{"stage": st, "role": r, "kind": k, "rc": rc, "elapsed_s": e,
@@ -57,7 +56,7 @@ def show(product, full=False):
 
 def runs_for_tenant(tenant_id, limit=15):
     """Per-tenant isolation: a tenant sees ONLY traces of products it owns (join tenant_products)."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("""SELECT t.product, count(*), max(t.ts), round(sum(coalesce(t.elapsed_s,0))),
                           count(*) FILTER (WHERE t.rc<>0)
                        FROM traces t JOIN tenant_products tp ON tp.product=t.product
@@ -69,16 +68,15 @@ def runs_for_tenant(tenant_id, limit=15):
 
 def prune(days=30):
     """Retention/cost control: drop traces older than N days. Returns rows removed."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("DELETE FROM traces WHERE ts < now() - (%s || ' days')::interval", (str(days),))
         n = cur.rowcount
-        c.commit()
     return n
 
 
 def errors():
     """Cross-run error search: every step that failed (rc<>0) — the first place a debugger looks."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""SELECT product, stage, role, kind, rc, ts FROM traces WHERE rc IS NOT NULL AND rc<>0
                        ORDER BY ts DESC LIMIT 40""")
         return [{"product": p, "stage": s, "role": r, "kind": k, "rc": rc, "ts": ts}
@@ -105,21 +103,24 @@ def _main(a):
         import os
         suf = os.urandom(3).hex()
         tid, mine, theirs = f"t-tr-{suf}", f"mine-{suf}", f"theirs-{suf}"
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenants (tenant_id,name,api_token) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
                         (tid, "tt", f"aos_{suf}0000000000000000"))
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product,tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (mine, tid))
-            for prod in (mine, theirs):
-                cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,prompt,output,rc)
-                               VALUES (%s,%s,'X','r','agent','p','o',0)""", (f"r-{suf}-{prod}", prod))
-            c.commit()
+            cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,prompt,output,rc)
+                           VALUES (%s,%s,'X','r','agent','p','o',0)""", (f"r-{suf}-{mine}", mine))
+        with connection() as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,prompt,output,rc)
+                           VALUES (%s,%s,'X','r','agent','p','o',0)""", (f"r-{suf}-{theirs}", theirs))
         scoped = runs_for_tenant(tid)
         isolated = bool(scoped) and all(r["product"] == mine for r in scoped)   # sees mine, never theirs
-        with psycopg.connect(DB) as c, c.cursor() as cur:   # cleanup
-            cur.execute("DELETE FROM traces WHERE product IN (%s,%s)", (mine, theirs))
+        with tenant_connection(tid) as c, c.cursor() as cur:
+            cur.execute("DELETE FROM traces WHERE product=%s", (mine,))
             cur.execute("DELETE FROM tenant_products WHERE product=%s", (mine,))
+        with connection() as c, c.cursor() as cur:   # cleanup
+            cur.execute("DELETE FROM traces WHERE product IN (%s,%s)", (mine, theirs))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
         print(f"per-tenant isolation (sees own, not others'): {isolated}; prune callable: {callable(prune)}")
         print("PASS: debug trace store + per-tenant isolation + retention ✅" if isolated else "FAIL")
         sys.exit(0 if isolated else 1)

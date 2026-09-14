@@ -77,3 +77,78 @@ records:
 
 A green render and a sub-second scripted happy-path are evidence the code mounts, not evidence a human
 can use it. The create-account timer-leak is the standing proof of the difference.
+
+## Per-job headed-browser and assistive-technology isolation
+
+Status: REQUIRED whenever a QA job launches a headed browser or an external assistive-technology driver
+(currently Orca/AT-SPI). Browser-capacity admission limits resource use; it is not an isolation boundary.
+Every admitted job gets its own complete desktop/AT session and its own exact cleanup authority.
+
+### Required boundary
+
+Each job MUST have all of the following, created for that job rather than inherited from the worker or
+shared with another job. Orca is an explicit exception: upstream supports one screen-reader process per
+Unix user, so real-AT jobs share one bounded workstation queue but never a live tenant browser session:
+
+- an automatically allocated Xvfb display;
+- a private D-Bus session and the AT-SPI bus it brokers;
+- a private `XDG_RUNTIME_DIR`, mode `0700`;
+- an explicitly owned foreground `speech-dispatcher` on a private Unix socket (never client autospawn);
+- a private Orca work directory and debug stream;
+- a private Playwright browser context, cookies/local storage, screenshots, video, and evidence ledger;
+- a process root registered with exact PID birth identity and the job's `(tenant, run_id)` scope; and
+- a browser-capacity lease held for the lifetime of that process root.
+
+The child environment MUST be built from an explicit runtime allowlist; copying the worker's complete
+environment into Xvfb, D-Bus, Orca, Node, or Chromium is forbidden because it forwards unrelated credentials
+and provider tokens into a larger process tree. Job-specific values are passed only in that child environment.
+A job MUST NOT modify the worker's global `DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`, AT-SPI,
+storage-state, or evidence variables.
+Two concurrently submitted real-AT jobs MUST NOT run two Orca instances. One holds the full-lifetime
+workstation lease and one waits without consuming browser capacity. After exact handoff, their recorded
+display, bus, runtime-directory, debug-stream, browser-storage, and evidence identities must differ. An
+utterance, cookie, screenshot, or state mutation from one job appearing in another is a release-blocking
+isolation failure. Required non-secret WSLg runtime endpoints such as `PULSE_SERVER` may be allowlisted;
+dropping them can deadlock Orca's event thread and is also release-blocking.
+
+### Startup and cleanup contract
+
+The boundary is fail closed:
+
+1. For real AT, acquire the bounded full-lifetime Orca workstation lease; only then acquire browser capacity.
+2. Create the private runtime directory with mode `0700`. From this point onward, every exception — including
+   invalid resume/storage input before process launch — MUST unwind the directory and capacity lease.
+3. Start `xvfb-run -a` and `dbus-run-session`, register the exact process identity, then await the
+   Orca/browser readiness handshake.
+4. Do not navigate, click, or claim actual-AT coverage unless readiness proves the real driver is live.
+5. On normal close, send the protocol `close` request and give the driver a bounded grace period to reap
+   Orca, Node, Chromium, ffmpeg, D-Bus, and Xvfb and remove its private work directory. Send `SIGTERM` only
+   after that grace period expires; use `SIGKILL` only after a second bounded wait.
+6. On startup failure, command failure, scoped cancellation, lease loss, or parent death, fence only the
+   exact identity-bound tree for that `(tenant, run_id)`. Never use a process-name match, bare PID, global
+   browser set, or broad `pkill`.
+7. Revalidate that every recorded process identity is dead, remove the private runtime/work directories,
+   unregister ownership, and release the exact capacity lease. Cleanup is not successful while any one of
+   those postconditions is unproven.
+
+`close_live_bridges(run_id=..., tenant=...)` MUST receive both scope fields for job cancellation and MUST
+reject calls supplying only one field. Supplying neither field is reserved for whole-worker shutdown. Closing
+one scope must leave concurrent neighbors responsive and must not delete or alter their evidence.
+
+### Release-gate proof
+
+The executable policy is `tests/test_qa_at_job_isolation.py`. A release gate must run both commands; a
+skip or an unavailable local desktop bus is **not** a pass:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_qa_at_job_isolation.py
+AOS_RUN_LIVE_AT_ISOLATION=1 .venv/bin/python -m pytest -q -s \
+  tests/test_qa_at_job_isolation.py::test_live_concurrent_jobs_are_isolated_and_failure_cleanup_is_complete
+```
+
+The live proof must submit two jobs concurrently; prove exactly one owns the real-AT workstation while its
+peer remains queued without browser admission; inspect the first job's real identities and utterance; cancel
+it by exact tenant/run scope; prove the queued job starts and records distinct identities/utterances; kill the
+remaining browser child; and verify every recorded identity and private directory is gone. Record the exact
+command output and what was not covered. If any assertion fails, BLOCK and notify platform/SRE plus the
+controller with the failed postcondition; do not ask the CEO to diagnose an internal cleanup failure.

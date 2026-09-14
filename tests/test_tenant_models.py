@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic_ai.models.test import TestModel
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIResponsesModel
@@ -103,6 +104,24 @@ def test_tenant_model_resolver_uses_platform_fallback_without_secret_access(tmp_
         )("org-a")
         assert selected.model == "google:gemini-2.5-flash"
         assert selected.name == "google:gemini-2.5-flash"
+        assert secrets.calls == []
+    finally:
+        settings.close()
+
+
+def test_tenant_model_resolver_preserves_a_local_model_adapter_and_auditable_name(tmp_path: Path):
+    settings = store(tmp_path)
+    secrets = SecretResolver()
+    fallback = TestModel()
+    try:
+        selected = TenantModelResolver(
+            settings,
+            secrets,
+            fallback_model=fallback,
+            fallback_name="codex-cli:default",
+        )("org-a")
+        assert selected.model is fallback
+        assert selected.name == "codex-cli:default"
         assert secrets.calls == []
     finally:
         settings.close()

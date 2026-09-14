@@ -51,6 +51,17 @@ _CFG = _read_env()
 # DATABASE_URL: the real environment overrides the file so CI/tests can inject it without writing one.
 DB = os.environ.get("DATABASE_URL") or _CFG.get("DATABASE_URL")
 
+# Portable runtime topology.  Defaults preserve the historical sibling layout
+# while allowing a public installation to live anywhere on disk.
+AOS_ROOT = Path(os.environ.get("AOS_ROOT") or _CFG.get("AOS_ROOT") or _REPO).expanduser().resolve()
+PROJECTS_ROOT = Path(os.environ.get("AOS_PROJECTS_ROOT") or _CFG.get("AOS_PROJECTS_ROOT")
+                     or AOS_ROOT.parent).expanduser().resolve()
+CONTROL_PLANE_ROOT = Path(os.environ.get("AOS_CONTROL_PLANE_ROOT")
+                          or _CFG.get("AOS_CONTROL_PLANE_ROOT")
+                          or PROJECTS_ROOT / "control-plane").expanduser().resolve()
+PRODUCTS_ROOT = Path(os.environ.get("AOS_PRODUCTS_ROOT") or _CFG.get("AOS_PRODUCTS_ROOT")
+                     or PROJECTS_ROOT / "products").expanduser().resolve()
+
 # venv python used to spawn sandboxed subprocesses — repo-relative if present, else the prod home path.
 _venv = _REPO / ".venv" / "bin" / "python"
 VENV_PY = str(_venv if _venv.exists()
@@ -67,3 +78,5 @@ if __name__ == "__main__":
     print(f"env file  = {ENV}  (exists={ENV.exists()})")
     print(f"DATABASE_URL resolved = {bool(DB)}")
     print(f"VENV_PY   = {VENV_PY}")
+    print(f"products  = {PRODUCTS_ROOT}")
+    print(f"control   = {CONTROL_PLANE_ROOT}")

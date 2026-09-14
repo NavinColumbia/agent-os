@@ -214,6 +214,7 @@ class WorkflowEventKind(str, Enum):
     NODE_WAITED = "node_waited"
     WAIT_RESUMED = "wait_resumed"
     NODE_FAILED = "node_failed"
+    NODE_RETRY_REQUESTED = "node_retry_requested"
     CHILD_WAITED = "child_waited"
     CHILD_COMPLETED = "child_completed"
     RUN_REVISED = "run_revised"
@@ -713,6 +714,52 @@ def fail_node(
     ))
 
 
+def retry_failed_node(
+    state: WorkflowRunState,
+    token_id: str,
+    *,
+    expected_version: int,
+    reason: str,
+) -> WorkflowMutation:
+    """Explicitly recover one failed node after its underlying blocker is repaired."""
+
+    if state.version != expected_version:
+        raise WorkflowTransitionRejected(
+            f"stale workflow version {expected_version}; current version is {state.version}"
+        )
+    if state.status is not WorkflowRunStatus.FAILED:
+        raise WorkflowTransitionRejected("node retry requires a failed workflow run")
+    token = state.token(token_id)
+    if token.status is not TokenStatus.FAILED or not reason.strip():
+        raise WorkflowTransitionRejected("node retry requires a failed token and recovery reason")
+    version = state.version + 1
+    updated = replace(
+        token,
+        status=TokenStatus.READY,
+        output={
+            **dict(token.output),
+            "operator_recovery": {
+                "reason": reason,
+                "prior_error": token.last_error,
+            },
+        },
+    )
+    next_state = replace(
+        state,
+        version=version,
+        status=WorkflowRunStatus.ACTIVE,
+        tokens=_replace_token(state, updated),
+        failure=None,
+    )
+    return WorkflowMutation(next_state, (
+        _action(state.run_id, version, 0, WorkflowActionKind.EXECUTE_NODE, updated, {
+            "operator_recovery": True,
+            "recovery_reason": reason,
+            "prior_error": token.last_error,
+        }),
+    ))
+
+
 def cancel_workflow(
     state: WorkflowRunState,
     *,
@@ -912,6 +959,13 @@ def evolve_workflow(
             expected_version=event.expected_version,
             reason=str(payload.get("reason") or ""),
             retryable=bool(payload.get("retryable", False)),
+        )
+    if event.kind is WorkflowEventKind.NODE_RETRY_REQUESTED:
+        return retry_failed_node(
+            state,
+            str(payload.get("token_id") or ""),
+            expected_version=event.expected_version,
+            reason=str(payload.get("reason") or ""),
         )
     if event.kind is WorkflowEventKind.RUN_REVISED:
         replacement_raw = payload.get("replacement_workflow")

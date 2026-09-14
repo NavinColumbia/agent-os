@@ -16,10 +16,10 @@ import sys
 import time
 from pathlib import Path
 
-import psycopg
 from dbos import DBOS, DBOSConfig, SetWorkflowID
 
-from aoscfg import ENV, DB
+from aoscfg import DB
+from dbpool import connection
 WF_FILE = Path("/tmp/commfabric_wf_id")
 TOPIC = "ask-await-demo"
 RECV_TIMEOUT = 300   # seconds the requester will durably suspend in recv awaiting a reply
@@ -35,7 +35,7 @@ def _wait_edge(waiter, awaited, add=True, reply_by_seconds=None):
     can never fire, making all overdue-wait / SLA-breach detection dead. The deadline is
     tied to the recv timeout so the wait is flagged overdue before (or as) the recv expires.
     """
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         if add:
             if reply_by_seconds is not None:
                 cur.execute(
@@ -47,7 +47,6 @@ def _wait_edge(waiter, awaited, add=True, reply_by_seconds=None):
                 cur.execute("INSERT INTO waits(waiter,awaited) VALUES(%s,%s) ON CONFLICT DO NOTHING", (waiter, awaited))
         else:
             cur.execute("DELETE FROM waits WHERE waiter=%s AND awaited=%s", (waiter, awaited))
-        c.commit()
 
 
 DBOS(config=DBOSConfig(name="agentos-comm", database_url=DB))
@@ -74,7 +73,7 @@ def main(mode):
         with SetWorkflowID(wf_id):
             DBOS.start_workflow(requester, "is SendGrid v2 still supported?")
         for _ in range(120):                       # wait until the workflow is parked in recv
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with connection() as c, c.cursor() as cur:
                 cur.execute("SELECT 1 FROM waits WHERE waiter=%s", (wf_id,))
                 if cur.fetchone():
                     break

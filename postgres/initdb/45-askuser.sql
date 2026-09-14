@@ -9,5 +9,6 @@ CREATE TABLE IF NOT EXISTS ask_user_requests (
     question   TEXT,
     status     TEXT DEFAULT 'open',     -- open | answered
     answer     TEXT,
+    agent_request_id BIGINT,
     created_at TIMESTAMPTZ DEFAULT now()
 );

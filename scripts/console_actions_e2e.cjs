@@ -25,6 +25,35 @@ const SKIP_TEXT = /sign out|log ?out|delete|remove|disconnect|cancel account|res
   try {
     const ctx = await b.newContext({ viewport: { width: 1280, height: 900 } });
     const p = await ctx.newPage();
+    // This crawler proves that each UI control is wired; it is NOT authorization to run builds,
+    // agents, OAuth, billing, deletes, approvals, or any other mutation.  Historically it blindly
+    // clicked those controls against the live local console and launched multiple Codex/Claude jobs.
+    // Intercept every non-GET API call inside Playwright so a full regression can never spend tokens,
+    // spawn a browser login, mutate operator state, or create runaway background work.  Read-only GETs
+    // remain real, so every screen is still rendered from the actual application and database.
+    let blockedMutations = 0;
+    await p.route('**/api/**', async route => {
+      const req = route.request();
+      const path = new URL(req.url()).pathname;
+      // These two nominally read-only views synthesize prose with a model on a cache miss.  A GET must
+      // not become a hidden token-spending action during regression testing.
+      if (req.method() === 'GET' && path === '/api/brief')
+        return route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify({
+          headline: 'Action-crawl fixture', needs_you: [], team_did: ['Rendered safely'], watch: [],
+          suggestion: 'Continue the bounded UI check'
+        })});
+      if (req.method() === 'GET' && path === '/api/explain')
+        return route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify({
+          explanation: 'Seeded planning, build, and QA evidence for this action-crawl fixture.'
+        })});
+      if (req.method() === 'GET') return route.continue();
+      blockedMutations++;
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ok: true, status: 'action-crawl-safe', message: 'mutation exercised without execution'})
+      });
+    });
     let where = 'boot';
     let reqs = 0, dialogs = 0;                           // a control that fires a request / opens a dialog is NOT dead
     p.on('request', () => reqs++);
@@ -63,17 +92,24 @@ const SKIP_TEXT = /sign out|log ?out|delete|remove|disconnect|cancel account|res
           const els = await p.$$(CLICK_SEL); const t = els[k]; if (!t) { exercised++; continue; }
           let label = `[${screen}] ` + await t.evaluate(e => `<${e.tagName.toLowerCase()}> "${(e.innerText || e.value || e.getAttribute('aria-label') || '').slice(0, 40).trim()}"`).catch(() => '<?>');
           if (SKIP_TEXT.test(label)) { exercised++; continue; }
+          // Controls inside a collapsed form/menu are not currently interactive.  The visible opener is
+          // exercised; force-clicking its hidden children creates false "dead" results and can bypass the
+          // same visibility guard a real user is subject to.
+          if (!(await t.isVisible().catch(() => false))) { exercised++; continue; }
           // submit-style buttons correctly no-op on empty input — give them content first so we test the REAL action
-          if (/send|submit|save|create|build|add|search/i.test(label))
+          // The screen is re-rendered after every click, so a later Answer/Respond control no longer sees
+          // the value filled during the initial input pass. Refill its freshly rendered companion input just
+          // before the click, exactly as a user would; otherwise the intentional empty-input guard looks dead.
+          if (/send|submit|save|create|build|add|search|answer|respond/i.test(label))
             await p.$$('#view input, #view textarea').then(a => a[0] && a[0].fill('test', { timeout: 800 })).catch(() => {});
           const before = errors.length, reqsB = reqs, dlgB = dialogs;
           const hadOnclick = await t.evaluate(e => !!(e.getAttribute('onclick') || e.onclick)).catch(() => false);
-          const domBefore = await p.evaluate(() => document.body.innerHTML.length);
+          const domBefore = await p.evaluate(() => document.body.innerHTML);
           const stBefore = await p.evaluate(() => (typeof CUR !== 'undefined' ? CUR : '') + '|' + location.hash);
           const inpBefore = await p.evaluate(() => [...document.querySelectorAll('input,textarea,.note,#cnote,#bknote')].map(e => (e.value || e.textContent || '')).join('|')).catch(() => '');
           await t.click({ timeout: 1500, force: true }).catch(() => {});
           await sleep(250);
-          const changed = await p.evaluate(bb => document.body.innerHTML.length !== bb, domBefore);
+          const changed = await p.evaluate(bb => document.body.innerHTML !== bb, domBefore);
           const navd = (await p.evaluate(() => (typeof CUR !== 'undefined' ? CUR : '') + '|' + location.hash)) !== stBefore;
           const opened = await p.evaluate(() => !!document.querySelector('.modal, [role=dialog]') || [...document.querySelectorAll('.menu')].some(m => getComputedStyle(m).display !== 'none'));
           const inpChanged = (await p.evaluate(() => [...document.querySelectorAll('input,textarea,.note,#cnote,#bknote')].map(e => (e.value || e.textContent || '')).join('|')).catch(() => '')) !== inpBefore;
@@ -127,7 +163,7 @@ const SKIP_TEXT = /sign out|log ?out|delete|remove|disconnect|cancel account|res
 
     const problems = errors.length + dead.length + broken.length;
     console.log(`ACTION COVERAGE: ${exercised}/${found} interactive controls exercised across ${SCREENS.length} screens`);
-    console.log(`  JS errors: ${errors.length} · dead controls: ${dead.length} · click-errors: ${broken.length}`);
+    console.log(`  JS errors: ${errors.length} · dead controls: ${dead.length} · click-errors: ${broken.length} · blocked mutations: ${blockedMutations}`);
     [...new Set([...errors, ...dead.map(d => 'DEAD ' + d), ...broken.map(x => 'BROKEN ' + x)])].slice(0, 40).forEach(x => console.log('  - ' + x));
     if (problems) { console.log(`FAIL: ${problems} action-coverage problem(s)`); await b.close(); process.exit(1); }
     console.log('PASS: every exercised control did something + no JS errors ✅');

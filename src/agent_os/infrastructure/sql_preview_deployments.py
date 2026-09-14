@@ -10,7 +10,9 @@ import hmac
 import json
 import re
 from typing import Any, Callable, Mapping
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from sqlalchemy import (
     Boolean,
@@ -40,7 +42,14 @@ from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
 preview_metadata = MetaData()
 _PUBLIC_ID = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _HTML_MEDIA_TYPES = {"text/html", "text/html; charset=utf-8"}
+_SOURCE_BUNDLE_MEDIA_TYPE = "application/vnd.agent-os.source-bundle+json"
 _MAX_PREVIEW_BYTES = 256 * 1024
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
 
 preview_deployments = Table(
     "aos_v2_preview_deployments",
@@ -124,6 +133,7 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
         self._artifacts = artifact_store
         self._public_base_url = public_base_url.rstrip("/")
+        self._public_base = urlparse(self._public_base_url)
         self._secret = capability_secret.encode()
         self._ttl = timedelta(seconds=ttl_seconds)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -148,6 +158,57 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
         digest = hmac.new(self._secret, material, hashlib.sha256).digest()
         return base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
+    def _html_artifact(
+        self, organization_id: str, artifact_id: str, idempotency_key: str,
+    ) -> tuple[str, bytes, str | None]:
+        """Resolve exact preview HTML without asking a model to copy bytes."""
+
+        artifact = self._artifacts.describe(organization_id, artifact_id)
+        content = self._artifacts.get(organization_id, artifact_id)
+        if artifact is None or content is None:
+            raise FatalCommandError("preview artifact does not exist in this tenant")
+        media_type = str(artifact.get("media_type") or "").lower()
+        if media_type in _HTML_MEDIA_TYPES:
+            return artifact_id, content, None
+        if media_type != _SOURCE_BUNDLE_MEDIA_TYPE:
+            raise FatalCommandError(
+                "static preview deployment requires text/html or a source bundle with index.html"
+            )
+        try:
+            bundle = json.loads(content)
+            files = bundle.get("files") if isinstance(bundle, Mapping) else None
+            specification = files.get("index.html") if isinstance(files, Mapping) else None
+            if (
+                not isinstance(bundle, Mapping)
+                or bundle.get("format") != "agent-os.source-bundle.v1"
+                or not isinstance(specification, Mapping)
+            ):
+                raise ValueError("missing canonical index.html")
+            encoding = specification.get("encoding")
+            raw_content = specification.get("content")
+            if encoding == "utf-8" and isinstance(raw_content, str):
+                html = raw_content.encode("utf-8")
+            elif encoding == "base64" and isinstance(raw_content, str):
+                html = base64.b64decode(raw_content, validate=True)
+            else:
+                raise ValueError("unsupported index.html encoding")
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise FatalCommandError(
+                "preview source bundle has no valid canonical index.html"
+            ) from exc
+        try:
+            derived_artifact_id = self._artifacts.put(
+                organization_id=organization_id,
+                content=html,
+                media_type="text/html; charset=utf-8",
+                idempotency_key=(
+                    f"preview-index:v1:{idempotency_key}:{artifact_id}"
+                ),
+            )
+        except ValueError as exc:
+            raise FatalCommandError("preview index artifact could not be persisted") from exc
+        return derived_artifact_id, html, artifact_id
+
     def deploy(
         self,
         *,
@@ -165,12 +226,9 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
             or len(idempotency_key) > 200
         ):
             raise FatalCommandError("preview deployment identity is missing or unbounded")
-        artifact = self._artifacts.describe(organization_id, artifact_id)
-        content = self._artifacts.get(organization_id, artifact_id)
-        if artifact is None or content is None:
-            raise FatalCommandError("preview artifact does not exist in this tenant")
-        if str(artifact.get("media_type") or "").lower() not in _HTML_MEDIA_TYPES:
-            raise FatalCommandError("static preview deployment requires a text/html artifact")
+        artifact_id, content, source_artifact_id = self._html_artifact(
+            organization_id, artifact_id, idempotency_key,
+        )
         if len(content) > _MAX_PREVIEW_BYTES:
             raise FatalCommandError("static preview artifact exceeds 256 KiB")
         try:
@@ -211,6 +269,7 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
             "tenant_id": organization_id,
             "deployment_id": deployment_id,
             "artifact_id": artifact_id,
+            **({"source_artifact_id": source_artifact_id} if source_artifact_id else {}),
             "public_url": public_url,
             "expires_at": expires_at.isoformat(),
         }
@@ -289,6 +348,114 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
                 preview_deployments.c.expires_at > _utc(self._clock()),
             ))).scalar_one_or_none()
         return None if raw is None else dict(raw)
+
+    def verify_fetch(
+        self,
+        *,
+        organization_id: str,
+        public_url: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]:
+        """Fetch one issued preview URL without granting generic workflow networking."""
+
+        organization_id = organization_id.strip()
+        public_url = public_url.strip()
+        idempotency_key = idempotency_key.strip()
+        if (
+            not organization_id
+            or not public_url
+            or not idempotency_key
+            or len(idempotency_key) > 200
+        ):
+            raise FatalCommandError("preview fetch identity is missing or unbounded")
+        parsed = urlparse(public_url)
+        base = self._public_base
+        if (
+            parsed.scheme != base.scheme
+            or parsed.netloc != base.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise FatalCommandError("preview fetch URL is outside the configured preview origin")
+        expected_prefix = f"{base.path.rstrip('/')}/v2/public/previews/"
+        if not parsed.path.startswith(expected_prefix):
+            raise FatalCommandError("preview fetch URL is outside the preview capability path")
+        suffix = parsed.path[len(expected_prefix):].split("/")
+        if len(suffix) != 2 or any(not item for item in suffix):
+            raise FatalCommandError("preview fetch URL has an invalid capability path")
+        tenant_slug, public_id = suffix
+        record = self.resolve_public(tenant_slug, public_id)
+        if record is None or record.get("tenant_id") != organization_id:
+            raise FatalCommandError("preview fetch URL is not active for this tenant")
+        artifact_id = str(record.get("artifact_id") or "")
+        expected = self._artifacts.get(organization_id, artifact_id)
+        if expected is None:
+            raise FatalCommandError("preview fetch source artifact is unavailable")
+
+        status_code: int | None = None
+        content_type: str | None = None
+        body = b""
+        error: str | None = None
+        try:
+            opener = build_opener(_RejectRedirects())
+            request = Request(
+                public_url,
+                headers={
+                    "Accept": "text/html",
+                    "User-Agent": "agent-os-preview-verifier/1",
+                },
+            )
+            with opener.open(request, timeout=10) as response:
+                status_code = int(response.status)
+                content_type = response.headers.get_content_type()
+                if response.geturl() != public_url:
+                    raise OSError("preview fetch changed URL")
+                body = response.read(_MAX_PREVIEW_BYTES + 1)
+        except HTTPError as exc:
+            status_code = int(exc.code)
+            error = f"HTTP {exc.code}"
+        except (URLError, TimeoutError, OSError) as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:300]}"
+
+        actual_digest = hashlib.sha256(body).hexdigest() if body else None
+        expected_digest = hashlib.sha256(expected).hexdigest()
+        verified = bool(
+            error is None
+            and status_code == 200
+            and content_type == "text/html"
+            and len(body) <= _MAX_PREVIEW_BYTES
+            and body == expected
+        )
+        verification = {
+            "format": "agent-os.static-preview-fetch.v1",
+            "tenant_id": organization_id,
+            "deployment_id": record.get("deployment_id"),
+            "artifact_id": artifact_id,
+            "public_url": public_url,
+            "status_code": status_code,
+            "content_type": content_type,
+            "content_bytes": len(body),
+            "content_sha256": actual_digest,
+            "expected_sha256": expected_digest,
+            "digest_matches": body == expected,
+            "redirected": False,
+            "verified": verified,
+            "error": error,
+        }
+        verification_artifact_id = self._artifacts.put(
+            organization_id=organization_id,
+            content=json.dumps(
+                verification, allow_nan=False, separators=(",", ":"), sort_keys=True,
+            ).encode(),
+            media_type="application/json",
+            idempotency_key=f"preview-fetch-verification:{idempotency_key}",
+        )
+        return {
+            **verification,
+            "verification_artifact_id": verification_artifact_id,
+        }
 
     def list_previews(
         self, organization_id: str, *, limit: int = 100,

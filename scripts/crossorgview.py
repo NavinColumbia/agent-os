@@ -25,14 +25,12 @@ import json
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402,F401  (convention parity with the other surfaces)
 import orgs   # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection
 
 # A ProductComplete with one of these decisions is a SHIPPED build; everything else is a failure.
 SUCCESS_DECISIONS = ("LAUNCHED", "INTEGRATED")
@@ -67,7 +65,7 @@ def portfolio(tenant_id):
     for those products), and live/building/failed counts from the latest ProductComplete per product."""
     org_meta = {o["org_id"]: o for o in orgs.list_orgs(tenant_id)}
     out_orgs = []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         by_org, _ = _org_products(cur, tenant_id)
         for org_id, meta in org_meta.items():
             prods = by_org.get(org_id, [])
@@ -129,7 +127,7 @@ def failures(tenant_id):
     ProductComplete whose decision is NOT a success) joined to their org, plus open findings per org."""
     org_meta = {o["org_id"]: o for o in orgs.list_orgs(tenant_id)}
     failed_builds, findings_by_org = [], {}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         by_org, prod_org = _org_products(cur, tenant_id)
         all_products = [p for ps in by_org.values() for p in ps]
         if all_products:
@@ -187,7 +185,7 @@ def _selftest():
     pb = tid.replace("t-", "")[:6] + "-inv"       # org B's product (gets a BLOCKED_AT_QA build)
     ok = False
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id, org_id) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
                         (pa, tid, a["org_id"]))
             cur.execute("INSERT INTO tenant_products (product, tenant_id, org_id) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
@@ -196,12 +194,11 @@ def _selftest():
                 cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, rc, cost_usd, tokens_in, tokens_out, elapsed_s, prompt, output, model)
                                VALUES (%s,%s,%s,'builder','agent',0,%s,1000,2000,30,'p','o','m')""",
                             (f"run-{pa}", pa, st, cost))
-            c.commit()
         # terminal build results via the append-only audit chain (NEVER deleted afterwards)
         audit.append(actor="crossorgview-selftest", action="ProductComplete", resource=pa,
-                     decision="LAUNCHED", payload={"org": a["org_id"]})
+                     decision="LAUNCHED", payload={"tenant": tid, "org": a["org_id"]}, tenant_id=tid)
         audit.append(actor="crossorgview-selftest", action="ProductComplete", resource=pb,
-                     decision="BLOCKED_AT_QA", payload={"org": b["org_id"]})
+                     decision="BLOCKED_AT_QA", payload={"tenant": tid, "org": b["org_id"]}, tenant_id=tid)
 
         port = portfolio(tid)
         an = analytics(tid)
@@ -225,12 +222,11 @@ def _selftest():
         print("PASS: crossorgview rolls up portfolio + analytics + failures across all a CEO's orgs ✅" if ok else "FAIL")
     finally:
         # clean up everything EXCEPT audit_log (append-only, tamper-evident hash chain — never touched)
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM traces WHERE product = ANY(%s)", ([pa, pb],))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM orgs WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

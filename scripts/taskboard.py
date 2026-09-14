@@ -15,13 +15,11 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
+from dbpool import connection  # noqa: E402
 
-from aoscfg import ENV as _ENV, DB as _DB
 STATUSES = ("asked", "in_progress", "blocked", "done")
 
 _DDL = """
@@ -40,10 +38,30 @@ CREATE TABLE IF NOT EXISTS task_board (
 
 
 def _conn():
-    c = psycopg.connect(_DB)
+    class _PooledConn:
+        def __init__(self):
+            self._cm = connection()
+            self._conn = self._cm.__enter__()
+            self._closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self._closed = True
+            return self._cm.__exit__(exc_type, exc, tb)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def close(self):
+            if not self._closed:
+                self._closed = True
+                self._cm.__exit__(None, None, None)
+
+    c = _PooledConn()
     with c.cursor() as cur:
         cur.execute(_DDL)
-    c.commit()
     return c
 
 

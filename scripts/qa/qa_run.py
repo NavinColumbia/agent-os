@@ -48,7 +48,6 @@ import time
 import urllib.request
 from pathlib import Path
 
-import psycopg
 from psycopg.types.json import Jsonb
 
 SCRIPTS = Path(__file__).resolve().parent.parent          # scripts/ (qa_run.py lives in scripts/qa/)
@@ -65,16 +64,20 @@ import dev_loop       # noqa: E402  — AI dev-fix loop + app restart/reset
 import qa_report      # noqa: E402  — grounded verdict + AI narrative report writer
 import artifacts      # noqa: E402  — Windows-visible evidence archive paths
 import pulse          # noqa: E402  — live heartbeat plane (observability: this run is alive + what it's doing)
+from dbpool import connection, tenant_connection  # noqa: E402
 
 # Rounds = fix-and-re-test cycles + coverage gap-fill cycles. This is only a RUNAWAY cap, not the real
 # terminator: the loop stops itself on coverage-complete or an honest gap-stall (a gap round that covers
 # nothing new). Liberal by default (was 6); raise/lower with AOS_QA_MAX_ROUNDS.
-MAX_ROUNDS = int(os.environ.get("AOS_QA_MAX_ROUNDS", "12"))    # runaway cap on fix + gap-fill rounds
+MAX_ROUNDS = int(os.environ.get("AOS_QA_MAX_ROUNDS", "3"))     # safe live default; dedicated workers may raise it
 # NOT a target, NOT a quality cap — a pure SAFETY BACKSTOP. The explorer is COVERAGE-DRIVEN: it stops when
 # it has tested everything a real user would try (an AI judgment), not after N clicks. This number only
 # guards against a runaway loop; when it trips, the run is marked INCOMPLETE and checkpoints what's left.
-# Default 250 (very high — a real end-to-end journey rarely needs it). Set AOS_QA_MAX_STEPS=0 for unbounded.
-_SAFETY_STEPS = int(os.environ.get("AOS_QA_MAX_STEPS", "250"))
+# The live process already has a cancellable slice deadline, bounded browser admission, host-pressure guards,
+# repeat/stall detection, and durable checkpoints.  A second arbitrary click ceiling split ordinary multi-form
+# journeys across fresh workers and made them repeat setup.  Default to coverage-driven completion; operators
+# can still set a positive AOS_QA_MAX_STEPS for a deliberately smaller external execution envelope.
+_SAFETY_STEPS = int(os.environ.get("AOS_QA_MAX_STEPS", "0"))
 MAX_STEPS = _SAFETY_STEPS or None                              # None => unbounded (ledger + stall guard bound it)
 # One AI reply occasionally comes back as prose instead of the JSON story array; a single flaky reply
 # must not collapse the whole gate into a 0-story NO VERDICT — retry the enumeration (each attempt is a
@@ -83,14 +86,38 @@ STORY_GEN_ATTEMPTS = int(os.environ.get("AOS_QA_STORYGEN_ATTEMPTS", "3"))
 # Optional cap on the exercised story count (0 = unlimited). An operator-set bound for small/simple
 # products where exhaustive enumeration overshoots (a tip calculator does not need 60 stories); the
 # verdict facts stay honest — stories>0 must still be REAL explored stories for the gate to pass.
-MAX_STORIES = int(os.environ.get("AOS_QA_MAX_STORIES", "0"))
-
-from aoscfg import ENV, DB
-
+MAX_STORIES = int(os.environ.get("AOS_QA_MAX_STORIES", "12"))
 
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
 # durable evidence — every run is a Postgres row; every open bug is a governed, owned finding.
 # ───────────────────────────────────────────────────────────────────────────────────────────────────
+def _conn(tenant_id=None):
+    return tenant_connection(tenant_id) if tenant_id else connection()
+
+
+def _tenant_for_product(product):
+    if not product:
+        return None
+    try:
+        with connection() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM tenant_products WHERE product=%s ORDER BY created_at DESC LIMIT 1",
+                        (product,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _ensure_qa_runs():
+    with connection() as c, c.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS qa_runs (
+            id BIGSERIAL PRIMARY KEY, product TEXT NOT NULL, rounds INT NOT NULL,
+            passed BOOLEAN NOT NULL, clean BOOLEAN NOT NULL, verdict JSONB NOT NULL,
+            report_md TEXT, report_json TEXT, ts TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        cur.execute("ALTER TABLE qa_runs ADD COLUMN IF NOT EXISTS tenant_id TEXT")
+        cur.execute("CREATE INDEX IF NOT EXISTS qa_runs_tenant_id_rls_idx ON qa_runs (tenant_id)")
+
+
 def _persist_run(report: dict, run: dict) -> int:
     """Every QA run becomes a qa_runs row (product, rounds, verdict json, report paths, ts): QA history
     is durable evidence in Postgres, not files in /tmp a reboot erases. Returns the row id."""
@@ -98,16 +125,17 @@ def _persist_run(report: dict, run: dict) -> int:
                                           "open_bugs", "blocking_open", "clean", "rounds")}
     verdict["url"] = run.get("url")
     verdict["vision"] = (run.get("vision") or "")[:500]
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS qa_runs (
-            id BIGSERIAL PRIMARY KEY, product TEXT NOT NULL, rounds INT NOT NULL,
-            passed BOOLEAN NOT NULL, clean BOOLEAN NOT NULL, verdict JSONB NOT NULL,
-            report_md TEXT, report_json TEXT, ts TIMESTAMPTZ NOT NULL DEFAULT now())""")
-        cur.execute("""INSERT INTO qa_runs (product, rounds, passed, clean, verdict, report_md, report_json)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+    tenant_id = run.get("tenant_id") or _tenant_for_product(run.get("product"))
+    if tenant_id in ("", "0", 0):
+        tenant_id = None
+    _ensure_qa_runs()
+    with _conn(tenant_id) as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO qa_runs
+                         (product, rounds, passed, clean, verdict, report_md, report_json, tenant_id)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                     (run.get("product", "app"), int(report.get("rounds") or 0), bool(report.get("passed")),
-                     bool(report.get("clean")), Jsonb(verdict), report.get("md"), report.get("json")))
-        rid = cur.fetchone()[0]; c.commit()
+                     bool(report.get("clean")), Jsonb(verdict), report.get("md"), report.get("json"), tenant_id))
+        rid = cur.fetchone()[0]
     return rid
 
 
@@ -166,14 +194,15 @@ def _file_open_bugs(report: dict, run: dict, stories: list, ctx: dict) -> list:
             r = findings.file(f"qa:{run.get('product', 'app')}", _route_role(b),
                               f"[{run.get('product', 'app')}] {b.get('title', 'defect')}", detail,
                               severity=b.get("severity", "medium"),
-                              priority=2 if b.get("blocking") else 4, verify=verify)
+                              priority=2 if b.get("blocking") else 4, verify=verify,
+                              tenant_id=ctx.get("tenant_id"))
         except Exception as e:                            # captured, surfaced in the report — never silent
             r = {"error": str(e), "bug": b.get("id")}
         filed.append(r)
     return filed
 
 
-def _file_audit_gaps(av: dict, product: str, report: dict, evidence_dir) -> list:
+def _file_audit_gaps(av: dict, product: str, report: dict, evidence_dir, tenant_id=None) -> list:
     """The AUDITOR's found gaps -> governed, owned, SLA-tracked findings, so a REJECTED audit becomes real
     dev/QA work, not just a blocked gate. Each skipped flow + unbacked coverage claim becomes an item,
     AI-routed to the owning role exactly like a QA bug (with the AUDIT.md as evidence)."""
@@ -190,7 +219,8 @@ def _file_audit_gaps(av: dict, product: str, report: dict, evidence_dir) -> list
                             default=str)
         try:
             r = findings.file(f"audit:{product}", _route_role(pseudo),
-                              f"[{product}] audit gap: {str(g)[:80]}", detail, severity="high", priority=3)
+                              f"[{product}] audit gap: {str(g)[:80]}", detail, severity="high", priority=3,
+                              tenant_id=tenant_id)
         except Exception as e:
             r = {"error": str(e), "gap": str(g)[:80]}
         filed.append(r)
@@ -493,14 +523,15 @@ def _audit_unavailable(report, err):
 def qa_run(target_url, vision, token, org, product_summary, *,
            product="app", repo=None, restart_cmd=None, health_url=None,
            stories=None, max_rounds=MAX_ROUNDS, max_steps=MAX_STEPS,
-           on_event=None, out_dir=None, file_findings=True, agentic=False, audit_gate=None):
+           on_event=None, out_dir=None, file_findings=True, agentic=None, audit_gate=None, thread_id=None,
+           tenant_id=None):
     """Autonomously QA a product from its VISION until it is bug-free (or a round cap trips), then report.
 
     agentic=True routes to the AGENTIC ORG path (scripts/qa/qa_agentic.run_agentic_qa): a qa-coordinator
     actor spawns qa-explorer tool-workers, hands blocking bugs to a dev-coordinator, re-tests after fixes,
     and emits an honest verdict — all as durable actors over the message bus (docs/AGENTIC-QA-ORG.md). It
-    persists the same qa_runs row + docs/QA-VERDICT.json. Default is the proven procedural loop below until
-    the agentic path is confirmed at parity on a live app (see docs/HANDOFF.md phase 6).
+    persists the same qa_runs row + docs/QA-VERDICT.json. Default is the durable agentic org path; set
+    AOS_QA_AGENTIC_DEFAULT=0 or pass agentic=False for the legacy procedural loop.
 
       target_url       — the running app to exercise (the explorer drives a real browser against it).
       vision           — the ORIGINAL product vision; held in context so every AI call judges intent.
@@ -518,12 +549,18 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     Returns qa_report.build_report(run)'s dict (md/json paths + grounded verdict). EVERY decision inside
     — story enumeration, each explore step, each fix plan/judge, the report narrative — is a real
     factory.agent call (resilient: overload retry + Codex failover)."""
-    if agentic:                                   # AGENTIC ORG path (opt-in; procedural stays default)
+    if agentic is None:
+        agentic = os.environ.get("AOS_QA_AGENTIC_DEFAULT", "1").lower() not in ("0", "false", "no", "")
+    if agentic:                                   # AGENTIC ORG path (default; procedural is rollback)
         import qa_agentic
         return qa_agentic.run_agentic_qa(target_url, vision, product=product, token=token, org=org,
                                          summary=product_summary, repo=repo, stories=stories,
-                                         restart_cmd=restart_cmd, health_url=health_url)
+                                         restart_cmd=restart_cmd, health_url=health_url,
+                                         on_event=on_event, max_steps=max_steps, thread_id=thread_id,
+                                         story_limit=MAX_STORIES,
+                                         tenant=(tenant_id or "agentic-qa"))
     started = time.time()
+    run_tenant = tenant_id or _tenant_for_product(product)
     repo = repo or str(factory.PRODUCTS)
     explorer_cls = qa_explorer.Explorer                   # module attr -> patchable in the offline selftest
     evidence_dir = Path(out_dir) if out_dir else artifacts.run_dir(product, started)
@@ -534,7 +571,7 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     # LIVE PULSE: register this run so the observability plane + watchdog can see it's alive and what phase
     # it's in — every explore step beats, and the finalize phases below beat too (they used to go dark).
     pulse_work_id = f"qa:{evidence_dir.name}"
-    pulse.start(pulse_work_id, "qa-run", label=f"QA: {product}", tenant_id=(org or None), stage="planning",
+    pulse.start(pulse_work_id, "qa-run", label=f"QA: {product}", tenant_id=run_tenant, stage="planning",
                 expected_cadence_s=int(os.environ.get("AOS_QA_PULSE_CADENCE_S", "150")),
                 meta={"evidence_dir": str(evidence_dir), "target_url": target_url})
 
@@ -711,6 +748,8 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     run = {
         "product": product,
         "vision": vision,
+        "org": org,
+        "tenant_id": run_tenant,
         "url": target_url,
         "started_at": started,
         "finished_at": time.time(),
@@ -815,7 +854,8 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     pulse.beat(pulse_work_id, stage="filing", progress="routing open findings")   # also a former dark phase
     report["findings_filed"] = (_file_open_bugs(
         report, run, stories, {"target_url": target_url, "vision": vision, "token": token,
-                               "org": org, "summary": product_summary, "max_steps": max_steps})
+                               "org": org, "summary": product_summary, "max_steps": max_steps,
+                               "tenant_id": run_tenant})
         if file_findings else [])
     if report["findings_filed"]:
         emit("findings_filed", {"count": len(report["findings_filed"]),
@@ -824,7 +864,8 @@ def qa_run(target_url, vision, token, org, product_summary, *,
     # so "the skeptic rejected it" doesn't just block the gate — it hands dev/QA a concrete, tracked list.
     report["audit_findings"] = []
     if file_findings and (report.get("audit") or {}).get("passed_audit") is False:
-        report["audit_findings"] = _file_audit_gaps(report["audit"], product, report, evidence_dir)
+        report["audit_findings"] = _file_audit_gaps(
+            report["audit"], product, report, evidence_dir, tenant_id=run_tenant)
         if report["audit_findings"]:
             emit("audit_findings_filed", {"count": len(report["audit_findings"])})
     report["evidence_dir"] = str(evidence_dir)
@@ -1006,7 +1047,8 @@ def _selftest():
                         token="TOK", org="9", product_summary="A web app with sign-in and an Assistant.",
                         product="demo", repo=str(fake_repo),
                         restart_cmd=["python", "app.py"], health_url=None,
-                        max_rounds=3, max_steps=5, on_event=on_event, out_dir=tmp)
+                        max_rounds=3, max_steps=5, on_event=on_event, out_dir=tmp,
+                        agentic=False, tenant_id="9")
 
         # the loop ran TWO rounds: round 1 found the blocking bug, fixed+reset, round 2 was clean.
         assert report["rounds"] == 2, f"expected 2 rounds, got {report['rounds']}"
@@ -1044,7 +1086,7 @@ def _selftest():
         # ts) and the verdict artifact is hash-linked to the run's evidence (qa_run_id + report sha).
         assert isinstance(report["qa_run_id"], int) and report["persist_error"] is None, report
         run_ids.append(report["qa_run_id"])
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn("9") as c, c.cursor() as cur:
             cur.execute("""SELECT product, rounds, passed, clean, verdict, report_md, ts
                            FROM qa_runs WHERE id=%s""", (report["qa_run_id"],))
             rp, rr, rpass, rclean, rverdict, rmd, rts = cur.fetchone()
@@ -1069,7 +1111,7 @@ def _selftest():
         # the fix loop, (b) fail the grounded verdict, and (c) be FILED through findings.py with a
         # routed owner + SLA + the originating story as its gated re-verification recipe.
         import directory
-        directory.register(owner_id, "builder", product=prod_b, task="idle")
+        directory.register(owner_id, "builder", product=prod_b, task="idle", tenant_id="9")
         stories_b = [
             {"id": "US-1", "title": "Sign in", "expected_outcome": "user reaches the dashboard"},
             {"id": "US-3", "title": "Rename org", "expected_outcome": "the new org name shows"},
@@ -1079,7 +1121,8 @@ def _selftest():
                           token="TOK", org="9", product_summary="A web app with sign-in and an Assistant.",
                           product=prod_b, repo=str(fake_repo), restart_cmd=None, stories=stories_b,
                           max_rounds=2, max_steps=5,
-                          on_event=lambda k, d: events_b.append((k, d)), out_dir=tmp)
+                          on_event=lambda k, d: events_b.append((k, d)), out_dir=tmp,
+                          agentic=False, tenant_id="9")
         run_ids.append(report_b["qa_run_id"])
         assert report_b["rounds"] == 1 and report_b["clean"] is True, report_b["rounds"]
         assert len(fix_calls) == 1, "a NON-blocking bug must never enter the fix loop"
@@ -1088,7 +1131,7 @@ def _selftest():
         filed = report_b["findings_filed"]
         assert len(filed) == 1 and filed[0].get("finding_id"), filed
         assert filed[0]["status"] == "routed" and filed[0]["owner"] == owner_id, filed
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn("9") as c, c.cursor() as cur:
             cur.execute("SELECT verify_check, severity FROM findings WHERE id=%s",
                         (filed[0]["finding_id"],))
             vc, sev = cur.fetchone()
@@ -1104,10 +1147,10 @@ def _selftest():
                           token="TOK", org="9", product_summary="A web app with sign-in and an Assistant.",
                           product=prod_b, repo=str(fake_repo), restart_cmd=None,
                           stories=[stories_b[1]], max_rounds=1, max_steps=5, out_dir=tmp,
-                          file_findings=False)
+                          file_findings=False, agentic=False, tenant_id="9")
         run_ids.append(report_c["qa_run_id"])
         assert report_c["findings_filed"] == [], "verification re-runs must not file findings"
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn("9") as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM findings WHERE source=%s", (f"qa:{prod_b}",))
             assert cur.fetchone()[0] == 1, "verification re-run filed a duplicate finding"
 
@@ -1125,7 +1168,7 @@ def _selftest():
         dev_loop.fix_bug, dev_loop.restart_target = real_fix, real_restart
         factory.agent = real_agent
         try:                                                     # scrub every DB row the selftest created
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with _conn("9") as c, c.cursor() as cur:
                 if run_ids:
                     cur.execute("DELETE FROM qa_runs WHERE id = ANY(%s)", (run_ids,))
                 cur.execute("DELETE FROM findings WHERE source=%s", (f"qa:{prod_b}",))
@@ -1235,7 +1278,7 @@ def _smoke():
         report = qa_run(url, vision, token=token, org=str(org), product_summary=summary,
                         product="console-smoke", restart_cmd=None, health_url=f"{url}/health",
                         stories=[story], max_rounds=1, max_steps=3,
-                        on_event=lambda k, d: events.append((k, d)))
+                        on_event=lambda k, d: events.append((k, d)), tenant_id=tid)
     except Exception as e:
         import traceback
         traceback.print_exc()

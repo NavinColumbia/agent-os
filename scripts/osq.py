@@ -15,14 +15,12 @@ import json
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import appguard  # noqa: E402
 import notify    # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection  # noqa: E402
 PRODUCTS = Path.home() / "projects" / "products"
 CODE_EXT = (".py", ".js", ".ts", ".html", ".css")
 
@@ -46,13 +44,13 @@ def complexity(app):
 
 
 def apps():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("SELECT DISTINCT product FROM traces WHERE product IS NOT NULL")
         return sorted(r[0] for r in cur.fetchall())
 
 
 def app(name):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""SELECT count(*), coalesce(sum(cost_usd),0), coalesce(sum(tokens_in+tokens_out),0),
                           coalesce(sum(elapsed_s),0) FROM traces WHERE product=%s""", (name,))
         steps, cost, tokens, secs = cur.fetchone()
@@ -93,7 +91,7 @@ def decisions():
     for p in appguard.paused_apps():
         out.append({"what": f"Resume or retire '{p['app']}'", "why": f"auto-paused: {p['reason']}"})
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("""SELECT need_role, count(*), max(requester) FROM hire_requests
                            WHERE status='open' GROUP BY need_role ORDER BY count(*) DESC""")
             for role, n, req in cur.fetchall():

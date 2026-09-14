@@ -24,6 +24,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from secret_filter import looks_like_secret  # noqa: E402
+import singleton_exec  # noqa: E402
 
 ROOT = Path.home() / "projects" / "agent-os"
 INBOX = ROOT / "bridge" / "inbox"
@@ -124,9 +125,16 @@ def main():
     print(f"listening on {url}  (inbox: {INBOX})")
     while True:
         try:
-            with requests.get(url, stream=True, timeout=(10, None)) as r:
+            singleton_exec.clear_ready("reply-listener")
+            # A bounded read timeout turns a silently wedged half-open stream back into an observable reconnect;
+            # ntfy emits keepalives, so a healthy subscription remains active without messages.
+            with requests.get(url, stream=True, timeout=(10, 90)) as r:
                 r.raise_for_status()
+                singleton_exec.mark_ready("reply-listener", {"connected_url": url})
                 for line in r.iter_lines(decode_unicode=True):
+                    # ntfy sends keepalive records even with no user messages. Refresh only on an actually
+                    # received stream line so the recovery age bound detects a wedged half-open listener.
+                    singleton_exec.mark_ready("reply-listener", {"connected_url": url, "stream": "active"})
                     if not line:
                         continue
                     try:
@@ -137,6 +145,7 @@ def main():
             print("\nstopped.")
             return
         except Exception as e:
+            singleton_exec.clear_ready("reply-listener")
             print(f"stream dropped ({e}); reconnecting in 3s...")
             time.sleep(3)
 

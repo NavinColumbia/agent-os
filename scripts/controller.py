@@ -29,10 +29,11 @@ import psycopg
 from dbos import DBOS, DBOSConfig, SetWorkflowID
 
 SCRIPTS = Path(__file__).resolve().parent
-CONTROL_PLANE = Path.home() / "projects" / "control-plane"
+sys.path.insert(0, str(SCRIPTS))
+from aoscfg import CONTROL_PLANE_ROOT, ENV, DB, PRODUCTS_ROOT  # noqa: E402
+CONTROL_PLANE = CONTROL_PLANE_ROOT
 ROLES = CONTROL_PLANE / "roles"
 ENFORCE_HOOK = CONTROL_PLANE / "hooks" / "enforce_manifest.py"
-sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(CONTROL_PLANE / "scripts"))
 import audit            # noqa: E402
 import metrics          # noqa: E402
@@ -40,10 +41,8 @@ import cerbos_check     # noqa: E402
 import governance       # noqa: E402  — the PDP-of-record's role-manifest reader (same as factory/loopcontroller)
 import gate_check       # noqa: E402
 
-from aoscfg import ENV, DB
-
 STAGES = ["SPEC", "BUILD", "QA", "REVIEW", "LAUNCH"]
-PRODUCTS = Path.home() / "projects" / "products"
+PRODUCTS = PRODUCTS_ROOT
 
 # What each stage produces (so gate_check for the NEXT stage passes) + a representative enforced action.
 STAGE_PLAN = {

@@ -121,9 +121,9 @@ def _tally(run: dict) -> dict:
     )
     interface_ok = (not requires_interface) or exercised
 
-    # A run passes only if every story passed, nothing blocking is still open, AND (for a UI target) the real
-    # interface was exercised. A non-blocking open bug is noted but does not veto (ship-with-known-issues).
-    passed = all_passed and not blocking_open and interface_ok
+    # A run passes only if every story passed, NO bug remains open, and (for a UI target) the real interface
+    # was exercised. Severity affects routing/escalation, not whether a product is clean enough to ship.
+    passed = all_passed and not open_bugs and interface_ok
     return {
         "total_stories": len(stories), "per_status": per,
         "total_bugs": len(bugs), "open_bugs": len(open_bugs),

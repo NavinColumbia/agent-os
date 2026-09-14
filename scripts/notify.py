@@ -45,6 +45,9 @@ def send(message, title="agent-os", priority="default", tags="", topic=""):
     """Importable notifier (agent -> your phone). Best-effort: returns True/False, never raises —
     so a down ntfy never breaks the caller. Reuses the secret-guard so we never leak over the bridge."""
     try:
+        if os.environ.get("AOS_DISABLE_EXTERNAL_NOTIFICATIONS", "").strip().lower() in {
+                "1", "true", "yes", "on"}:
+            return False
         cfg = load_env()
         topic = topic or cfg.get("NTFY_TOPIC", "")
         if not topic or "CHANGE-ME" in topic:

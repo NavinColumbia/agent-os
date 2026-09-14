@@ -18,15 +18,15 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
+import aoscfg  # noqa: E402
 import audit   # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
 
-from aoscfg import ENV, DB
+DB = aoscfg.DB  # compatibility for older tests/tools; runtime paths use dbpool.
 
-PROVIDER = "Anthropic Claude"           # the DEFAULT named provider (platform subscription / Anthropic key)
+PROVIDER = "OpenAI"                     # the DEFAULT named provider (platform Codex/OpenAI path)
 DISCLOSURE_VERSION = "2026-06-v1"       # bump when the disclosure text below materially changes
 
 # The disclosure must NAME the provider the tenant's data is ACTUALLY sent to (Apple 5.1.2(i) / Play AI /
@@ -38,7 +38,7 @@ PROVIDER_NAMES = {"claude": "Anthropic Claude", "anthropic": "Anthropic Claude",
 
 def provider_name(engine_or_name):
     """Resolve an engine id / provider string to the NAMED legal provider for the disclosure. Unknown ->
-    the default (Anthropic Claude), so a resolution gap fails safe to the platform default rather than a
+    the configured platform default, so a resolution gap fails safe to the platform default rather than a
     blank name."""
     if not engine_or_name:
         return PROVIDER
@@ -77,12 +77,11 @@ def _resolve(tenant_id, provider):
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS ai_consent (
             id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, provider TEXT NOT NULL,
             disclosure_version TEXT NOT NULL, accepted_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ,
             UNIQUE (tenant_id, provider, disclosure_version))""")
-        c.commit()
 
 
 def require_consent(tenant_id, provider=None):
@@ -90,7 +89,7 @@ def require_consent(tenant_id, provider=None):
     A gate calls this and refuses the AI action when it returns False."""
     provider = _resolve(tenant_id, provider)
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("""SELECT accepted_at, revoked_at FROM ai_consent
                        WHERE tenant_id=%s AND provider=%s AND disclosure_version=%s""",
                     (tenant_id, provider, DISCLOSURE_VERSION))
@@ -101,28 +100,26 @@ def require_consent(tenant_id, provider=None):
 def record(tenant_id, provider=None):
     provider = _resolve(tenant_id, provider)
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO ai_consent (tenant_id, provider, disclosure_version, accepted_at)
                        VALUES (%s,%s,%s, now())
                        ON CONFLICT (tenant_id, provider, disclosure_version)
                        DO UPDATE SET accepted_at=now(), revoked_at=NULL""",
                     (tenant_id, provider, DISCLOSURE_VERSION))
-        c.commit()
     audit.append(actor="consent", action="ConsentAccepted", resource=tenant_id, decision="accepted",
-                 payload={"provider": provider, "version": DISCLOSURE_VERSION})
+                 payload={"provider": provider, "version": DISCLOSURE_VERSION}, tenant_id=tenant_id)
     return True
 
 
 def revoke(tenant_id, provider=None):
     provider = _resolve(tenant_id, provider)
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("""UPDATE ai_consent SET revoked_at=now()
                        WHERE tenant_id=%s AND provider=%s AND disclosure_version=%s""",
                     (tenant_id, provider, DISCLOSURE_VERSION))
-        c.commit()
     audit.append(actor="consent", action="ConsentRevoked", resource=tenant_id, decision="revoked",
-                 payload={"provider": provider, "version": DISCLOSURE_VERSION})
+                 payload={"provider": provider, "version": DISCLOSURE_VERSION}, tenant_id=tenant_id)
     return True
 
 
@@ -141,8 +138,8 @@ def _selftest():
     after = require_consent(tid)                   # accepted -> True (build allowed)
     revoke(tid)
     revoked = require_consent(tid)                 # revoked -> False again
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,)); c.commit()
+    with connection() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,))
     named = PROVIDER in DISCLOSURE                 # disclosure must NAME the provider (generic = rejected)
     ok = (not before) and after and (not revoked) and named
     print(f"pre={before} accepted={after} post-revoke={revoked} provider-named={named}")

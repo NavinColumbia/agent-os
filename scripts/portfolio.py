@@ -17,16 +17,14 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import billing  # noqa: E402
+from dbpool import connection  # noqa: E402
 
-import psycopg  # noqa: E402
-
-from aoscfg import ENV, DB
 PRODUCTS = Path.home() / "projects" / "products"
 BUILD_COST_PER_MIN = 0.10   # rough compute proxy until token-cost is instrumented ($/build-minute)
 
 
 def summary():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""SELECT product, count(*) steps, coalesce(sum(elapsed_s),0) secs,
                           coalesce(sum(cost_usd),0) cost, max(ts) last
                        FROM traces WHERE product IS NOT NULL GROUP BY product""")

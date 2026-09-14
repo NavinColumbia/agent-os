@@ -16,13 +16,13 @@ invoices = plan base + metered overage.
 Run with the agent-os venv python.
 """
 import sys
+import threading
 from pathlib import Path
-
-import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import tenancy  # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
 
 from aoscfg import ENV, DB
 
@@ -33,45 +33,54 @@ PLANS = {
     "enterprise": {"price": 499, "builds": 1000, "tokens": 100_000_000, "ov_build": 0.25, "ov_1k_tok": 0.001},
 }
 
+_ensured = False
+_ensure_lock = threading.Lock()
+
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free'")
-        cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT false")
-        # liveness fix: remember WHETHER a suspension was automatic (over-quota enforcement by quota())
-        # vs manual (admin). Only automatic suspensions are auto-lifted once a new billing period brings
-        # the tenant back within limits; admin suspensions stay sticky. Defaults false (== admin/none).
-        cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
-                    "auto_suspended BOOLEAN NOT NULL DEFAULT false")
-        # finding #16: every tenant gets a monthly billing-period anchor so metered usage/quota/invoice
-        # reset each cycle instead of accumulating lifetime totals. New tenants anchor to the current
-        # month; existing rows are backfilled to the current month boundary at migration time.
-        cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
-                    "period_start timestamptz NOT NULL DEFAULT date_trunc('month', now())")
-        # finding #16 follow-up: durable per-period settlement ledger. Each fully-elapsed billing month
-        # is settled into exactly one row here (idempotent on (tenant_id, period_start)) so that letting
-        # the invoicing cadence lapse beyond a calendar month no longer drops the intervening months'
-        # usage — every elapsed month is metered and invoiced before the anchor rolls past it.
-        cur.execute("""CREATE TABLE IF NOT EXISTS billing_invoices (
-                           tenant_id    text        NOT NULL,
-                           period_start timestamptz NOT NULL,
-                           period_end   timestamptz NOT NULL,
-                           plan         text        NOT NULL,
-                           base         numeric     NOT NULL,
-                           builds       integer     NOT NULL,
-                           tokens       bigint      NOT NULL,
-                           overage_cost numeric     NOT NULL,
-                           total        numeric     NOT NULL,
-                           settled_at   timestamptz NOT NULL DEFAULT now(),
-                           PRIMARY KEY (tenant_id, period_start))""")
-        c.commit()
+    global _ensured
+    if _ensured:
+        return
+    with _ensure_lock:
+        if _ensured:
+            return
+        with connection() as c, c.cursor() as cur:
+            cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free'")
+            cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT false")
+            # liveness fix: remember WHETHER a suspension was automatic (over-quota enforcement by quota())
+            # vs manual (admin). Only automatic suspensions are auto-lifted once a new billing period brings
+            # the tenant back within limits; admin suspensions stay sticky. Defaults false (== admin/none).
+            cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+                        "auto_suspended BOOLEAN NOT NULL DEFAULT false")
+            # finding #16: every tenant gets a monthly billing-period anchor so metered usage/quota/invoice
+            # reset each cycle instead of accumulating lifetime totals. New tenants anchor to the current
+            # month; existing rows are backfilled to the current month boundary at migration time.
+            cur.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+                        "period_start timestamptz NOT NULL DEFAULT date_trunc('month', now())")
+            # finding #16 follow-up: durable per-period settlement ledger. Each fully-elapsed billing month
+            # is settled into exactly one row here (idempotent on (tenant_id, period_start)) so that letting
+            # the invoicing cadence lapse beyond a calendar month no longer drops the intervening months'
+            # usage — every elapsed month is metered and invoiced before the anchor rolls past it.
+            cur.execute("""CREATE TABLE IF NOT EXISTS billing_invoices (
+                               tenant_id    text        NOT NULL,
+                               period_start timestamptz NOT NULL,
+                               period_end   timestamptz NOT NULL,
+                               plan         text        NOT NULL,
+                               base         numeric     NOT NULL,
+                               builds       integer     NOT NULL,
+                               tokens       bigint      NOT NULL,
+                               overage_cost numeric     NOT NULL,
+                               total        numeric     NOT NULL,
+                               settled_at   timestamptz NOT NULL DEFAULT now(),
+                               PRIMARY KEY (tenant_id, period_start))""")
+        _ensured = True
 
 
 def _audit(action, tid, payload, actor="billing", decision="executed"):
     """Best-effort tamper-evident audit (reuse audit.py); never blocks the billing op if the DB/key is down."""
     try:
         import audit
-        audit.append(actor=actor, action=action, resource=tid, decision=decision, payload=payload)
+        audit.append(actor=actor, action=action, resource=tid, decision=decision, payload=payload, tenant_id=tid)
     except Exception:
         pass
 
@@ -108,7 +117,7 @@ def _settle_elapsed(tid):
     p = PLANS[plan]
     settled = []
     while True:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute(
                 """UPDATE tenants
                       SET period_start = period_start + interval '1 month'
@@ -135,7 +144,6 @@ def _settle_elapsed(tid):
                    ON CONFLICT (tenant_id, period_start) DO NOTHING""",
                 (tid, wstart, wend, plan, p["price"], builds, tokens, ov_cost, total),
             )
-            c.commit()
         settled.append({"tenant": tid, "plan": plan, "base": p["price"],
                         "period_start": wstart.isoformat(), "period_end": wend.isoformat(),
                         "usage": {"builds": builds, "tokens": tokens},
@@ -161,7 +169,7 @@ def _period(tid):
     only ever see THIS period's activity (finding #16) — now with no per-month under-count."""
     _ensure()
     _settle_elapsed(tid)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT period_start, period_start + interval '1 month' "
                     "FROM tenants WHERE tenant_id=%s", (tid,))
         row = cur.fetchone()
@@ -178,11 +186,10 @@ def suspend(tid, reason="", actor="billing:admin", auto=False):
     ``auto=True`` marks the suspension as automatic over-quota enforcement (quota() path) so it can be
     auto-lifted at period rollover; ``auto=False`` (default) marks a sticky admin/manual suspension."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("UPDATE tenants SET suspended=true, auto_suspended=%s WHERE tenant_id=%s", (auto, tid))
         if cur.rowcount == 0:
             raise ValueError(f"no such tenant {tid}")
-        c.commit()
     _audit("TenantSuspended", tid, {"reason": reason, "auto": auto}, actor=actor, decision="deny")
     return {"tenant": tid, "suspended": True, "reason": reason, "auto": auto}
 
@@ -191,18 +198,17 @@ def unsuspend(tid, actor="billing:admin"):
     """Lift a suspension (admin or automatic period-rollover path): WRITE tenants.suspended=false,
     clear the auto_suspended marker, and audit."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("UPDATE tenants SET suspended=false, auto_suspended=false WHERE tenant_id=%s", (tid,))
         if cur.rowcount == 0:
             raise ValueError(f"no such tenant {tid}")
-        c.commit()
     _audit("TenantUnsuspended", tid, {}, actor=actor, decision="allow")
     return {"tenant": tid, "suspended": False}
 
 
 def _auto_suspended(tid):
     """Was this tenant's current suspension applied automatically (over-quota) rather than by an admin?"""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT auto_suspended FROM tenants WHERE tenant_id=%s", (tid,))
         row = cur.fetchone()
     if not row:
@@ -216,14 +222,13 @@ def signup(name, plan="free"):
     _ensure()
     t = tenancy.create_tenant(name)
     tid, token = t["tenant_id"], t["api_token"]
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("UPDATE tenants SET plan=%s WHERE tenant_id=%s", (plan, tid))
-        c.commit()
     return {"tenant_id": tid, "api_token": token, "plan": plan}
 
 
 def _plan_of(tid):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT plan, suspended FROM tenants WHERE tenant_id=%s", (tid,))
         row = cur.fetchone()
     if not row:
@@ -236,7 +241,7 @@ def usage(tid):
     (LAUNCHED) + tokens spent, filtered to the current monthly window [period_start, period_end) so
     quotas and invoices reset each cycle instead of comparing lifetime totals to a monthly plan limit."""
     start, end = _period(tid)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s", (tid,))
         prods = [r[0] for r in cur.fetchall()]
         builds, tokens = _usage_window(cur, prods, start, end)
@@ -284,7 +289,7 @@ def quota(tid):
 
 def mrr():
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("SELECT plan, count(*) FROM tenants WHERE NOT suspended GROUP BY plan")
         by = dict(cur.fetchall())
     total = sum(PLANS.get(pl, {"price": 0})["price"] * n for pl, n in by.items())
@@ -322,18 +327,17 @@ def _main(a):
         tid = t["tenant_id"]
         # attribute a shipped product + tokens to this tenant via the REAL chain-preserving APIs
         prod = f"saas-demo-{os.urandom(3).hex()}"
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s)", (prod, tid))
-            c.commit()
-        audit.append(actor="factory:controller", action="ProductComplete", resource=prod, decision="LAUNCHED")
+        audit.append(actor="factory:controller", action="ProductComplete", resource=prod, decision="LAUNCHED",
+                     tenant_id=tid)
         metrics.record("state_change", product=prod, task_id="t", tokens_in=6_000_000, tokens_out=0,
                        model="m", outcome="success")
         # finding #16: an OUT-OF-PERIOD record (2 months ago) must NOT count toward this period's usage.
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute("""INSERT INTO org_metrics (ts, product, task_id, event, tokens_in, tokens_out,
                            model, outcome) VALUES (now() - interval '2 months', %s,'old','state_change',
                            9_000_000, 0,'m','success')""", (prod,))
-            c.commit()
         inv = invoice(tid)
         q = quota(tid)
         # the 9M out-of-period tokens are excluded -> usage reflects only the 6M from this period.
@@ -351,17 +355,15 @@ def _main(a):
         tf = signup(f"free-{os.urandom(3).hex()}", "free")
         ftid = tf["tenant_id"]
         fprod = f"free-demo-{os.urandom(3).hex()}"
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(ftid) as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s)", (fprod, ftid))
-            c.commit()
         metrics.record("state_change", product=fprod, task_id="t", tokens_in=200_000, tokens_out=0,
                        model="m", outcome="success")  # 200k > free's 100k limit -> over quota
         qf_over = quota(ftid)  # auto-suspends (no-overage plan over hard limit)
         # advance the tenant into a fresh, empty billing period so this period's usage is back to 0
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(ftid) as c, c.cursor() as cur:
             cur.execute("UPDATE tenants SET period_start = date_trunc('month', now()) + interval '1 month'"
                         " WHERE tenant_id=%s", (ftid,))
-            c.commit()
         qf_next = quota(ftid)  # within limits again -> auto-unsuspend the AUTOMATIC suspension
         suspend(ftid, reason="admin hold", actor="billing:admin")  # sticky admin suspension (auto=False)
         qf_admin = quota(ftid)  # within quota, but admin suspension must NOT be auto-lifted

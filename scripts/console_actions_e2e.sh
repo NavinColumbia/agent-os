@@ -10,6 +10,14 @@ GATE=0; case "${1:-}" in gate|GATE) GATE=1 ;; esac
 case "${AOS_UX_GATE:-0}" in 1|true|TRUE|yes) GATE=1 ;; esac
 miss() { if [ "$GATE" = 1 ]; then echo "FAIL: action gate requires $1"; exit 1; fi; echo "SKIP: $1"; exit 0; }
 console_up() { curl -s --max-time 4 http://127.0.0.1:8099/health 2>/dev/null | grep -q console; }
+TID=""; TID2=""
+cleanup_fixtures() {
+  for fixture_tid in "${TID:-}" "${TID2:-}"; do
+    [ -n "$fixture_tid" ] || continue
+    "$PY" "$ROOT/scripts/qa/seed_fixtures.py" cleanup "$fixture_tid" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup_fixtures EXIT
 
 if ! console_up; then
   if [ "$GATE" = 1 ]; then
@@ -38,7 +46,8 @@ curl -s -X POST http://127.0.0.1:8099/api/settings/consent -H "X-Tenant-Token: $
 
 # crawl; retry once on failure (a transient — console warming, a slow first paint — must not red the suite;
 # a REAL dead/erroring control fails deterministically both times). Fresh seed on retry.
-crawl() { NODE_PATH="$NP" node "$ROOT/scripts/console_actions_e2e.cjs" http://127.0.0.1:8099 "$1" "${2:-0}" 2>/dev/null; }
+crawl() { timeout --signal=TERM --kill-after=10s 180s env NODE_PATH="$NP" \
+  node "$ROOT/scripts/console_actions_e2e.cjs" http://127.0.0.1:8099 "$1" "${2:-0}" 2>/dev/null; }
 OUT="$(crawl "$TOK" "$ORG")"
 if ! echo "$OUT" | grep -q '^PASS'; then
   sleep 2

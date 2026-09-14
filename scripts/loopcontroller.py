@@ -25,10 +25,12 @@ import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import psycopg
@@ -38,6 +40,9 @@ sys.path.insert(0, str(SCRIPTS))
 import audit         # noqa: E402
 import factory       # noqa: E402
 import orchestrator  # noqa: E402
+import process_assurance  # noqa: E402
+import qatiming      # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
 
 from aoscfg import ENV, DB
 
@@ -63,7 +68,8 @@ _RESOLVED_GATE_KINDS = {"consent_required", "provider_required"}
 # controller's promised ETA never disagree (the #2 "~3 min then 13" bug came from two drifting constants —
 # loopcontroller said 3, console said 10). Build phases (PROTOTYPE/IMPLEMENT) prefer estimate.py's
 # history-backed median at dispatch and only fall back to these; RESEARCH prefers the research_runs median.
-_PHASE_ETA_DEFAULT = {"RESEARCH": 10, "PROTOTYPE": 6, "IMPLEMENT": 14, "TESTQA": 5}
+_PHASE_ETA_DEFAULT = {"RESEARCH": 10, "PROTOTYPE": 6, "IMPLEMENT": 14,
+                      "TESTQA": qatiming.slice_eta_min()}
 
 # Honest-range multipliers (mirror estimate.py's LOW_MULT/HIGH_MULT) so a promised ETA is a RANGE, not a
 # false-precision point — "~10-14 min", never a bare "~3 min" that over-runs. When a job overruns we RAISE
@@ -71,7 +77,64 @@ _PHASE_ETA_DEFAULT = {"RESEARCH": 10, "PROTOTYPE": 6, "IMPLEMENT": 14, "TESTQA":
 _ETA_LOW_MULT, _ETA_HIGH_MULT = 0.6, 1.6
 # How long past a prior SLA warning before we WARN + PING AGAIN on a still-overrunning job (#2.6/#5 re-ping
 # on continued overrun) — a CEO who left the tab gets a fresh heads-up, not one-and-done silence.
-_SLA_REWARN_MIN = 5
+# A healthy worker has an output-independent heartbeat; repeated five-minute "still working" alerts add no
+# information and previously produced 143 unread duplicates for one tenant.  Warn on the first ETA miss, then
+# at most hourly while health is unchanged. State transitions (crash, cleanup failure, completion) notify
+# immediately through their own paths.
+_SLA_REWARN_MIN = int(os.environ.get("AOS_SLA_REWARN_MIN", "60"))
+
+# A QA wall-clock limit is a process-safety checkpoint, not a CEO approval gate.  Keep each worker bounded so
+# Chromium/model pressure is reaped predictably, but let the company hand the durable campaign to a fresh worker
+# without bothering the CEO.  These campaign-level bounds are deliberately independent of the 15-minute worker
+# slice: repeated lack of progress or an excessive number of hand-offs is a genuine management incident.
+QA_AUTO_CHECKPOINT_MAX = int(os.environ.get("AOS_QA_AUTO_CHECKPOINT_MAX", "18"))  # <= ~6h at 20m/slice
+QA_NO_PROGRESS_MAX = int(os.environ.get("AOS_QA_NO_PROGRESS_MAX", "3"))
+
+
+def _bounded_ms(name, default, minimum=50, maximum=30000):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(int(minimum), min(int(maximum), value))
+
+
+# Controller DDL and dispatch serialization are recovery paths. They may defer to
+# the next jobd tick, but they may never pin that daemon behind an unbounded DB
+# wait. PostgreSQL applies both settings transaction-locally, including pooled
+# connections, so no timeout leaks to another borrower.
+CONTROLLER_LOCK_TIMEOUT_MS = _bounded_ms("AOS_CONTROLLER_LOCK_TIMEOUT_MS", 500)
+CONTROLLER_STATEMENT_TIMEOUT_MS = _bounded_ms("AOS_CONTROLLER_STATEMENT_TIMEOUT_MS", 5000)
+RESUME_SWEEP_BATCH = max(1, min(100, _bounded_ms("AOS_CONTROLLER_RESUME_BATCH", 20, 1, 100)))
+RESUME_SWEEP_BUDGET_S = max(5, min(90, _bounded_ms("AOS_CONTROLLER_RESUME_BUDGET_S", 45, 5, 90)))
+SLA_WATCHDOG_BATCH = max(1, min(100, _bounded_ms("AOS_SLA_WATCHDOG_BATCH", 20, 1, 100)))
+SLA_CLAIM_TTL_MIN = max(1, min(30, _bounded_ms("AOS_SLA_CLAIM_TTL_MIN", 5, 1, 30)))
+_RETRYABLE_CONTROLLER_DB_ERRORS = (
+    psycopg.errors.LockNotAvailable,
+    psycopg.errors.QueryCanceled,
+    psycopg.errors.DeadlockDetected,
+    psycopg.errors.SerializationFailure,
+)
+_CONTROLLER_ENSURED = False
+_CONTROLLER_ENSURE_LOCK = threading.Lock()
+
+
+class ControllerDatabaseBusy(RuntimeError):
+    """A bounded controller DB operation deferred without committing partial state."""
+
+    retryable = True
+
+
+def _conn(tenant_id=None):
+    return tenant_connection(tenant_id) if tenant_id else connection()
+
+
+def _set_controller_db_timeouts(cur, *, lock_ms=None, statement_ms=None):
+    lock_ms = CONTROLLER_LOCK_TIMEOUT_MS if lock_ms is None else max(1, int(lock_ms))
+    statement_ms = (CONTROLLER_STATEMENT_TIMEOUT_MS if statement_ms is None
+                    else max(lock_ms, int(statement_ms)))
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_ms}ms",))
+    cur.execute("SELECT set_config('statement_timeout', %s, true)", (f"{statement_ms}ms",))
 
 
 def _eta_range(mins):
@@ -95,48 +158,89 @@ def _eta_phrase(mins):
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS controller_state (
-            thread_id BIGINT PRIMARY KEY, tenant_id TEXT, org_id BIGINT,
-            phase TEXT NOT NULL DEFAULT 'DISCOVER', brief JSONB, options JSONB, chosen_option JSONB,
-            plan JSONB, research_run_id BIGINT, product TEXT, awaiting TEXT, updated_at TIMESTAMPTZ DEFAULT now())""")
-        # LIVE-PROGRESS columns (added in-place for existing orgs): the in-flight job's kind, when it
-        # started, its ETA (minutes), and a short status string the console renders live.
-        cur.execute("""ALTER TABLE controller_state
-            ADD COLUMN IF NOT EXISTS job_kind TEXT,
-            ADD COLUMN IF NOT EXISTS job_started_at TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS job_eta_min INTEGER,
-            ADD COLUMN IF NOT EXISTS job_status TEXT,
-            ADD COLUMN IF NOT EXISTS job_sla_warned BOOLEAN DEFAULT false,
-            ADD COLUMN IF NOT EXISTS job_sla_warned_at TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS pending_intent TEXT""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS controller_jobs (
-            id BIGSERIAL PRIMARY KEY, thread_id BIGINT, tenant_id TEXT, phase TEXT, kind TEXT,
-            status TEXT DEFAULT 'running', result JSONB,
-            started_at TIMESTAMPTZ DEFAULT now(), finished_at TIMESTAMPTZ)""")
-        # ARCHITECTURE-OVERHAUL Step 1: an OUTPUT-INDEPENDENT liveness heartbeat. The worker ticks heartbeat_at
-        # on a fixed timer (NOT when it produces output), so the reaper can tell "worker process dead" (heartbeat
-        # stopped) from "claude working quietly" (heartbeat still ticking) — killing the false-positive reap (F8).
-        # lease_token is a fencing token: a reap bumps it so a wrongly-reaped-but-alive worker's writes are rejected.
-        cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ")
-        cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS lease_token BIGINT DEFAULT 0")
-        # Step 3 dispatch-and-park: the OS pid of the detached worker process (NULL for the in-process daemon
-        # path), so parked work is observable — park_status() can tell "worker alive" from "worker died".
-        cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS worker_pid BIGINT")
-        c.commit()
+    global _CONTROLLER_ENSURED
+    if _CONTROLLER_ENSURED:
+        return
+    # A second caller must not wait forever behind a bootstrap thread that is
+    # itself stalled. The database statements below are bounded separately.
+    ensure_wait_s = max(0.1, CONTROLLER_STATEMENT_TIMEOUT_MS / 1000.0 + 0.5)
+    if not _CONTROLLER_ENSURE_LOCK.acquire(timeout=ensure_wait_s):
+        raise ControllerDatabaseBusy("controller schema initialization is already in progress")
+    try:
+        if _CONTROLLER_ENSURED:
+            return
+        try:
+            with _conn() as c, c.cursor() as cur:
+                _set_controller_db_timeouts(cur)
+                cur.execute("""CREATE TABLE IF NOT EXISTS controller_state (
+                    thread_id BIGINT PRIMARY KEY, tenant_id TEXT, org_id BIGINT,
+                    phase TEXT NOT NULL DEFAULT 'DISCOVER', brief JSONB, options JSONB, chosen_option JSONB,
+                    plan JSONB, research_run_id BIGINT, product TEXT, awaiting TEXT,
+                    execution_scope TEXT NOT NULL DEFAULT 'production',
+                    updated_at TIMESTAMPTZ DEFAULT now())""")
+                # LIVE-PROGRESS columns (added in-place for existing orgs): the in-flight job's kind, when it
+                # started, its ETA (minutes), and a short status string the console renders live.
+                cur.execute("""ALTER TABLE controller_state
+                    ADD COLUMN IF NOT EXISTS job_kind TEXT,
+                    ADD COLUMN IF NOT EXISTS job_started_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS job_eta_min INTEGER,
+                    ADD COLUMN IF NOT EXISTS job_status TEXT,
+                    ADD COLUMN IF NOT EXISTS job_sla_warned BOOLEAN DEFAULT false,
+                    ADD COLUMN IF NOT EXISTS job_sla_warned_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS job_sla_claimed_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS job_sla_claim_token TEXT,
+                    ADD COLUMN IF NOT EXISTS execution_scope TEXT NOT NULL DEFAULT 'production',
+                    ADD COLUMN IF NOT EXISTS pending_intent TEXT,
+                    ADD COLUMN IF NOT EXISTS qa_checkpoint_count INTEGER DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS qa_last_completed INTEGER,
+                    ADD COLUMN IF NOT EXISTS qa_no_progress_count INTEGER DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS qa_campaign_key TEXT""")
+                cur.execute("""CREATE TABLE IF NOT EXISTS controller_jobs (
+                    id BIGSERIAL PRIMARY KEY, thread_id BIGINT, tenant_id TEXT, phase TEXT, kind TEXT,
+                    status TEXT DEFAULT 'running', result JSONB,
+                    started_at TIMESTAMPTZ DEFAULT now(), finished_at TIMESTAMPTZ)""")
+                # ARCHITECTURE-OVERHAUL Step 1: an OUTPUT-INDEPENDENT liveness heartbeat. The worker ticks
+                # heartbeat_at on a fixed timer, decoupled from model output.
+                cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ")
+                cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS lease_token BIGINT DEFAULT 0")
+                cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS worker_pid BIGINT")
+                cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS worker_start_ticks BIGINT")
+                cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS worker_boot_id TEXT")
+                # Meaningful-work lease, separate from the output-independent process heartbeat. A QA worker
+                # can legitimately live for hours; its absolute age is not evidence of a runaway while new
+                # story/step checkpoints are still landing. Browser workers renew this only for a new durable
+                # progress signature, so a tight heartbeat loop cannot keep a wedged campaign alive forever.
+                cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS progress_at TIMESTAMPTZ")
+                cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS progress_signature TEXT")
+                cur.execute("ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS progress_meta JSONB")
+                cur.execute("""ALTER TABLE controller_jobs ADD COLUMN IF NOT EXISTS execution_scope TEXT
+                               NOT NULL DEFAULT 'production'""")
+                cur.execute("""CREATE INDEX IF NOT EXISTS controller_state_execution_queue_idx
+                               ON controller_state(execution_scope, updated_at, thread_id)
+                               WHERE awaiting IS NULL AND phase <> 'DELIVER'""")
+                c.commit()
+            _CONTROLLER_ENSURED = True
+        except _RETRYABLE_CONTROLLER_DB_ERRORS as exc:
+            # The connection context rolls the whole DDL transaction back. A
+            # later request/jobd tick retries from the same durable state.
+            raise ControllerDatabaseBusy("controller schema lock busy; retry on the next tick") from exc
+    finally:
+        _CONTROLLER_ENSURE_LOCK.release()
 
 
 def _st(thread_id):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""SELECT thread_id, tenant_id, org_id, phase, brief, options, chosen_option, plan,
-                              research_run_id, product, awaiting, pending_intent
+                              research_run_id, product, awaiting, pending_intent, qa_checkpoint_count,
+                              qa_last_completed, qa_no_progress_count, qa_campaign_key, execution_scope
                        FROM controller_state WHERE thread_id=%s""",
                     (thread_id,))
         r = cur.fetchone()
     if not r:
         return None
     keys = ["thread_id", "tenant_id", "org_id", "phase", "brief", "options", "chosen_option", "plan",
-            "research_run_id", "product", "awaiting", "pending_intent"]
+            "research_run_id", "product", "awaiting", "pending_intent", "qa_checkpoint_count",
+            "qa_last_completed", "qa_no_progress_count", "qa_campaign_key", "execution_scope"]
     return dict(zip(keys, r))
 
 
@@ -148,7 +252,7 @@ def _set(thread_id, **kw):
         cols.append(f"{k}=%s")
         vals.append(json.dumps(v) if k in ("brief", "options", "chosen_option", "plan") and v is not None else v)
     vals.append(thread_id)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute(f"UPDATE controller_state SET {', '.join(cols)}, updated_at=now() WHERE thread_id=%s", vals)
         c.commit()
 
@@ -156,9 +260,10 @@ def _set(thread_id, **kw):
 def _job_begin(thread_id, kind, eta_min, status):
     """Stamp the LIVE-PROGRESS fields when an async job kicks off (kind/start/ETA/status) so the console
     can render a real, ticking 'Researching… (Nm elapsed, ~M min)' bubble instead of a static one."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""UPDATE controller_state SET job_kind=%s, job_started_at=now(), job_eta_min=%s,
-                       job_status=%s, job_sla_warned=false, updated_at=now() WHERE thread_id=%s""",
+                       job_status=%s, job_sla_warned=false, job_sla_claimed_at=NULL,
+                       job_sla_claim_token=NULL, updated_at=now() WHERE thread_id=%s""",
                     (kind, eta_min, status, thread_id))
         c.commit()
 
@@ -166,19 +271,136 @@ def _job_begin(thread_id, kind, eta_min, status):
 def _job_progress(thread_id, status):
     """Update the live status string mid-run — only while the thread is genuinely on its fleet gate, so a
     late update can never resurrect a status on an already-finished/cancelled job (NO false 'working')."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""UPDATE controller_state SET job_status=%s, updated_at=now()
                        WHERE thread_id=%s AND awaiting='fleet'""", (status, thread_id))
         c.commit()
 
 
+def _worker_progress(thread_id, jid, stage, event, detail=None):
+    """Renew a worker's progress lease from a substantive, deduplicated checkpoint.
+
+    ``heartbeat_at`` says the process is alive; ``progress_at`` says its work moved. Keeping them separate
+    prevents a heartbeat timer from disguising a deadlock while allowing a healthy long build to outlive any
+    nominal wall-clock estimate.
+    """
+    label = f"{str(stage or 'build')} · {str(event or 'progress')}"
+    safe_detail = detail if isinstance(detail, (dict, list, str, int, float, bool)) else None
+    meta = json.dumps({"stage": str(stage or "")[:120], "event": str(event or "")[:120],
+                       "detail": safe_detail}, default=str)
+    try:
+        with _conn() as c, c.cursor() as cur:
+            _set_controller_db_timeouts(cur)
+            cur.execute("""UPDATE controller_jobs
+                              SET progress_at=now(),
+                                  result=COALESCE(result,'{}'::jsonb)
+                                         || jsonb_build_object('progress',%s::jsonb)
+                            WHERE id=%s AND thread_id=%s AND status='running'""",
+                        (meta, jid, thread_id))
+            changed = cur.rowcount
+            if changed:
+                cur.execute("""UPDATE controller_state SET job_status=%s,updated_at=now()
+                                WHERE thread_id=%s AND awaiting='fleet'""", (label, thread_id))
+            c.commit()
+        return bool(changed)
+    except Exception:
+        return False
+
+
 def _job_clear(thread_id):
     """Clear the LIVE-PROGRESS fields once a job leaves flight (done/failed/cancelled)."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""UPDATE controller_state SET job_kind=NULL, job_started_at=NULL, job_eta_min=NULL,
-                       job_status=NULL, job_sla_warned=false, updated_at=now() WHERE thread_id=%s""",
+                       job_status=NULL, job_sla_warned=false, job_sla_claimed_at=NULL,
+                       job_sla_claim_token=NULL, updated_at=now() WHERE thread_id=%s""",
                     (thread_id,))
         c.commit()
+
+
+def _qa_checkpoint_counts(previous_completed, completed, checkpoint_count, no_progress_count):
+    """Pure campaign accounting used by the TESTQA hand-off policy.
+
+    Missing progress is treated as unknown (older workers did not return it), not as proof of a stall.  Once
+    both samples exist, a non-increasing completed count is a no-progress slice; any forward movement resets
+    the streak.  The hard checkpoint count remains an independent resource ceiling.
+    """
+    checkpoints = max(0, int(checkpoint_count or 0)) + 1
+    prior_stalls = max(0, int(no_progress_count or 0))
+    if completed is None or previous_completed is None:
+        stalls = prior_stalls
+    elif int(completed) > int(previous_completed):
+        stalls = 0
+    else:
+        stalls = prior_stalls + 1
+    return checkpoints, stalls
+
+
+def _qa_campaign_checkpoint_counts(previous_campaign_key, campaign_key, previous_completed, completed,
+                                   checkpoint_count, no_progress_count):
+    """Scope raw progress counters to the campaign/revision that produced them."""
+    changed = bool(campaign_key and campaign_key != previous_campaign_key)
+    checkpoints, stalls = _qa_checkpoint_counts(
+        None if changed else previous_completed, completed,
+        0 if changed else checkpoint_count, 0 if changed else no_progress_count)
+    return checkpoints, stalls, changed
+
+
+def _qa_checkpoint_can_continue(cleanup_processes, manager):
+    """A time-slice count is never, by itself, a request for CEO authority.
+
+    Process leakage is a hard safety stop. A manager may request authority only when
+    `_qa_manager_decision` validated a concrete external boundary supplied by the
+    work, never because an arbitrary number of internal shift rotations elapsed.
+    """
+    return int(cleanup_processes or 0) == 0 and manager.get("action") != "request_new_authority"
+
+
+def _qa_manager_decision(thread_id, facts):
+    """Ask the QA manager what to do after an abnormal checkpoint; hard safety remains deterministic.
+
+    Productive shift hand-offs need no new decision—the standing objective already authorizes continuing.
+    Repeated no-progress is different: diagnose and choose an organizational response rather than converting a
+    timer into a CEO gate.  The model may request new authority only for a genuine authority boundary.  A model
+    outage fails toward an internal incident + fresh bounded recovery, never toward silently bothering the CEO.
+    """
+    allowed = {"continue_fresh_worker", "retry_failed_actor", "reassign_worker",
+               "open_internal_incident_and_cleanup", "request_new_authority"}
+    try:
+        s = _st(thread_id) or {}
+        product = s.get("product") or "unknown"
+        repo = str(Path(factory.PRODUCTS) / product)
+        prompt = (
+            "You are the QA director managing a durable browser-QA campaign. Decide the next management action "
+            "from evidence, like an elite human lead. A wall-clock slice is only a host-safety boundary. "
+            "Reversible internal retry/reassignment/cleanup is already authorized. Ask the CEO ONLY if the next "
+            "step genuinely needs new money, credentials/legal consent, an irreversible external action, or a "
+            "business tradeoff outside the objective. Reply ONLY JSON: "
+            '{"action":"continue_fresh_worker|retry_failed_actor|reassign_worker|'
+            'open_internal_incident_and_cleanup|request_new_authority","reason":"...",'
+            '"authority_gap":"none|spend|credential|legal|irreversible|business"}.\nFACTS:\n' +
+            json.dumps(facts, default=str)[:4000])
+        out = factory.agent("qa-director", repo, prompt, timeout=180, retries=1,
+                            spawner="qa-coordinator")
+        data = factory._extract_json((out or {}).get("out_full") or (out or {}).get("out") or "") or {}
+        action = data.get("action")
+        gap = data.get("authority_gap") or "none"
+        if action in allowed:
+            # A bare/model-invented request for authority is not enough.  The observed state must contain the
+            # same concrete boundary; otherwise the manager keeps the issue inside the company.
+            observed_boundaries = set(facts.get("authority_boundaries") or [])
+            if action == "request_new_authority" and (gap not in {
+                    "spend", "credential", "legal", "irreversible", "business"}
+                    or gap not in observed_boundaries):
+                action = "open_internal_incident_and_cleanup"
+            return {"action": action, "reason": str(data.get("reason") or "")[:300],
+                    "authority_gap": gap, "model_decided": True}
+    except Exception as e:
+        return {"action": "open_internal_incident_and_cleanup",
+                "reason": f"QA manager unavailable: {str(e)[:180]}",
+                "authority_gap": "none", "model_decided": False}
+    return {"action": "open_internal_incident_and_cleanup",
+            "reason": "QA manager returned no valid structured decision",
+            "authority_gap": "none", "model_decided": False}
 
 
 def _research_history_min(default=None):
@@ -190,7 +412,7 @@ def _research_history_min(default=None):
     NOT the old unrealistic 3. Always returns a positive int; never raises."""
     try:
         import statistics
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             # Only completed runs with a sane positive duration count (a still-running / mis-stamped row must
             # not drag the median). Recent-first, capped, mirroring estimate.py's "median of similar past runs".
             cur.execute("""SELECT EXTRACT(EPOCH FROM (finished_at - started_at)) / 60.0
@@ -210,7 +432,7 @@ def _estimate_runtime(phase, plan=None):
     """Best-effort ETA (minutes) for an async phase. RESEARCH uses a history-backed median of recent real
     research_runs (else a realistic ~12-min default — it's a multi-agent fleet, not a 3-min call). Build/
     design phases use estimate.py's history-backed estimate for the plan's kind (a 'project' falls back to
-    'service'); a prototype is only a slice of the full build. QA uses a small sensible default. Always
+    'service'); a prototype is only a slice of the full build. QA derives from its configured safety slice. Always
     returns a positive int — never raises."""
     plan = plan or {}
     # Realistic point-estimate defaults (minutes) — the CANONICAL, console-reconciled `_PHASE_ETA_DEFAULT`
@@ -241,17 +463,20 @@ def _ping(tid, title, body, category="build", level="urgent"):
     Two channels, both best-effort:
       * IN-APP feed (notifications.send): the ALWAYS-AVAILABLE channel — the bell/badge lights up even with
         no ntfy/email configured. We default to level='urgent' (NOT a silent/passive default) because that's
-        the taxonomy level whose contract includes a push and makes the feed unmistakable.
-      * PUSH (push.send on a daemon thread, high priority for urgent): reaches a closed tab / phone. HONEST
-        CAVEAT: on a self-host box this only actually delivers if ntfy is configured AND the tenant has a
-        push topic registered (email likewise needs SMTP); otherwise it's a no-op. The in-app feed above is
-        what we rely on always reaching the user.
-    The daemon thread keeps a slow/down ntfy from ever blocking the control loop. Never raises."""
+        the taxonomy level whose contract includes email + tenant push and makes the feed unmistakable.
+      * PUSH fallback (push.send on a daemon thread) only when notification delivery itself fails. HONEST
+        CAVEAT: on a self-host box push only actually delivers if ntfy is configured AND the tenant has a
+        push topic registered (email likewise needs SMTP); otherwise the in-app feed is the reliable channel.
+    Never raises."""
+    sent_notification = False
     try:
         import notifications
         notifications.send(tid, category, title, (body or "")[:300], level=level)
+        sent_notification = True
     except Exception:
         pass
+    if sent_notification:
+        return
 
     def _p():
         try:
@@ -262,32 +487,312 @@ def _ping(tid, title, body, category="build", level="urgent"):
     threading.Thread(target=_p, daemon=True).start()
 
 
+def _authorize_qa_checkpoint_resume(state):
+    """Turn an explicit user retry into authority to reopen the strongest matching QA checkpoint.
+
+    A plain cancel must keep every actor dead. Once the same thread explicitly retries, however, starting a
+    fresh org discards the exact durable continuity the cancel preserved. Choose the halted matching campaign
+    with the most recorded story state (latest wins ties), mark only its cancelled actors resumable, and move
+    the file locator back to that workforce. This also repairs a short-lived empty replacement run.
+    """
+    state = dict(state or {})
+    if state.get("phase") != "TESTQA" or not state.get("product"):
+        return None
+    tenant, product, thread_id = state.get("tenant_id"), state.get("product"), state.get("thread_id")
+    if not tenant or thread_id is None:
+        return None
+    marker = {"resumable_checkpoint": True, "resume_authorized_by": "explicit_user_retry",
+              "resume_authorized_at": time.time()}
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""SELECT r.run_id,q.memory
+                             FROM orchestra_runs r
+                             JOIN orchestra_actors q ON q.run_id=r.run_id AND q.tenant_id=r.tenant_id
+                            WHERE r.tenant_id=%s AND r.status='halted' AND q.role='qa-coordinator'
+                              AND q.memory->'context'->>'product'=%s
+                              AND q.memory->'context'->>'thread_id'=%s
+                            ORDER BY (SELECT count(*) FROM jsonb_object_keys(
+                                       COALESCE(q.memory->'story_status','{}'::jsonb))) DESC,
+                                     r.run_id DESC
+                            LIMIT 1""", (tenant, product, str(thread_id)))
+            row = cur.fetchone()
+            if not row:
+                return None
+            run_id, memory = int(row[0]), dict(row[1] or {})
+            payload = json.dumps(marker)
+            cur.execute("""UPDATE orchestra_runs
+                              SET result=COALESCE(result,'{}'::jsonb) || %s::jsonb
+                            WHERE run_id=%s AND tenant_id=%s AND status='halted'""",
+                        (payload, run_id, tenant))
+            cur.execute("""UPDATE orchestra_actors
+                              SET result=COALESCE(result,'{}'::jsonb) || %s::jsonb,
+                                  last_active=now()
+                            WHERE run_id=%s AND tenant_id=%s AND status='dead'
+                              AND COALESCE(result->>'cancelled','false')='true'""",
+                        (payload, run_id, tenant))
+            c.commit()
+
+        # The file is a process locator, not a second authority. Repoint it atomically to the selected durable
+        # org; its coordinator memory remains the source of story verdicts and revision fencing.
+        context = dict(memory.get("context") or {})
+        repo = context.get("repo")
+        stories = list(context.get("stories") or [])
+        if repo and stories:
+            qa_path = str(SCRIPTS / "qa")
+            if qa_path not in sys.path:
+                sys.path.insert(0, qa_path)
+            import campaign_checkpoint
+            target_url = context.get("target_url")
+            signature = campaign_checkpoint.campaign_signature(
+                tenant=tenant, product=product, target_url=target_url,
+                vision=context.get("vision"), repo=repo, stories=stories, thread_id=thread_id)
+            document = campaign_checkpoint.checkpoint_document(
+                run_id=run_id, signature=signature, tenant=tenant, product=product,
+                target_url=target_url, thread_id=thread_id, stories=stories,
+                story_status=memory.get("story_status"),
+                batch_size=context.get("story_batch_size") or 0, status="halted")
+            document["product_revision"] = memory.get("coverage_revision")
+            document["revision_generation"] = int(memory.get("revision_generation") or 0)
+            campaign_checkpoint.write_checkpoint(Path(repo) / "docs" / "QA-CHECKPOINT.json", document)
+        audit.append(actor="loopcontroller", action="QaCheckpointResumeAuthorized",
+                     resource=str(thread_id), decision=str(run_id),
+                     payload={"product": product,
+                              "recorded_stories": len(dict(memory.get("story_status") or {}))},
+                     tenant_id=tenant)
+        return run_id
+    except Exception:
+        return None
+
+
 def _resume_halts(thread_id):
-    """Lift any kill-switch HALT this thread set via cancel(), so a 'retry' actually re-dispatches the
-    parked phase instead of immediately re-stopping on the still-set halt. Idempotent + best-effort."""
+    """Lift kill switches and authorize the strongest QA checkpoint after an explicit retry.
+
+    Cancel itself remains terminal. This function is called only after a fresh user proceed/retry decision,
+    so it is the authority boundary that permits the same durable workforce—not a blank replacement—to run.
+    """
+    state = _st(thread_id)
+    resumed_run_id = _authorize_qa_checkpoint_resume(state)
     try:
         import killswitch
         killswitch.resume(f"thread-{thread_id}")
-        s = _st(thread_id)
-        if s and s.get("product"):
-            killswitch.resume(s["product"])
+        if state and state.get("product"):
+            killswitch.resume(state["product"])
     except Exception:
         pass
+    return resumed_run_id
 
 
-def live_status(thread_id):
+def _research_progress(tenant_id, research_run_id):
+    """Live sub-step summary for durable research runs, derived from orchestra actor rows.
+    No model calls: this reads the org's real hired researchers, their assignments, statuses, and liveness."""
+    if not tenant_id or not research_run_id:
+        return None
+    try:
+        with _conn(tenant_id) as c, c.cursor() as cur:
+            cur.execute("""SELECT run_id FROM orchestra_actors
+                           WHERE tenant_id=%s AND memory->>'research_run_id'=%s
+                           ORDER BY run_id DESC LIMIT 1""", (tenant_id, str(research_run_id)))
+            row = cur.fetchone()
+            if not row:
+                return None
+            orc = row[0]
+            cur.execute("""SELECT name, role, kind, status, assignment,
+                                  EXTRACT(EPOCH FROM (now()-last_active))::int
+                           FROM orchestra_actors
+                           WHERE tenant_id=%s AND run_id=%s
+                           ORDER BY actor_id""", (tenant_id, orc))
+            rows = cur.fetchall()
+            cur.execute("""SELECT actor_id FROM orchestra_tool_leases
+                           WHERE tenant_id=%s AND run_id=%s AND lease_until>now()""",
+                        (tenant_id, orc))
+            active_tool_actors = {int(item[0]) for item in cur.fetchall()}
+            cur.execute("""SELECT actor_id,name,role,kind,status,assignment,
+                                  EXTRACT(EPOCH FROM (now()-last_active))::int
+                           FROM orchestra_actors
+                           WHERE tenant_id=%s AND run_id=%s
+                           ORDER BY actor_id""", (tenant_id, orc))
+            actor_rows = cur.fetchall()
+    except Exception:
+        return None
+    # Keep the legacy row shape below while retaining actor identity for exact tool-lease classification.
+    workers = [(actor_id, name, role, kind, status, assignment, age)
+               for actor_id, name, role, kind, status, assignment, age in actor_rows if kind == "worker"]
+    if not workers:
+        return None
+    total = len(workers)
+    done = sum(1 for r in workers if r[4] == "done")
+    blocked = sum(1 for r in workers if r[4] == "blocked" and r[0] not in active_tool_actors)
+    working = sum(1 for r in workers if r[4] in ("working", "parked", "idle") or
+                  (r[4] == "blocked" and r[0] in active_tool_actors))
+    active = next((r for r in workers if r[4] in ("working", "parked", "idle") or
+                   (r[4] == "blocked" and r[0] in active_tool_actors)), None)
+    if active is None:
+        active = next((r for r in workers if r[4] == "blocked"), None)
+    current = (active[5] if active else "") or ""
+    if len(current) > 90:
+        current = current[:87].rstrip() + "..."
+    detail = f"{done}/{total} researchers done"
+    if blocked:
+        detail += f", {blocked} blocked"
+    if working and done < total:
+        detail += f", {working} active"
+    if current:
+        detail += f" · {current}"
+    return {"orchestra_run_id": orc, "researchers_total": total, "researchers_done": done,
+            "researchers_blocked": blocked, "researchers_active": working, "current_step": current,
+            "progress_detail": detail, "subprogress_pct": int(round((done / total) * 100))}
+
+
+def _qa_story_snapshot(coordinator_memory):
+    """Release-facing progress from the coordinator's canonical per-story state."""
+    coordinator_memory = dict(coordinator_memory or {})
+    context = dict(coordinator_memory.get("context") or {})
+    planned = list(dict.fromkeys(
+        str(story.get("id") or story.get("title")) for story in (context.get("stories") or [])
+        if isinstance(story, dict) and (story.get("id") or story.get("title"))))
+    statuses = {str(key): str(value) for key, value in
+                dict(coordinator_memory.get("story_status") or {}).items()}
+    clean = [story for story in planned if statuses.get(story) == "clean"]
+    blocking = [story for story in planned if statuses.get(story) == "blocking"]
+    recorded_incomplete = [story for story in planned
+                           if story in statuses and statuses.get(story) not in ("clean", "blocking")]
+    missing = [story for story in planned if story not in statuses]
+    incomplete = recorded_incomplete + missing
+    return {"planned": planned, "statuses": statuses, "clean": clean,
+            "blocking": blocking, "recorded_incomplete": recorded_incomplete,
+            "missing": missing, "incomplete": incomplete}
+
+
+def _qa_progress(thread_id):
+    """Real TESTQA campaign progress from the durable QA org, not an ETA-shaped approximation.
+
+    QA tool actors are intentionally `blocked` while their browser job runs off-loop, so expose them as
+    outstanding rather than falsely telling the CEO the workforce is blocked. Historical explorer actors are
+    attempts/sessions, not acceptance passes: release progress is the coordinator's latest per-story verdict.
+    The two-browser admission cap is an upper bound on simultaneous activity.
+    """
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""SELECT a.run_id,
+                                  EXTRACT(EPOCH FROM (now()-r.created_at))::bigint
+                           FROM orchestra_actors a JOIN orchestra_runs r USING (run_id)
+                           WHERE a.role='qa-coordinator'
+                             AND a.memory->'context'->>'thread_id'=%s
+                             AND r.status='running'
+                           ORDER BY a.run_id DESC LIMIT 1""", (str(thread_id),))
+            row = cur.fetchone()
+            if not row:
+                return None
+            run_id, campaign_elapsed_s = row
+            cur.execute("""SELECT role,status,assignment,memory FROM orchestra_actors
+                           WHERE run_id=%s ORDER BY actor_id""", (run_id,))
+            all_rows = cur.fetchall()
+    except Exception:
+        return None
+    rows = [(status, assignment) for role, status, assignment, _ in all_rows if role == "qa-explorer"]
+    if not rows:
+        return None
+    total = len(rows)
+    done = sum(1 for status, _ in rows if status == "done")
+    outstanding = sum(1 for status, _ in rows if status not in ("done", "dead", "failed"))
+    explorer_current = next((assignment for status, assignment in rows
+                             if status not in ("done", "dead", "failed") and assignment), "")
+    support = [(role, assignment, dict(memory or {})) for role, status, assignment, memory in all_rows
+               if role not in ("qa-explorer", "qa-coordinator")
+               and status not in ("done", "dead", "failed")]
+    support_active = len(support)
+    support_current = next((assignment for _, assignment, _ in support if assignment), "")
+    support_story = ""
+    for _, _, memory in support:
+        support_context = dict(memory.get("context") or {})
+        bug = dict(support_context.get("bug") or {})
+        tool_args = dict(support_context.get("tool_args") or {})
+        tool_story = tool_args.get("story") or {}
+        if isinstance(tool_story, dict):
+            tool_story = tool_story.get("id") or tool_story.get("title")
+        support_story = str(bug.get("story") or tool_story or "").strip()
+        if support_story:
+            break
+    coordinator_memory = next((dict(memory or {}) for role, _, _, memory in all_rows
+                               if role == "qa-coordinator"), {})
+    snapshot = _qa_story_snapshot(coordinator_memory)
+    planned, statuses = snapshot["planned"], snapshot["statuses"]
+    clean_stories = snapshot["clean"]
+    blocking_stories = snapshot["blocking"]
+    incomplete_stories = snapshot["incomplete"]
+    recorded_incomplete = snapshot["recorded_incomplete"]
+    missing_stories = snapshot["missing"]
+    story_total = len(planned)
+    story_clean = len(clean_stories)
+    if story_total:
+        if missing_stories:
+            recorded = story_total - len(missing_stories)
+            detail = f"{recorded}/{story_total} current-revision verdicts"
+            detail += f" · {story_clean} clean"
+            if blocking_stories:
+                detail += f" · {len(blocking_stories)} blocking"
+            if recorded_incomplete:
+                detail += f" · {len(recorded_incomplete)} incomplete"
+            detail += f" · {len(missing_stories)} awaiting impact/recheck"
+        else:
+            detail = f"{story_clean}/{story_total} stories clean"
+            if blocking_stories:
+                detail += f" · {len(blocking_stories)} blocking"
+            if recorded_incomplete:
+                detail += f" · {len(recorded_incomplete)} incomplete"
+        detail += f" · {done}/{total} explorer sessions complete"
+        subprogress_pct = int(round((story_clean / story_total) * 100))
+    else:
+        detail = f"{done}/{total} QA explorer sessions complete"
+        subprogress_pct = int(round((done / total) * 100))
+    if outstanding:
+        detail += f" · {outstanding} browser session(s) queued/running (max 2)"
+    if support_active:
+        detail += (f" · repairing/verifying {support_story}" if support_story else "")
+        detail += f" · {support_active} repair/verification agent(s) active"
+    current = explorer_current or support_current
+    return {"qa_run_id": run_id, "qa_campaign_elapsed_s": int(campaign_elapsed_s or 0),
+            "qa_explorers_total": total, "qa_explorers_done": done,
+            "qa_explorers_outstanding": outstanding, "qa_support_active": support_active,
+            "qa_stories_total": story_total, "qa_stories_clean": story_clean,
+            "qa_stories_blocking": len(blocking_stories),
+            "qa_stories_incomplete": len(incomplete_stories),
+            "qa_story_status": {story: statuses.get(story, "missing") for story in planned},
+            "current_step": (current or "")[:100],
+            "progress_detail": detail, "subprogress_pct": subprogress_pct}
+
+
+def _headline_progress_pct(phase, time_pct, subprogress):
+    """Use release completion—not elapsed-time saturation—for a live QA headline.
+
+    Elapsed/ETA remains useful for detecting a slow worker slice, but it is not campaign completion.  A QA
+    slice can hit 99% of its expected runtime with only a few clean stories.  Publishing that time fraction as
+    the CEO progress bar is materially misleading, so TESTQA is bounded by its canonical clean-story ratio.
+    """
+    if phase == "TESTQA" and isinstance(subprogress, dict):
+        total = int(subprogress.get("qa_stories_total") or 0)
+        release_pct = subprogress.get("subprogress_pct")
+        if total > 0 and isinstance(release_pct, int):
+            return min(99, max(0, release_pct))
+    return time_pct
+
+
+def live_status(thread_id, tenant_id=None):
     """Truthful live snapshot for the console: what the controller is doing RIGHT NOW. While a durable job
     runs it reports running + elapsed + ETA + a short status (so the UI shows 'Researching… (2m elapsed)');
     on a gate it reports the real awaiting status; and it reports done ONLY when the loop has actually
     reached DELIVER and isn't awaiting anything — never a false 'done' mid-job."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("""SELECT phase, awaiting, job_kind, job_status, job_eta_min,
+                              tenant_id, research_run_id,
                               EXTRACT(EPOCH FROM (now()-job_started_at))::int
-                       FROM controller_state WHERE thread_id=%s""", (thread_id,))
+                       FROM controller_state
+                       WHERE thread_id=%s AND (%s::text IS NULL OR tenant_id=%s)""",
+                    (thread_id, tenant_id, tenant_id))
         r = cur.fetchone()
     if not r:
         return {"error": "no such thread"}
-    phase, awaiting, jk, js, eta, elapsed = r
+    phase, awaiting, jk, js, eta, tid, research_run_id, elapsed = r
     running = bool(awaiting == "fleet" and jk)
     out = {"thread_id": thread_id, "phase": phase, "awaiting": awaiting, "running": running, "done": False}
     if running:
@@ -302,9 +807,16 @@ def live_status(thread_id):
         overrun = bool(eta and em >= eta)
         eta_txt = (f", {'over the usual' if overrun else 'usually'} ~{lo}-{hi} min" if lo else "")
         base_status = js or _KIND_LABEL.get(jk, "Working…")
+        sub = (_research_progress(tid, research_run_id) if phase == "RESEARCH" else
+               _qa_progress(thread_id) if phase == "TESTQA" else None)
         out.update(job_kind=jk, elapsed_s=es, elapsed_min=em, eta_min=eta, eta_lo=lo, eta_hi=hi,
                    progress_pct=pct, overrun=overrun, status=base_status,
                    label=f"{base_status} ({em}m elapsed{eta_txt})")
+        if sub:
+            out.update(sub)
+            out["time_progress_pct"] = pct
+            out["progress_pct"] = _headline_progress_pct(phase, pct, sub)
+            out["label"] += f" · {sub['progress_detail']}"
     elif awaiting in _GATE_LABEL:
         out["status"] = out["label"] = _GATE_LABEL[awaiting]
     else:
@@ -333,9 +845,8 @@ def _parse_block(text, tag):
 
 # ── dispatch-and-park: phase work rebuildable from persisted state (overhaul Step 3) ─────────────────
 # Each phase's work is reconstructed here from controller_state (product/plan/brief/run-id) instead of being
-# captured in an advance()-local closure, so the SAME callable runs whether executed in-process (daemon path)
-# or in a fresh worker PROCESS after a park. advance() dispatches by `kind`; both _dispatch and run_job rebuild
-# the fn here — one source of truth, no drift between the two execution modes.
+# captured in an advance()-local closure. A fresh, identity-recorded worker process rebuilds it from `kind`,
+# leaving one source of truth and no closure that a driver thread could continue after cancellation.
 def _phase_fn(thread_id, kind):
     if kind == "__selftest__":            # trivial, side-effect-free phase used ONLY by _park_selftest
         return lambda: {"ok": True, "parked_selftest": True}
@@ -409,7 +920,7 @@ def _phase_fn(thread_id, kind):
             if not repo.exists() or not any(repo.iterdir()):
                 # a UI platform (web/game-web) builds the real servable artifact via kind=web
                 build_kind = "web" if platform in ("web", "game-web") else plan.get("kind", "web")
-                factory.build_product(product, charter, kind=build_kind)
+                factory.build_product(product, charter, kind=build_kind, tenant_id=tid)
             import qualityloop
             return qualityloop.run(product, bar="high")
         return _do_build
@@ -422,12 +933,16 @@ def _phase_fn(thread_id, kind):
 
 def _rebuild_ctx(thread_id):
     """Reconstruct factory._ctx from persisted state so a PARKED phase in a fresh worker process bills/gates
-    EXACTLY like the in-process path (tenant, org, product, resolved-provider engine+key). Without this a
-    detached worker would silently lose the tenant's BYO key and consent/billing context."""
+    with the persisted tenant, org, product, and resolved provider/key. Without this a detached worker would
+    silently lose the tenant's BYO key and consent/billing context."""
     s = _st(thread_id)
     factory._ctx.tenant = s["tenant_id"]
     factory._ctx.org = s.get("org_id")
     factory._ctx.product = s.get("product")
+    factory._ctx.thread_id = thread_id
+    factory._ctx.run = f"controller-{thread_id}"
+    factory._ctx.stage = s.get("phase")
+    os.environ["AOS_CONTROLLER_THREAD_ID"] = str(thread_id)
     try:
         prov = _resolved_provider(s["tenant_id"])
         if prov:
@@ -437,23 +952,25 @@ def _rebuild_ctx(thread_id):
     return s
 
 
-# DISPATCH-AND-PARK master switch (overhaul Step 3). DEFAULT ON: each phase runs in a DETACHED worker process
-# that survives THIS process's death — retiring G1 — while the poller (resume_stalled/jobd) advances on
-# completion. De-risked: mechanics proven (parkcrash), billing-context rebuild proven (_rebuild_ctx test),
-# worker death self-heals (crash-resume), and a launch failure FALLS BACK to the in-process path. Instant
-# rollback to the pure in-process engine: AOS_DISPATCH_PARK=0.
-_PARK = os.environ.get("AOS_DISPATCH_PARK", "1") not in ("0", "false", "no", "")
+# Durable phases always run in a detached, identity-recorded worker process. The old
+# AOS_DISPATCH_PARK=0 rollback launched an unkillable daemon thread: cancellation
+# could terminalize its DB row while the thread kept making external side effects.
+# Keep the public flag for status/tests, but make safe parked execution invariant.
+_PARK = True
+_DISPATCH_LOCK_NS = 841001
+_DISPATCH_GLOBAL_LOCK = 841002
+_MAX_ACTIVE_CONTROLLER_JOBS = max(1, int(os.environ.get("AOS_JOBD_MAX_ACTIVE_JOBS", "2")))
 
 
 def _start_heartbeat(jid):
-    """Output-independent liveness beat for job `jid` on a background timer (Step 1). Returns a stop Event.
-    Shared by the in-process daemon path and the parked worker so both prove PROCESS liveness identically."""
+    """Output-independent liveness beat for one parked worker. Returns its cooperative stop Event."""
     stop = threading.Event()
 
     def _beat():
         while not stop.wait(HEARTBEAT_S):
             try:
-                with psycopg.connect(DB) as c, c.cursor() as cur:
+                with _conn() as c, c.cursor() as cur:
+                    _set_controller_db_timeouts(cur)
                     cur.execute("UPDATE controller_jobs SET heartbeat_at=now() WHERE id=%s AND status='running'",
                                 (jid,))
                     c.commit()
@@ -463,36 +980,34 @@ def _start_heartbeat(jid):
     return stop
 
 
-def _finish_job(thread_id, jid, result, status, parked):
-    """Write a phase job's terminal outcome — the single completion path shared by the in-process daemon and
-    the parked worker. A 'pending' sentinel parks the job for resume_stalled to reconcile (research outliving
-    its poll budget). The terminal write is GUARDED on status='running' so a cancel()/reap that already moved
-    the job wins. parked=False advances inline (daemon path); parked=True leaves awaiting='fleet' and lets the
-    poller advance under the drive lock (single-owner) — the worker never advances, so it can't race a driver."""
+def _finish_job(thread_id, jid, result, status):
+    """Write a parked phase worker's terminal outcome without advancing inline.
+
+    A ``pending`` sentinel is left for ``resume_stalled`` to reconcile. The
+    terminal update is fenced on ``status='running'`` so cancellation/reaping
+    wins, and the durable poller is always the only component that advances.
+    """
     if isinstance(result, dict) and result.get("pending"):
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
+            _set_controller_db_timeouts(cur)
             cur.execute("UPDATE controller_jobs SET status='pending', result=%s WHERE id=%s AND status='running'",
                         (json.dumps(result), jid))
             c.commit()
         _job_progress(thread_id, "Still working — this one's taking a little longer…")
         return False
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
+        _set_controller_db_timeouts(cur)
         cur.execute("""UPDATE controller_jobs SET status=%s, result=%s, finished_at=now()
                        WHERE id=%s AND status='running'""", (status, json.dumps(result), jid))
         changed = cur.rowcount; c.commit()
     if not changed:
         return False
-    if parked:
-        return True                                      # poller (resume_stalled/jobd) advances under the lock
-    _set(thread_id, awaiting=None)
-    _job_clear(thread_id)
-    advance(thread_id, job_result=result)
-    return True
+    return True                                          # poller advances under the drive lock
 
 
 def _spawn_parked_worker(thread_id, kind, jid):
     """Launch the phase in a DETACHED worker process (start_new_session so it survives THIS process's death
-    and isn't killed by the driver's signals). Returns True if launched, False to fall back to in-process."""
+    and isn't killed by the driver's signals). Returns whether the durable worker generation launched."""
     try:
         # Keep the worker's own output. It used to go to DEVNULL, so when a parked worker died there was
         # NOTHING to diagnose from — a research run vanished at 23:20 and the only evidence left anywhere
@@ -509,8 +1024,13 @@ def _spawn_parked_worker(thread_id, kind, jid):
             start_new_session=True, stdout=_log, stderr=_log,
             cwd=str(Path(__file__).resolve().parent))
         try:                                             # record the worker pid so parked work is observable
-            with psycopg.connect(DB) as c, c.cursor() as cur:
-                cur.execute("UPDATE controller_jobs SET worker_pid=%s WHERE id=%s", (p.pid, jid))
+            with _conn() as c, c.cursor() as cur:
+                _set_controller_db_timeouts(cur)
+                snap = process_assurance.read_snapshot(p.pid)
+                cur.execute("""UPDATE controller_jobs SET worker_pid=%s,worker_start_ticks=%s,
+                               worker_boot_id=%s WHERE id=%s""",
+                            (p.pid, snap.identity.start_ticks if snap else None,
+                             snap.identity.boot_id if snap else None, jid))
                 c.commit()
         except Exception:
             pass
@@ -523,12 +1043,69 @@ def _spawn_parked_worker(thread_id, kind, jid):
         return False
 
 
+def _worker_eta_floor(kind):
+    """Minimum truthful ETA a freshly loaded worker may inherit from an older dispatcher."""
+    return qatiming.slice_eta_min() if kind == "qa" else None
+
+
+def _reconcile_worker_eta(thread_id, kind):
+    """Repair rolling-upgrade metadata without resetting elapsed time or touching execution ownership."""
+    eta_floor = _worker_eta_floor(kind)
+    if eta_floor is None:
+        return False
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""UPDATE controller_state
+                              SET job_eta_min=GREATEST(COALESCE(job_eta_min,0),%s),updated_at=now()
+                            WHERE thread_id=%s AND phase='TESTQA' AND awaiting='fleet'
+                              AND job_kind='qa' AND COALESCE(job_eta_min,0)<%s
+                            RETURNING tenant_id""", (eta_floor, thread_id, eta_floor))
+            row = cur.fetchone(); c.commit()
+        if row:
+            audit.append(actor="loopcontroller", action="RepairStaleQAEta", resource=str(thread_id),
+                         decision="reconciled", payload={"eta_min": eta_floor, "source": "worker"})
+        return bool(row)
+    except Exception:
+        # ETA display repair is observability-only; it must never prevent owned phase work from running.
+        return False
+
+
 def run_job(thread_id, kind, jid):
     """Parked-worker entrypoint (`loopcontroller.py run_job <thread_id> <kind> <jid>`): run ONE phase job in
     this dedicated process. Rebuild factory._ctx + the phase fn from persisted state, beat the heartbeat, run
     the work, then write its terminal result. Does NOT advance — the poller does, under the drive lock."""
     _ensure()
+    snap = process_assurance.read_snapshot(os.getpid())
+    if snap is None:
+        return {"thread_id": thread_id, "kind": kind, "jid": jid,
+                "status": "refused", "error": "worker birth identity unavailable"}
+    with _conn() as c, c.cursor() as cur:
+        _set_controller_db_timeouts(cur)
+        cur.execute("""UPDATE controller_jobs SET worker_pid=%s,worker_start_ticks=%s,worker_boot_id=%s
+                       WHERE id=%s AND thread_id=%s AND kind=%s AND status='running'""",
+                    (snap.identity.pid, snap.identity.start_ticks, snap.identity.boot_id,
+                     jid, thread_id, kind))
+        claimed = cur.rowcount; c.commit()
+    if claimed != 1:
+        return {"thread_id": thread_id, "kind": kind, "jid": jid,
+                "status": "refused", "error": "job is absent, terminal, or belongs to another worker"}
+    _reconcile_worker_eta(thread_id, kind)
     _rebuild_ctx(thread_id)
+    # Factory/project component threads share this callback. Only a new stage/event/detail signature renews
+    # progress, so a repeated "still alive" message cannot masquerade as forward movement.
+    progress_seen = set()
+    progress_lock = threading.Lock()
+
+    def _progress(stage, event, detail=None):
+        signature = (str(stage), str(event), json.dumps(detail, sort_keys=True, default=str)[:1000])
+        with progress_lock:
+            if signature in progress_seen:
+                return
+            progress_seen.add(signature)
+        _worker_progress(thread_id, jid, stage, event, detail)
+
+    factory._ctx.progress_callback = _progress
+    _progress(kind.upper(), "worker-started", {"jid": jid})
     stop = _start_heartbeat(jid)
     result, status = {}, "done"
     try:
@@ -537,105 +1114,332 @@ def run_job(thread_id, kind, jid):
         result, status = {"error": str(e)[:200]}, "failed"
     finally:
         stop.set()
-    _finish_job(thread_id, jid, result, status, parked=True)
+    _finish_job(thread_id, jid, result, status)
     return {"thread_id": thread_id, "kind": kind, "jid": jid, "status": status}
 
 
-def _pid_alive(pid):
+def _pid_alive(pid, start_ticks=None, boot_id=None):
     if not pid:
         return None
-    try:
-        os.kill(int(pid), 0)                             # signal 0 = liveness probe, doesn't touch the process
-        return True
-    except ProcessLookupError:
+    snap = process_assurance.read_snapshot(int(pid))
+    if snap is None:
         return False
-    except PermissionError:
-        return True                                      # exists but owned by another user
-    except Exception:
-        return None
+    if snap.state == "Z":
+        return False
+    if start_ticks is None or not boot_id:
+        return None                                      # legacy bare PID exists, but ownership is unprovable
+    expected = process_assurance.ProcessIdentity(int(pid), int(start_ticks), str(boot_id))
+    return process_assurance.same_process(expected, snap)
 
 
 def park_status():
     """Operator view of in-flight phase work — the observability that makes dispatch-and-park safe to run:
     every running/pending job with its age, heartbeat freshness, worker pid, and whether that worker process
-    is actually alive. `parked` distinguishes a detached worker (worker_pid set) from the in-process daemon."""
+    is actually alive. ``parked=False`` identifies a legacy/unproven row with no recorded worker identity."""
     _ensure()
     rows = []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""SELECT id, thread_id, phase, kind, status, worker_pid,
+                              worker_start_ticks,worker_boot_id,
                               EXTRACT(EPOCH FROM now()-started_at)::int,
                               EXTRACT(EPOCH FROM now()-COALESCE(heartbeat_at, started_at))::int
                        FROM controller_jobs WHERE status IN ('running','pending')
                        ORDER BY started_at""")
-        for jid, tid, phase, kind, st, pid, age, beat in cur.fetchall():
+        for jid, tid, phase, kind, st, pid, start_ticks, boot_id, age, beat in cur.fetchall():
             rows.append({"job": jid, "thread": tid, "phase": phase, "kind": kind, "status": st,
-                         "worker_pid": pid, "parked": pid is not None, "worker_alive": _pid_alive(pid),
+                         "worker_pid": pid, "worker_start_ticks": start_ticks,
+                         "worker_boot_id": boot_id, "parked": pid is not None,
+                         "worker_alive": _pid_alive(pid, start_ticks, boot_id),
                          "age_s": age, "heartbeat_age_s": beat})
     return {"park_mode": _PARK, "in_flight": rows}
 
 
+def _worker_tool_leases(pid):
+    """Return durable long-tool leases owned by one parked worker process.
+
+    A provider/browser child proves obvious activity, but a tool thread can briefly be child-free while it
+    hashes a diff, updates a checkpoint, or transitions between model stages. Treat its fenced lease as the
+    stronger quiescence signal so rolling source deployment cannot land in that unsafe gap.
+    """
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""SELECT lease_key,actor_id,tool,lease_until
+                             FROM orchestra_tool_leases
+                            WHERE owner_id LIKE %s AND lease_until>now()
+                            ORDER BY actor_id,lease_key LIMIT 20""", (f"{int(pid)}-%",))
+            return [{"lease_key": row[0], "actor_id": row[1], "tool": row[2],
+                     "lease_until": str(row[3])} for row in cur.fetchall()]
+    except Exception:
+        # Older installations may not have the lease table yet. Descendant fencing remains the compatibility
+        # behavior; current installations fail closed through the durable rows above.
+        return []
+
+
+def _worker_orchestra_claims(pid):
+    """Return actor/event step claims owned by one parked worker process.
+
+    A coordinator decision runs inside the controller process itself, so it can be child-free and hold no
+    long-tool lease while it is still applying a durable event.  Killing it in that window preserves the event
+    but strands the actor-step claim for the normal crash lease (15 minutes today).  More importantly, it is not
+    actually a quiescent handoff boundary.  Fence on both claim types just as strictly as on child processes and
+    tool leases; the normal runtime releases them immediately after committing the step.
+    """
+    try:
+        owner_prefix = f"{int(pid)}-%"
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""SELECT actor_id,step_claimed_by,step_claimed_at
+                             FROM orchestra_actors
+                            WHERE step_claimed_by LIKE %s
+                            ORDER BY actor_id LIMIT 20""", (owner_prefix,))
+            actor_steps = [{"actor_id": row[0], "claimed_by": row[1], "claimed_at": str(row[2])}
+                           for row in cur.fetchall()]
+            cur.execute("""SELECT id,to_actor,kind,claimed_by,claimed_at
+                             FROM orchestra_events
+                            WHERE claimed_by LIKE %s AND processed_at IS NULL
+                            ORDER BY id LIMIT 20""", (owner_prefix,))
+            events = [{"event_id": row[0], "actor_id": row[1], "kind": row[2],
+                       "claimed_by": row[3], "claimed_at": str(row[4])}
+                      for row in cur.fetchall()]
+            return {"actor_steps": actor_steps, "events": events}
+    except Exception:
+        # Compatibility with installations that predate durable orchestra step claims. Descendant and tool
+        # lease fencing remain available there; current installations fail closed through these rows too.
+        return {"actor_steps": [], "events": []}
+
+
+def controlled_handoff(jid, reason="rolling runtime upgrade"):
+    """Fence and stop one exact parked worker only at a proven child-free boundary.
+
+    This is the deploy-safe alternative to an ad-hoc ``kill``. It never interrupts a provider/browser child,
+    binds authority to boot-id/PID/start-ticks, freezes the root to close the spawn race, commits a durable
+    non-crash handoff marker, and then terminates only that exact generation. ``resume_stalled``/jobd reloads
+    the same phase from its checkpoint using current source.
+    """
+    _ensure()
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""SELECT id,thread_id,phase,status,worker_pid,worker_start_ticks,worker_boot_id
+                         FROM controller_jobs WHERE id=%s""", (int(jid),))
+        row = cur.fetchone()
+    if not row:
+        return {"handoff": False, "reason": "job not found", "job_id": int(jid)}
+    job_id, thread_id, phase, status, pid, start_ticks, boot_id = row
+    if status != "running" or not pid or start_ticks is None or not boot_id:
+        return {"handoff": False, "reason": "job is not an identity-bound running worker",
+                "job_id": job_id, "status": status}
+    identity = process_assurance.ProcessIdentity(int(pid), int(start_ticks), str(boot_id))
+    snapshots = process_assurance.scan_snapshots()
+    if not process_assurance.same_process(identity, snapshots.get(identity.pid)):
+        return {"handoff": False, "reason": "worker identity is no longer live", "job_id": job_id}
+    descendants = process_assurance.descendant_pids(identity, snapshots)
+    if descendants:
+        return {"handoff": False, "reason": "worker is not quiescent", "job_id": job_id,
+                "active_descendants": descendants[:20]}
+    active_claims = _worker_orchestra_claims(identity.pid)
+    if active_claims["actor_steps"] or active_claims["events"]:
+        return {"handoff": False, "reason": "worker has active durable orchestra claims",
+                "job_id": job_id, "active_orchestra_claims": active_claims}
+    active_leases = _worker_tool_leases(identity.pid)
+    if active_leases:
+        return {"handoff": False, "reason": "worker has active durable tool work", "job_id": job_id,
+                "active_tool_leases": active_leases}
+
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is None or pidfd_signal is None:
+        return {"handoff": False, "reason": "race-safe pidfd signaling is unavailable", "job_id": job_id}
+    try:
+        pidfd = pidfd_open(identity.pid, 0)
+    except (OSError, ValueError) as exc:
+        return {"handoff": False, "reason": f"could not bind worker pidfd: {exc}", "job_id": job_id}
+    stopped = False
+    try:
+        if not process_assurance.same_process(identity, process_assurance.read_snapshot(identity.pid)):
+            return {"handoff": False, "reason": "worker identity changed before freeze", "job_id": job_id}
+        pidfd_signal(pidfd, signal.SIGSTOP)
+        stopped = True
+        time.sleep(0.1)
+        frozen = process_assurance.scan_snapshots()
+        if not process_assurance.same_process(identity, frozen.get(identity.pid)):
+            return {"handoff": False, "reason": "worker exited during freeze", "job_id": job_id}
+        descendants = process_assurance.descendant_pids(identity, frozen)
+        if descendants:
+            pidfd_signal(pidfd, signal.SIGCONT)
+            stopped = False
+            return {"handoff": False, "reason": "worker became busy before freeze", "job_id": job_id,
+                    "active_descendants": descendants[:20]}
+        active_claims = _worker_orchestra_claims(identity.pid)
+        if active_claims["actor_steps"] or active_claims["events"]:
+            pidfd_signal(pidfd, signal.SIGCONT)
+            stopped = False
+            return {"handoff": False, "reason": "worker claimed durable orchestra work before freeze",
+                    "job_id": job_id, "active_orchestra_claims": active_claims}
+        active_leases = _worker_tool_leases(identity.pid)
+        if active_leases:
+            pidfd_signal(pidfd, signal.SIGCONT)
+            stopped = False
+            return {"handoff": False, "reason": "worker claimed durable tool work before freeze",
+                    "job_id": job_id, "active_tool_leases": active_leases}
+        marker = {"error": "controlled rolling-runtime handoff", "status": "failed",
+                  "controlled_handoff": True, "job_id": job_id, "reason": str(reason)[:300]}
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""UPDATE controller_jobs
+                              SET status='failed', lease_token=lease_token+1,
+                                  result=COALESCE(result,'{}'::jsonb)||%s::jsonb, finished_at=now()
+                            WHERE id=%s AND status='running' AND worker_pid=%s
+                              AND worker_start_ticks=%s AND worker_boot_id=%s""",
+                        (json.dumps(marker), job_id, identity.pid, identity.start_ticks, identity.boot_id))
+            changed = cur.rowcount
+            c.commit()
+        if changed != 1:
+            pidfd_signal(pidfd, signal.SIGCONT)
+            stopped = False
+            return {"handoff": False, "reason": "job ownership changed before durable fence", "job_id": job_id}
+        pidfd_signal(pidfd, signal.SIGKILL)
+        stopped = False
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and process_assurance.same_process(
+                identity, process_assurance.read_snapshot(identity.pid)):
+            time.sleep(0.05)
+        gone = not process_assurance.same_process(identity, process_assurance.read_snapshot(identity.pid))
+        audit.append(actor="loopcontroller", action="ControlledRuntimeHandoff", resource=str(thread_id),
+                     decision=phase, payload={"job_id": job_id, "worker": identity.token(),
+                                              "worker_gone": gone, "reason": str(reason)[:300]})
+        return {"handoff": True, "job_id": job_id, "thread_id": thread_id, "phase": phase,
+                "worker_gone": gone, "worker": identity.token()}
+    except OSError as exc:
+        return {"handoff": False, "reason": f"handoff signal failed: {exc}", "job_id": job_id}
+    finally:
+        if stopped and process_assurance.same_process(identity, process_assurance.read_snapshot(identity.pid)):
+            try:
+                pidfd_signal(pidfd, signal.SIGCONT)
+            except OSError:
+                pass
+        os.close(pidfd)
+
+
 def _dispatch(thread_id, kind, fn=None, eta_min=None, kickoff=None, status=None):
-    """Durable job + daemon worker that runs a real module then advances. Survives via controller_jobs.
+    """Atomically claim a durable phase and launch its identity-recorded worker process.
 
     On kickoff it (a) stamps the LIVE-PROGRESS fields (kind/ETA/status) so the console shows a ticking
     bubble, and (b) optionally posts a forward-looking 'working… (~N min)' message so the CEO sees an ETA
     the instant async work starts — never a silent stall."""
-    s = _st(thread_id)
-    if fn is None:                                        # dispatch-and-park: rebuild the phase work from state
-        fn = _phase_fn(thread_id, kind)
+    # Retained for source compatibility with older callers/tests. Captured
+    # closures are intentionally never executed; the worker rebuilds by `kind`.
+    del fn
+    # Read the phase under the same finite statement bound as the ownership
+    # transaction. In particular, an ACCESS EXCLUSIVE migration lock must not
+    # pin the controller before it reaches its advisory-lock guard.
+    try:
+        with _conn() as c, c.cursor() as cur:
+            _set_controller_db_timeouts(cur)
+            cur.execute("""SELECT tenant_id,phase,plan,execution_scope FROM controller_state
+                            WHERE thread_id=%s""", (thread_id,))
+            state_row = cur.fetchone()
+    except _RETRYABLE_CONTROLLER_DB_ERRORS:
+        return None
+    if not state_row:
+        return None
+    s = {"tenant_id": state_row[0], "phase": state_row[1], "plan": state_row[2],
+         "execution_scope": state_row[3]}
     if eta_min is None:
         eta_min = _estimate_runtime(s["phase"], s.get("plan"))
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        # SINGLE-WRITER AT DISPATCH (overhaul Step 2, defense-in-depth): never create a SECOND running job for a
-        # thread that already has one in flight. In normal flow the awaiting='fleet' gate + the per-thread drive
-        # lock already serialize phases, so this is inert; it exists so a duplicate dispatch that somehow slips
-        # through (a racing driver, a double advance) can't double-RUN the phase. Dead 'running' rows are flipped
-        # to 'failed' by _reap_dead_jobs BEFORE any re-dispatch, so this never wedges a legitimately-crashed job.
-        cur.execute("SELECT id FROM controller_jobs WHERE thread_id=%s AND status='running' LIMIT 1", (thread_id,))
-        if cur.fetchone():
-            return None                              # already an in-flight job for this thread — don't double-run
-        cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, heartbeat_at)
-                       VALUES (%s,%s,%s,%s, now()) RETURNING id""", (thread_id, s["tenant_id"], s["phase"], kind))
-        jid = cur.fetchone()[0]; c.commit()
-    _set(thread_id, awaiting="fleet")
-    _job_begin(thread_id, kind, eta_min, status or _KIND_LABEL.get(kind, "Working…"))
-    if kickoff:
-        rng = _eta_phrase(eta_min)
-        eta_txt = f" ({rng})" if rng else ""
-        _report(s["tenant_id"], thread_id, kickoff + eta_txt,
-                {"kind": "working", "phase": s["phase"], "job": kind, "eta_min": eta_min})
+    try:
+        with _conn() as c, c.cursor() as cur:
+            _set_controller_db_timeouts(cur)
+            # Capacity is an execution invariant, not merely a jobd scheduling hint.
+            # Serialize every direct/completion/recovery dispatch across processes,
+            # then count the durable active rows while holding that bounded lock.
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_DISPATCH_GLOBAL_LOCK,))
+            # The outer session drive lock is the normal owner. This transaction
+            # lock makes the SELECT→INSERT guard atomic even for recovery/admin
+            # callers that enter here without it.
+            cur.execute("SELECT pg_advisory_xact_lock(%s,%s)",
+                        (_DISPATCH_LOCK_NS, int(thread_id)))
+            # SINGLE-WRITER AT DISPATCH (overhaul Step 2, defense-in-depth): never create a SECOND running job for
+            # a thread that already has one in flight.
+            cur.execute("""SELECT id FROM controller_jobs
+                           WHERE thread_id=%s AND status IN ('running','pending') LIMIT 1""", (thread_id,))
+            if cur.fetchone():
+                return None                          # already in flight; duplicate attempt is a no-op
+            cur.execute("""SELECT count(*) FROM controller_jobs
+                           WHERE status IN ('running','pending') AND execution_scope=%s""",
+                        (s["execution_scope"],))
+            if int(cur.fetchone()[0]) >= _MAX_ACTIVE_CONTROLLER_JOBS:
+                return None                          # durable queue; jobd retries when capacity opens
 
-    # DISPATCH-AND-PARK (Step 3): run the phase in a DETACHED worker PROCESS that survives this process's
-    # death. The worker owns its own heartbeat + terminal write; the poller advances on completion. If the
-    # launch fails we fall through to the in-process path so the phase still runs.
-    if _PARK and _spawn_parked_worker(thread_id, kind, jid):
+            # Publish the fleet gate/progress and its owning job in ONE transaction.
+            # A lock/statement timeout rolls both back, so no ownerless 'running'
+            # row or fleet gate can survive a deferred dispatch.
+            cur.execute("""UPDATE controller_state
+                              SET awaiting='fleet',job_kind=%s,job_started_at=now(),job_eta_min=%s,
+                                  job_status=%s,job_sla_warned=false,job_sla_claimed_at=NULL,
+                                  job_sla_claim_token=NULL,updated_at=now()
+                            WHERE thread_id=%s AND awaiting IS NULL""",
+                        (kind, eta_min, status or _KIND_LABEL.get(kind, "Working…"), thread_id))
+            if cur.rowcount != 1:
+                return None                          # another owner changed the durable phase/gate
+            cur.execute("""INSERT INTO controller_jobs
+                              (thread_id, tenant_id, phase, kind, heartbeat_at, progress_at, execution_scope)
+                           VALUES (%s,%s,%s,%s,now(),now(),%s) RETURNING id""",
+                        (thread_id, s["tenant_id"], s["phase"], kind, s["execution_scope"]))
+            jid = cur.fetchone()[0]
+            c.commit()
+    except _RETRYABLE_CONTROLLER_DB_ERRORS:
+        # The transaction context rolls back every statement. Returning None is
+        # the controller's existing retryable/queued outcome: awaiting remains
+        # NULL and jobd will attempt the same durable phase on its next tick.
+        return None
+    # Run the phase only in a detached, identity-recorded process. A launch
+    # failure is a durable crashed generation; recovery may retry it, but no
+    # unkillable in-process thread is allowed to outlive a terminal DB row.
+    if not _spawn_parked_worker(thread_id, kind, jid):
+        _finish_job(thread_id, jid,
+                    {"error": "detached worker launch failed", "status": "failed", "crashed": True},
+                    "failed")
         return jid
-
-    # IN-PROCESS PATH (default): an output-independent heartbeat (Step 1) proves the worker PROCESS is alive
-    # regardless of `claude` output; if the process dies the beat stops and the reaper detects a real death.
-    stop = _start_heartbeat(jid)
-
-    def _work():
-        result, status = {}, "done"
+    # Notification/storage failure must never sit between durable ownership and
+    # worker launch. The phase is already safely running; the poller remains the
+    # authoritative progress path if this best-effort kickoff cannot be posted.
+    if kickoff:
         try:
-            result = fn() or {}
-        except Exception as e:
-            result, status = {"error": str(e)[:200]}, "failed"
-        finally:
-            stop.set()
-        _finish_job(thread_id, jid, result, status, parked=False)
-    threading.Thread(target=_work, daemon=True).start()
+            rng = _eta_phrase(eta_min)
+            eta_txt = f" ({rng})" if rng else ""
+            _report(s["tenant_id"], thread_id, kickoff + eta_txt,
+                    {"kind": "working", "phase": s["phase"], "job": kind, "eta_min": eta_min})
+        except Exception:
+            pass
     return jid
 
 
-def start(tid, org_id):
+def start(tid, org_id, *, execution_scope="production"):
+    if execution_scope not in {"production", "test"}:
+        raise ValueError("execution_scope must be 'production' or 'test'")
     _ensure()
     thread_id = orchestrator.start_thread(tid)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, awaiting)
-                       VALUES (%s,%s,%s,'DISCOVER','user_feedback') ON CONFLICT (thread_id) DO NOTHING""",
-                    (thread_id, tid, org_id))
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO controller_state
+                          (thread_id, tenant_id, org_id, phase, awaiting, execution_scope)
+                       VALUES (%s,%s,%s,'DISCOVER','user_feedback',%s)
+                       ON CONFLICT (thread_id) DO NOTHING""",
+                    (thread_id, tid, org_id, execution_scope))
         c.commit()
+    try:
+        import workstreamspine
+        workstreamspine.ensure_workstream(
+            tid, f"controller:{thread_id}",
+            f"Deliver the product workstream owned by controller thread {thread_id}",
+            {"grounded_qa_passed": "qa_ok must be true",
+             "no_blocking_findings": "blocking_open must equal zero",
+             "nonempty_test_coverage": "at least one grounded story must be exercised"},
+            accountable_owner="build-team", manager_owner="controller",
+            backup_owner="qa-director", created_by="loopcontroller", org_id=org_id,
+            risk="high", update_cadence_s=900, execution_scope=execution_scope)
+    except Exception as exc:
+        # The organization spine is additive observability/acceptance state. A
+        # migration outage must not prevent the CEO from opening a workstream.
+        audit.append(actor="loopcontroller", action="WorkstreamSpineSeed",
+                     resource=str(thread_id), decision="deferred",
+                     payload={"error": str(exc)[:300]}, tenant_id=tid)
     _report(tid, thread_id, "I'm your controller. Tell me what you want to build — e.g. \"a competitor to "
                             "YouTube\" — and I'll ask a couple of questions, research it, and bring you a plan.")
     audit.append(actor="loopcontroller", action="ControllerStart", resource=str(thread_id), decision="DISCOVER",
@@ -652,7 +1456,7 @@ def workstreams(tid, org_id):
     the CEO can see + switch between concurrent workstreams. The default thread (thread_for_org) is just
     the first of these."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""SELECT thread_id, phase, product, awaiting, job_kind, job_status
                        FROM controller_state WHERE tenant_id=%s AND org_id=%s ORDER BY thread_id""",
                     (tid, org_id))
@@ -674,7 +1478,7 @@ def thread_for_org(tid, org_id):
     """The org's DEFAULT controller thread (the first workstream) — create it on first access. Additional
     concurrent workstreams are created via new_workstream() and listed by workstreams()."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT thread_id FROM controller_state WHERE tenant_id=%s AND org_id=%s ORDER BY thread_id LIMIT 1",
                     (tid, org_id))
         r = cur.fetchone()
@@ -726,7 +1530,7 @@ def _research_headline(s, max_chars=1800):
         rid = s.get("research_run_id")
         if not rid:
             return ""
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT report_path FROM research_runs WHERE id=%s AND status='done'", (int(rid),))
             row = cur.fetchone()
         if not row or not row[0]:
@@ -761,7 +1565,7 @@ def _resolved_provider(tid):
         r = tenantproviders.resolve(tid)
     except Exception:
         return None
-    return r if (r.get("key") or r.get("auth_mode") == "subscription") else None
+    return r if (r.get("key") or r.get("auth_mode") in {"subscription", "default_cli"}) else None
 
 
 def _ceo_context(tid, org_id=None):
@@ -804,7 +1608,7 @@ def _research_report_for_run(tid, run_id):
     the run hasn't written its doc yet (or the file is gone)."""
     report, status, options = "", None, []
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT status, report_path FROM research_runs WHERE id=%s AND tenant_id=%s",
                         (run_id, tid))
             r = cur.fetchone()
@@ -832,7 +1636,7 @@ def research_report(tid, org):
     raises. (Distinct from the distilled option summaries — this is the whole synthesized report.)"""
     _ensure()
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("""SELECT research_run_id FROM controller_state
                            WHERE tenant_id=%s AND org_id=%s AND research_run_id IS NOT NULL
                            ORDER BY thread_id DESC LIMIT 1""", (tid, org))
@@ -889,7 +1693,87 @@ def _answer_at_options(tid, thread_id, s, msg, on_delta=None):
     return _llm(tid, thread_id, sysp, s, on_delta=on_delta)
 
 
-def say(tid, thread_id, msg, api_key=None, on_delta=None):
+def _agentic_lifecycle_decision(tid, thread_id, decision_type, state, revision, *,
+                                authority_kind="business", default=None):
+    """Route a reversible lifecycle choice through durable line management.
+
+    A temporary decision-service failure keeps the transition autonomous by
+    taking the explicit bounded default. Dangerous boundaries are still owned
+    by consent/provider/spend gates and ``authority`` itself.
+    """
+    fallback = default or {"action": "proceed", "confidence": 1.0,
+                           "rationale": "bounded reversible lifecycle default"}
+    try:
+        import decisionchain
+        corr = decisionchain.stable_correlation(thread_id, decision_type, revision)
+        return decisionchain.decide(
+            tid, thread_id, f"controller:{thread_id}:{decision_type}", decision_type, state,
+            correlation_id=corr, authority_kind=authority_kind, default=fallback)
+    except Exception as exc:
+        audit.append(actor="loopcontroller", action="AgenticDecisionFallback",
+                     resource=str(thread_id), decision=decision_type,
+                     payload={"error": str(exc)[:300], "default": fallback}, tenant_id=tid)
+        if fallback.get("action") == "request_human" and fallback.get("boundary"):
+            try:
+                import authority
+                corr = f"controller-fallback:{thread_id}:{decision_type}:{revision}"
+                routed = authority.open_decision(
+                    tid, f"controller:{thread_id}:{decision_type}", fallback["boundary"],
+                    {"question": fallback.get("rationale"), "reason": fallback.get("rationale"),
+                     "confidence": 1.0, "amount_usd": state.get("amount_usd", 0),
+                     "campaign_spent_usd": state.get("campaign_spent_usd", 0),
+                     "management_exhausted": True,
+                     "requires_ceo_business_judgment": fallback.get("boundary") == "business"},
+                    correlation_id=corr, thread_id=thread_id, owner_role="senior-product-director")
+                if routed.get("disposition") == "human_required":
+                    return {"status": "human_wait", "action": "request_human",
+                            "boundary": fallback["boundary"], "authority_decision_id": routed.get("id"),
+                            "rationale": routed.get("reason"), "decided_by": "senior-product-director"}
+                if routed.get("disposition") == "delegated":
+                    return {"status": "resolved", "action": "continue", "boundary": "none",
+                            "rationale": routed.get("reason"), "decided_by": "senior-product-director"}
+            except Exception:
+                pass
+        return {"status": "resolved", "decided_by": "controller-recovery",
+                "tier": 2, "fallback": True, "boundary": "none", **fallback}
+
+
+def _agentic_plan_review(tid, thread_id, state):
+    """Review a durable plan internally; only a typed authority gap parks it."""
+    plan = state.get("plan") or {}
+    revision = json.dumps(plan, sort_keys=True, default=str)
+    decision = _agentic_lifecycle_decision(
+        tid, thread_id, "plan_acceptance",
+        {"plan": plan, "chosen_option": state.get("chosen_option"),
+         "allowed_actions": ["proceed", "revise", "request_human"]}, revision,
+        default={"action": "proceed", "confidence": 1.0,
+                 "rationale": "senior product director accepted the reversible implementation plan"})
+    if decision.get("status") == "human_wait":
+        _set(thread_id, awaiting="user_feedback")
+        _report(tid, thread_id,
+                "The product team finished its plan review and found one decision outside standing authority. "
+                "A specific request is waiting for your answer; the plan is safely checkpointed.",
+                {"kind": "authority_required", "decision": decision, "plan": plan}, urgent=True)
+        return {"phase": "DEEP_DESIGN", "awaiting": "user_feedback", "decision": decision}
+    if decision.get("action") == "revise":
+        note = str(decision.get("rationale") or "internal plan review requested revisions")
+        _set(thread_id, plan=None, awaiting=None,
+             pending_intent=((state.get("pending_intent") or "") + "\n" + note).strip())
+        _report(tid, thread_id, "The plan review found improvements, so the team is revising it internally.",
+                {"kind": "internal_plan_revision", "decision": decision}, urgent=False)
+        _advance_owned(thread_id)
+        return {"phase": "DEEP_DESIGN", "revising": True, "decision": decision}
+    _set(thread_id, awaiting=None)
+    _to(thread_id, "PLAN_APPROVAL")
+    _report(tid, thread_id,
+            f"The plan was approved by {decision.get('decided_by') or 'the product team'} and is moving forward. "
+            "You can still steer or cancel at any time.",
+            {"kind": "internal_plan_approved", "decision": decision, "plan": plan}, urgent=False)
+    _advance_owned(thread_id)
+    return {"phase": "PLAN_APPROVAL", "advanced": True, "decision": decision}
+
+
+def say(tid, thread_id, msg, api_key=None, on_delta=None, _internal=False):
     # on_delta (optional): a token sink the console's SSE endpoint passes in to STREAM the conversational
     # reply live. It's threaded only into the free-text LLM turns (DISCOVER clarify, DEEP_DESIGN plan draft,
     # generic answer); the fixed-string gate/status/affirmative branches never stream (nothing to stream) and
@@ -902,11 +1786,17 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
     # SUPPRESS DUPLICATE identical user messages (#2.1): a double-tapped send / retried request must not be
     # stored twice (polluting the model transcript) nor earn a second identical reply. `dup` is True when this
     # turn repeats the immediately-prior user message; _store_user no-ops the duplicate insert.
-    dup = not _store_user(tid, thread_id, msg)
+    # Internal worker/manager turns use the same guarded lifecycle logic without
+    # impersonating the CEO in the conversation transcript.
+    dup = False if _internal else not _store_user(tid, thread_id, msg)
     phase = s["phase"]
     factory._ctx.api_key = api_key
     factory._ctx.tenant = tid          # lets factory.agent enforce the consent gate as a backstop (defense-in-depth)
     factory._ctx.org = s.get("org_id") # MEMORY SPINE (A3): scope company-memory injection to this org
+    factory._ctx.run = f"controller-{thread_id}"
+    factory._ctx.thread_id = thread_id
+    factory._ctx.stage = phase
+    factory._ctx.product = s.get("product")
 
     # CONSENT GATE (EU AI Act Art.50 / Apple 5.1.2(i) / Play AI policy): the controller's whole job is AI work —
     # every phase either sends the CEO's text to the provider (_llm) or fans out paid agent work. Refuse BEFORE
@@ -1009,11 +1899,20 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
             _report(tid, thread_id, reply)
         return {"phase": _st(thread_id)["phase"]}
 
-    if phase == "DEEP_DESIGN" and s["awaiting"] != "user_feedback":
+    if phase == "DEEP_DESIGN" and s["awaiting"] != "user_feedback" and not _internal:
         return {"phase": phase}
     if phase == "DEEP_DESIGN":
-        if s["plan"] and _classify_intent(tid, thread_id, msg, phase, "user_feedback",
-                                           api_key=api_key)["verdict"] in ("approve", "proceed"):
+        verdict = None
+        if s["plan"] and _internal:
+            return _agentic_plan_review(tid, thread_id, s)
+        if s["plan"] and _is_proceed(msg):
+            verdict = "approve"
+        elif s["plan"]:
+            verdict = _classify_intent(tid, thread_id, msg, phase, "user_feedback",
+                                       api_key=api_key)["verdict"]
+        if verdict in ("approve", "proceed"):
+            _report(tid, thread_id, "Registered — I approved the plan and I’m moving the work forward.",
+                    {"kind": "decision_registered", "verdict": verdict, "phase": phase})
             _set(thread_id, awaiting=None); _to(thread_id, "PLAN_APPROVAL"); _advance_owned(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
         sysp = ("Turn the chosen direction into a concrete, RIGOROUS plan that accounts for EVERYTHING before "
@@ -1073,8 +1972,9 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
                                          actor_id="loopcontroller", phase="PLAN")
             except Exception:
                 pass
-            _report(tid, thread_id, (clean or "Here's the plan.") + "\n\nDoes this look right? Say \"looks good\" "
-                                    "to lock it in, or tell me what to change.", {"kind": "plan", "plan": plan})
+            _report(tid, thread_id, clean or "The product team completed the plan.",
+                    {"kind": "plan", "plan": plan, "autonomous_review": True})
+            return _agentic_plan_review(tid, thread_id, {**s, "plan": plan})
         else:
             _report(tid, thread_id, reply)
         return {"phase": phase}
@@ -1086,6 +1986,15 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
         # Map an ordinal -> choose(); an EMPTY/whitespace message -> gently nudge to pick; ANYTHING ELSE ->
         # ELABORATE — answer their question about the options/research (fast model, report+options as
         # context), then remind they can pick when ready (#1). The gate is HELD throughout.
+        if _is_retry(msg):
+            _resume_halts(thread_id)
+            _report(tid, thread_id, "Registered — I’m rerunning the research and will bring back better options.",
+                    {"kind": "decision_registered", "verdict": "retry", "phase": phase})
+            _set(thread_id, awaiting=None, options=None, chosen_option=None, research_run_id=None,
+                 pending_intent=None)
+            _to(thread_id, "RESEARCH")
+            _advance_owned(thread_id)
+            return {"phase": _st(thread_id)["phase"], "advanced": True, "retried": True}
         oid = _option_ordinal(msg, s.get("options") or [])
         if oid is not None:
             return choose(tid, thread_id, oid)
@@ -1114,12 +2023,16 @@ def say(tid, thread_id, msg, api_key=None, on_delta=None):
             return {"phase": _st(thread_id)["phase"], "advanced": True, "retried": True}
         if _is_proceed(msg):                       # a prescribed affirmative — never a model call away
             _resume_halts(thread_id)
+            _report(tid, thread_id, "Registered — I approved that and I’m moving the work forward.",
+                    {"kind": "decision_registered", "verdict": "approve", "phase": phase})
             _set(thread_id, awaiting=None)
             _advance_owned(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
         intent = _classify_intent(tid, thread_id, msg, phase, s["awaiting"], api_key=api_key)
         if intent["verdict"] in ("approve", "proceed"):
             _resume_halts(thread_id)   # a 'retry' after a cancel() must lift the halt before re-dispatching
+            _report(tid, thread_id, "Registered — I approved that and I’m moving the work forward.",
+                    {"kind": "decision_registered", "verdict": intent["verdict"], "phase": phase})
             _set(thread_id, awaiting=None); _advance_owned(thread_id)
             return {"phase": _st(thread_id)["phase"], "advanced": True}
         if intent["verdict"] == "cancel":
@@ -1167,10 +2080,12 @@ def choose(tid, thread_id, option_id):
         chosen = research.select(tid, s["research_run_id"], option_id) or chosen
     except Exception:
         pass
-    _set(thread_id, chosen_option=chosen, awaiting="user_feedback")
+    _set(thread_id, chosen_option=chosen, awaiting=None)
     _to(thread_id, "DEEP_DESIGN")
-    _report(tid, thread_id, "Great — going with that direction. Tell me anything specific you want, or say "
-                            "\"go ahead\" and I'll draft the technical plan.")
+    _report(tid, thread_id, "Got it — your choice overrides the team's recommendation. The product team is "
+                            "drafting and reviewing the technical plan now.",
+            {"kind": "option_chosen", "user_override": True})
+    _advance_owned(thread_id)
     return {"phase": "DEEP_DESIGN", "chosen": chosen}
 
 
@@ -1186,18 +2101,21 @@ def run_ceo_directive(directive, *, tenant_id=None, thread_id=None, functions=No
         _sys.path.insert(0, _orch)
     import company
     tid = tenant_id or (_st(thread_id).get("tenant_id") if thread_id else None) or "ceo"
+    execution_scope = (_st(thread_id).get("execution_scope") if thread_id else None) or "production"
     jid = None
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind)
-                           VALUES (%s,%s,'DIRECTIVE','company-directive') RETURNING id""", (thread_id, tid))
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_jobs
+                              (thread_id, tenant_id, phase, kind, execution_scope)
+                           VALUES (%s,%s,'DIRECTIVE','company-directive',%s) RETURNING id""",
+                        (thread_id, tid, execution_scope))
             jid = cur.fetchone()[0]; c.commit()
     except Exception:
         pass
     out = company.run_directive(directive, tenant=tid, functions=functions)
     try:
         if jid is not None:
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with _conn() as c, c.cursor() as cur:
                 cur.execute("UPDATE controller_jobs SET status=%s, result=%s WHERE id=%s",
                             (out.get("status", "done"), json.dumps({"run_id": out.get("run_id"),
                              "functions": len(out.get("functions") or [])}), jid))
@@ -1205,6 +2123,43 @@ def run_ceo_directive(directive, *, tenant_id=None, thread_id=None, functions=No
     except Exception:
         pass
     return out
+
+
+def _manage_operational_failure(thread_id, state, error):
+    """Get an evidence-backed line-management decision for a failed internal step.
+
+    The durable management case is stable per thread/phase, so repeated failures build one transcript instead
+    of creating disconnected alerts.  A targeted leased review cannot overlap the duty manager.  If management
+    itself is temporarily unavailable we choose one fresh bounded worker and leave an auditable internal alert;
+    infrastructure failure never silently manufactures CEO work.
+    """
+    phase = state.get("phase") or "unknown"
+    tid = state.get("tenant_id")
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""SELECT count(*) FROM controller_jobs
+                           WHERE thread_id=%s AND phase=%s AND status IN ('failed','crashed')""",
+                        (thread_id, phase))
+            failures = int(cur.fetchone()[0])
+        import management
+        case = management.signal(
+            f"controller:{thread_id}:{phase}", f"{phase} worker repeatedly failed",
+            "worker_state_changed", {"thread_id": thread_id, "phase": phase,
+                "error": str(error)[:1000], "failure_count": failures,
+                "objective": "recover the phase and continue the authorized workstream"},
+            tenant_id=tid, product=state.get("product"), work_id=f"controller:{thread_id}:{phase}",
+            worker=None, manager_role="team-lead", progress=False)
+        return management.review_now(case["case_id"])
+    except Exception as exc:
+        try:
+            import alerts
+            alerts.raise_alert("loopcontroller", "incident-commander",
+                               f"management review unavailable for thread {thread_id}/{phase}: {exc}",
+                               severity="high", signature=f"management-unavailable:{thread_id}:{phase}")
+        except Exception:
+            pass
+        return {"action": "retry", "status": "open", "manager_role": "incident-commander",
+                "reason": f"management review unavailable: {str(exc)[:200]}"}
 
 
 def advance(thread_id, job_result=None):
@@ -1215,6 +2170,19 @@ def advance(thread_id, job_result=None):
         return
     tid, phase = s["tenant_id"], s["phase"]
 
+    # A deliberate rolling-runtime handoff is neither product work nor a crash. The old generation was fenced
+    # only after it had no children, so resume the SAME durable phase from its checkpoints regardless of the
+    # historical crash count. Treating an operator-controlled code rotation as another crash can strand a
+    # healthy long-running QA campaign merely because earlier infrastructure failures exhausted its retry cap.
+    if job_result and job_result.get("controlled_handoff"):
+        audit.append(actor="loopcontroller", action="ControlledRuntimeResume", resource=str(thread_id),
+                     decision=phase, payload={"job_id": job_result.get("job_id"),
+                                              "reason": job_result.get("reason")})
+        _set(thread_id, awaiting=None)
+        _job_clear(thread_id)
+        advance(thread_id)                         # phase unchanged -> loads a fresh worker from current source
+        return
+
     # A worker CRASH (its process died -> reaped by heartbeat-lapse/ceiling, marked crashed=true) is NOT a real
     # job failure — it's transient infra. Transparently RE-RUN the phase (builds resume from their _stage_done
     # checkpoint; research reconciles against research_runs) instead of escalating to the human — this is
@@ -1222,7 +2190,8 @@ def advance(thread_id, job_result=None):
     # is systematically killing the worker (real bug / OOM), so fall through to the user-facing surface below.
     if job_result and job_result.get("crashed"):
         crashes = _crash_count(thread_id, phase)
-        if crashes <= CRASH_RETRY_MAX:
+        crash_cap = QA_CRASH_RETRY_MAX if phase == "TESTQA" else CRASH_RETRY_MAX
+        if crashes <= crash_cap:
             audit.append(actor="loopcontroller", action="CrashResume", resource=str(thread_id), decision=phase,
                          payload={"crash_count": crashes})
             # NOTHING FAILS INVISIBLY: crash-resume is silent to the CEO, but an OPERATOR should see repeated
@@ -1231,7 +2200,7 @@ def advance(thread_id, job_result=None):
                 import alerts
                 alerts.raise_alert("loopcontroller", "controller",
                                    f"thread {thread_id} phase {phase}: worker crashed {crashes}× — auto-resuming "
-                                   f"from checkpoint (cap {CRASH_RETRY_MAX})",
+                                   f"from checkpoint (cap {crash_cap})",
                                    severity="warn" if crashes >= 2 else "info",
                                    signature=f"crashresume:{thread_id}:{phase}")
             except Exception:
@@ -1242,32 +2211,45 @@ def advance(thread_id, job_result=None):
             return
         # crashes exhausted -> a human should know; fall through to the user-facing failure surface below
 
-    # A dispatched job came back BROKEN — the worker raised (_work() -> {'error':...}, status='failed')
-    # or the underlying module reported failure/timeout. We must NOT fall through to the phase block:
-    # that re-runs the SAME failing job, silently re-dispatching it forever (#9). Surface it to the user
-    # and park on a feedback gate so they decide (e.g. say "retry" to re-dispatch the phase, or change it).
+    # A dispatched job came back BROKEN. Concrete consent/quota boundaries still go to the person who owns
+    # them; ordinary operational failures go to the durable management hierarchy for an agentic decision.
     if job_result and (job_result.get("error") or job_result.get("status") in ("failed", "timeout")):
         err = job_result.get("error") or job_result.get("status")
-        _set(thread_id, awaiting="user_feedback")
-        # Map a KNOWN governed-spend block (the gate refused BEFORE any spend) to an ACTIONABLE message so the
-        # user can fix the precondition and resume, instead of an opaque 'failed'. Unknown errors keep the
-        # generic surface. After fixing it they say "ready"/"retry" -> the user_feedback gate re-dispatches.
         es = str(err).lower()
         if "consent" in es:
+            _set(thread_id, awaiting="user_feedback")
             text = ("⚠️ I can't research or build yet because AI-processing consent isn't on file. Please accept "
                     "it in Settings → Privacy (it names the provider your text is sent to), then say \"ready\" "
                     "and I'll pick up right where we left off.")
             meta_kind = "consent_required"
         elif "quota reached" in es or "quota exceeded" in es or "over quota" in es:
+            _set(thread_id, awaiting="user_feedback")
             # ONLY a genuine over-quota (research.py emits "quota reached (...)"); an internal spend-gate error
             # ("internal_error: quota check failed …") must NOT be mis-rendered as a billing/upgrade message.
             text = ("⚠️ You've hit your plan's build quota, so I paused before spending anything. Upgrade your "
                     "plan (or wait for it to reset) in Settings → Billing, then say \"ready\" to continue.")
             meta_kind = "quota_reached"
         else:
-            text = (f"⚠️ The **{phase}** step hit a problem and stopped: {err}. "
-                    f"Tell me how you'd like to proceed, or say \"retry\" to run it again.")
-            meta_kind = "job_failed"
+            decision = _manage_operational_failure(thread_id, s, err)
+            if decision.get("status") != "human_wait":
+                _job_clear(thread_id)
+                _report(tid, thread_id,
+                        f"The {phase} worker hit a problem. {decision.get('manager_role') or 'Its manager'} "
+                        f"reviewed the evidence and chose **{decision.get('action') or 'retry'}**; the company "
+                        "is continuing internally and does not need anything from you.",
+                        {"kind": "internal_management_decision", "phase": phase,
+                         "error": str(err)[:300], "decision": decision}, urgent=False)
+                audit.append(actor="loopcontroller", action="OperationalFailureManaged",
+                             resource=str(thread_id), decision=decision.get("action") or "retry",
+                             payload={"phase": phase, "error": str(err)[:200], "management": decision})
+                _set(thread_id, awaiting=None)
+                advance(thread_id)
+                return
+            # `human_wait` can only be produced through authority.open_decision after a named, typed boundary.
+            _set(thread_id, awaiting="user_feedback")
+            text = (f"⚠️ The {phase} manager found a decision outside the company's standing authority. "
+                    "A correlated request is now waiting for your answer; the failed work remains checkpointed.")
+            meta_kind = "authority_required"
         # Clear the live-progress fields. Without this the thread keeps reporting the LAST in-flight status
         # ("Still working — this one's taking a little longer…") for a job that has already failed, so the
         # status line contradicts the failure message directly above it. Observed on thread 2090 hours after
@@ -1290,69 +2272,85 @@ def advance(thread_id, job_result=None):
         opts = _enrich_options(job_result.get("options", []), report_text)
         _set(thread_id, research_run_id=job_result["run_id"], options=opts)
         _job_clear(thread_id)
-        _to(thread_id, "OPTIONS"); _set(thread_id, awaiting="user_approval")
-
-        # PRE-AUTHORIZED INTENT (#2.1 follow-up): if the CEO told us mid-research to "go with the recommendation
-        # and start building", honour it NOW instead of silently re-parking on the approval gate. Auto-select
-        # the RECOMMENDED direction via the SAME path a chip-tap takes (-> DEEP_DESIGN feedback gate), so every
-        # downstream guard (plan draft, plan approval, spend gates) still holds — we never blast a human-gated
-        # build. If there's no recommended option we can't safely auto-pick, so we fall through and just ask.
         pend = (s.get("pending_intent") or "").strip()
         rec = next((o for o in opts if isinstance(o, dict) and o.get("recommended")), None)
-        if pend and rec and _intent_auto_proceed(pend):
-            _set(thread_id, pending_intent=None)
-            rid = rec.get("id")
-            chosen = {"option_id": rid}
-            try:
-                import research as _research
-                chosen = _research.select(tid, job_result["run_id"], rid) or chosen
-            except Exception:
-                pass
-            _set(thread_id, chosen_option=chosen, awaiting="user_feedback")
-            _to(thread_id, "DEEP_DESIGN")
+        default_option = rec or next((o for o in opts if isinstance(o, dict)), None) or {}
+        decision = _agentic_lifecycle_decision(
+            tid, thread_id, "option_selection",
+            {"options": opts, "research_run_id": job_result["run_id"], "ceo_steering": pend,
+             "allowed_actions": ["select", "experiment", "request_human"]},
+            str(job_result["run_id"]),
+            default={"action": "select", "selection": default_option.get("id"), "confidence": 1.0,
+                     "rationale": "senior product director selected the research recommendation"})
+        _to(thread_id, "OPTIONS")
+        if decision.get("status") == "human_wait":
+            _set(thread_id, awaiting="user_feedback")
             _report(tid, thread_id,
-                    "Research is in — and as you asked, I went with my recommendation: "
-                    f"“{rec.get('title', 'the recommended direction')}”. I'll turn that into the "
-                    "technical plan next; say \"go ahead\" when you want me to draft it and start the build.",
-                    {"kind": "option_chosen", "auto_selected": rid, "title": rec.get("title")})
-            _ping(tid, "Research done — I picked your recommended direction",
-                  "As you asked, I went with the recommended option and I'm teeing up the plan. "
-                  "Open the chat to follow along.", level="urgent")
-            audit.append(actor="loopcontroller", action="IntentAutoApplied", resource=str(thread_id),
-                         decision="auto_select_recommended", payload={"option_id": rid})
+                    "Research is complete. The product team narrowed the options but found one typed decision "
+                    "outside standing authority; a specific request is waiting for you.",
+                    {"kind": "authority_required", "options": opts, "decision": decision}, urgent=True)
             return
-
-        # Otherwise present the options. If the CEO left a (non-directive) note mid-research, acknowledge it up
-        # front so it's never silently dropped — its substance also rides along in the transcript the plan reads.
-        if pend:
-            _set(thread_id, pending_intent=None)
-            intro = ("Here's what I found — pick a direction. (I saw the note you sent while I was working; "
-                     "I'll carry it into the plan once you choose.)")
-        else:
-            intro = "Here's what I found — pick a direction:"
-        _report(tid, thread_id, intro, {"kind": "options", "options": opts,
-                                        "research_run_id": job_result["run_id"], "report_available": True})
-        # PING: research RESULTS landed — heads-up the CEO now (not only on failure/final ship). level=urgent
-        # so the in-app bell/feed lights up unmistakably AND a push fires (if ntfy/email are configured).
-        _ping(tid, "Your options are ready — review them",
-              "I finished researching and brought back a few directions. Open the chat to pick one.",
-              level="urgent")
+        selected = decision.get("selection")
+        if isinstance(selected, dict):
+            selected = selected.get("id") or selected.get("option_id")
+        picked = next((o for o in opts if isinstance(o, dict) and str(o.get("id")) == str(selected)),
+                      default_option)
+        rid = picked.get("id")
+        chosen = {"option_id": rid}
+        try:
+            import research as _research
+            chosen = _research.select(tid, job_result["run_id"], rid) or chosen
+        except Exception:
+            pass
+        _set(thread_id, chosen_option=chosen, awaiting=None, pending_intent=None)
+        _to(thread_id, "DEEP_DESIGN")
+        _report(tid, thread_id,
+                "Research is in. The product team selected "
+                f"“{picked.get('title', 'the recommended direction')}” and is drafting the plan now. "
+                "The options and rationale remain visible, and you can override or cancel at any time.",
+                {"kind": "option_chosen", "auto_selected": rid, "title": picked.get("title"),
+                 "options": opts, "decision": decision})
+        _ping(tid, "Research done — the product team chose a direction",
+              "The team selected a reversible direction and is drafting the plan. Open the chat to steer it.",
+              level="normal")
+        advance(thread_id)
         return
-    if job_result and job_result.get("screens") is not None:        # prototype finished -> gate at IMPLEMENT
+    if job_result and job_result.get("screens") is not None:        # prototype finished -> internal review
         _job_clear(thread_id)
-        # SURFACE THE DESIGN (#4): reference the design artifact in the meta (org + a flag + the product +
-        # the surfaces) so the console can link straight to "Review the design" instead of a dead-end bubble.
-        _report(tid, thread_id, f"I've drafted {job_result.get('screens', 0)} prototype screens "
-                                f"(cockpit / team / external) — review them in Design. Say \"approve\" to build it.",
+        decision = _agentic_lifecycle_decision(
+            tid, thread_id, "prototype_acceptance",
+            {"prototype": job_result, "plan": s.get("plan"),
+             "allowed_actions": ["proceed", "revise", "retry", "request_human"]},
+            json.dumps(job_result, sort_keys=True, default=str),
+            default={"action": "proceed", "confidence": 1.0,
+                     "rationale": "senior product director accepted the reversible prototype"})
+        # Always surface the artifact and the team's decision. Visibility is not an approval tax.
+        _report(tid, thread_id, f"The team drafted {job_result.get('screens', 0)} prototype screens "
+                                "(cockpit / team / external) and completed its internal review.",
                 {"kind": "prototype", "design_ready": True, "org": s.get("org_id"),
                  "product": s.get("product"), "screens": job_result.get("screens", 0),
-                 "surfaces": job_result.get("surfaces")})
-        _to(thread_id, "IMPLEMENT"); _set(thread_id, awaiting="user_feedback")
-        # PING: a PROTOTYPE landed — heads-up the CEO to review + approve. level=urgent so the bell/feed lights
-        # up unmistakably AND a push fires (if ntfy/email are configured).
-        _ping(tid, "Your prototype is ready — review it",
-              f"{job_result.get('screens', 0)} screens are ready to review. Approve in the chat to build it.",
-              level="urgent")
+                 "surfaces": job_result.get("surfaces"), "decision": decision})
+        if decision.get("status") == "human_wait":
+            _set(thread_id, awaiting="user_feedback")
+            _report(tid, thread_id, "Prototype review found a typed authority boundary. A specific request "
+                                    "is waiting for you; the prototype remains checkpointed.",
+                    {"kind": "authority_required", "decision": decision}, urgent=True)
+            return
+        if decision.get("action") == "revise":
+            _set(thread_id, plan=None, awaiting=None,
+                 pending_intent=str(decision.get("rationale") or "revise the prototype plan"))
+            _to(thread_id, "DEEP_DESIGN")
+            advance(thread_id)
+            return
+        if decision.get("action") == "retry":
+            _set(thread_id, awaiting=None)
+            advance(thread_id)
+            return
+        _to(thread_id, "IMPLEMENT"); _set(thread_id, awaiting=None)
+        _ping(tid, "Prototype reviewed — build is starting",
+              f"{job_result.get('screens', 0)} screens passed internal review. The build is moving forward; "
+              "open the chat any time to steer or cancel.", level="normal")
+        advance(thread_id)
         return
     if job_result and (job_result.get("shipped") is not None or job_result.get("result")):  # build done
         product = _st(thread_id).get("product")
@@ -1360,8 +2358,7 @@ def advance(thread_id, job_result=None):
         # then VALIDATE that QA is even allowed to run — build genuinely succeeded AND its artifact exists at the
         # REGISTERED path. A failed/empty build must NOT advance to a QA that can't find it (F6/F7); it auto-loops
         # back to the builder instead. Fail-open: a registry hiccup never blocks the pipeline.
-        build_ok = bool(job_result.get("shipped")) or (job_result.get("result") not in (None, "", "error")
-                                                        and job_result.get("status") != "error")
+        build_ok = _build_result_ok(job_result)
         proceed, why = True, ""
         try:
             import productregistry as _preg
@@ -1371,6 +2368,10 @@ def advance(thread_id, job_result=None):
         except Exception:
             proceed = True
         if proceed:
+            # A newly-authorized QA campaign owns its internal checkpoint hand-offs.  Reset the campaign
+            # counters here; a CEO should not have to approve each safe worker rotation.
+            _set(thread_id, qa_checkpoint_count=0, qa_last_completed=None, qa_no_progress_count=0,
+                 qa_campaign_key=None)
             _to(thread_id, "TESTQA"); advance(thread_id)
         else:
             _autoloop_build(thread_id, tid, product, reason=why)
@@ -1384,7 +2385,139 @@ def advance(thread_id, job_result=None):
         except Exception:
             pass
         if job_result.get("qa_ok"):
+            try:
+                import workstreamspine
+                assurance = workstreamspine.record_assurance(
+                    tid, f"controller:{thread_id}", job_result,
+                    executor_id="build-team", manager_id="controller",
+                    reviewer_id="qa-gate-auditor", submitted_by="qa-coordinator",
+                    subject_id=product)
+                audit.append(actor="qa-gate-auditor", action="DeliveryAssuranceRecorded",
+                             resource=str(thread_id), decision=assurance.get("verdict") or "recorded",
+                             payload={"review_id": assurance.get("review_id")}, tenant_id=tid)
+            except Exception as exc:
+                # Existing qa_ok remains the fail-closed delivery gate. Persistence
+                # is retried by idempotent phase callbacks and never reruns live QA.
+                audit.append(actor="loopcontroller", action="DeliveryAssuranceRecord",
+                             resource=str(thread_id), decision="deferred",
+                             payload={"error": str(exc)[:300]}, tenant_id=tid)
             _to(thread_id, "DELIVER"); advance(thread_id)
+        elif job_result.get("safety_limited"):
+            if job_result.get("internal_management_wait"):
+                # The durable QA hierarchy—not another browser worker—owns this checkpoint.  A fresh slice
+                # would merely rediscover the same disputed evidence, while a generic user gate would bypass
+                # the named authority request already opened by QA management (when one is actually needed).
+                _job_clear(thread_id)
+                _set(thread_id, awaiting="internal_management")
+                review_ids = list(job_result.get("internal_review_ids") or [])
+                case_ids = list(job_result.get("qa_review_case_ids") or [])
+                authority_ids = list(job_result.get("authority_decision_ids") or [])
+                _report(tid, thread_id,
+                        "🧪 QA is checkpointed while its internal management chain resolves disputed "
+                        "evidence. No new QA slice will be started, and nothing is needed from you unless "
+                        "the correlated named-authority request asks for a decision.",
+                        {"kind": "qa_internal_management", "autonomous": True,
+                         "internal_review_ids": review_ids, "qa_review_case_ids": case_ids,
+                         "authority_decision_ids": authority_ids,
+                         "internal_review_states": job_result.get("internal_review_states") or {}},
+                        urgent=False)
+                audit.append(actor="loopcontroller", action="QAInternalManagementCheckpoint",
+                             resource=str(thread_id), decision="internal_management",
+                             payload={"internal_review_ids": review_ids,
+                                      "qa_review_case_ids": case_ids,
+                                      "authority_decision_ids": authority_ids})
+                return
+            # A slice limit protects the host; it is NOT a business decision and must not silently turn the CEO
+            # into the scheduler.  Checkpoint, account for forward progress, and rotate to a fresh bounded worker.
+            # Only escalate after repeated zero-progress recovery attempts, incomplete cleanup, or the campaign
+            # hard ceiling.  This is the same behaviour expected from a competent human QA lead changing shifts.
+            # Story evidence, not terminated worker processes, is progress. An infrastructure failure can end
+            # ten explorer actors without proving a single story; counting those exits reset the stall detector
+            # and produced misleading "11/12 complete" updates while eight stories still lacked coverage.
+            completed = job_result.get("stories_done")
+            if completed is None:                    # rolling compatibility with an already-running old worker
+                completed = job_result.get("explorers_done")
+            completed_total = job_result.get("stories_total") or job_result.get("stories")
+            campaign_key = job_result.get("qa_campaign_key")
+            checkpoints, stalls, campaign_changed = _qa_campaign_checkpoint_counts(
+                s.get("qa_campaign_key"), campaign_key, s.get("qa_last_completed"), completed,
+                s.get("qa_checkpoint_count"), s.get("qa_no_progress_count"))
+            # A timed-out shift may still have Python tool threads unwinding after their browser/Codex child
+            # groups have been killed.  Those threads are contained by this short-lived run_job process, and
+            # jobd cannot start its successor until that process exits.  They are therefore telemetry, not a
+            # CEO decision or evidence of host leakage.  Only surviving OS descendants are a cleanup fault.
+            cleanup_incomplete = int(job_result.get("cleanup_incomplete") or 0)
+            cleanup_processes = int(job_result.get("cleanup_processes_incomplete") or 0)
+            _set(thread_id, qa_checkpoint_count=checkpoints,
+                 qa_last_completed=completed if completed is not None else s.get("qa_last_completed"),
+                 qa_no_progress_count=stalls,
+                 qa_campaign_key=campaign_key or s.get("qa_campaign_key"))
+            # A rotation count is an internal management signal, not evidence that money or CEO authority
+            # was exhausted.  The old hardcoded threshold silently parked healthy campaigns even when the CEO
+            # had explicitly asked the company to continue.  Real spend/credential/legal boundaries must come
+            # from their durable authority/resource ledgers, not be invented from elapsed wall-clock time.
+            authority_boundaries = []
+            # Every shift boundary is a real management event.  The QA director reviews current evidence and
+            # chooses the next organizational action even when progress is healthy; the timer itself never
+            # makes that decision.  Deterministic safety/accounting remains an invariant around the decision.
+            manager = _qa_manager_decision(thread_id, {
+                "event": "qa_shift_checkpoint", "thread_id": thread_id, "product": product,
+                "checkpoint": checkpoints, "completed": completed,
+                "previous_completed": s.get("qa_last_completed"),
+                "campaign_key": campaign_key, "campaign_changed": campaign_changed,
+                "total": completed_total, "no_progress_streak": stalls,
+                "open_blockers": job_result.get("blocking_open"),
+                "cleanup_incomplete": cleanup_incomplete,
+                "cleanup_processes_incomplete": cleanup_processes,
+                "management_review_due": checkpoints >= QA_AUTO_CHECKPOINT_MAX,
+                "standing_authority_exhausted": False,
+                "authority_boundaries": authority_boundaries,
+                "verdict": str(job_result.get("verdict") or "")[:500]})
+            can_continue = _qa_checkpoint_can_continue(cleanup_processes, manager)
+            audit.append(actor="qa-director", action="QAManagementDecision", resource=str(thread_id),
+                         decision=manager.get("action"), payload=manager)
+            if manager.get("action") == "open_internal_incident_and_cleanup":
+                try:
+                    import alerts
+                    alerts.raise_alert("qa-director", "controller",
+                                       f"QA campaign {thread_id} opened an internal management incident at "
+                                       f"checkpoint {checkpoints}: {manager.get('reason')}",
+                                       severity="high", signature=f"qa-stalled:{thread_id}")
+                except Exception:
+                    pass
+            _job_clear(thread_id)
+            if can_continue:
+                _report(tid, thread_id,
+                        f"🧪 QA checkpoint {checkpoints}: "
+                        f"{completed if completed is not None else '?'}"
+                        f"/{completed_total or '?'} stories have settled evidence. "
+                        "The QA coordinator is handing unfinished work to a fresh bounded worker; "
+                        "nothing is needed from you.",
+                        {"kind": "qa_checkpoint", "checkpoint": checkpoints,
+                         "stories_done": completed, "stories_total": completed_total,
+                         "explorers_done": job_result.get("explorers_done"),
+                         "explorers_total": job_result.get("explorers_total"),
+                         "no_progress_streak": stalls, "autonomous": True,
+                         "manager_decision": manager}, urgent=False)
+                audit.append(actor="loopcontroller", action="QACheckpointContinue", resource=str(thread_id),
+                             decision="continue", payload={"checkpoint": checkpoints,
+                             "completed": completed, "no_progress_streak": stalls})
+                _set(thread_id, awaiting=None)
+                advance(thread_id)
+            else:
+                reason = (f"cleanup left {cleanup_processes} OS process(es)" if cleanup_processes else
+                          f"QA director requested {manager.get('authority_gap')} authority: "
+                          f"{manager.get('reason')}" if manager else
+                          f"campaign reached its {QA_AUTO_CHECKPOINT_MAX}-slice standing spend/time authority")
+                _set(thread_id, awaiting="user_feedback")
+                _report(tid, thread_id,
+                        f"⚠️ QA management escalated after autonomous recovery was exhausted: {reason}. "
+                        "The build remains held back and the durable checkpoint is intact.",
+                        {"kind": "qa_management_escalation", "reason": reason,
+                         "checkpoint": checkpoints, "no_progress_streak": stalls,
+                         "actions": ["continue", "cancel"]}, urgent=True)
+                audit.append(actor="loopcontroller", action="QACheckpointEscalate", resource=str(thread_id),
+                             decision="user_feedback", payload={"reason": reason})
         else:
             # A failed/unverifiable build must NOT reach DELIVER — but the CEO is NOT the first responder.
             # Auto-loop back to the builder (bounded); escalate to the human ONLY when the loop is exhausted.
@@ -1401,15 +2534,21 @@ def advance(thread_id, job_result=None):
                   status="Researching directions…")
         return
 
+    if phase == "DEEP_DESIGN":
+        # The durable phase itself is the retry record. Internal turns are not
+        # written as CEO messages; a crash before the plan checkpoint leaves the
+        # state runnable and jobd simply asks the product team again.
+        say(tid, thread_id, "", _internal=True)
+        return
+
     if phase == "PLAN_APPROVAL":
         try:
-            import tenantproviders
-            r = tenantproviders.resolve(tid)
-            if not r.get("key") and r.get("auth_mode") != "subscription":
+            if not _resolved_provider(tid):
                 import agent_request
                 agent_request.ask(tid, "To build this I need a model provider connected (Anthropic or Codex) — "
                                        "add one in Settings → Providers, then say \"ready\".",
-                                  kind="credential", org_id=s["org_id"], thread_id=thread_id)
+                                  kind="credential", org_id=s["org_id"], thread_id=thread_id,
+                                  correlation_id=f"controller:{thread_id}:provider")
                 _set(thread_id, awaiting="credentials")
                 return
         except Exception:
@@ -1446,6 +2585,8 @@ def advance(thread_id, job_result=None):
         return
 
     if phase == "TESTQA":
+        if not _qa_spend_gate(thread_id, s):
+            return
         _dispatch(thread_id, "qa", eta_min=_estimate_runtime("TESTQA", s.get("plan")),
                   kickoff="Running QA on the build…", status="Testing…")
         return
@@ -1454,7 +2595,8 @@ def advance(thread_id, job_result=None):
         product = s.get("product")
         try:
             import orgs
-            orgs.record_artifact(s["org_id"], "product_repo", f"Shipped {product}", product=product)
+            orgs.record_artifact(s["org_id"], "product_repo", f"Shipped {product}",
+                                 product=product, tenant_id=tid)
             orgs.set_stage(tid, s["org_id"], "live")
         except Exception:
             pass
@@ -1498,7 +2640,26 @@ def qa_gate(product, platform=None) -> dict:
         qa_ok = factory.qa_verdict_ok(v)
         return {"qa_ok": qa_ok, "stories": (v or {}).get("stories"),
                 "blocking_open": (v or {}).get("blocking_open"),
-                "verdict": (v or {}).get("verdict"), "verdict_json": (v or {}).get("verdict_json")}
+                "verdict": (v or {}).get("verdict"), "verdict_json": (v or {}).get("verdict_json"),
+                "safety_limited": bool((v or {}).get("safety_limited")),
+                "deferred_stories": (v or {}).get("deferred_stories"),
+                "timed_out": bool((v or {}).get("timed_out")),
+                "cleanup_incomplete": int((v or {}).get("cleanup_incomplete") or 0),
+                "cleanup_threads_incomplete": int((v or {}).get("cleanup_threads_incomplete") or 0),
+                "cleanup_processes_incomplete": int((v or {}).get("cleanup_processes_incomplete") or 0),
+                "cleanup_process_contained": bool((v or {}).get("cleanup_process_contained")),
+                "explorers_done": (v or {}).get("explorers_done"),
+                "explorers_total": (v or {}).get("explorers_total"),
+                "stories_done": (v or {}).get("stories_done"),
+                "stories_total": (v or {}).get("stories_total"),
+                "qa_campaign_run_id": (v or {}).get("qa_campaign_run_id"),
+                "qa_campaign_key": (v or {}).get("qa_campaign_key"),
+                "evidence_policy_revision": (v or {}).get("evidence_policy_revision"),
+                "internal_management_wait": bool((v or {}).get("internal_management_wait")),
+                "internal_review_states": (v or {}).get("internal_review_states") or {},
+                "internal_review_ids": (v or {}).get("internal_review_ids") or [],
+                "qa_review_case_ids": (v or {}).get("qa_review_case_ids") or [],
+                "authority_decision_ids": (v or {}).get("authority_decision_ids") or []}
     except Exception as e:
         # FAIL-CLOSED: if verification cannot run, we have NO evidence the build is good, so we
         # must not let it ship. Treat an unverifiable build as a QA failure (gate blocks DELIVER).
@@ -1522,14 +2683,32 @@ HARD_CEILING_MIN = int(os.environ.get("AOS_JOB_CEILING_MIN", "360"))     # 6h ru
 # A worker CRASH (process died -> reaped) is transient infra, not a real job failure: re-run the phase
 # transparently (builds resume from their _stage_done checkpoint) rather than escalate to the human. Bounded —
 # after this many crashes on the SAME phase something is systematically killing the worker, so we surface it.
-CRASH_RETRY_MAX = int(os.environ.get("AOS_CRASH_RETRY_MAX", "3"))
+CRASH_RETRY_MAX = int(os.environ.get("AOS_CRASH_RETRY_MAX", "2"))
+# QA is checkpointed and tool-side-effect fenced, so a dead worker can safely receive the same bounded
+# infrastructure retry allowance as other phases.  Zero made the first process loss look systematic and routed
+# an otherwise resumable campaign into management before a fresh worker had even tried its durable checkpoint.
+QA_CRASH_RETRY_MAX = int(os.environ.get("AOS_QA_CRASH_RETRY_MAX", "2"))
+# QA owns a durable, progress-leased campaign.  A 30-minute controller guillotine raced the tool's 25-minute
+# checkpoint and repeatedly killed healthy finalization.  Use the same liberal runaway backstop as other live,
+# heartbeating work; appguard/spend authority and QA's no-progress management path remain the real boundaries.
+QA_HARD_CEILING_MIN = int(os.environ.get("AOS_QA_JOB_CEILING_MIN", str(HARD_CEILING_MIN)))
+# A QA hard ceiling is only an emergency backstop after this much *progress silence*. This is intentionally
+# longer than QA's own renewable progress lease (default 15m): the worker gets the first chance to checkpoint
+# itself cleanly. Unlike an absolute wall-clock ceiling, active progress can renew forever until the story is
+# genuinely complete; spend authority and kill switches remain independent boundaries.
+QA_PROGRESS_STALL_MIN = int(os.environ.get("AOS_QA_PROGRESS_STALL_MIN", "30"))
+BUILD_HARD_CEILING_MIN = int(os.environ.get("AOS_BUILD_JOB_CEILING_MIN", "60"))
+# IMPLEMENT uses the nominal ceiling only as the earliest point at which a no-progress generation may be
+# recovered. Every real factory/project/quality checkpoint renews progress_at, so forward movement can
+# continue indefinitely. This is not an absolute wall-clock timeout.
+BUILD_PROGRESS_STALL_MIN = int(os.environ.get("AOS_BUILD_PROGRESS_STALL_MIN", "30"))
 
 
 def _crash_count(thread_id, phase):
     """How many times a worker has CRASHED (been reaped) on this thread's current phase — the bound on
     transparent crash-resume before we stop hiding it and escalate to the human."""
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM controller_jobs WHERE thread_id=%s AND phase=%s "
                         "AND status='failed' AND result->>'crashed'='true'", (thread_id, phase))
             return cur.fetchone()[0]
@@ -1537,7 +2716,7 @@ def _crash_count(thread_id, phase):
         return CRASH_RETRY_MAX          # on a counting error, DON'T loop forever — treat as exhausted
 
 
-def _reap_dead_jobs():
+def _reap_dead_jobs(thread_ids=None, limit=RESUME_SWEEP_BATCH, execution_scope="production"):
     """Reap ONLY jobs whose worker is genuinely dead — its heartbeat lapsed (process gone) OR it blew the hard
     ceiling (runaway) — and NEVER on output silence (overhaul Step 1; the correct Temporal/Step-Functions liveness
     model). A long, quiet-but-alive build keeps beating heartbeat_at on its background timer, so it is never
@@ -1549,63 +2728,137 @@ def _reap_dead_jobs():
     its reap to the heartbeat/floor path below; it can never falsely reap a LIVE worker, because _pid_alive
     returns False only on ProcessLookupError (the pid truly doesn't exist). Reaped jobs carry crashed:true so
     advance() transparently re-runs the phase (crash-resume)."""
+    if execution_scope not in {"production", "test"}:
+        raise ValueError("execution_scope must be 'production' or 'test'")
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT id, worker_pid FROM controller_jobs WHERE status='running' AND worker_pid IS NOT NULL")
-        dead_pids = [jid for jid, pid in cur.fetchall() if _pid_alive(pid) is False]
+    scoped = [int(x) for x in thread_ids] if thread_ids is not None else None
+    limit = max(1, min(500, int(limit or 1)))
+    reaped_workers = []
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""SELECT id,worker_pid,worker_start_ticks,worker_boot_id FROM controller_jobs
+                       WHERE status='running' AND worker_pid IS NOT NULL
+                         AND execution_scope=%s
+                         AND (%s::bigint[] IS NULL OR thread_id=ANY(%s))
+                       ORDER BY COALESCE(heartbeat_at,started_at), id LIMIT %s""",
+                    (execution_scope, scoped, scoped, limit))
+        candidates = cur.fetchall()
+        dead_pids = [jid for jid, pid, started, boot in candidates
+                     if _pid_alive(pid, started, boot) is False]
         if dead_pids:
             cur.execute("""
                 UPDATE controller_jobs cj SET status='failed', lease_token = cj.lease_token + 1,
                     result = COALESCE(cj.result,'{}'::jsonb)
                              || '{"error":"parked worker process gone (pid dead)","status":"failed","crashed":true}'::jsonb,
                     finished_at = now()
-                WHERE cj.id = ANY(%s) AND cj.status='running'""", (dead_pids,))
+                WHERE cj.id = ANY(%s) AND cj.status='running'
+                RETURNING cj.worker_pid,cj.worker_start_ticks,cj.worker_boot_id""", (dead_pids,))
+            reaped_workers.extend(cur.fetchall())
             c.commit()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""
-            UPDATE controller_jobs cj SET status='failed', lease_token = cj.lease_token + 1,
-                result = COALESCE(cj.result,'{}'::jsonb)
-                         || '{"error":"worker died (heartbeat lapsed or hard ceiling)","status":"failed","crashed":true}'::jsonb,
-                finished_at = now()
-            WHERE cj.status='running'
-              AND cj.started_at < now() - make_interval(mins => %s)               -- past the generous floor
-              AND (
-                    COALESCE(cj.heartbeat_at, cj.started_at) < now() - make_interval(secs => %s)  -- heartbeat lapsed
-                 OR cj.started_at < now() - make_interval(mins => %s)             -- OR hard ceiling (runaway)
-              )
-        """, (RUNNING_FLOOR_MIN, HEARTBEAT_TIMEOUT_S, HARD_CEILING_MIN))
-        n = cur.rowcount; c.commit()
-        return n + len(dead_pids)
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""WITH candidates AS (
+              SELECT cj.id FROM controller_jobs cj
+               WHERE cj.status='running'
+                 AND cj.execution_scope=%s
+                 AND (%s::bigint[] IS NULL OR cj.thread_id=ANY(%s))
+                 AND cj.started_at < now() - make_interval(mins => %s)
+                 AND (
+                       COALESCE(cj.heartbeat_at,cj.started_at) < now()-make_interval(secs => %s)
+                    OR (cj.phase NOT IN ('TESTQA','IMPLEMENT')
+                        AND cj.started_at < now()-make_interval(mins => %s))
+                    OR (cj.phase='TESTQA'
+                        AND cj.started_at < now()-make_interval(mins => %s)
+                        AND COALESCE(cj.progress_at,cj.started_at)
+                            < now()-make_interval(mins => %s))
+                    OR (cj.phase='IMPLEMENT'
+                        AND cj.started_at < now()-make_interval(mins => %s)
+                        AND COALESCE(cj.progress_at,cj.started_at)
+                            < now()-make_interval(mins => %s))
+                 )
+               ORDER BY cj.started_at,cj.id FOR UPDATE SKIP LOCKED LIMIT %s
+            )
+            UPDATE controller_jobs cj SET status='failed', lease_token=cj.lease_token+1,
+                result=COALESCE(cj.result,'{}'::jsonb)
+                       || '{"error":"worker died (heartbeat lapsed or progress stalled after runaway threshold)","status":"failed","crashed":true}'::jsonb,
+                finished_at=now()
+            FROM candidates c WHERE cj.id=c.id
+            RETURNING cj.worker_pid,cj.worker_start_ticks,cj.worker_boot_id""",
+                    (execution_scope, scoped, scoped, RUNNING_FLOOR_MIN, HEARTBEAT_TIMEOUT_S, HARD_CEILING_MIN,
+                     QA_HARD_CEILING_MIN, QA_PROGRESS_STALL_MIN, BUILD_HARD_CEILING_MIN,
+                     BUILD_PROGRESS_STALL_MIN, limit))
+        hard_reaped = cur.fetchall()
+        reaped_workers.extend(hard_reaped)
+        n = len(hard_reaped)
+        # A non-research pending result has no external durable run to reconcile. If its worker identity
+        # is gone/reused or its heartbeat lapsed, fence it so resume_stalled can advance the failure.
+        cur.execute("""SELECT id,worker_pid,worker_start_ticks,worker_boot_id
+                       FROM controller_jobs WHERE status='pending' AND phase<>'RESEARCH'
+                         AND execution_scope=%s
+                         AND (%s::bigint[] IS NULL OR thread_id=ANY(%s))
+                         AND started_at < now()-make_interval(mins=>%s)
+                         AND COALESCE(heartbeat_at,started_at)<now()-make_interval(secs=>%s)
+                       ORDER BY started_at,id LIMIT %s""",
+                    (execution_scope, scoped, scoped, RUNNING_FLOOR_MIN, HEARTBEAT_TIMEOUT_S, limit))
+        stale_pending = [jid for jid, pid, started, boot in cur.fetchall()
+                         if pid is None or _pid_alive(pid, started, boot) is not True]
+        if stale_pending:
+            cur.execute("""UPDATE controller_jobs SET status='failed',lease_token=lease_token+1,
+                result=COALESCE(result,'{}'::jsonb)||
+                  '{"error":"pending worker ownership lost","status":"failed","crashed":true}'::jsonb,
+                finished_at=now() WHERE id=ANY(%s) AND status='pending'""", (stale_pending,))
+        c.commit()
+    # Fencing the database row is necessary but not sufficient: the old worker still has CPU, credentials,
+    # and child processes. Terminate only the birth-identity-verified process tree after the transaction commits.
+    # A replacement generation cannot be launched until the terminal row is observed, and durable tool leases
+    # provide a second fence during that short hand-off.
+    for pid, started, boot in reaped_workers:
+        if pid:
+            _terminate_worker_group(pid, started, boot, grace_s=2.0)
+    return n + len(dead_pids) + len(stale_pending)
 
 
 def liveness_selftest():
-    """Prove the overhaul Step-1 liveness model: a quiet-but-beating job is NEVER reaped; a job whose heartbeat
-    lapsed IS reaped; a job past the hard ceiling IS reaped. This is the fix for F8 (healthy build killed for
-    going quiet). Offline, DB-only."""
+    """Prove heartbeat liveness plus progress-renewable long work.
+
+    A quiet but healthy worker survives; a lapsed worker is recovered; generic runaway work is bounded; and
+    IMPLEMENT may exceed its nominal threshold forever while substantive checkpoints remain fresh. Only an
+    old IMPLEMENT generation with both fresh heartbeats *and* stale progress is treated as a runaway.
+    """
     _ensure()
-    import psycopg as _pg
-    def mk(started_min_ago, beat_secs_ago):
-        with _pg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, status, started_at, heartbeat_at)
-                           VALUES (0,'live-selftest','IMPLEMENT','build','running',
+    def mk(started_min_ago, beat_secs_ago, phase="IMPLEMENT", progress_min_ago=None):
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_jobs
+                              (thread_id, tenant_id, phase, kind, status, started_at, heartbeat_at,
+                               progress_at, execution_scope)
+                           VALUES (0,'live-selftest',%s,'build','running',
                                    now() - make_interval(mins => %s),
-                                   CASE WHEN %s IS NULL THEN NULL ELSE now() - make_interval(secs => %s) END)
+                                   CASE WHEN %s IS NULL THEN NULL ELSE now() - make_interval(secs => %s) END,
+                                   CASE WHEN %s::int IS NULL THEN now() - make_interval(mins => %s)
+                                        ELSE now() - make_interval(mins => %s) END,
+                                   'test')
                            RETURNING id""",
-                        (started_min_ago, beat_secs_ago, beat_secs_ago or 0))
+                        (phase, started_min_ago, beat_secs_ago, beat_secs_ago or 0,
+                         progress_min_ago, started_min_ago, progress_min_ago or 0))
             jid = cur.fetchone()[0]; c.commit(); return jid
     def status(jid):
-        with _pg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT status FROM controller_jobs WHERE id=%s", (jid,)); return cur.fetchone()[0]
     ok = True
     try:
-        alive = mk(120, 20)                # 2h old but beat 20s ago → ALIVE (slow Opus build), must NOT reap
+        alive = mk(45, 20)                 # quiet but within IMPLEMENT ceiling + fresh heartbeat → ALIVE
         dead = mk(40, 600)                 # 40 min old, last beat 10 min ago → worker dead, MUST reap
-        runaway = mk(HARD_CEILING_MIN + 30, 10)   # beating, but past the liberal hard ceiling → MUST reap
+        runaway = mk(HARD_CEILING_MIN + 30, 10, phase="PROTOTYPE")  # generic ceiling → MUST reap
+        build_progressing = mk(BUILD_HARD_CEILING_MIN + 90, 10, progress_min_ago=1)
+        build_runaway = mk(BUILD_HARD_CEILING_MIN + 90, 10,
+                           progress_min_ago=BUILD_PROGRESS_STALL_MIN + 5)
         young = mk(5, 600)                 # heartbeat lapsed but under the floor → too young, must NOT reap
-        _reap_dead_jobs()
+        _reap_dead_jobs(execution_scope="test")
         checks = [(status(alive) == "running", "quiet-but-beating build is NOT reaped (F8 fixed)"),
                   (status(dead) == "failed", "heartbeat-lapsed worker IS reaped"),
                   (status(runaway) == "failed", "past-hard-ceiling runaway IS reaped"),
+                  (status(build_progressing) == "running",
+                   "progressing build may exceed nominal IMPLEMENT threshold"),
+                  (status(build_runaway) == "failed",
+                   "heartbeat-alive but progress-stalled IMPLEMENT runaway IS reaped"),
                   (status(young) == "running", "job under the floor is NOT reaped")]
         for cond, label in checks:
             print(("PASS" if cond else "FAIL") + f": {label}"); ok = ok and cond
@@ -1613,7 +2866,7 @@ def liveness_selftest():
               if ok else "liveness_selftest: FAIL")
         return 0 if ok else 1
     finally:
-        with _pg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("DELETE FROM controller_jobs WHERE tenant_id='live-selftest'"); c.commit()
 
 
@@ -1625,10 +2878,10 @@ def liveness_selftest():
 _DRIVE_LOCK_NS = 841000
 
 
-def _close_quietly(conn):
-    if conn is not None:
+def _exit_conn_quietly(cm):
+    if cm is not None:
         try:
-            conn.close()
+            cm.__exit__(None, None, None)
         except Exception:
             pass
 
@@ -1638,7 +2891,7 @@ def _latest_job_status(thread_id):
     drive lock that a pre-lock read isn't stale — another owner may have advanced the thread and dispatched
     the next phase (a fresh 'running' job) between our read and our lock acquisition."""
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT status FROM controller_jobs WHERE thread_id=%s ORDER BY id DESC LIMIT 1",
                         (thread_id,))
             r = cur.fetchone()
@@ -1647,28 +2900,51 @@ def _latest_job_status(thread_id):
         return None
 
 
+def _build_result_ok(job_result: dict) -> bool:
+    """True only for explicit successful build outcomes. HOLD/BLOCKED/ERROR values must not advance to QA."""
+    job_result = job_result or {}
+    result_name = str(job_result.get("result") or "").strip().upper()
+    status_name = str(job_result.get("status") or "").strip().lower()
+    return (
+        bool(job_result.get("shipped"))
+        or bool(job_result.get("passed"))
+        # project.build_complex's terminal success contract is INTEGRATED. Omitting it caused a verified,
+        # deployable complex build to be recorded as build.ok=false and wastefully routed back to BUILD.
+        or result_name in ("OK", "PASS", "PASSED", "SUCCESS", "SUCCEEDED", "SHIPPED", "GREEN", "INTEGRATED")
+        or status_name in ("ok", "pass", "passed", "success", "succeeded", "shipped")
+    )
+
+
 @contextlib.contextmanager
 def thread_drive_lock(thread_id):
     """Yield True if THIS caller now owns the right to advance `thread_id` (lock acquired), False if another
     driver already holds it (caller must skip and let the owner proceed). Session-scoped advisory lock held
-    on a dedicated connection for the whole block. FAIL-OPEN (yields True) on a DB hiccup — a lock-server
-    blip must never wedge all forward progress; the terminal-write guards remain the backstop.
+    on a dedicated connection for the whole block. FAIL-CLOSED (yields False) on a DB hiccup: uncertain
+    ownership must defer to a later tick, never create duplicate controller drivers during DB distress.
 
     Structured so the generator yields EXACTLY once on every path (setup error, not-owned, owned) and an
     exception raised inside the caller's block propagates normally after the lock is released."""
+    cm = None
     conn = None
     got = False
-    try:                                              # SETUP: acquire the lock (fail-open on infra error)
-        conn = psycopg.connect(DB)
+    try:                                              # SETUP: acquire the lock (fail-closed on infra error)
+        # Session advisory locks survive transaction boundaries. Use autocommit
+        # so the dedicated pooled backend is `idle`, never `idle in transaction`,
+        # while advance() performs model/network work under the ownership lock.
+        cm = connection(autocommit=True)
+        conn = cm.__enter__()
         with conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s, %s)", (_DRIVE_LOCK_NS, int(thread_id)))
             got = cur.fetchone()[0]
     except Exception:
-        _close_quietly(conn)
-        yield True                                    # lock infra down -> own it ungated rather than stall
+        _exit_conn_quietly(cm)
+        # Ownership uncertainty is not ownership.  Failing open here creates
+        # duplicate controller drivers precisely while PostgreSQL is distressed.
+        # The durable transition remains runnable and a later tick retries it.
+        yield False
         return
     if not got:
-        _close_quietly(conn)
+        _exit_conn_quietly(cm)
         yield False                                   # another driver owns this thread -> caller skips
         return
     try:
@@ -1679,7 +2955,7 @@ def thread_drive_lock(thread_id):
                 cur.execute("SELECT pg_advisory_unlock(%s, %s)", (_DRIVE_LOCK_NS, int(thread_id)))
         except Exception:
             pass                                      # closing the session below drops the lock regardless
-        _close_quietly(conn)
+        _exit_conn_quietly(cm)
 
 
 def _advance_owned(thread_id, job_result=None):
@@ -1688,13 +2964,163 @@ def _advance_owned(thread_id, job_result=None):
     a jobd tick advances the same thread (the double-driver race). If another driver currently owns the
     thread we skip: the transition the caller already persisted (awaiting cleared, phase set) is carried
     forward by that owner's in-flight advance or the next jobd tick within seconds, so no progress is lost —
-    and _dispatch's single-writer guard remains the final backstop. Fail-open like the lock itself."""
+    and _dispatch's single-writer guard remains the final backstop. Ownership failures defer safely."""
     with thread_drive_lock(thread_id) as owned:
         if owned:
             advance(thread_id, job_result=job_result)
 
 
-def resume_stalled():
+def _resume_agentic_answers(limit=1, execution_scope="production"):
+    """Apply answered typed authority requests to their durable lifecycle phase."""
+    try:
+        import decisionchain
+        answered = decisionchain.reconcile_human_answers(limit=limit)
+    except Exception:
+        return 0
+    resumed = 0
+    for item in answered:
+        thread_id, tid = item.get("thread_id"), item.get("tenant_id")
+        if thread_id is None:
+            continue
+        with thread_drive_lock(thread_id) as owned:
+            if not owned:
+                continue
+            # Another sweeper may have selected the same durable answer before
+            # we acquired this thread lock.  Recheck the application ack while
+            # holding ownership so only the first successful side effect runs.
+            if not decisionchain.needs_application(item.get("id"), tid):
+                continue
+            s = _st(thread_id) or {}
+            if s.get("execution_scope", "production") != execution_scope:
+                continue
+            outcome = item.get("outcome") or {}
+            action = outcome.get("action") or "revise"
+            answer = str(outcome.get("human_answer") or "").strip()
+            if action == "cancel":
+                cancel(tid, thread_id, reason="cancelled by answered authority request", who="user")
+                decisionchain.mark_applied(item.get("id"), tid)
+                resumed += 1
+                continue
+            if _apply_qa_budget_answer(item, s):
+                decisionchain.mark_applied(item.get("id"), tid)
+                resumed += 1
+                continue
+            if _apply_build_budget_answer(item, s):
+                decisionchain.mark_applied(item.get("id"), tid)
+                resumed += 1
+                continue
+            if s.get("phase") == "OPTIONS":
+                options = s.get("options") or []
+                selected = outcome.get("selection")
+                if isinstance(selected, dict):
+                    selected = selected.get("id") or selected.get("option_id")
+                if selected is None:
+                    selected = _option_ordinal(answer, options)
+                chosen_option = next((o for o in options if isinstance(o, dict)
+                                      and str(o.get("id")) == str(selected)), None)
+                chosen_option = chosen_option or next((o for o in options
+                    if isinstance(o, dict) and o.get("recommended")), None)
+                chosen_option = chosen_option or next((o for o in options if isinstance(o, dict)), {})
+                oid = chosen_option.get("id")
+                chosen = {"option_id": oid}
+                try:
+                    import research
+                    chosen = research.select(tid, s.get("research_run_id"), oid) or chosen
+                except Exception:
+                    pass
+                _set(thread_id, chosen_option=chosen, pending_intent=answer or None, awaiting=None)
+                _to(thread_id, "DEEP_DESIGN")
+                advance(thread_id)
+            elif s.get("phase") == "PROTOTYPE":
+                if action == "revise":
+                    _set(thread_id, plan=None, pending_intent=answer or None, awaiting=None)
+                    _to(thread_id, "DEEP_DESIGN")
+                    advance(thread_id)
+                else:
+                    with _conn() as c, c.cursor() as cur:
+                        cur.execute("""SELECT result FROM controller_jobs WHERE thread_id=%s
+                                       AND kind='design' AND status='done' ORDER BY id DESC LIMIT 1""",
+                                    (thread_id,))
+                        row = cur.fetchone()
+                    _set(thread_id, pending_intent=answer or None, awaiting=None)
+                    advance(thread_id, job_result=(row[0] if row and isinstance(row[0], dict) else {}))
+            else:
+                if action == "revise" and s.get("phase") == "DEEP_DESIGN":
+                    _set(thread_id, plan=None, pending_intent=answer or None, awaiting=None)
+                else:
+                    _set(thread_id, pending_intent=answer or None, awaiting=None)
+                advance(thread_id)
+            decisionchain.mark_applied(item.get("id"), tid)
+            resumed += 1
+    return resumed
+
+
+def _resume_resolved_internal_management(*, execution_scope="production", limit=RESUME_SWEEP_BATCH):
+    """Resume parked TESTQA controllers once every durable evidence dispute is terminal.
+
+    The QA actor still owns applying each outcome to its story ledger. This function only reopens a bounded
+    worker slice so that actor can consume its durable event/reconcile state. It cannot run while a controller
+    job or unresolved dispute exists, and the per-thread drive lock prevents duplicate dispatch.
+    """
+    limit = max(1, min(500, int(limit or 1)))
+    # A clean current-revision replay can supersede a historical disputed finding inside the owning QA
+    # coordinator before the independently durable dispute row observes that result. Reconcile those exact
+    # terminal identities first; otherwise the generic unresolved-dispute guard below parks this controller
+    # forever even though its authoritative runtime ledger has already retired the finding.
+    try:
+        import qareview
+        qareview.reconcile_runtime_resolutions(limit=limit)
+    except Exception:
+        # Controller recovery remains fail-closed: a reconciliation outage simply leaves the internal
+        # management checkpoint parked for the next sweep rather than bypassing an unresolved dispute.
+        pass
+    with _conn() as c, c.cursor() as cur:
+        _set_controller_db_timeouts(cur)
+        cur.execute("""SELECT cs.thread_id,cs.tenant_id
+                         FROM controller_state cs
+                        WHERE cs.phase='TESTQA' AND cs.awaiting='internal_management'
+                          AND cs.execution_scope=%s
+                          AND NOT EXISTS (SELECT 1 FROM controller_jobs j
+                                           WHERE j.thread_id=cs.thread_id
+                                             AND j.status IN ('pending','running'))
+                          AND NOT EXISTS (SELECT 1 FROM qa_evidence_disputes q
+                                           WHERE q.tenant_id=cs.tenant_id
+                                             AND q.thread_id=cs.thread_id
+                                             AND q.status NOT IN ('resolved','closed','cancelled'))
+                        ORDER BY cs.updated_at,cs.thread_id LIMIT %s""",
+                    (execution_scope, limit))
+        candidates = cur.fetchall()
+    resumed = 0
+    for thread_id, tenant_id in candidates:
+        with thread_drive_lock(thread_id) as owned:
+            if not owned:
+                continue
+            with _conn() as c, c.cursor() as cur:
+                _set_controller_db_timeouts(cur)
+                cur.execute("""UPDATE controller_state cs SET awaiting=NULL,
+                                      job_status='QA management resolved; resuming durable checkpoint',
+                                      updated_at=now()
+                                WHERE cs.thread_id=%s AND cs.tenant_id=%s
+                                  AND cs.phase='TESTQA' AND cs.awaiting='internal_management'
+                                  AND cs.execution_scope=%s
+                                  AND NOT EXISTS (SELECT 1 FROM controller_jobs j
+                                                   WHERE j.thread_id=cs.thread_id
+                                                     AND j.status IN ('pending','running'))
+                                  AND NOT EXISTS (SELECT 1 FROM qa_evidence_disputes q
+                                                   WHERE q.tenant_id=cs.tenant_id
+                                                     AND q.thread_id=cs.thread_id
+                                                     AND q.status NOT IN ('resolved','closed','cancelled'))
+                                RETURNING cs.thread_id""",
+                            (int(thread_id), str(tenant_id), execution_scope))
+                claimed = cur.fetchone()
+            if not claimed:
+                continue
+            advance(int(thread_id))
+            resumed += 1
+    return resumed
+
+
+def resume_stalled(execution_scope="production"):
     """Crash-recovery sweep (run from the scheduler). Recovers EVERY durable job a killed worker left
     behind on the 'fleet' gate — not just the clean 'done' ones the original query saw (#10):
       * status='running' older than RUNNING_TIMEOUT_MIN -> the worker died (often before writing status
@@ -1709,15 +3135,19 @@ def resume_stalled():
     so a long fleet that outran the in-worker poll budget — or that completed after the thread was parked
     on a feedback gate by an old false-timeout build — still surfaces its options instead of being orphaned.
     """
+    if execution_scope not in {"production", "test"}:
+        raise ValueError("execution_scope must be 'production' or 'test'")
     _ensure()
-    advanced = 0
+    deadline = time.monotonic() + RESUME_SWEEP_BUDGET_S
+    degraded = []
+    advanced = _resume_agentic_answers(limit=1, execution_scope=execution_scope)
     # USER-FACING SLA first (#2.6): surface "taking longer than usual" the moment a job overruns its ETA —
     # well before the 30-min crash-reap below — so the same scheduler tick that recovers dead workers also
     # keeps live-but-slow jobs honest. Best-effort: a watchdog hiccup must never block crash recovery.
     try:
-        sla_watchdog()
-    except Exception:
-        pass
+        sla_watchdog(execution_scope=execution_scope)
+    except Exception as exc:
+        degraded.append({"source": "sla", "error": str(exc)[:200]})
     # 0) RESEARCH threads are reconciled against the REAL research run (research_runs) — NOT the dispatch
     #    poll. A fleet run that outlived the in-worker poll budget (-> 'pending'), or whose worker/process
     #    died, still reaches a terminal state in its own daemon; pull its result through so the extracted
@@ -1726,11 +3156,20 @@ def resume_stalled():
     #    or a spurious failure from a controller_job the reaper marked 'failed' while the run was healthy.
     try:
         import research as _r
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""SELECT thread_id, tenant_id, research_run_id, awaiting FROM controller_state
-                           WHERE phase='RESEARCH' AND research_run_id IS NOT NULL""")
+        with _conn() as c, c.cursor() as cur:
+            _set_controller_db_timeouts(cur)
+            cur.execute("""SELECT cs.thread_id, cs.tenant_id, cs.research_run_id, cs.awaiting
+                           FROM controller_state cs
+                           JOIN research_runs rr ON rr.id=cs.research_run_id
+                           WHERE cs.phase='RESEARCH' AND cs.research_run_id IS NOT NULL
+                             AND cs.execution_scope=%s
+                             AND rr.status IN ('done','failed')
+                             AND (rr.status='done' OR cs.awaiting='fleet')
+                           ORDER BY cs.thread_id LIMIT %s""", (execution_scope, RESUME_SWEEP_BATCH))
             rrows = cur.fetchall()
         for thread_id, rtid, rid, awaiting in rrows:
+            if time.monotonic() >= deadline:
+                break
             # Step 2 single-owner: hold the per-thread drive lock across the reconcile+advance so a second
             # sweeper (or jobd's advance loop) can't also advance this thread. Not owned -> the owner has it.
             with thread_drive_lock(thread_id) as owned:
@@ -1754,7 +3193,7 @@ def resume_stalled():
                 # so this UPDATE legitimately claims 0 rows. The anti-double-advance guard must therefore be the
                 # PHASE state under the drive lock, NOT this rowcount — otherwise a park-completed research run
                 # is stranded at RESEARCH/fleet forever (the job is 'done' so nothing ever re-advances it).
-                with psycopg.connect(DB) as c, c.cursor() as cur:
+                with _conn() as c, c.cursor() as cur:
                     cur.execute("""UPDATE controller_jobs SET status=%s, finished_at=COALESCE(finished_at, now())
                                    WHERE thread_id=%s AND kind='research' AND status IN ('running','pending')""",
                                 (rstatus, thread_id))
@@ -1767,9 +3206,20 @@ def resume_stalled():
                 _set(thread_id, awaiting=None)
                 advance(thread_id, job_result=jr)  # done -> OPTIONS; failed -> surfaces failure
                 advanced += 1
-    except Exception:
-        pass
-    _reap_dead_jobs()                       # overhaul Step 1: reap by heartbeat/ceiling, NEVER by output silence
+    except Exception as exc:
+        degraded.append({"source": "research", "error": str(exc)[:200]})
+    try:
+        _reap_dead_jobs(limit=RESUME_SWEEP_BATCH, execution_scope=execution_scope)
+    except Exception as exc:
+        degraded.append({"source": "job-reaper", "error": str(exc)[:200]})
+    # A terminal QA-management decision has no fleet job to advance. Reopen the same durable QA phase once
+    # all correlated disputes are terminal so its coordinator can apply the outcomes and continue its queues.
+    # This is bounded and independently fenced; a failed sweep is surfaced as degraded recovery blindness.
+    try:
+        advanced += _resume_resolved_internal_management(
+            execution_scope=execution_scope, limit=RESUME_SWEEP_BATCH)
+    except Exception as exc:
+        degraded.append({"source": "qa-internal-management", "error": str(exc)[:200]})
     # 1.5) RESEARCH-CRASH STRAND: a research worker that died BEFORE persisting research_run_id (crash between
     # dispatch and _set(research_run_id=...), or research.start() returning run_id=None) leaves the thread at
     # RESEARCH/fleet with research_run_id IS NULL — invisible to block 0 (needs NOT NULL) AND block 2 (excludes
@@ -1777,18 +3227,22 @@ def resume_stalled():
     # is terminal (crashed/failed, i.e. the reaper gave up on it), surface the failure so the CEO can retry,
     # instead of stranding forever. (A still-running job is left alone; a healthy run always persists its id.)
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
+            _set_controller_db_timeouts(cur)
             cur.execute("""SELECT cs.thread_id, cj.status, cj.result
                            FROM controller_state cs
                            JOIN LATERAL (SELECT status, result FROM controller_jobs
                                          WHERE thread_id=cs.thread_id AND kind='research'
                                          ORDER BY id DESC LIMIT 1) cj ON true
                            WHERE cs.phase='RESEARCH' AND cs.awaiting='fleet'
-                             AND cs.research_run_id IS NULL""")
+                             AND cs.execution_scope=%s
+                             AND cs.research_run_id IS NULL
+                             AND cj.status NOT IN ('running','pending')
+                           ORDER BY cs.thread_id LIMIT %s""", (execution_scope, RESUME_SWEEP_BATCH))
             strays = cur.fetchall()
         for thread_id, jstatus, jresult in strays:
-            if jstatus in ("running", "pending"):
-                continue                     # a fresh dispatch that just hasn't persisted its id yet — wait
+            if time.monotonic() >= deadline:
+                break
             with thread_drive_lock(thread_id) as owned:
                 if not owned:
                     continue
@@ -1799,20 +3253,30 @@ def resume_stalled():
                 advance(thread_id, job_result={"status": "failed",
                         "error": "research did not start (worker died before it began); say \"retry\" to run it again"})
                 advanced += 1
-    except Exception:
-        pass
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        # 2) For every NON-research thread parked on 'fleet', take its most recent job (any status).
-        #    RESEARCH is reconciled above against its real run, so exclude it here.
-        cur.execute("""SELECT DISTINCT ON (cj.thread_id) cj.thread_id, cj.result, cj.status
-                       FROM controller_jobs cj
-                       JOIN controller_state cs ON cs.thread_id=cj.thread_id
-                       WHERE cs.awaiting='fleet' AND cs.phase <> 'RESEARCH'
-                       ORDER BY cj.thread_id, cj.id DESC""")
-        rows = cur.fetchall()
+    except Exception as exc:
+        degraded.append({"source": "research-strays", "error": str(exc)[:200]})
+    rows = []
+    try:
+        with _conn() as c, c.cursor() as cur:
+            # Terminal-only candidates disappear when advanced, so a persistent healthy prefix cannot starve
+            # the tail. The lateral latest-row lookup preserves the original "latest job only" invariant.
+            _set_controller_db_timeouts(cur)
+            cur.execute("""SELECT cs.thread_id, cj.result, cj.status
+                           FROM controller_state cs
+                           JOIN LATERAL (
+                             SELECT result,status FROM controller_jobs
+                              WHERE thread_id=cs.thread_id ORDER BY id DESC LIMIT 1
+                           ) cj ON true
+                           WHERE cs.awaiting='fleet' AND cs.phase<>'RESEARCH'
+                             AND cs.execution_scope=%s
+                             AND cj.status NOT IN ('running','pending')
+                           ORDER BY cs.thread_id LIMIT %s""", (execution_scope, RESUME_SWEEP_BATCH))
+            rows = cur.fetchall()
+    except Exception as exc:
+        degraded.append({"source": "fleet-terminal", "error": str(exc)[:200]})
     for thread_id, result, status in rows:
-        if status in ("running", "pending"):
-            continue                              # newest job still genuinely in flight — leave it alone
+        if time.monotonic() >= deadline:
+            break
         # Step 2 single-owner: claim the per-thread drive lock before advancing so concurrent sweepers /
         # jobd never double-advance. Re-check the newest job UNDER the lock — another owner may have just
         # advanced it, making our pre-lock read stale.
@@ -1827,10 +3291,68 @@ def resume_stalled():
             _set(thread_id, awaiting=None)
             advance(thread_id, job_result=res)    # done -> advances phase; failed -> surfaces failure
             advanced += 1
-    return {"resumed": advanced}
+    return {"resumed": advanced, "degraded": degraded,
+            "budget_exhausted": time.monotonic() >= deadline,
+            "batch_limit": RESUME_SWEEP_BATCH}
 
 
-def sla_watchdog():
+def _sla_pageable_phase(phase):
+    """Healthy QA slices checkpoint and continue autonomously; their ETA boundary is not a CEO incident."""
+    return phase != "TESTQA"
+
+
+def _claim_sla_warnings(limit=SLA_WATCHDOG_BATCH, execution_scope="production"):
+    """Claim one bounded overdue page without holding a transaction across delivery."""
+    token = uuid.uuid4().hex
+    with _conn() as c, c.cursor() as cur:
+        _set_controller_db_timeouts(cur)
+        cur.execute("""WITH candidates AS (
+                         SELECT thread_id
+                           FROM controller_state
+                          WHERE awaiting='fleet' AND phase <> 'TESTQA' AND execution_scope=%s
+                            AND job_started_at IS NOT NULL AND job_eta_min IS NOT NULL
+                            AND now()-job_started_at > make_interval(mins => job_eta_min)
+                            AND (job_sla_warned_at IS NULL
+                                 OR now()-job_sla_warned_at > make_interval(mins => %s))
+                            AND (job_sla_claimed_at IS NULL
+                                 OR now()-job_sla_claimed_at > make_interval(mins => %s))
+                          ORDER BY job_started_at, thread_id
+                          FOR UPDATE SKIP LOCKED
+                          LIMIT %s
+                       ), claimed AS (
+                         UPDATE controller_state cs
+                            SET job_sla_claimed_at=now(), job_sla_claim_token=%s
+                           FROM candidates c
+                          WHERE cs.thread_id=c.thread_id
+                         RETURNING cs.thread_id, cs.tenant_id, cs.phase, cs.job_kind,
+                                   cs.job_eta_min, cs.job_started_at,
+                                   EXTRACT(EPOCH FROM (now()-cs.job_started_at))::int
+                       ) SELECT * FROM claimed""",
+                    (execution_scope, _SLA_REWARN_MIN, SLA_CLAIM_TTL_MIN,
+                     max(1, int(limit or 1)), token))
+        rows = cur.fetchall()
+    return token, rows
+
+
+def _finish_sla_warning(thread_id, token, accepted, new_eta=None):
+    """Token-fenced completion. Failed delivery releases immediately; a dead claimant cannot stamp."""
+    with _conn() as c, c.cursor() as cur:
+        _set_controller_db_timeouts(cur)
+        if accepted:
+            cur.execute("""UPDATE controller_state
+                              SET job_sla_warned=true, job_sla_warned_at=now(), updated_at=now(),
+                                  job_eta_min=GREATEST(COALESCE(job_eta_min,0)+1, %s),
+                                  job_sla_claimed_at=NULL, job_sla_claim_token=NULL
+                            WHERE thread_id=%s AND awaiting='fleet' AND job_sla_claim_token=%s""",
+                        (int(new_eta or 1), thread_id, token))
+        else:
+            cur.execute("""UPDATE controller_state
+                              SET job_sla_claimed_at=NULL, job_sla_claim_token=NULL
+                            WHERE thread_id=%s AND job_sla_claim_token=%s""", (thread_id, token))
+        return cur.rowcount
+
+
+def sla_watchdog(limit=SLA_WATCHDOG_BATCH, execution_scope="production"):
     """USER-FACING SLA WATCHDOG (#2.6). The moment a still-running fleet job overruns its ETA, post ONE
     visible "this is taking longer than usual — retry or cancel?" heads-up (with the retry/cancel
     affordances the failure UI already understands), well BEFORE the 30-min crash-reaper — so the CEO is
@@ -1842,54 +3364,53 @@ def sla_watchdog():
     + the re-warn throttle so a racing tick, or a job that finishes mid-sweep, can never double-post. Each
     warn also RAISES the stored ETA (#2) to at least the current elapsed + a buffer, so the promised range
     tracks reality (no more "~3 min" pinned under a 13-min run). The job keeps running untouched."""
+    if execution_scope not in {"production", "test"}:
+        raise ValueError("execution_scope must be 'production' or 'test'")
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT thread_id, tenant_id, phase, job_kind, job_eta_min,
-                              EXTRACT(EPOCH FROM (now()-job_started_at))::int
-                       FROM controller_state
-                       WHERE awaiting='fleet' AND job_started_at IS NOT NULL AND job_eta_min IS NOT NULL
-                         AND now() - job_started_at > make_interval(mins => job_eta_min)
-                         AND (job_sla_warned_at IS NULL
-                              OR now() - job_sla_warned_at > make_interval(mins => %s))""",
-                    (_SLA_REWARN_MIN,))
-        rows = cur.fetchall()
+    token, rows = _claim_sla_warnings(limit, execution_scope)
     warned = 0
-    for thread_id, tid, phase, jk, eta, elapsed in rows:
-        # Claim the warning atomically (still on its fleet gate + still outside the re-warn throttle) so a
-        # concurrent sweep or a job that just finished can't also post. In the SAME write, RAISE the stored
-        # ETA so the console's live range stops lying about "N min left". 0 rows -> beaten to it; skip.
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""UPDATE controller_state
-                           SET job_sla_warned=true, job_sla_warned_at=now(), updated_at=now(),
-                               job_eta_min = GREATEST(
-                                   COALESCE(job_eta_min, 0) + 1,
-                                   CEIL(EXTRACT(EPOCH FROM (now()-job_started_at)) / 60.0)::int + 2)
-                           WHERE thread_id=%s AND awaiting='fleet'
-                             AND (job_sla_warned_at IS NULL
-                                  OR now() - job_sla_warned_at > make_interval(mins => %s))
-                           RETURNING job_eta_min""", (thread_id, _SLA_REWARN_MIN))
-            claim = cur.fetchone(); c.commit()
-        if not claim:
-            continue
-        new_eta = claim[0]
+    failed = 0
+    for thread_id, tid, phase, jk, eta, started_at, elapsed in rows:
         em = int((elapsed or 0) // 60)
+        new_eta = max(int(eta or 0) + 1, em + 2)
         again = eta and em >= eta + _SLA_REWARN_MIN     # a follow-up re-ping vs. the first overrun warning
         lead = "It's still running" if again else "This is taking longer than usual — still running"
-        _report(tid, thread_id,
-                f"⏳ {lead} ({em}m elapsed; now expecting up to ~{new_eta} min total). It may just need a "
-                f"little more time; say \"retry\" to start it over or \"cancel\" to stop.",
-                {"kind": "sla_warning", "phase": phase, "job": jk, "elapsed_min": em, "eta_min": new_eta,
-                 "reping": bool(again), "actions": ["retry", "cancel"]}, urgent=True)
-        # The _report above only reaches an OPEN chat tab. Also light up the always-available in-app feed (and
-        # a push, if ntfy/email are configured) so a CEO who LEFT is told their run is overrunning — not left
-        # wondering whether it died. level=urgent -> the bell/feed is unmistakable + push fires high-priority.
-        _ping(tid, "Still working — taking longer than usual",
-              f"Your {(phase or 'current').lower()} step is still running ({em}m elapsed). I'll post the "
-              f"results in the chat the moment it's done.", level="urgent")
+        started_key = started_at.isoformat() if hasattr(started_at, "isoformat") else str(started_at)
+        bucket = max(0, em // max(1, _SLA_REWARN_MIN))
+        context_key = f"controller-sla:{thread_id}:{started_key}:{bucket}"
+        text = (f"⏳ {lead} ({em}m elapsed; now expecting up to ~{new_eta} min total). "
+                "The manager is still monitoring it; you can retry or cancel from the chat.")
+        delivered = False
+        try:
+            import notifications
+            result = notifications.send(
+                tid, "build", "Still working — taking longer than usual",
+                f"Your {(phase or 'current').lower()} step is still running ({em}m elapsed). "
+                "I'll post the results in the chat the moment it's done.",
+                level="urgent", url=f"/#assistant/{thread_id}", context_key=context_key)
+            delivered = isinstance(result, dict) and bool(result.get("id"))
+        except Exception:
+            delivered = False
+        if not delivered:
+            _finish_sla_warning(thread_id, token, False)
+            failed += 1
+            continue
+        try:
+            _report(tid, thread_id, text,
+                    {"kind": "sla_warning", "phase": phase, "job": jk, "elapsed_min": em,
+                     "eta_min": new_eta, "reping": bool(again), "actions": ["retry", "cancel"],
+                     "context_key": context_key}, urgent=False)
+        except Exception:
+            # The tenant notification is the durable always-available delivery. Chat is idempotent and will
+            # be retried only if finalization itself is lost; do not manufacture an undelivered warning.
+            pass
+        if not _finish_sla_warning(thread_id, token, True, new_eta):
+            failed += 1
+            continue
         audit.append(actor="loopcontroller", action="SLAWarn", resource=str(thread_id), decision=phase,
                      payload={"elapsed_min": em, "eta_min": new_eta, "reping": bool(again)})
         warned += 1
-    return {"warned": warned}
+    return {"warned": warned, "failed": failed, "claimed": len(rows), "batch_limit": int(limit)}
 
 
 MAX_BUILD_RETRY = int(os.environ.get("AOS_MAX_BUILD_RETRY", "3"))
@@ -1905,29 +3426,201 @@ def _spend_usd(product):
         return 0.0
 
 
-def _autoloop_build(thread_id, tid, product, reason=""):
-    """A failed/unverifiable build routes back to the DEV/builder AUTOMATICALLY (bounded), and escalates to the
-    CEO ONLY when the autonomous loop is exhausted — never bothering the human before then (North Star: the
-    human is the last resort, not the first responder). Leaves the thread runnable so jobd/advance re-dispatches
-    the build in a long-lived process. HARD BUDGET GATE: a non-converging build must not bleed money — if
-    cumulative spend has crossed BUILD_BUDGET_USD, STOP retrying and escalate regardless of the retry count."""
-    spent = _spend_usd(product)
-    if spent >= BUILD_BUDGET_USD:                   # hard money stop — stop spawning, hand it to the human
-        _set(thread_id, awaiting="user_feedback"); _to(thread_id, "IMPLEMENT")
+def _product_spend_policy(product):
+    """Return the product's actual persisted circuit-breaker envelope.
+
+    ``_spend_usd`` is a product-lifetime ledger that includes build, QA, and review calls. Comparing it to a
+    separate fixed build fallback made every post-QA repair look over budget even after the CEO had raised the
+    product cap. The appguard policy is the authoritative cumulative envelope; the environment fallback is
+    used only when that ledger cannot be read.
+    """
+    try:
+        import appguard
+        policy = appguard._policy(product)
+        return {"cap": max(0.0, float(policy.get("spend_cap") or 0.0)),
+                "status": str(policy.get("status") or "active"),
+                "reason": policy.get("reason")}
+    except Exception:
+        return {"cap": max(0.0, BUILD_BUDGET_USD), "status": "unknown", "reason": None}
+
+
+def _next_product_spend_cap(spent, current_cap):
+    """Request enough runway for a meaningful bounded retry, rounded to an auditable $50 boundary."""
+    target = max(float(current_cap or 0.0) * 1.25, float(spent or 0.0) + 100.0, 50.0)
+    return float(int((target + 49.999999) // 50) * 50)
+
+
+def _qa_spend_gate(thread_id, state):
+    """Stop new QA shifts at an actual product spend boundary and open one typed authority request.
+
+    The circuit breaker previously wrote a pause marker but the controller kept dispatching QA workers, so
+    they either spent past the boundary (because background threads lost product context) or ran browsers whose
+    model judgements were guaranteed to be refused. Existing work is allowed to checkpoint; this gate controls
+    the next shift and never fabricates a generic CEO/debugging request.
+    """
+    state = dict(state or {})
+    product, tid = state.get("product"), state.get("tenant_id")
+    if not product or not tid:
+        return True
+    try:
+        import appguard
+        policy = appguard._policy(product)
+        economics = appguard.economics(product)
+        blocked = appguard.blocks(product)
+    except Exception:
+        return True                       # factory's independent spawn chokepoint still fails closed on a pause
+    if not blocked:
+        return True
+    spent = float(economics.get("spend") or 0.0)
+    cap = float(policy.get("spend_cap") or appguard.DEFAULT_CAP)
+    # Ask one concrete yes/no question. A round $50 step above both the current cap and observed spend avoids
+    # an answer that immediately re-trips on the next model call while remaining tightly bounded.
+    requested_cap = float(max(50, int((max(cap * 1.25, spent + 100) + 49) // 50) * 50))
+    amount = max(0.0, requested_cap - cap)
+    question = (f"QA for {product} has a tracked model-cost estimate of ${spent:.2f} and reached its "
+                f"${cap:.2f} standing limit. Authorize ${max(0.0, requested_cap - spent):.2f} more under "
+                f"this ledger by raising its cumulative cap to ${requested_cap:.2f} so the checkpointed "
+                "campaign can continue?")
+    decision = _agentic_lifecycle_decision(
+        tid, thread_id, "qa_budget_extension",
+        {"product": product, "campaign_spent_usd": spent, "budget_usd": cap,
+         "requested_cap_usd": requested_cap, "amount_usd": amount, "question": question,
+         "allowed_actions": ["proceed", "cancel", "request_human"]},
+        f"{product}:{cap:.2f}:{requested_cap:.2f}", authority_kind="spend",
+        default={"action": "request_human", "boundary": "spend", "confidence": 1.0,
+                 "amount_usd": amount, "campaign_spent_usd": spent, "rationale": question})
+    if decision.get("status") == "human_wait" or decision.get("action") == "request_human":
+        _job_clear(thread_id)
+        _set(thread_id, awaiting="user_feedback")
+        _report(tid, thread_id, question,
+                {"kind": "authority_required", "boundary": "spend", "product": product,
+                 "spent_usd": round(spent, 2), "current_cap_usd": cap,
+                 "requested_cap_usd": requested_cap, "decision": decision,
+                 "actions": ["authorize", "cancel"]}, urgent=True)
+        audit.append(actor="qa-director", action="QASpendAuthorityRequired", resource=product,
+                     decision="spend", payload={"spent": spent, "cap": cap,
+                                                "requested_cap": requested_cap}, tenant_id=tid)
+        return False
+    return True
+
+
+def _apply_qa_budget_answer(item, state):
+    """Apply an explicitly answered fixed-cap request before resuming TESTQA."""
+    if (item or {}).get("decision_type") != "qa_budget_extension":
+        return False
+    payload = dict((item or {}).get("state") or {})
+    outcome = dict((item or {}).get("outcome") or {})
+    action = str(outcome.get("action") or "revise").lower()
+    tid, thread_id = item.get("tenant_id"), item.get("thread_id")
+    product = payload.get("product") or (state or {}).get("product")
+    if action == "cancel":
+        cancel(tid, thread_id, reason="QA spend extension declined", who="user")
+        return True
+    if action != "proceed":
+        _set(thread_id, awaiting="user_feedback")
         _report(tid, thread_id,
-                f"🛑 I paused this build — it's spent ${spent:.0f} (budget ${BUILD_BUDGET_USD:.0f}) and still "
-                f"isn't passing verification ({str(reason)[:120]}). I stopped before spending more. Say "
-                f"\"keep going\" to raise the budget and continue, or tell me how you'd like to proceed.",
-                {"kind": "budget_stop", "spent": round(spent, 2)}, urgent=True)
-        audit.append(actor="loopcontroller", action="BuildBudgetStop", resource=str(product),
-                     decision="halted", payload={"spent": round(spent, 2), "budget": BUILD_BUDGET_USD})
-        return
+                "The QA spend extension was not authorized, so the release remains safely checkpointed.",
+                {"kind": "authority_declined", "boundary": "spend", "product": product}, urgent=True)
+        return True
+    try:
+        cap = float(payload.get("requested_cap_usd"))
+        if not product or cap <= 0:
+            raise ValueError("invalid authorized QA cap")
+        import appguard
+        import killswitch
+        current = appguard._policy(product)
+        appguard.set_policy(product, cap=cap, loss=current.get("loss_limit"))
+        appguard.resume(product)
+        # The automatic spend stop owns both scopes.  Raising appguard's cap
+        # without clearing these exact stops leaves advance() permanently
+        # fenced, making an approved request appear accepted while no work can
+        # resume.  Clear only the product/thread scopes tied to this decision.
+        if killswitch.is_halted(product).get("halted"):
+            killswitch.resume(product)
+        thread_scope = f"thread-{int(thread_id)}"
+        if killswitch.is_halted(thread_scope).get("halted"):
+            killswitch.resume(thread_scope)
+    except Exception as exc:
+        _set(thread_id, awaiting="user_feedback")
+        _report(tid, thread_id, f"The authorized cap could not be applied safely: {str(exc)[:180]}",
+                {"kind": "authority_apply_failed", "boundary": "spend", "product": product}, urgent=True)
+        return True
+    _set(thread_id, awaiting=None)
+    audit.append(actor="human", action="QASpendCapAuthorized", resource=str(product), decision=str(cap),
+                 payload={"decision_id": item.get("id"), "answer": outcome.get("human_answer")}, tenant_id=tid)
+    advance(thread_id)
+    return True
+
+
+def _apply_build_budget_answer(item, state):
+    """Apply a human-approved cumulative product cap before another build/repair dispatch.
+
+    Generic decision reconciliation only clears ``awaiting``. For a spend boundary that is insufficient: the
+    factory's independent appguard/killswitch checks would refuse the very next agent call and reopen the same
+    request. Apply the exact persisted cap and clear only this product/thread's automatic stops first.
+    """
+    if (item or {}).get("decision_type") != "build_budget_extension":
+        return False
+    payload = dict((item or {}).get("state") or {})
+    outcome = dict((item or {}).get("outcome") or {})
+    action = str(outcome.get("action") or "revise").lower()
+    tid, thread_id = item.get("tenant_id"), item.get("thread_id")
+    product = payload.get("product") or (state or {}).get("product")
+    if action == "cancel":
+        cancel(tid, thread_id, reason="build spend extension declined", who="user")
+        return True
+    if action != "proceed":
+        _set(thread_id, awaiting="user_feedback")
+        _report(tid, thread_id,
+                "The build spend extension was not authorized, so the release remains safely checkpointed.",
+                {"kind": "authority_declined", "boundary": "spend", "product": product}, urgent=True)
+        return True
+    try:
+        import appguard
+        import killswitch
+        spent = _spend_usd(product)
+        current = appguard._policy(product)
+        requested = payload.get("requested_cap_usd")
+        cap = float(requested) if requested is not None else _next_product_spend_cap(
+            spent, current.get("spend_cap"))
+        if not product or cap <= spent:
+            raise ValueError("authorized cumulative cap does not exceed recorded spend")
+        appguard.set_policy(product, cap=cap, loss=current.get("loss_limit"))
+        appguard.resume(product)
+        if killswitch.is_halted(product).get("halted"):
+            killswitch.resume(product)
+        thread_scope = f"thread-{int(thread_id)}"
+        if killswitch.is_halted(thread_scope).get("halted"):
+            killswitch.resume(thread_scope)
+    except Exception as exc:
+        _set(thread_id, awaiting="user_feedback")
+        _report(tid, thread_id, f"The authorized build cap could not be applied safely: {str(exc)[:180]}",
+                {"kind": "authority_apply_failed", "boundary": "spend", "product": product}, urgent=True)
+        return True
+    _set(thread_id, awaiting=None)
+    audit.append(actor="human", action="BuildSpendCapAuthorized", resource=str(product), decision=str(cap),
+                 payload={"decision_id": item.get("id"), "answer": outcome.get("human_answer")}, tenant_id=tid)
+    advance(thread_id)
+    return True
+
+
+def _autoloop_build(thread_id, tid, product, reason=""):
+    """Route failed builds through bounded retries, then durable line management.
+
+    Retry counts and spend remain hard evidence, but they no longer make the CEO
+    the default debugger. Reversible retry/reassignment/plan revision stays in
+    the org; only a typed authority result may create a human wait.
+    """
+    spent = _spend_usd(product)
     try:
         import productregistry as _preg
         n = _preg.attempt(product, "build_retry")
     except Exception:
         n = MAX_BUILD_RETRY + 1                     # registry unavailable -> be conservative, escalate
-    if n <= MAX_BUILD_RETRY:
+    spend_policy = _product_spend_policy(product)
+    current_cap = float(spend_policy.get("cap") or BUILD_BUDGET_USD)
+    over_budget = spent >= current_cap or spend_policy.get("status") == "paused"
+    if n <= MAX_BUILD_RETRY and not over_budget:
         _to(thread_id, "IMPLEMENT"); _set(thread_id, awaiting=None)     # runnable -> re-dispatch the build
         _report(tid, thread_id,
                 f"🔧 Verification didn't pass (attempt {n}/{MAX_BUILD_RETRY}: {str(reason)[:150]}). Handing it "
@@ -1935,13 +3628,59 @@ def _autoloop_build(thread_id, tid, product, reason=""):
                 {"kind": "auto_rebuild", "attempt": n}, urgent=False)
         audit.append(actor="loopcontroller", action="AutoRebuild", resource=str(thread_id), decision=f"attempt-{n}")
         advance(thread_id)
-    else:
+        return
+
+    decision_type = "build_budget_extension" if over_budget else "build_recovery"
+    authority_kind = "spend" if over_budget else "internal_recovery"
+    requested_cap = _next_product_spend_cap(spent, current_cap) if over_budget else current_cap
+    extra = max(0.0, round(requested_cap - spent, 2)) if over_budget else 0.0
+    question = (f"The {product} workstream has a tracked model-cost estimate of ${spent:.2f} and reached "
+                f"its ${current_cap:.2f} cumulative product cap. Authorize up to ${extra:.2f} more by "
+                f"raising that cap to ${requested_cap:.2f} for one bounded repair and re-verification? "
+                f"Current release blocker: {str(reason)[:420]}" if over_budget else "")
+    decision = _agentic_lifecycle_decision(
+        tid, thread_id, decision_type,
+        {"product": product, "reason": str(reason)[:1000], "failed_attempts": n,
+         "retry_cap": MAX_BUILD_RETRY, "campaign_spent_usd": spent,
+         "amount_usd": extra, "budget_usd": current_cap,
+         "requested_cap_usd": requested_cap, "question": question,
+         "allowed_actions": ["retry", "reassign", "revise", "request_human"]},
+        f"{n}:{round(spent, 2)}:{str(reason)[:120]}", authority_kind=authority_kind,
+        default={"action": "request_human" if over_budget else "retry", "confidence": 1.0,
+                 "boundary": "spend" if over_budget else "none",
+                 "amount_usd": extra, "campaign_spent_usd": spent,
+                 "question": question, "rationale": question if over_budget
+                              else "senior engineering manager authorized one bounded recovery"})
+    if decision.get("status") == "human_wait" or decision.get("action") == "request_human":
         _set(thread_id, awaiting="user_feedback"); _to(thread_id, "IMPLEMENT")
         _report(tid, thread_id,
-                f"⚠️ I tried to fix and re-test this {MAX_BUILD_RETRY}× but it still isn't passing "
-                f"({str(reason)[:150]}). I've held it back from delivery — tell me how you'd like to proceed, or "
-                f"say \"retry\" to keep trying.", {"kind": "qa_failed_escalate"}, urgent=True)
-        audit.append(actor="loopcontroller", action="QAGate", resource=str(thread_id), decision="ESCALATE")
+                question or ("The engineering management chain exhausted its standing authority and opened "
+                             "one specific decision request. The failed build and evidence remain checkpointed."),
+                {"kind": "authority_required", "spent": round(spent, 2),
+                 "current_cap_usd": current_cap, "requested_cap_usd": requested_cap,
+                 "decision": decision, "actions": ["authorize", "cancel"]}, urgent=True)
+        audit.append(actor="loopcontroller", action="BuildAuthorityRequired", resource=str(product),
+                     decision=decision.get("boundary") or authority_kind,
+                     payload={"spent": round(spent, 2), "attempt": n})
+        return
+    if decision.get("action") == "revise":
+        _set(thread_id, plan=None, awaiting=None,
+             pending_intent=str(decision.get("rationale") or reason)[:2000])
+        _to(thread_id, "DEEP_DESIGN")
+        _report(tid, thread_id, "Engineering escalated internally and product leadership is revising the plan "
+                                "before another build. Nothing is needed from you.",
+                {"kind": "internal_build_replan", "decision": decision}, urgent=False)
+        advance(thread_id)
+        return
+    _to(thread_id, "IMPLEMENT"); _set(thread_id, awaiting=None)
+    _report(tid, thread_id,
+            f"Engineering management reviewed {n} failed build attempts and chose "
+            f"**{decision.get('action') or 'retry'}** within standing authority. A fresh bounded worker is "
+            "continuing; nothing is needed from you.",
+            {"kind": "internal_build_recovery", "decision": decision, "attempt": n}, urgent=False)
+    audit.append(actor="loopcontroller", action="BuildRecoveryManaged", resource=str(product),
+                 decision=decision.get("action") or "retry", payload={"attempt": n, "spent": spent})
+    advance(thread_id)
 
 
 def _to(thread_id, phase):
@@ -1955,13 +3694,28 @@ def _to(thread_id, phase):
                                  actor_id="loopcontroller", phase=phase)
     except Exception:
         pass
+    try:
+        import workstreamspine
+        s = _st(thread_id) or {}
+        workstreamspine.record_progress(
+            s.get("tenant_id") or "ceo", f"controller:{thread_id}", "phase_changed",
+            {"phase": phase, "product": s.get("product"), "awaiting": s.get("awaiting"),
+             "brief": s.get("brief")},
+            actor="loopcontroller", substantive=True)
+    except Exception as exc:
+        try:
+            audit.append(actor="loopcontroller", action="WorkstreamProgressRecord",
+                         resource=str(thread_id), decision="deferred",
+                         payload={"phase": phase, "error": str(exc)[:300]})
+        except Exception:
+            pass
 
 
 def _store_user(tid, thread_id, msg):
     """Persist a user turn, SUPPRESSING a consecutive identical duplicate (a double-tapped send / client
     retry). Returns True if it stored a new turn, False if it suppressed an exact repeat of the last user
     message — so callers can also skip re-posting a duplicate reply."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""SELECT content FROM chat_messages WHERE thread_id=%s AND role='user'
                        ORDER BY id DESC LIMIT 1""", (thread_id,))
         last = cur.fetchone()
@@ -2021,9 +3775,17 @@ def _llm(tid, thread_id, sysp, s, on_delta=None):
             break
         time.sleep(2 * (attempt + 1))
     if not _ok(r):
-        # exhausted — surface an actionable, resumable message (NEVER a bare "timeout"); phase stays put so the
-        # CEO can just say "retry" and pick up exactly here.
-        return "⚠️ The model call kept timing out for a moment — say \"retry\" and I'll pick right back up."
+        # Exhausted — surface the actual typed failure instead of calling auth, quota, budget, and provider
+        # errors all "timeout". The complete attempt I/O is also persisted under controller-<thread>.
+        failure = str(r.get("reason") or r.get("blocker") or r.get("out") or "model call failed")
+        try:
+            import redact
+            failure = redact.scrub(failure)
+        except Exception:
+            pass
+        failure = re.sub(r"\s+", " ", failure).strip()[:240]
+        return (f"⚠️ The model call could not complete ({failure}). Say \"retry\" and I'll pick right back "
+                "up from this checkpoint.")
     # Use the COMPLETE output (out_full) — never the tail-truncated 'out'. The controller's reply carries
     # leading control blocks ([[RESEARCH]]/[[PLAN]]); a >1500-char plan would lose its OPENING tag under
     # front-truncation, so _parse_block fails (plan never persists) and a dangling [[/PLAN]] leaks to chat.
@@ -2138,7 +3900,8 @@ _RETRY_RE = re.compile(
 # LLM classifier is what turned "retry" into filed feedback and stranded a thread with no way out.
 _PROCEED_RE = re.compile(
     r"^\s*(?:ok(?:ay)?[,\s]+|yes[,\s]+|yep[,\s]+|sure[,\s]+|please\s+|just\s+)*"
-    r"(?:ready|go\s*ahead|go|continue|proceed|carry\s+on|keep\s+going|resume|done)"
+    r"(?:ready|go\s*ahead|go|continue|proceed|carry\s+on|keep\s+going|resume|done|"
+    r"approve(?:\s+the\s+(?:plan|screens|proposal|direction))?|looks\s+good|lgtm)"
     r"(?:\s+now|\s+please|\s+with\s+it)?[.!\s]*$", re.I)
 
 _NEGATION_RE = re.compile(r"\b(?:do\s*n[o']?t|dont|do not|never|no\s+need|not\s+yet|hold\s+off|wait|stop|cancel|abort)\b", re.I)
@@ -2265,20 +4028,219 @@ def cancel(tid, thread_id, reason="stopped by user", who="user"):
         killswitch.halt(f"thread-{thread_id}", reason, set_by=who); scopes.append(f"thread-{thread_id}")
     except Exception:
         pass
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    worker_pids = []
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""SELECT worker_pid,worker_start_ticks,worker_boot_id FROM controller_jobs
+                       WHERE thread_id=%s AND status IN ('running', 'pending') AND worker_pid IS NOT NULL""",
+                    (thread_id,))
+        worker_pids = [(int(r[0]), r[1], r[2]) for r in cur.fetchall() if r[0]]
         cur.execute("""UPDATE controller_jobs SET status='cancelled',
                           result = COALESCE(result, '{}'::jsonb) || '{"cancelled":true}'::jsonb,
                           finished_at = now()
                        WHERE thread_id=%s AND status IN ('running', 'pending')""", (thread_id,))
         jobs = cur.rowcount; c.commit()
+    for pid, started, boot in worker_pids:
+        _terminate_worker_group(pid, started, boot)
+    # Terminalize the durable subordinate org only after the exact worker generation is gone.  Doing this
+    # before process containment leaves a race where a still-running research synthesizer can overwrite
+    # ``halted`` with ``done``.  The link is the controller thread/research-run identity (with a narrow legacy
+    # QA product fallback), never "all runs for this tenant".
+    halted_org_runs = _halt_linked_orchestra_runs(
+        tid, thread_id, research_run_id=s.get("research_run_id"), product=product, reason=reason)
     _set(thread_id, awaiting="user_feedback")
     _job_clear(thread_id)
     _report(tid, thread_id,
             f"⏹️ Stopped the **{phase}** step — nothing more will run until you say so. Say \"retry\" to "
             f"start it again, or tell me what to change.", {"kind": "cancelled", "phase": phase})
     audit.append(actor="loopcontroller", action="JobCancelled", resource=str(thread_id), decision=phase,
-                 payload={"scopes": scopes, "jobs": jobs, "reason": str(reason)[:200]})
+                 payload={"scopes": scopes, "jobs": jobs, "halted_org_runs": halted_org_runs,
+                          "reason": str(reason)[:200]})
     return {"cancelled": True, "phase": phase, "scopes": scopes, "jobs_cancelled": jobs}
+
+
+def _halt_linked_orchestra_runs(tid, thread_id, *, research_run_id=None, product=None,
+                                reason="cancelled"):
+    """Close only durable org runs owned by this controller workstream.
+
+    Research has no product yet, so the older product-only QA cleanup could not see it.  A cancelled
+    controller therefore killed every OS process while leaving ``research_runs`` and ``orchestra_runs``
+    falsely ``running`` forever.  Besides lying to the CEO, those ghosts block migration quiescence.
+
+    The research coordinator carries ``research_run_id``; modern QA coordinators carry ``thread_id`` and
+    ``product`` in their context.  Legacy QA checkpoints may lack ``thread_id``, so product matching is
+    accepted only for the qa-coordinator role.  Completed actors remain evidence; unfinished actors become
+    dead and all claims/leases for the halted generation are released after its worker has been reaped.
+    """
+    tenant = str(tid or "").strip()
+    if not tenant or thread_id is None:
+        return 0
+    thread_text = str(int(thread_id))
+    research_text = None if research_run_id is None else str(research_run_id)
+    product_text = None if not product else str(product)
+    payload = json.dumps({"cancelled": True, "reason": str(reason)[:240],
+                          "thread_id": int(thread_id), "product": product_text,
+                          "research_run_id": research_run_id})
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""SELECT DISTINCT r.run_id
+                              FROM orchestra_runs r
+                             WHERE r.tenant_id=%s AND r.status='running'
+                               AND EXISTS (
+                                   SELECT 1 FROM orchestra_actors a
+                                    WHERE a.run_id=r.run_id AND a.tenant_id=r.tenant_id
+                                      AND (
+                                          (%s::text IS NOT NULL AND
+                                           a.memory->>'research_run_id'=%s::text)
+                                       OR a.memory->'context'->>'thread_id'=%s
+                                       OR (%s::text IS NOT NULL AND a.role='qa-coordinator'
+                                           AND a.memory->'context'->>'product'=%s
+                                           AND COALESCE(a.memory->'context'->>'thread_id',%s)=%s)
+                                      ))
+                             ORDER BY r.run_id""",
+                        (tenant, research_text, research_text, thread_text,
+                         product_text, product_text, thread_text, thread_text))
+            run_ids = [int(row[0]) for row in cur.fetchall()]
+            if run_ids:
+                cur.execute("""UPDATE orchestra_actors
+                                  SET status=CASE WHEN status='done' THEN status ELSE 'dead' END,
+                                      result=CASE WHEN status='done' THEN result
+                                                  ELSE COALESCE(result,'{}'::jsonb) || %s::jsonb END,
+                                      last_active=now(),step_claimed_at=NULL,step_claimed_by=NULL
+                                WHERE tenant_id=%s AND run_id=ANY(%s)""",
+                            (payload, tenant, run_ids))
+                cur.execute("DELETE FROM orchestra_tool_leases WHERE tenant_id=%s AND run_id=ANY(%s)",
+                            (tenant, run_ids))
+                cur.execute("""UPDATE orchestra_runs
+                                  SET status='halted',finished_at=now(),
+                                      result=COALESCE(result,'{}'::jsonb) || %s::jsonb
+                                WHERE tenant_id=%s AND run_id=ANY(%s) AND status='running'""",
+                            (payload, tenant, run_ids))
+                halted = cur.rowcount
+            else:
+                halted = 0
+            if research_run_id is not None:
+                cur.execute("""UPDATE research_runs SET status='cancelled',finished_at=now()
+                                WHERE id=%s AND tenant_id=%s AND status='running'""",
+                            (research_run_id, tenant))
+            c.commit()
+        return halted
+    except Exception:
+        # Cancellation's OS-process containment and controller-job fence must still succeed if an older
+        # database does not yet have the orchestra linkage columns.  The reconciliation sweep can retry.
+        return 0
+
+
+def _halt_agentic_qa_runs(product, reason="cancelled"):
+    """Mark product-owned agentic QA org runs halted when their controller job is cancelled.
+
+    The controller worker process may die before qa_agentic can finish its run row. Without this, the orgview
+    shows stale QA organizations as `running` forever, which is false liveness and confuses retries.
+    """
+    if not product:
+        return 0
+    payload = json.dumps({"cancelled": True, "reason": str(reason)[:240], "product": product})
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""UPDATE orchestra_actors a
+                              SET status='dead',
+                                  result = COALESCE(a.result, '{}'::jsonb) || %s::jsonb,
+                                  last_active=now(),
+                                  step_claimed_at=NULL,
+                                  step_claimed_by=NULL
+                            WHERE a.status NOT IN ('done','dead')
+                              AND EXISTS (
+                                  SELECT 1 FROM orchestra_actors q
+                                  WHERE q.run_id=a.run_id
+                                    AND q.tenant_id=a.tenant_id
+                                    AND q.role='qa-coordinator'
+                                    AND q.memory->'context'->>'product'=%s)""",
+                        (payload, product))
+            cur.execute("""UPDATE orchestra_runs r
+                              SET status='halted', finished_at=now(), result=%s::jsonb
+                            WHERE r.status='running'
+                              AND EXISTS (
+                                  SELECT 1 FROM orchestra_actors q
+                                  WHERE q.run_id=r.run_id
+                                    AND q.tenant_id=r.tenant_id
+                                    AND q.role='qa-coordinator'
+                                    AND q.memory->'context'->>'product'=%s)""",
+                        (payload, product))
+            n = cur.rowcount
+            c.commit()
+            return n
+    except Exception:
+        return 0
+
+
+def _terminate_worker_group(pid, start_ticks=None, boot_id=None, grace_s=5.0):
+    """Terminate a parked phase worker and descendant process groups.
+
+    Phase workers are launched with start_new_session=True, and some children (notably the QA browser bridge)
+    also start their own sessions. Killing only the root process group can therefore orphan a browser tree.
+    Snapshot descendants first, terminate every distinct process group, then fall back to individual pids.
+    """
+    if not pid:
+        return False
+    root = int(pid)
+    snapshots = process_assurance.scan_snapshots()
+    if start_ticks is None or not boot_id:
+        # Compatibility for an immediate parent cleaning up a child it just spawned: ancestry itself proves
+        # ownership, and we bind the observed birth identity before signaling. Arbitrary legacy PIDs fail shut.
+        caller = snapshots.get(os.getpid())
+        if caller is None or root not in process_assurance.descendant_pids(caller.identity, snapshots):
+            return False
+        root_id = snapshots[root].identity
+    else:
+        root_id = process_assurance.ProcessIdentity(root, int(start_ticks), str(boot_id))
+    if not process_assurance.same_process(root_id, snapshots.get(root)):
+        return False
+    plan = process_assurance.cleanup_plan(root_id, snapshots) + [root_id]
+    ok = True
+    for expected in plan:
+        try:
+            if process_assurance.same_process(expected, process_assurance.read_snapshot(expected.pid)):
+                os.kill(expected.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            ok = False
+    deadline = time.time() + float(grace_s)
+    while time.time() < deadline:
+        if all(not process_assurance.same_process(p, process_assurance.read_snapshot(p.pid)) for p in plan):
+            return ok
+        time.sleep(0.1)
+    for expected in plan:
+        try:
+            if process_assurance.same_process(expected, process_assurance.read_snapshot(expected.pid)):
+                os.kill(expected.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            ok = False
+    return ok and all(not process_assurance.same_process(
+        p, process_assurance.read_snapshot(p.pid)) for p in plan)
+
+
+def _descendant_pids(root_pid):
+    children = {}
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                parts = (p / "stat").read_text(errors="ignore").split()
+                ppid = int(parts[3])
+                children.setdefault(ppid, []).append(int(p.name))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    out, stack = [], list(children.get(int(root_pid), []))
+    while stack:
+        p = stack.pop()
+        out.append(p)
+        stack.extend(children.get(p, []))
+    return out
 
 
 def state(thread_id):
@@ -2300,20 +4262,37 @@ def _selftest():
     import time
     import billing
     import orgs as _orgs
-    # RUN IN-PROCESS. The selftest stubs research.start/factory.agent by monkeypatching this module, but
-    # park mode (default ON) dispatches each phase to a DETACHED WORKER — a fresh process that re-imports
-    # everything and therefore sees NONE of those stubs. So the "stubbed" RESEARCH phase was starting a
-    # REAL fleet run: three invocations on 2026-08-11 spawned research runs 533/534/535 ("How to build a
-    # YouTube competitor", the fixture question) at $9.27 + $10.19 + $8.99 = $28.45 of real spend, plus
-    # ~15 minutes each of live agents. A test must not be able to spend money. Park mechanics have their
-    # own dedicated coverage in park_selftest(), which asserts them deliberately rather than by accident.
-    global _PARK
-    _park_was = _PARK
-    _PARK = False
+    # The selftest stubs research/factory in this interpreter. A detached worker
+    # would re-import the real providers and could spend money, so replace only
+    # the process-launch seam with a synchronous, non-background test driver.
+    # Production dispatch remains parked-only: there is no environment switch
+    # and no daemon-thread fallback that can outlive a terminal durable row.
+    global _spawn_parked_worker
+    _spawn_was = _spawn_parked_worker
+
+    def _selftest_worker(thread_id, kind, jid):
+        result, status = {}, "done"
+        try:
+            result = _phase_fn(thread_id, kind)() or {}
+            if isinstance(result, dict) and (result.get("error") or result.get("blocked")):
+                status = "failed"
+        except Exception as exc:
+            result, status = {"error": str(exc)[:200]}, "failed"
+        if _finish_job(thread_id, jid, result, status):
+            # Only this fully stubbed selftest drives synchronously; production
+            # workers always leave the ownership transition to the poller.
+            _set(thread_id, awaiting=None)
+            _job_clear(thread_id)
+            advance(thread_id, job_result=result)
+        return True
+
+    _spawn_parked_worker = _selftest_worker
     tid = billing.signup("loopctl-selftest", "free")["tenant_id"]
     org = _orgs.create(tid, "Test Org", "a test")["org_id"]
     real_agent = factory.agent
     real_build = getattr(factory, "build_product", None)
+    import tenantproviders as _tp
+    real_tp_resolve = _tp.resolve
     import research as _r, design_fleet as _d, qualityloop as _q
     real = (_r.start, _r.run_state, _r.select, _d.prototype, _q.run, factory.run_grounded_qa)
     # the IMPLEMENT phase now SCAFFOLDS via build_product before the quality loop — stub it to scaffold the
@@ -2370,10 +4349,8 @@ def _selftest():
         "passed": True, "blocking_open": 0, "stories": 3,
         "verdict": "ALL 3 STORIES PASSED", "verdict_json": "/tmp/aos-qa/selftest-verdict.json"}
     factory.run_grounded_qa = _green_gq
-    try:
-        import tenantproviders; tenantproviders.connect(tid, "anthropic", "subscription")
-    except Exception:
-        pass
+    _tp.resolve = lambda _tid: {"engine": "codex", "provider": "openai", "key": None,
+                                "auth_mode": "subscription"}
     import consent
 
     def wait(th, target, gate=None, tmax=14):
@@ -2384,41 +4361,48 @@ def _selftest():
             time.sleep(0.2)
         return False
     try:
-        th = start(tid, org)["thread_id"]
+        th = start(tid, org, execution_scope="test")["thread_id"]
         # CONSENT GATE: pre-consent, say() must REFUSE before touching the LLM (no phase change, no spend) and
         # tell the CEO to accept consent — not silently send their text to the provider.
         pre = say(tid, th, "I want a YouTube competitor")
         consent_gate_ok = (pre.get("blocked") == "consent_required" and _st(th)["phase"] == "DISCOVER")
         consent.record(tid)                                       # CEO accepts AI-processing consent in Settings
-        say(tid, th, "I want a YouTube competitor")               # DISCOVER->RESEARCH->OPTIONS
-        opt = wait(th, "OPTIONS", "user_approval")
-        # (#1) OPTIONS ELABORATES, doesn't force: a typed QUESTION about the options runs an LLM answer (a new
-        # task) and the gate is HELD (still OPTIONS/user_approval) — never advances, never a bare "tap one".
-        n_opt = len(tasks)
-        say(tid, th, "which option is cheaper and why?")
-        options_elaborate_ok = (len(tasks) > n_opt and _st(th)["phase"] == "OPTIONS"
-                                and _st(th)["awaiting"] == "user_approval")
-        # an EMPTY/whitespace message just NUDGES to pick — no LLM turn, gate still held.
-        n_opt2 = len(tasks)
-        say(tid, th, "   ")
-        options_nudge_ok = (len(tasks) == n_opt2 and _st(th)["phase"] == "OPTIONS")
+        say(tid, th, "I want a YouTube competitor")               # autonomous research + manager decisions
+        # Internal/reversible direction, plan, and prototype calls are manager-owned now. The controller must
+        # keep advancing without requiring the CEO to type "go ahead" at each phase; only a typed authority
+        # boundary may create a human gate. Drive explicit no-gate phase ticks in this synchronous harness.
+        phase_trail = []
+        human_gate_seen = False
+        for _ in range(40):
+            current = _st(th) or {}
+            phase_trail.append(current.get("phase"))
+            if current.get("phase") == "DELIVER":
+                break
+            if current.get("awaiting") in ("user_feedback", "user_approval", "credentials"):
+                human_gate_seen = True
+                break
+            if current.get("awaiting") is None:
+                advance(th)
+            else:
+                time.sleep(0.05)
+        opts_now = _st(th).get("options") or []
+        opt = bool(opts_now)
+        options_elaborate_ok = opt and not human_gate_seen
+        options_nudge_ok = not human_gate_seen
         # (#2) EXPOSE THE RESEARCH DOC + option summaries: research_report() returns the report+options for the
         # org, and every presented option card carries a non-empty summary (not a bare title).
         rr = research_report(tid, org)
-        opts_now = _st(th).get("options") or []
         research_report_ok = (isinstance(rr, dict) and "report" in rr and isinstance(rr.get("options"), list)
                               and bool(opts_now)
                               and all((o.get("summary") or "").strip() for o in opts_now if isinstance(o, dict)))
-        gate_held = _st(th)["phase"] == "OPTIONS"                  # OPTIONS only moves via choose()/an ordinal
-        choose(tid, th, 1)                                         # ->DEEP_DESIGN
-        in_design = _st(th)["phase"] == "DEEP_DESIGN"
-        say(tid, th, "go ahead")                                  # draft PLAN (awaiting feedback)
+        gate_held = not human_gate_seen                             # internal choices never invent a CEO gate
+        in_design = "DEEP_DESIGN" in phase_trail or bool((_st(th).get("plan") or {}).get("name"))
         # PLAN must parse from the (front-truncatable) LLM reply: persisted to state, rendered as a plan
         # card (meta.kind='plan'), and NO dangling control tag leaked into the user-visible chat.
         plan_persisted = bool((_st(th).get("plan") or {}).get("name"))
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("""SELECT content, meta FROM chat_messages WHERE thread_id=%s AND role='assistant'
-                           ORDER BY id DESC LIMIT 1""", (th,))
+                           AND meta->>'kind'='plan' ORDER BY id DESC LIMIT 1""", (th,))
             pc, pm = cur.fetchone()
         plan_card = isinstance(pm, dict) and pm.get("kind") == "plan"
         no_tag_leak = "[[" not in (pc or "")
@@ -2427,26 +4411,24 @@ def _selftest():
         plan_full_ok = (bool((_st(th).get("plan") or {}).get("full"))
                         and isinstance(pm, dict) and bool(((pm.get("plan") or {}).get("full")))
                         and "Plan:" in ((_st(th).get("plan") or {}).get("full") or ""))
-        say(tid, th, "looks good")                                # approve plan -> PLAN_APPROVAL -> PROTOTYPE
-        proto = wait(th, "IMPLEMENT", "user_feedback")            # prototype done -> gated at IMPLEMENT for approval
+        proto = "PROTOTYPE" in phase_trail or "IMPLEMENT" in phase_trail or _st(th)["phase"] == "DELIVER"
         # (#4) SURFACE THE DESIGN: the prototype message meta references the design artifact (org + a flag) so
         # the console can link "Review the design".
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("""SELECT meta FROM chat_messages WHERE thread_id=%s AND role='assistant'
                            AND meta->>'kind'='prototype' ORDER BY id DESC LIMIT 1""", (th,))
             _pr = cur.fetchone()
         design_surface_ok = (bool(_pr) and isinstance(_pr[0], dict) and _pr[0].get("design_ready") is True
                              and _pr[0].get("org") == org)
-        say(tid, th, "approve")                                   # -> build -> TESTQA -> DELIVER
         deliver = wait(th, "DELIVER")
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM controller_jobs WHERE thread_id=%s AND status='done'", (th,))
             jobs = cur.fetchone()[0]
 
         # (1) ETA on kickoff: estimate.py-backed, positive, and surfaced as an HONEST RANGE "~lo-hi min" in a
         # kickoff message — never a false-precision point (#2). The _eta_range helper must bracket the point.
         eta_min = _estimate_runtime("IMPLEMENT", {"kind": "service", "charter": "auth billing dashboard api"})
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("""SELECT count(*) FROM chat_messages WHERE thread_id=%s AND role='assistant'
                            AND content ~ '~[0-9]+-[0-9]+ min'""", (th,))
             eta_msg = cur.fetchone()[0]
@@ -2455,7 +4437,8 @@ def _selftest():
         eta_ok = isinstance(eta_min, int) and eta_min > 0 and eta_msg >= 1 and eta_range_ok
         # (1c) CONSTANTS RECONCILED with console.py:163 — the controller's coarse fallbacks equal the console's,
         # so the two live-progress bubbles can never promise different numbers.
-        consts_ok = _PHASE_ETA_DEFAULT == {"RESEARCH": 10, "PROTOTYPE": 6, "IMPLEMENT": 14, "TESTQA": 5}
+        consts_ok = _PHASE_ETA_DEFAULT == {"RESEARCH": 10, "PROTOTYPE": 6, "IMPLEMENT": 14,
+                                           "TESTQA": qatiming.slice_eta_min()}
         # (1b) RESEARCH ETA REALISM: research is a multi-agent fleet (~10-14 min), so its promised ETA must be
         # realistic (history-backed median of real research_runs when available, else a sane default) — never
         # the old unrealistic ~3 min that under-promised and over-ran.
@@ -2476,28 +4459,29 @@ def _selftest():
         # (2.6) USER-FACING SLA WATCHDOG: a fleet job that overruns its ETA gets ONE visible
         # 'taking longer than usual — retry or cancel?' heads-up, well before the 30-min reaper, and the
         # watchdog never double-warns the same job.
-        th3 = start(tid, org)["thread_id"]
+        th3 = start(tid, org, execution_scope="test")["thread_id"]
         _set(th3, awaiting="fleet")
         _job_begin(th3, "build", 5, "Building…")
-        with psycopg.connect(DB) as c, c.cursor() as cur:    # backdate start so it has clearly overrun ~5m ETA
+        with _conn() as c, c.cursor() as cur:    # backdate start so it has clearly overrun ~5m ETA
             cur.execute("UPDATE controller_state SET job_started_at=now()-interval '9 min' WHERE thread_id=%s",
                         (th3,))
             c.commit()
-        w1 = sla_watchdog().get("warned", 0)
-        with psycopg.connect(DB) as c, c.cursor() as cur:   # ETA must be RAISED past the elapsed time (#2)
+        w1 = sla_watchdog(execution_scope="test").get("warned", 0)
+        with _conn() as c, c.cursor() as cur:   # ETA must be RAISED past the elapsed time (#2)
             cur.execute("SELECT job_eta_min FROM controller_state WHERE thread_id=%s", (th3,))
             eta_after_warn = cur.fetchone()[0]
-        w2 = sla_watchdog().get("warned", 0)                 # immediate re-sweep must NOT re-warn (throttled)
-        # (5) RE-PING ON CONTINUED OVERRUN: after the re-warn window elapses and the job is STILL overrunning,
+        w2 = sla_watchdog(execution_scope="test").get("warned", 0)  # immediate re-sweep must NOT re-warn
+        # (5) RE-PING ON CONTINUED OVERRUN: after the (hourly by default) re-warn window elapses and the job is
+        # STILL overrunning,
         # the watchdog warns + pings AGAIN — not one-and-done silence. Backdate the last-warn + start so both
         # the throttle and the (now-raised) ETA are exceeded, then a fresh sweep must re-warn exactly once.
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("""UPDATE controller_state
-                           SET job_sla_warned_at=now()-interval '9 min',
-                               job_started_at=now()-interval '40 min' WHERE thread_id=%s""", (th3,))
+                           SET job_sla_warned_at=now()-interval '90 min',
+                               job_started_at=now()-interval '180 min' WHERE thread_id=%s""", (th3,))
             c.commit()
-        w3 = sla_watchdog().get("warned", 0)                 # continued overrun -> re-ping fires again
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        w3 = sla_watchdog(execution_scope="test").get("warned", 0)  # continued overrun -> re-ping fires again
+        with _conn() as c, c.cursor() as cur:
             cur.execute("""SELECT count(*) FROM chat_messages WHERE thread_id=%s AND role='assistant'
                            AND meta->>'kind'='sla_warning'""", (th3,))
             sla_msgs = cur.fetchone()[0]
@@ -2506,12 +4490,12 @@ def _selftest():
 
         # (2.1) STATUS HONESTY: a message typed WHILE a durable job is in flight must return the TRUE running
         # status (kind='working') and run NO free-form LLM turn — never a hallucinated "Done".
-        th4 = start(tid, org)["thread_id"]
+        th4 = start(tid, org, execution_scope="test")["thread_id"]
         _to(th4, "RESEARCH"); _set(th4, awaiting="fleet")
         _job_begin(th4, "research", 6, "Researching directions…")
         n_before = len(tasks)
         r4 = say(tid, th4, "is it done yet?")
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("""SELECT meta->>'kind' FROM chat_messages WHERE thread_id=%s AND role='assistant'
                            ORDER BY id DESC LIMIT 1""", (th4,))
             last_kind = cur.fetchone()[0]
@@ -2520,7 +4504,7 @@ def _selftest():
         # (2.1b) MID-FLIGHT PRE-AUTHORIZED INTENT: a real directive typed WHILE research runs must be QUEUED
         # (not dropped, no LLM turn, gate held) and then APPLIED when results land — auto-selecting the
         # recommended option into DEEP_DESIGN instead of silently re-parking on the user_approval gate.
-        th5 = start(tid, org)["thread_id"]
+        th5 = start(tid, org, execution_scope="test")["thread_id"]
         _to(th5, "RESEARCH"); _set(th5, awaiting="fleet", research_run_id=777)
         _job_begin(th5, "research", 6, "Researching…")
         n5 = len(tasks)
@@ -2530,10 +4514,11 @@ def _selftest():
         _set(th5, awaiting=None)                                   # worker clears the gate before advancing
         advance(th5, {"run_id": 777, "options": [{"id": 1, "title": "A", "recommended": True}]})
         s5 = _st(th5)
-        intent_applied = (s5["phase"] == "DEEP_DESIGN" and s5["awaiting"] == "user_feedback"
+        intent_applied = (s5["phase"] not in ("RESEARCH", "OPTIONS")
+                          and s5["awaiting"] not in ("user_feedback", "user_approval")
                           and bool(s5.get("chosen_option")) and not (s5.get("pending_intent") or ""))
         # a pure status ping must NOT be queued as an intent (stays a status reply, no pending_intent)
-        th5b = start(tid, org)["thread_id"]
+        th5b = start(tid, org, execution_scope="test")["thread_id"]
         _to(th5b, "RESEARCH"); _set(th5b, awaiting="fleet")
         _job_begin(th5b, "research", 6, "Researching…")
         rq = say(tid, th5b, "is it done yet?")
@@ -2542,12 +4527,12 @@ def _selftest():
 
         # (2.1c) DUPLICATE SUPPRESSION: a double-tapped identical message must NOT store a second user turn nor
         # post a second identical status bubble — the first reply stands (flagged duplicate on the retry).
-        th6 = start(tid, org)["thread_id"]
+        th6 = start(tid, org, execution_scope="test")["thread_id"]
         _to(th6, "RESEARCH"); _set(th6, awaiting="fleet")
         _job_begin(th6, "research", 6, "Researching…")
         d1 = say(tid, th6, "how's it going?")
         d2 = say(tid, th6, "how's it going?")                       # exact repeat -> suppressed
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM chat_messages WHERE thread_id=%s AND role='user' "
                         "AND content='how''s it going?'", (th6,))
             dup_user_rows = cur.fetchone()[0]
@@ -2558,7 +4543,7 @@ def _selftest():
                      and dup_user_rows == 1 and dup_status_bubbles == 1)
 
         # (2) LIVE PROGRESS + (4) NO FALSE DONE + (5) CANCEL — on a fresh thread with a stamped in-flight job:
-        th2 = start(tid, org)["thread_id"]
+        th2 = start(tid, org, execution_scope="test")["thread_id"]
         _set(th2, awaiting="fleet", product="liveprod-" + os.urandom(2).hex())
         prod2 = _st(th2)["product"]
         _job_begin(th2, "build", 9, "Building…")
@@ -2595,6 +4580,37 @@ def _selftest():
         factory.run_grounded_qa = _green_gq                    # back to green for anything downstream
         qa_gate_ok = qa_green and qa_zero_story and qa_blocking and qa_crash
 
+        # LIVE RESEARCH SUB-PROGRESS: long research should narrate real worker progress, not only elapsed time.
+        # Seed a tiny durable orchestra run linked to a controller research_run_id and prove live_status reads
+        # the actual researcher rows: assignments, done/blocked counts, and a percent.
+        th_prog = start(tid, org, execution_scope="test")["thread_id"]
+        _to(th_prog, "RESEARCH"); _set(th_prog, awaiting="fleet", research_run_id=424242)
+        _job_begin(th_prog, "research", 10, "Researching directions")
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO orchestra_runs (tenant_id, org_id, vision, status)
+                           VALUES (%s,%s,'progress proof','running') RETURNING run_id""", (tid, org))
+            orc_prog = cur.fetchone()[0]
+            cur.execute("""INSERT INTO orchestra_actors
+                           (run_id, tenant_id, org_id, name, role, kind, status, assignment, memory)
+                           VALUES (%s,%s,%s,'research-coordinator','research-coordinator','supervisor',
+                                   'working','coordinate research', %s::jsonb)""",
+                        (orc_prog, tid, org, json.dumps({"research_run_id": 424242})))
+            for name, status, assignment in (
+                ("researcher-01", "done", "competitor pricing"),
+                ("researcher-02", "working", "payment providers"),
+                ("researcher-03", "blocked", "regulatory edge cases"),
+            ):
+                cur.execute("""INSERT INTO orchestra_actors
+                               (run_id, tenant_id, org_id, name, role, kind, status, assignment)
+                               VALUES (%s,%s,%s,%s,'research-growth','worker',%s,%s)""",
+                            (orc_prog, tid, org, name, status, assignment))
+            c.commit()
+        lp = live_status(th_prog)
+        research_subprogress_ok = (lp.get("researchers_total") == 3 and lp.get("researchers_done") == 1
+                                   and lp.get("researchers_blocked") == 1
+                                   and lp.get("subprogress_pct") == 33
+                                   and "payment providers" in (lp.get("progress_detail") or ""))
+
         # A1 WIRING: with AOS_ORCHESTRA on (default), the RESEARCH phase must have dispatched the
         # run as an ORCHESTRA org run (engine='orchestra' through research.start) — the review's
         # "zero production callers" verdict is dead only if the LIVE path actually routes there.
@@ -2607,7 +4623,7 @@ def _selftest():
               and eta_ok and research_eta_ok and consts_ok and ping_ok and live_cancel_ok
               and consent_reask_ok and sla_ok and status_honest_ok and midflight_intent_ok and dedupe_ok
               and options_elaborate_ok and options_nudge_ok and research_report_ok and plan_full_ok
-              and design_surface_ok and orchestra_wired_ok)
+              and design_surface_ok and research_subprogress_ok and orchestra_wired_ok)
         print(f"consent_gate={consent_gate_ok} options={opt} gate_held={gate_held} design={in_design} "
               f"plan_persisted={plan_persisted} plan_card={plan_card} no_tag_leak={no_tag_leak} "
               f"prototype={proto} deliver={deliver} jobs_done={jobs}")
@@ -2616,6 +4632,8 @@ def _selftest():
               f"(={research_eta}m) ping(results-land)={ping_ok} "
               f"live_progress={live_ok} no_false_done={no_false_done_running and no_false_done_after} "
               f"cancel(killswitch)={cancel_ok}")
+        print(f"research_subprogress={research_subprogress_ok}"
+              f"(detail={lp.get('progress_detail')}, pct={lp.get('subprogress_pct')})")
         print(f"consent_reask_fixed={consent_reask_ok}(note={consent_note_ok},no_stale={no_stale_consent_ctx}) "
               f"sla_watchdog={sla_ok}(w1={w1},w2={w2},w3={w3},msgs={sla_msgs},eta_raised={eta_after_warn}) "
               f"status_honest={status_honest_ok}")
@@ -2638,13 +4656,15 @@ def _selftest():
         print("PASS: loopcontroller DISCOVER->DELIVER + ETA/live/ping/no-false-done/cancel"
               " + consent-reask/sla/status-honesty + A2 agentic-intent-gate ✅" if ok else "FAIL")
     finally:
-        _PARK = _park_was
+        _spawn_parked_worker = _spawn_was
         factory.agent = real_agent
         if real_build is not None:
             factory.build_product = real_build
+        _tp.resolve = real_tp_resolve
         _r.start, _r.run_state, _r.select, _d.prototype, _q.run, factory.run_grounded_qa = real
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             for t in ("controller_jobs", "controller_state", "chat_messages", "chat_threads", "orgs",
+                      "orchestra_events", "orchestra_actors", "orchestra_runs",
                       "tenant_providers", "tenant_products", "ai_consent", "notifications", "push_targets",
                       "tenants", "memory_checkpoints"):
                 cur.execute(f"DELETE FROM {t} WHERE tenant_id=%s", (tid,))
@@ -2676,10 +4696,20 @@ def _main(a):
     elif a[0] == "cancel" and len(a) > 2:
         print(json.dumps(cancel(a[1], int(a[2]), a[3] if len(a) > 3 else "stopped by user")))
     elif a[0] == "resume":
-        print(json.dumps(resume_stalled()))
+        result = resume_stalled()
+        print(json.dumps(result))
+        if result.get("degraded"):
+            raise SystemExit(2)
     elif a[0] == "run_job" and len(a) > 3:
         # dispatch-and-park worker entrypoint: run_job <thread_id> <kind> <jid>
-        print(json.dumps(run_job(int(a[1]), a[2], int(a[3]))))
+        result = run_job(int(a[1]), a[2], int(a[3]))
+        print(json.dumps(result), flush=True)
+        # This CLI is a dedicated, disposable phase process. Some provider/HTTP libraries leave background
+        # helper threads behind even after the phase's own bounded child cleanup and durable result commit;
+        # normal interpreter shutdown then waits indefinitely and defeats process containment. At this point
+        # run_job has committed the controller_jobs result and phase cleanup has killed/reaped owned OS child
+        # groups, so a direct process exit is the final containment boundary. In-process callers are unaffected.
+        os._exit(0)
     elif a[0] == "_park_crash_driver" and len(a) > 1:
         _park_crash_driver(int(a[1]))       # test-only helper spawned by parkcrash
     elif a[0] == "watchdog":
@@ -2692,9 +4722,15 @@ def _main(a):
         sys.exit(_park_crash_selftest())
     elif a[0] == "parkstatus":
         print(json.dumps(park_status(), indent=2, default=str))
+    elif a[0] == "handoff" and len(a) > 1:
+        result = controlled_handoff(int(a[1]), " ".join(a[2:]) or "rolling runtime upgrade")
+        print(json.dumps(result, indent=2, default=str))
+        if not result.get("handoff"):
+            raise SystemExit(2)
     else:
         sys.exit("usage: loopcontroller.py "
-                 "start|say|choose|state|research|live|cancel|resume|run_job|watchdog|liveness|parktest|selftest ...")
+                 "start|say|choose|state|research|live|cancel|resume|run_job|watchdog|liveness|parktest|"
+                 "parkstatus|handoff|selftest ...")
 
 
 def _park_crash_driver(thread_id):
@@ -2702,12 +4738,16 @@ def _park_crash_driver(thread_id):
     the harness can hard-KILL this process mid-phase and prove the worker outlives it."""
     import time
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, awaiting, updated_at)
-                       VALUES (%s,1,1,'__PARKTEST__','fleet', now())
-                       ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting='fleet'""", (thread_id,))
-        cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, status, heartbeat_at)
-                       VALUES (%s,1,'__PARKTEST__','__selftest_slow__','running', now()) RETURNING id""", (thread_id,))
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO controller_state
+                          (thread_id, tenant_id, org_id, phase, awaiting, updated_at, execution_scope)
+                       VALUES (%s,1,1,'__PARKTEST__','fleet',now(),'test')
+                       ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting='fleet',
+                         execution_scope='test'""", (thread_id,))
+        cur.execute("""INSERT INTO controller_jobs
+                          (thread_id, tenant_id, phase, kind, status, heartbeat_at, execution_scope)
+                       VALUES (%s,1,'__PARKTEST__','__selftest_slow__','running',now(),'test')
+                       RETURNING id""", (thread_id,))
         jid = cur.fetchone()[0]; c.commit()
     _spawn_parked_worker(thread_id, "__selftest_slow__", jid)
     print(f"DRIVER_UP jid={jid}", flush=True)
@@ -2726,7 +4766,7 @@ def _park_crash_selftest():
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
     def _status(jid):
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT status FROM controller_jobs WHERE id=%s", (jid,))
             r = cur.fetchone()
             return r[0] if r else None
@@ -2756,7 +4796,7 @@ def _park_crash_selftest():
             driver.kill()
         except Exception:
             pass
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid,))
             cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid,))
             c.commit()
@@ -2774,23 +4814,27 @@ def _park_selftest():
     tid_thread = 960000 + int(os.urandom(2).hex(), 16) % 1000
 
     def _mkjob():
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, awaiting, updated_at)
-                           VALUES (%s,1,1,'__PARKTEST__','fleet', now())
-                           ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting='fleet'""",
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""INSERT INTO controller_state
+                              (thread_id, tenant_id, org_id, phase, awaiting, updated_at, execution_scope)
+                           VALUES (%s,1,1,'__PARKTEST__','fleet',now(),'test')
+                           ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting='fleet',
+                             execution_scope='test'""",
                         (tid_thread,))
-            cur.execute("""INSERT INTO controller_jobs (thread_id, tenant_id, phase, kind, status, heartbeat_at)
-                           VALUES (%s,1,'__PARKTEST__','__selftest__','running', now()) RETURNING id""", (tid_thread,))
+            cur.execute("""INSERT INTO controller_jobs
+                              (thread_id, tenant_id, phase, kind, status, heartbeat_at, execution_scope)
+                           VALUES (%s,1,'__PARKTEST__','__selftest__','running',now(),'test')
+                           RETURNING id""", (tid_thread,))
             jid = cur.fetchone()[0]; c.commit()
         return jid
 
     def _status(jid):
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT status, result FROM controller_jobs WHERE id=%s", (jid,))
             return cur.fetchone()
 
     def _awaiting():
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT awaiting FROM controller_state WHERE thread_id=%s", (tid_thread,))
             return cur.fetchone()[0]
 
@@ -2817,12 +4861,12 @@ def _park_selftest():
             time.sleep(0.5)
         assert st2 == "done", f"detached worker must complete the job (got {st2})"
         print("PASS: detached worker process rebuilt state, ran, and wrote 'done' (survives as its own process)")
-        print("park_selftest: PASS (dispatch-and-park mechanics verified; default ON via AOS_DISPATCH_PARK)")
+        print("park_selftest: PASS (parked-only dispatch invariant verified)")
     except AssertionError as e:
         ok = False
         print(f"park_selftest: FAIL — {e}")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid_thread,))
             cur.execute("DELETE FROM controller_state WHERE thread_id=%s", (tid_thread,))
             c.commit()

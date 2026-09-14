@@ -11,25 +11,39 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection
+
+
+def _conn(tenant_id=None):
+    return tenant_connection(tenant_id) if tenant_id else connection()
+
+
+def _tenant_for(product):
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM tenant_products WHERE product=%s ORDER BY created_at DESC LIMIT 1",
+                        (product,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
 
 
 def set_budget(product, token_budget, hard_stop=True):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    tenant_id = _tenant_for(product)
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("INSERT INTO budgets (product, token_budget, hard_stop) VALUES (%s,%s,%s) "
                     "ON CONFLICT (product) DO UPDATE SET token_budget=EXCLUDED.token_budget, hard_stop=EXCLUDED.hard_stop",
                     (product, token_budget, hard_stop))
-        c.commit()
 
 
 def status(product):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    tenant_id = _tenant_for(product)
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("SELECT token_budget, hard_stop FROM budgets WHERE product=%s", (product,))
         r = cur.fetchone()
         budget, hard = (r[0], r[1]) if r else (None, False)
@@ -47,7 +61,8 @@ def allow_spend(product, est_tokens):
     over = (s["spent"] + est_tokens) > s["budget"]
     decision = "deny" if (over and s["hard_stop"]) else "allow"
     audit.append(actor="governor", action="BudgetCheck", resource=product, decision=decision,
-                 payload={"spent": int(s["spent"]), "budget": int(s["budget"]), "est": est_tokens})
+                 payload={"spent": int(s["spent"]), "budget": int(s["budget"]), "est": est_tokens},
+                 tenant_id=_tenant_for(product))
     return not (over and s["hard_stop"])
 
 
@@ -58,9 +73,9 @@ def _test():
     metrics.record("state_change", product=p, to_state="build", tokens_in=400, tokens_out=300)  # 700 spent
     allowed = allow_spend(p, 200)     # 700+200=900 <= 1000 -> allow
     denied = allow_spend(p, 500)      # 700+500=1200 > 1000 -> deny
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(_tenant_for(p)) as c, c.cursor() as cur:
         cur.execute("DELETE FROM budgets WHERE product=%s", (p,))
-        cur.execute("DELETE FROM org_metrics WHERE product=%s", (p,)); c.commit()
+        cur.execute("DELETE FROM org_metrics WHERE product=%s", (p,))
     ok = allowed and not denied
     print(f"under budget allowed={allowed}, over budget denied={not denied}")
     print("PASS: budget governor enforces token caps ✅" if ok else "FAIL")

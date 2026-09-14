@@ -77,7 +77,8 @@ def proposed_workflow() -> dict:
                     "tool": "workflow.revise",
                     "source": {"node_id": "replan",
                                "output_path": ["artifact_ids", "mission-program-revision"]},
-                    "success_condition": "revised", "max_iterations": 2,
+                    "success_condition": "revised", "repair_condition": "repair",
+                    "max_iterations": 2,
                 },
             },
             {
@@ -92,6 +93,7 @@ def proposed_workflow() -> dict:
             {"source": "replan", "target": "done", "condition": "stable"},
             {"source": "replan", "target": "revise-program", "condition": "changed"},
             {"source": "revise-program", "target": "build", "condition": "revised"},
+            {"source": "revise-program", "target": "replan", "condition": "repair"},
         ],
     }
 
@@ -174,6 +176,18 @@ def test_materialized_plan_is_tenant_owned_bounded_and_cannot_request_unknown_to
     assert definition.version == 1
     assert definition.workflow_id.startswith("mission-")
 
+    compatible = proposed_workflow()
+    compatible["nodes"][0]["configuration"]["agent_context"] = "Build the compact source."
+    normalized = materialize_mission_workflow(
+        compatible,
+        tenant_id="tenant-a",
+        planning_run_id="plan-string-context",
+        artifact_id="artifact-string-context",
+    )
+    assert normalized.nodes[0].configuration["agent_context"] == {
+        "instructions": "Build the compact source."
+    }
+
     bad = proposed_workflow()
     bad["nodes"][0] = {
         "node_id": "build",
@@ -192,15 +206,45 @@ def test_materialized_plan_is_tenant_owned_bounded_and_cannot_request_unknown_to
 
 def test_planner_advertises_and_enforces_only_runtime_available_tools():
     definition = mission_bootstrap_definition(
-        "tenant-a", available_tools={"deploy.preview", "sandbox.run"},
+        "tenant-a", available_tools={"deploy.preview", "preview.fetch", "sandbox.run"},
     )
     planner = next(node for node in definition.nodes if node.node_id == "plan")
     context = planner.configuration["agent_context"]
-    assert context["available_tools"] == ["deploy.preview", "sandbox.run", "workflow.revise"]
+    assert context["available_tools"] == [
+        "deploy.preview", "preview.fetch", "sandbox.run", "workflow.revise",
+    ]
     assert "preview_deployment_configuration" in context
+    assert context["preview_fetch_configuration"]["tool"] == "preview.fetch"
     assert "sandbox_tool_configuration" in context
+    assert context["workflow_node_configuration_contract"]["agent_or_decision"][
+        "allowed_keys_only"
+    ] == ["max_iterations", "agent_context"]
+    assert "workflow_revision_configuration" in context
+    assert context["workflow_revision_configuration"]["bounded_correction_format"][
+        "format"
+    ] == "agent-os.mission-program-merge-patch.v1"
     assert "production_static_deployment_configuration" not in context
     assert "production_service_deployment_configuration" not in context
+    assert any(
+        "requires owner_role" in item and "accountable_role_id" in item
+        for item in context["semantic_constraints"]
+    )
+    assert any(
+        "directly target" in item and "workflow.revise" in item
+        for item in context["semantic_constraints"]
+    )
+    assert any(
+        "recipient_ids" in item and "requested_from" in item
+        for item in context["semantic_constraints"]
+    )
+    assert any(
+        "required_tool_ids" in item and "expansion_node_ids" in item
+        for item in context["semantic_constraints"]
+    )
+    assert any(
+        edge.source == "launch" and edge.target == "plan" and edge.condition == "repair"
+        for edge in definition.edges
+    )
 
     plan = proposed_workflow()
     plan["nodes"][0] = {
@@ -408,6 +452,66 @@ def test_start_mission_plans_validates_and_launches_a_child_graph(tmp_path: Path
         artifacts.close()
 
 
+def test_bootstrap_routes_a_rejected_program_back_to_the_architect(tmp_path: Path):
+    graph = SQLGraphWorkflowEngine(
+        f"sqlite:///{tmp_path / 'repair-graph.sqlite3'}", create_schema=True,
+    )
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'repair-artifacts.sqlite3'}", create_schema=True,
+    )
+    try:
+        definition = mission_bootstrap_definition(
+            "tenant-a", available_tools={"sandbox.run", "deploy.preview"},
+        )
+        graph.register_workflow(definition)
+        graph.start_graph_run(
+            "tenant-a", definition.workflow_id, definition.version,
+            run_id="repair-planning-run", request_id="repair-start",
+            context={"lifecycle_run_id": "lifecycle-repair", "budget_limit_cents": 0},
+        )
+        rejected = proposed_program()
+        rejected["workflow"]["nodes"][0]["owner_role"] = "mission-manager"
+        artifact_id = artifacts.put(
+            organization_id="tenant-a", content=json.dumps(rejected).encode(),
+            media_type="application/json", idempotency_key="rejected-program",
+        )
+        state = graph.get_graph_run("tenant-a", "repair-planning-run")
+        plan = state.tokens[0]
+        state = graph.submit_graph_event("tenant-a", state.run_id, WorkflowEvent(
+            "repair-plan-began", WorkflowEventKind.NODE_BEGAN, state.version,
+            {"token_id": plan.token_id},
+        )).state
+        state = graph.submit_graph_event("tenant-a", state.run_id, WorkflowEvent(
+            "repair-plan-complete", WorkflowEventKind.NODE_COMPLETED, state.version,
+            {"token_id": plan.token_id, "satisfied_conditions": ["planned"],
+             "evidence_ids": [artifact_id],
+             "output": {"artifact_ids": {"mission-workflow": artifact_id}}},
+        )).state
+        launch_token = next(token for token in state.tokens if token.node_id == "launch")
+        state = graph.submit_graph_event("tenant-a", state.run_id, WorkflowEvent(
+            "repair-launch-began", WorkflowEventKind.NODE_BEGAN, state.version,
+            {"token_id": launch_token.token_id},
+        )).state
+        launch_node = next(node for node in definition.nodes if node.node_id == "launch")
+        result = WorkflowLaunchToolNodeHandlers(
+            graph, artifacts, available_tools={"sandbox.run", "deploy.preview"},
+        ).execute(
+            "tenant-a", state.run_id, definition, state,
+            WorkflowAction(
+                "repair-launch-action", WorkflowActionKind.EXECUTE_NODE,
+                launch_token.token_id, launch_token.node_id,
+            ),
+            launch_node,
+        )
+        assert result["disposition"] == "complete"
+        assert result["satisfied_conditions"] == ["repair"]
+        assert "owner does not match" in result["output"]["validation_error"]
+        assert result["evidence_ids"] == [artifact_id]
+    finally:
+        artifacts.close()
+        graph.close()
+
+
 def test_cancelled_lifecycle_cannot_start_a_late_planning_graph(tmp_path: Path):
     lifecycle = InMemoryWorkflowEngine()
     lifecycle.start_run(
@@ -536,6 +640,138 @@ def test_material_replan_supersedes_the_graph_in_place_without_restarting_the_mi
         graph.close()
 
 
+def test_rejected_material_replan_routes_back_for_bounded_repair(tmp_path: Path):
+    graph = SQLGraphWorkflowEngine(
+        f"sqlite:///{tmp_path / 'revision-repair-graph.sqlite3'}", create_schema=True,
+    )
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'revision-repair-artifacts.sqlite3'}", create_schema=True,
+    )
+    try:
+        original = proposed_program()
+        _, definition = materialize_mission_program(
+            original, tenant_id="tenant-a", planning_run_id="planning",
+            artifact_id="program-one",
+        )
+        invalid_id = artifacts.put(
+            organization_id="tenant-a",
+            content=b'{"format":"agent-os.mission-program.v1","revision":2}',
+            media_type="application/json",
+            idempotency_key="invalid-replacement",
+        )
+        source = NodeToken(
+            "replan-token", "replan", TokenStatus.SUCCEEDED, 1,
+            evidence_ids=(invalid_id,),
+            output={"artifact_ids": {"mission-program-revision": invalid_id}},
+        )
+        state = WorkflowRunState(
+            "same-mission-run", "tenant-a", definition.workflow_id, 1, 3,
+            WorkflowRunStatus.ACTIVE, (source,), {
+                "mission_execution": True,
+                "planning_run_id": "planning",
+                "mission_program": {
+                    key: value for key, value in original.items() if key != "workflow"
+                },
+                "mission_program_revision": 1,
+            }, (),
+        )
+        node = next(item for item in definition.nodes if item.node_id == "revise-program")
+        result = WorkflowLaunchToolNodeHandlers(graph, artifacts).revise(
+            "tenant-a", state.run_id, definition, state,
+            WorkflowAction(
+                "repair-revision-action", WorkflowActionKind.EXECUTE_NODE,
+                "revise-token", node.node_id,
+            ),
+            node,
+        )
+
+        assert result["disposition"] == "complete"
+        assert result["satisfied_conditions"] == ["repair"]
+        assert result["output"]["repair_required"] is True
+        assert "Field required" in result["output"]["validation_error"]
+        assert result["evidence_ids"] == [invalid_id]
+    finally:
+        artifacts.close()
+        graph.close()
+
+
+def test_rejected_program_can_be_corrected_with_a_bounded_merge_patch(tmp_path: Path):
+    graph = SQLGraphWorkflowEngine(
+        f"sqlite:///{tmp_path / 'revision-patch-graph.sqlite3'}", create_schema=True,
+    )
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'revision-patch-artifacts.sqlite3'}", create_schema=True,
+    )
+    try:
+        original = proposed_program()
+        base_id = artifacts.put(
+            organization_id="tenant-a",
+            content=json.dumps(original).encode(),
+            media_type="application/json",
+            idempotency_key="patch-base",
+        )
+        patch_id = artifacts.put(
+            organization_id="tenant-a",
+            content=json.dumps({
+                "format": "agent-os.mission-program-merge-patch.v1",
+                "base_artifact_id": base_id,
+                "patch": {
+                    "revision": 2,
+                    "workflow": {"name": "Corrected without rewriting unchanged sections"},
+                },
+            }).encode(),
+            media_type="application/json",
+            idempotency_key="bounded-program-patch",
+        )
+        source = NodeToken(
+            "patch-source", "replan", TokenStatus.SUCCEEDED, 1,
+            evidence_ids=(base_id, patch_id),
+            output={"artifact_ids": {"mission-program-revision": patch_id}},
+        )
+        state = WorkflowRunState(
+            "patched-mission", "tenant-a", "mission-workflow", 1, 3,
+            WorkflowRunStatus.ACTIVE, (source,), {
+                "mission_execution": True,
+                "planning_run_id": "planning",
+                "mission_program": {
+                    key: value for key, value in original.items() if key != "workflow"
+                },
+                "mission_program_revision": 1,
+            }, (),
+        )
+        action = WorkflowAction(
+            "bounded-patch-action", WorkflowActionKind.EXECUTE_NODE,
+            "revise-token", "revise-program",
+        )
+
+        candidate, candidate_id, evidence = WorkflowLaunchToolNodeHandlers(
+            graph, artifacts,
+        )._revision_program("tenant-a", state, action, patch_id)
+
+        assert candidate["revision"] == 2
+        assert candidate["workflow"]["name"] == (
+            "Corrected without rewriting unchanged sections"
+        )
+        assert candidate["workflow"]["nodes"] == original["workflow"]["nodes"]
+        assert candidate_id not in {base_id, patch_id}
+        assert evidence == (patch_id, base_id, candidate_id)
+        assert json.loads(artifacts.get("tenant-a", candidate_id)) == candidate
+        program, replacement = materialize_mission_program(
+            candidate,
+            tenant_id="tenant-a",
+            planning_run_id="planning",
+            artifact_id=candidate_id,
+            workflow_id="mission-workflow",
+            workflow_version=2,
+            supersedes_version=1,
+        )
+        assert program.revision == 2
+        assert replacement.version == 2
+    finally:
+        artifacts.close()
+        graph.close()
+
+
 class OneStateGraph:
     def __init__(self, state: WorkflowRunState) -> None:
         self.state = state
@@ -589,6 +825,58 @@ def test_successful_child_graph_projects_once_to_the_coarse_ceo_lifecycle():
     assert state.artifact_revision == "artifact-release"
     assert first["projected"] is True
     assert replay["duplicate"] is True
+
+
+def test_recovered_lifecycle_accepts_terminal_result_at_current_version():
+    lifecycle = InMemoryWorkflowEngine()
+    lifecycle.start_run(
+        LifecycleState("recovered-lifecycle", "tenant-a"),
+        Event("scope-recovered", EventKind.SCOPE_ACCEPTED, 0, {"prompt": "Build"}),
+    )
+    lifecycle.submit_event(
+        "tenant-a", "recovered-lifecycle",
+        Event("failed-once", EventKind.OPERATION_FAILED, 1, {
+            "operation": "mission_graph", "reason": "context overflow", "recoverable": True,
+        }),
+    )
+    lifecycle.submit_event(
+        "tenant-a", "recovered-lifecycle",
+        Event("recovered", EventKind.RECOVERY_REQUESTED, 2, {
+            "operation": "mission_graph", "reason": "runtime repaired",
+            "resume_command": "notify_operator",
+        }),
+    )
+    token = NodeToken(
+        "recovered-terminal", "done", TokenStatus.SUCCEEDED, 1,
+        evidence_ids=("artifact-recovered-release",),
+    )
+    graph_state = WorkflowRunState(
+        "recovered-mission", "tenant-a", "mission-workflow", 1, 2,
+        WorkflowRunStatus.SUCCEEDED, (token,), {
+            "mission_execution": True,
+            "lifecycle_run_id": "recovered-lifecycle",
+            # This is the immutable version at launch, before failure/recovery.
+            "lifecycle_expected_version": 1,
+        }, (token.token_id,),
+    )
+    action = WorkflowAction(
+        "recovered-mission-succeeded", WorkflowActionKind.RUN_SUCCEEDED,
+        token.token_id, token.node_id, {"terminal_token_ids": [token.token_id]},
+    )
+
+    result = MissionGraphEffectHandlers(
+        lifecycle_engine=lifecycle,
+        graph_engine=OneStateGraph(graph_state),
+        notification_handlers={},
+    ).graph_handlers()[WorkflowActionKind.RUN_SUCCEEDED]({
+        "tenant_id": "tenant-a", "run_id": "recovered-mission",
+    }, action)
+
+    state = lifecycle.get_run("tenant-a", "recovered-lifecycle")
+    assert result["projected"] is True
+    assert state.version == 4
+    assert state.status is LifecycleStatus.SUCCEEDED
+    assert state.artifact_revision == "artifact-recovered-release"
 
 
 def test_recursive_child_program_waits_resumes_and_returns_evidence(tmp_path: Path):

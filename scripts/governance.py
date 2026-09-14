@@ -30,14 +30,15 @@ import fnmatch
 import os
 import sys
 from pathlib import Path
+from aoscfg import CONTROL_PLANE_ROOT
 
-ROLES = Path.home() / "projects" / "control-plane" / "roles"
+ROLES = CONTROL_PLANE_ROOT / "roles"
 
 # THE single canonical role-permission decision, shared verbatim with the PreToolUse hook
 # (control-plane/hooks/enforce_manifest.py). Both layers derive their allow/deny from this module
 # so they CANNOT diverge. It is stdlib-only (no pyyaml/agent-os imports). We add the control-plane
 # hooks dir to sys.path (governance.py already locates control-plane/roles the same way).
-_HOOKS = Path.home() / "projects" / "control-plane" / "hooks"
+_HOOKS = CONTROL_PLANE_ROOT / "hooks"
 if str(_HOOKS) not in sys.path:
     sys.path.insert(0, str(_HOOKS))
 try:
@@ -64,7 +65,7 @@ except ModuleNotFoundError:
     # to silence this; anywhere else, an operator sees it in the very first log line of every process.
     if not os.environ.get("AOS_ALLOW_MISSING_CONTROL_PLANE"):
         sys.stderr.write(
-            "[governance] WARNING: control-plane repo not found at ~/projects/control-plane — role-manifest "
+            f"[governance] WARNING: control-plane repo not found at {CONTROL_PLANE_ROOT} — role-manifest "
             "policy enforcement is DISABLED and any policy decision will fail closed. Set "
             "AOS_ALLOW_MISSING_CONTROL_PLANE=1 to acknowledge (CI/selftest only).\n")
 
@@ -75,8 +76,9 @@ def assert_control_plane() -> None:
     per-decision RuntimeError. Opt out (CI, offline selftest) with AOS_ALLOW_MISSING_CONTROL_PLANE=1."""
     if not CONTROL_PLANE_OK and not os.environ.get("AOS_ALLOW_MISSING_CONTROL_PLANE"):
         raise RuntimeError(
-            "control-plane repo not present (~/projects/control-plane) — refusing to start the fleet without "
-            "role-manifest policy enforcement. Check out control-plane, or set AOS_ALLOW_MISSING_CONTROL_PLANE=1 "
+            f"control-plane repo not present ({CONTROL_PLANE_ROOT}) — refusing to start the fleet without "
+            f"role-manifest policy enforcement. Check out control-plane at {CONTROL_PLANE_ROOT}, or set "
+            "AOS_ALLOW_MISSING_CONTROL_PLANE=1 "
             "for an explicitly unenforced run (CI/selftest).")
 
 # capability name (as used by may/enforce) -> the manifest flag that grants it.

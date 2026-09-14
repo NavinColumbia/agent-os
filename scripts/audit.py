@@ -24,8 +24,10 @@ import sys
 from pathlib import Path
 
 import psycopg
+from psycopg import sql
 
 from aoscfg import ENV as ENV_LOCAL
+from dbpool import connection
 
 
 def _cfg():
@@ -57,6 +59,17 @@ def _chain_hash(key, canonical):
     return hmac.new(key, canonical.encode(), hashlib.sha256).hexdigest()
 
 
+def _audit_role():
+    # Append through the narrow hash-chain writer by default.  An unset
+    # variable must not silently turn every application audit append into a
+    # superuser operation; explicit ``off`` remains a break-glass path.
+    role = os.environ.get("AOS_DB_AUDIT_ROLE")
+    if role is None or not role.strip():
+        return "agentos_audit_writer"
+    role = role.strip()
+    return None if role.lower() in {"off", "none", "disabled"} else role
+
+
 def append(actor, action, resource="", decision="executed", payload=None, tenant_id=None):
     """Append one tamper-evident entry; returns (id, entry_hash).
 
@@ -65,14 +78,23 @@ def append(actor, action, resource="", decision="executed", payload=None, tenant
     (arg or payload.tenant/tenant_id), we ALSO link this row into that tenant's OWN hash sub-chain
     (t_prev_hash/t_entry_hash), so each tenant has an independently-verifiable audit trail (verify_tenant).
     Untenanted rows (platform events) simply leave the tenant columns NULL — the global chain covers them."""
-    db, key = _cfg()
+    _db, key = _cfg()
     payload = payload or {}
+    # Release/selftests deliberately exercise deny paths at high volume. Keep those decisions in the immutable
+    # audit chain, but identify them so production health metrics do not page on expected test traffic. Copy the
+    # mapping so adding metadata never mutates a caller-owned payload object.
+    if os.environ.get("AOS_SELFTEST", "").strip().lower() in ("1", "true", "yes", "on"):
+        payload = dict(payload) if isinstance(payload, dict) else {"value": payload}
+        payload["_selftest"] = True
     # derive the tenant for the sub-chain: explicit arg > payload.tenant/tenant_id > actor when the actor IS a
     # tenant (ids are 't-…'; no role/system actor uses that prefix), so tenant-actor events (account export/
     # delete, settings, etc.) land in the tenant's own trail too — without threading tid through every caller.
     tid = (tenant_id or ((payload.get("tenant") or payload.get("tenant_id")) if isinstance(payload, dict) else None)
            or (actor if isinstance(actor, str) and actor.startswith("t-") else None))
-    with psycopg.connect(db) as conn, conn.cursor() as cur:
+    with connection() as conn, conn.cursor() as cur:
+        role = _audit_role()
+        if role:
+            cur.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(role)))
         # serialize appends so the chain has no races
         cur.execute("SELECT pg_advisory_xact_lock(742042)")
         cur.execute("SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1")
@@ -96,7 +118,6 @@ def append(actor, action, resource="", decision="executed", payload=None, tenant
              (str(tid) if tid else None), t_prev, t_entry),
         )
         new_id = cur.fetchone()[0]
-        conn.commit()
         return new_id, entry_hash
 
 
@@ -168,7 +189,11 @@ def reseal(operator=None, break_glass=False, reason=""):
 def verify():
     """Walk the chain; return (True, None) if intact else (False, reason)."""
     db, key = _cfg()
-    with psycopg.connect(db) as conn, conn.cursor() as cur:
+    # The SELECT itself gets a consistent statement snapshot.  Autocommit releases that
+    # snapshot before the CPU-bound HMAC walk, so a large audit log cannot sit "idle in
+    # transaction" for minutes and be correctly mistaken for a leaked transaction by the
+    # sentinel.  Concurrent appends after this snapshot do not invalidate the prefix proved here.
+    with psycopg.connect(db, autocommit=True) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT id, actor, action, resource, decision, payload, prev_hash, entry_hash FROM audit_log ORDER BY id"
         )
@@ -189,7 +214,7 @@ def verify_tenant(tid):
     verifiable: a tenant (or their auditor) can cryptographically prove their own complete, unbroken trail
     without trusting the platform or seeing any other tenant's rows (C2 per-tenant audit chains)."""
     db, key = _cfg()
-    with psycopg.connect(db) as conn, conn.cursor() as cur:
+    with psycopg.connect(db, autocommit=True) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT id, actor, action, resource, decision, payload, t_prev_hash, t_entry_hash "
             "FROM audit_log WHERE tenant_id=%s ORDER BY id", (str(tid),))

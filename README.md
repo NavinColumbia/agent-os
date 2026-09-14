@@ -41,6 +41,7 @@ git clone git@github.com:NavinColumbia/agent-os.git ~/projects/agent-os
 cd ~/projects/agent-os && bash bootstrap.sh        # clones control-plane, builds venv, wires a product
 # pick your agent:
 #   AOS_PROVIDER=claude                              (full agentic, default)
+#   AOS_HERMES_ENABLED=1 AOS_PROVIDER=hermes         (optional canary-gated read-only specialist)
 #   AOS_PROVIDER=deepseek  AOS_PROVIDER_KEY=sk-...    (or openai / together / groq / ollama)
 bash scripts/recover.sh                              # bring all services up
 # run a product through the governed lifecycle:

@@ -12,6 +12,7 @@ re-run it to keep everything up. Libs and extensions have no URL (not browser-re
     devserve.py down <name> | down-all
 Run with the agent-os venv python.
 """
+import os
 import socket
 import subprocess
 import sys
@@ -175,9 +176,19 @@ def up(name):
 
 
 def up_all():
+    """Optionally restore a bounded recent working set, never every historical generated product.
+
+    Automatic recovery defaults to zero. Products start on demand through `up <name>`/QA. A dedicated host
+    may opt into restoring N recent apps with AOS_DEVSERVE_MAX_ACTIVE=N.
+    """
     out = []
+    limit = max(0, int(os.environ.get("AOS_DEVSERVE_MAX_ACTIVE", "0")))
+    if limit == 0:
+        return out
     for r in ar.as_rows():
         if r["kind"] in ("web", "service") and not r["name"].startswith(("ev-", "ut-", "dbg-", "st-")):
+            if len(out) >= limit:
+                break
             out.append(up(r["name"]))
     return out
 

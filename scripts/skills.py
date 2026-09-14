@@ -3,10 +3,10 @@
 tools, an ENGINE, and readiness. Roles query this so an agent KNOWS its capabilities without having to
 invent tooling each time.
 
-ENGINE — the heart of the model (see docs/adr/0006-claude-first-cognitive-substrate.md):
-  claude  : Claude does it natively (reason/write/code/analyze/translate/plan/advise). No extra ML
-            model needed — these REPLACE the old zoo of task-specific models. Ready by default;
-            "ready" here = a governed role + a playbook, both of which ship in this OS.
+ENGINE — capability execution class:
+  claude  : historical schema value for LLM-native work (reason/write/code/analyze/translate/plan/advise).
+            The runtime provider is selected by factory.agent (`AOS_DEFAULT_ENGINE`, Codex-first by default)
+            or by the tenant's connected provider. No extra task-specific ML model needed.
   tool    : a deterministic local binary for things that aren't text (ffmpeg, imagemagick, blender,
             godot, playwright, piper, whisper, pandoc, qpdf, postgres). Ready when installed.
   device  : needs a physical target (Mac runner for iOS, adb/emulator for Android).
@@ -24,9 +24,7 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
-from aoscfg import ENV, DB
+from dbpool import connection
 
 R = "ready"; SU = "needs_setup"; SK = "needs_key"
 CL = "claude"; TO = "tool"; DV = "device"; GPU = "gpu"; PAID = "paid"
@@ -165,7 +163,7 @@ CATALOG = [
 
 
 def seed():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("ALTER TABLE skills ADD COLUMN IF NOT EXISTS engine TEXT NOT NULL DEFAULT 'claude'")
         for name, cat, desc, roles, tools, status, engine in CATALOG:
             cur.execute("""INSERT INTO skills (name, category, description, roles, tools, status, engine)
@@ -173,12 +171,11 @@ def seed():
                            ON CONFLICT (name) DO UPDATE SET category=EXCLUDED.category, description=EXCLUDED.description,
                              roles=EXCLUDED.roles, tools=EXCLUDED.tools, status=EXCLUDED.status, engine=EXCLUDED.engine""",
                         (name, cat, desc, roles, tools, status, engine))
-        c.commit()
     return len(CATALOG)
 
 
 def for_role(role):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("SELECT name, status, engine, tools FROM skills WHERE %s = ANY(roles) ORDER BY status, name", (role,))
         return cur.fetchall()
 
@@ -200,7 +197,7 @@ def brief_for(role):
 
 
 def find(sub):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""SELECT name, status, engine FROM skills
                        WHERE name ILIKE %s OR description ILIKE %s OR category ILIKE %s ORDER BY name""",
                     (f"%{sub}%", f"%{sub}%", f"%{sub}%"))
@@ -222,7 +219,7 @@ def _main(a):
             print(f"  {name:28} [{engine}/{status}]")
     elif a[0] == "status":
         seed()
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("SELECT engine, count(*) FROM skills GROUP BY engine ORDER BY engine")
             by_engine = dict(cur.fetchall())
             cur.execute("SELECT status, count(*) FROM skills GROUP BY status ORDER BY status")
@@ -233,13 +230,13 @@ def _main(a):
         print(f"  by status: {by_status}")
     elif a[0] == "test":
         n = seed()
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM skills WHERE engine='claude'"); claude_native = cur.fetchone()[0]
             cur.execute("SELECT count(*) FROM skills WHERE status='ready'"); ready = cur.fetchone()[0]
         media = for_role("video-producer")
         ok = n >= 80 and claude_native >= 40 and ready >= 70 and any("demo-video" in m[0] for m in media)
         print(f"seeded {n} skills; {claude_native} are Claude-native; {ready} ready now")
-        print("PASS: skills registry — broad org pre-built, Claude-first ✅" if ok else "FAIL")
+        print("PASS: skills registry — broad org pre-built, LLM-native skills ready ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 
 

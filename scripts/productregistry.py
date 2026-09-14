@@ -30,15 +30,17 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import psycopg  # noqa: E402
-import trace as _trace  # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
 
-DB = _trace.DB
 PRODUCTS = Path.home() / "projects" / "products"
 
 
+def _conn(tenant_id=None):
+    return tenant_connection(tenant_id) if tenant_id else connection()
+
+
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS product_registry (
             product_id   TEXT PRIMARY KEY,
             tenant_id    TEXT, org_id TEXT,
@@ -49,7 +51,17 @@ def _ensure():
             attempts     JSONB NOT NULL DEFAULT '{}',   -- {phase: n} for the bounded auto-loop
             ts           TIMESTAMPTZ DEFAULT now(),
             updated_at   TIMESTAMPTZ DEFAULT now())""")
-        c.commit()
+
+
+def _tenant_for(product_id):
+    """Best-effort lookup so legacy product-only phase calls can still run under the tenant GUC."""
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM product_registry WHERE product_id=%s", (product_id,))
+            r = cur.fetchone()
+            return r[0] if r else None
+    except Exception:
+        return None
 
 
 def register(product_id, tenant_id=None, org_id=None, repo_path=None, plan=None):
@@ -58,7 +70,7 @@ def register(product_id, tenant_id=None, org_id=None, repo_path=None, plan=None)
     can re-point the product. Returns the full record."""
     _ensure()
     repo_path = str(repo_path) if repo_path else str(PRODUCTS / product_id)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO product_registry (product_id, tenant_id, org_id, repo_path, plan)
                        VALUES (%s,%s,%s,%s,%s)
                        ON CONFLICT (product_id) DO UPDATE SET
@@ -68,13 +80,13 @@ def register(product_id, tenant_id=None, org_id=None, repo_path=None, plan=None)
                          updated_at=now()""",
                     (product_id, tenant_id, str(org_id) if org_id is not None else None,
                      repo_path, json.dumps(plan) if plan else None))
-        c.commit()
-    return get(product_id)
+    return get(product_id, tenant_id=tenant_id)
 
 
-def get(product_id):
+def get(product_id, tenant_id=None):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    tenant_id = tenant_id or _tenant_for(product_id)
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("""SELECT product_id, tenant_id, org_id, repo_path, plan, current_phase, phases, attempts
                        FROM product_registry WHERE product_id=%s""", (product_id,))
         r = cur.fetchone()
@@ -84,40 +96,40 @@ def get(product_id):
     return dict(zip(keys, r))
 
 
-def path(product_id):
+def path(product_id, tenant_id=None):
     """THE single source of truth for where this product lives on disk. Every phase (build, QA, deliver) reads
     its path from HERE — never recomputes it — so they cannot diverge. Falls back to the canonical default for
     an unregistered id (so a caller is never left without a path)."""
-    r = get(product_id)
+    r = get(product_id, tenant_id=tenant_id)
     return (r or {}).get("repo_path") or str(PRODUCTS / product_id)
 
 
-def record_phase(product_id, phase, ok, artifact=None, verdict=None):
+def record_phase(product_id, phase, ok, artifact=None, verdict=None, tenant_id=None):
     """Record a phase's OUTCOME into the authoritative record — the thing the NEXT phase's contract checks."""
     _ensure()
+    tenant_id = tenant_id or _tenant_for(product_id)
     entry = {"ok": bool(ok), "artifact": str(artifact) if artifact else None,
              "verdict": (str(verdict)[:500] if verdict else None)}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("""UPDATE product_registry
                        SET phases = phases || %s::jsonb, current_phase=%s, updated_at=now()
                        WHERE product_id=%s""",
                     (json.dumps({phase: entry}), phase, product_id))
-        c.commit()
     return entry
 
 
-def attempt(product_id, phase):
+def attempt(product_id, phase, tenant_id=None):
     """Increment + return the bounded auto-loop counter for a phase (so a failing build/QA re-tries a few times
     autonomously before we ever escalate to the human)."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    tenant_id = tenant_id or _tenant_for(product_id)
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("SELECT COALESCE((attempts->>%s)::int,0) FROM product_registry WHERE product_id=%s",
                     (phase, product_id))
         row = cur.fetchone()
         n = (row[0] if row else 0) + 1
         cur.execute("UPDATE product_registry SET attempts = attempts || %s::jsonb WHERE product_id=%s",
                     (json.dumps({phase: n}), product_id))
-        c.commit()
     return n
 
 
@@ -129,13 +141,13 @@ def _isdir(p):
         return False
 
 
-def precondition(product_id, phase):
+def precondition(product_id, phase, tenant_id=None):
     """(ok, reason) — is `phase` allowed to run? Validated against the registry, NOT a loose assumption:
       * qa      requires build succeeded AND its artifact actually exists on disk (kills F6/F7 deterministically).
       * deliver requires QA passed.
     Anything else (research/design/build) is always allowed. A failed precondition tells the caller to route
     back to the producing phase (auto), not to the human."""
-    r = get(product_id)
+    r = get(product_id, tenant_id=tenant_id)
     if not r:
         return False, f"product '{product_id}' is not registered (no single source of truth)"
     ph = r.get("phases") or {}
@@ -195,8 +207,8 @@ def _selftest():
         return 0 if ok else 1
     finally:
         shutil.rmtree(d, ignore_errors=True)
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("DELETE FROM product_registry WHERE product_id=%s", (pid,)); c.commit()
+        with connection() as c, c.cursor() as cur:
+            cur.execute("DELETE FROM product_registry WHERE product_id=%s", (pid,))
 
 
 if __name__ == "__main__":

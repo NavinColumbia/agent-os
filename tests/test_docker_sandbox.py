@@ -107,6 +107,10 @@ def test_docker_runner_requires_pinned_image_and_source_bundle_media_type(tmp_pa
     store = SQLArtifactStore(f"sqlite:///{tmp_path / 'sandbox.sqlite3'}", create_schema=True)
     with pytest.raises(ValueError, match="pinned"):
         DockerSandboxRunner(store, image="python:latest", docker_binary="/bin/true")
+    local = DockerSandboxRunner(
+        store, image="sha256:" + "a" * 64, docker_binary="/bin/true",
+    )
+    assert local._image == "sha256:" + "a" * 64
     wrong_id = store.put(
         organization_id="tenant-a", content=b"not a bundle", media_type="text/plain",
         idempotency_key="wrong-source",

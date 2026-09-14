@@ -17,22 +17,26 @@ import subprocess
 import time
 from pathlib import Path
 
-import psycopg
 from dbos import DBOS, DBOSConfig, SetWorkflowID
 
 SCRIPTS = Path(__file__).resolve().parent
-from aoscfg import ENV, DB
+from aoscfg import DB
+from dbpool import connection
 WF = Path("/tmp/approval_wf_id")
 TOPIC = "human-approval"
+APPROVAL_TIMEOUT_S = 3600
 
 
 def _wait(wf, on):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         if on:
-            cur.execute("INSERT INTO waits(waiter,awaited) VALUES(%s,'human') ON CONFLICT DO NOTHING", (wf,))
+            cur.execute(
+                "INSERT INTO waits(waiter,awaited,reply_by) "
+                "VALUES(%s,'human', now() + make_interval(secs => %s)) "
+                "ON CONFLICT (waiter,awaited) DO UPDATE SET reply_by = EXCLUDED.reply_by",
+                (wf, APPROVAL_TIMEOUT_S))
         else:
             cur.execute("DELETE FROM waits WHERE waiter=%s AND awaited='human'", (wf,))
-        c.commit()
 
 
 def _notify(text):
@@ -51,7 +55,7 @@ def gated(action: str):
     me = DBOS.workflow_id
     _wait(me, True)
     print(f"[gate] '{action}' awaiting human approval; suspended (no tokens burned)", flush=True)
-    decision = DBOS.recv(topic=TOPIC, timeout_seconds=3600)  # durable, survives crash
+    decision = DBOS.recv(topic=TOPIC, timeout_seconds=APPROVAL_TIMEOUT_S)  # durable, survives crash
     _wait(me, False)
     if decision is None:
         return "TIMEOUT->escalate"   # no unbounded wait — SLA breach escalates
@@ -67,7 +71,7 @@ def main(mode, arg=None):
         with SetWorkflowID(wf):
             DBOS.start_workflow(gated, action)
         for _ in range(120):
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with connection() as c, c.cursor() as cur:
                 cur.execute("SELECT 1 FROM waits WHERE waiter=%s", (wf,))
                 if cur.fetchone():
                     break

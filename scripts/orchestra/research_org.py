@@ -78,9 +78,9 @@ def run_research(question, out_rel="REPORT.md", api_key=None, research_run_id=No
     """Execute one research question as a durable org run. Same return contract as
     research_fleet.research: {"report": <path>, "subquestions": N, "answered": N} (+ the
     orchestra run id). Raises on a refused/failed run so research._run marks it failed."""
-    if os.environ.get("AOS_RESEARCH_RUNORG", "0").lower() not in ("0", "false", "no", ""):
-        # CRASH-RESUMABLE engine (docs/RESEARCH-RUNORG-REWIRE.md): route through runtime.run_org. Flagged OFF
-        # by default until the offline crash-resume proof AND one live run pass; then this becomes the default.
+    if os.environ.get("AOS_RESEARCH_RUNORG", "1").lower() not in ("0", "false", "no", ""):
+        # CRASH-RESUMABLE engine (docs/RESEARCH-RUNORG-REWIRE.md): route through runtime.run_org by default;
+        # set AOS_RESEARCH_RUNORG=0 to use the legacy inline research path during rollback/debugging.
         return run_research_via_org(question, out_rel, api_key, research_run_id, tenant_id, org_id)
     rid = research_run_id if research_run_id is not None else uuid.uuid4().hex[:12]
     tenant = tenant_id or "platform"
@@ -266,6 +266,7 @@ def _selftest():
     tid = f"research-org-selftest-{uuid.uuid4().hex[:8]}"
     tmp = Path(tempfile.mkdtemp())
     real_agent, real_products = factory.agent, factory.PRODUCTS
+    real_flag = os.environ.get("AOS_RESEARCH_RUNORG")
     factory.PRODUCTS = tmp
 
     def fake_agent(role, repo, task, **k):
@@ -285,6 +286,7 @@ def _selftest():
         return {"rc": 0, "out": "ok"}
 
     factory.agent = fake_agent
+    os.environ["AOS_RESEARCH_RUNORG"] = "0"       # this selftest proves the legacy rollback path
     ok = False
     try:
         res = run_research("how should we grow the creator platform",
@@ -343,6 +345,10 @@ def _selftest():
               "console expects it ✅" if ok else "FAIL")
     finally:
         factory.agent, factory.PRODUCTS = real_agent, real_products
+        if real_flag is None:
+            os.environ.pop("AOS_RESEARCH_RUNORG", None)
+        else:
+            os.environ["AOS_RESEARCH_RUNORG"] = real_flag
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
         with psycopg.connect(store.DB) as c, c.cursor() as cur:

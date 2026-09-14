@@ -160,6 +160,59 @@ def test_ceo_inbox_resolves_only_current_authorized_human_wait_and_replay_is_saf
         graph.close()
 
 
+def test_owner_can_recover_a_failed_graph_node_but_viewer_cannot(tmp_path: Path):
+    graph = SQLGraphWorkflowEngine(
+        f"sqlite:///{tmp_path / 'failed-graph-api.sqlite3'}", create_schema=True,
+    )
+    definition = WorkflowDefinition(
+        "recover", "tenant-a", "Recover", 1, "work",
+        (
+            WorkflowNode("work", NodeKind.AGENT, "Do work", "engineer"),
+            WorkflowNode("done", NodeKind.TERMINAL, "Done"),
+        ),
+        (WorkflowEdge("work", "done", "done"),),
+        "architect",
+    )
+    graph.register_workflow(definition)
+    started = graph.start_graph_run(
+        "tenant-a", "recover", 1, run_id="failed-run", request_id="failed-start",
+    )
+    token_id = started.state.ready()[0].token_id
+    running = graph.submit_graph_event("tenant-a", "failed-run", WorkflowEvent(
+        "failed-begin", WorkflowEventKind.NODE_BEGAN, 0, {"token_id": token_id},
+    ))
+    failed = graph.submit_graph_event("tenant-a", "failed-run", WorkflowEvent(
+        "failed-result", WorkflowEventKind.NODE_FAILED, running.state.version,
+        {"token_id": token_id, "reason": "fixed later", "retryable": False},
+    ))
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=Identity(), graph_engine=graph,
+    ))
+    payload = {
+        "event_id": "operator-recovery",
+        "kind": "node_retry_requested",
+        "expected_version": failed.state.version,
+        "payload": {"token_id": token_id, "reason": "The blocker is repaired."},
+    }
+    try:
+        denied = api.post(
+            "/v2/graph-runs/failed-run/events",
+            headers={"Authorization": "Bearer viewer"},
+            json=payload,
+        )
+        accepted = api.post(
+            "/v2/graph-runs/failed-run/events",
+            headers={"Authorization": "Bearer owner"},
+            json=payload,
+        )
+        assert denied.status_code == 403
+        assert accepted.status_code == 202
+        assert accepted.json()["state"]["status"] == "active"
+    finally:
+        api.close()
+        graph.close()
+
+
 def test_viewer_cannot_cancel_a_ceo_mission():
     api = TestClient(create_app(engine=InMemoryWorkflowEngine(), identity=Identity()))
     try:

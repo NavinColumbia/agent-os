@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from typing import Callable, Mapping, Any
 
-from agent_os.application.command_worker import FatalCommandError
+from agent_os.application.command_worker import FatalCommandError, is_retryable_execution_error
 from agent_os.application.ports import GraphActionExecutor, GraphNodeRuntime, GraphWorkflowEngine
 from agent_os.domain.workflow_runtime import (
     TokenStatus,
@@ -109,7 +109,9 @@ class DurableGraphActionExecutor(GraphActionExecutor):
                 action=action,
                 idempotency_key=action.action_id,
             )
-        except FatalCommandError as exc:
+        except Exception as exc:
+            if not isinstance(exc, FatalCommandError) and is_retryable_execution_error(exc):
+                raise
             current = self._engine.get_graph_run(tenant_id, run_id)
             if current is None:
                 raise FatalCommandError("graph run disappeared while recording node failure") from exc

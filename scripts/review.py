@@ -18,9 +18,11 @@ The audit is grounded and adversarial: every judgement must cite a step index or
 DEFAULT posture is skeptical — "not shown in the evidence" reads as NOT DONE, never "probably fine".
 """
 import json
+import hashlib
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -101,6 +103,30 @@ def _load(evidence_dir: Path) -> dict:
                                "files": fr.get("files") or [], "residual": fr.get("residual") or [],
                                "reason": ((fr.get("verdict") or {}).get("reason")
                                           or (fr.get("verdict") or {}).get("summary") or fr.get("error"))})
+    inspections = []
+    for p in sorted((evidence_dir / "inspections").glob("*recorder-inspection*.json")):
+        try:
+            data = json.loads(p.read_text())
+            inspections.append({
+                "file": p.name,
+                "accepted": data.get("accepted"),
+                "capture_started_at": data.get("capture_started_at") or
+                                      (data.get("source_summary") or {}).get("capture_started_at"),
+                "capture_ended_at": data.get("capture_ended_at") or
+                                    (data.get("source_summary") or {}).get("capture_ended_at"),
+                "actions": len(data.get("actions") or []) or (data.get("source_summary") or {}).get("actions"),
+                "requests": len(data.get("network_requests") or []) or
+                            (data.get("source_summary") or {}).get("requests"),
+                "console_errors": len(data.get("console_errors") or []) if "console_errors" in data else
+                                  (data.get("source_summary") or {}).get("console_errors"),
+                "checked": data.get("checked"),
+                "issues": data.get("issues"),
+                "summary": data.get("summary"),
+                "source_sha256": data.get("source_sha256"),
+                "media": data.get("video") or (data.get("source_summary") or {}).get("media"),
+            })
+        except Exception:
+            inspections.append({"file": p.name, "unreadable": True})
     return {
         "dir": evidence_dir,
         "input": _j("run-input.json", {}),
@@ -108,9 +134,11 @@ def _load(evidence_dir: Path) -> dict:
         "coverage": _j("coverage.json", []),
         "checkpoint": _j("checkpoint.json", {}),
         "fix_rounds": fix_rounds,
+        "inspections": inspections,
         "stories": run_final.get("stories", []),
         "screenshots": sorted(str(p) for p in (evidence_dir / "screenshots").glob("*.png")),
-        "video": next((str(p) for p in (evidence_dir / "videos").glob("*.mp4")
+        "video": next((str(p) for pattern in ("*.mp4", "*.webm")
+                       for p in (evidence_dir / "videos").glob(pattern)
                        if p.name != "qa-session.mp4"), None),
         "session_video": str(evidence_dir / "qa-session.mp4") if (evidence_dir / "qa-session.mp4").exists() else None,
     }
@@ -121,10 +149,11 @@ def dossier(evidence_dir) -> dict:
     expected, ACTUAL, verdict, aspects claimed, screenshot). Returns {'data':..., 'md': <str>}."""
     evidence_dir = _resolve_dir(evidence_dir)
     d = _load(evidence_dir)
+    story_videos = [story.get("video") for story in d.get("stories", []) if story.get("video")]
     L = [f"# Work-execution evidence — {evidence_dir.name}", "",
          f"**Vision:** {d['input'].get('vision', '(none)')}", "",
          f"**Screenshots on disk:** {len(d['screenshots'])} · **Session video:** "
-         f"{d['session_video'] or '(none)'}", ""]
+         f"{d['session_video'] or '(none)'} · **Recorded story videos:** {len(story_videos)}", ""]
     if d.get("fix_rounds"):
         L += ["## Dev-fix rounds (the ACTUAL changes + residual bugs — cross-check claims against these)", "",
               "| round | dev claims fixed | files changed | RESIDUAL bugs still open | fix-judge reason |",
@@ -132,6 +161,11 @@ def dossier(evidence_dir) -> dict:
         for fr in d["fix_rounds"]:
             L.append(f"| {fr['round']} | {fr.get('fixed')} | {_clip('; '.join(fr.get('files') or []), 60)} | "
                      f"**{len(fr.get('residual') or [])}** | {_clip(fr.get('reason'), 80)} |")
+        L.append("")
+    if d.get("inspections"):
+        L += ["## Immutable recorder inspections (open the named JSON for the full raw trace)", ""]
+        for item in d["inspections"]:
+            L.append("- " + json.dumps(item, sort_keys=True, default=str))
         L.append("")
     for cov in d["coverage"]:
         L += [f"## Story: {cov.get('story', '?')}",
@@ -141,15 +175,66 @@ def dossier(evidence_dir) -> dict:
               + ("; ".join(cov.get("yet_to_test", [])) or "(none)"), ""]
     for st in d["stories"]:
         L += [f"## Step-by-step for: {st.get('title', st.get('id', '?'))}  (reported status: {st.get('status')})",
-              "", "| # | reasoning (WHY) | action | expected | ACTUAL | verdict | claimed-covers | screenshot |",
+              f"- Story video: {st.get('video') or '(none)'}",
+              f"- Explicit recorder-contract records: {len(st.get('artifact_evidence') or [])} "
+              f"(independent boundary inspection is required only when this story names recorder evidence; "
+              f"the story video count is reported separately above)", "",
+              "| # | reasoning (WHY) | action | expected | ACTUAL | verdict | claimed-covers | screenshot |",
               "|---|---|---|---|---|---|---|---|"]
         for i, s in enumerate(st.get("steps", [])):
             shot = Path(s.get("screenshot") or "").name or "-"
-            L.append(f"| {i} | {_clip(s.get('reasoning'))} | {_clip(s.get('action'))} | "
-                     f"{_clip(s.get('expected'))} | {_clip(s.get('actual'))} | {s.get('verdict', '?')} | "
-                     f"{_clip('; '.join(s.get('covers') or []))} | {shot} |")
+            L.append(f"| {i} | {_clip(s.get('reasoning'), 180)} | {_clip(s.get('action'), 160)} | "
+                     f"{_clip(s.get('expected'), 240)} | {_clip(s.get('actual'), 1200)} | "
+                     f"{s.get('verdict', '?')} | "
+                     f"{_clip('; '.join(s.get('covers') or []), 300)} | {shot} |")
         L.append("")
     return {"data": d, "md": "\n".join(L)}
+
+
+def _story_dossier(data, story) -> str:
+    """Render one complete story dossier plus a compact campaign manifest.
+
+    Repeating a multi-hundred-kilobyte whole-run prompt for every juror made the audit both slow and prone to
+    evidence being buried near model context limits.  Each focused juror still receives the product vision,
+    every planned story's coverage state, and all raw steps/evidence for the story it must judge.
+    """
+    story_id = str(story.get("id") or story.get("title") or "?")
+    coverage = list(data.get("coverage") or [])
+    matching = next((item for item in coverage
+                     if str(item.get("story") or "") == story_id), {})
+    lines = [f"# Focused work-execution evidence — {story_id}", "",
+             f"**Vision:** {(data.get('input') or {}).get('vision', '(none)')}", "",
+             "## Complete campaign manifest (this focus is not permission to ignore another story)", ""]
+    for item in coverage:
+        lines.append(
+            f"- {item.get('story', '?')}: stop={item.get('stop_reason', '?')}; "
+            f"tested={len(item.get('tested') or [])}; yet-to-test={len(item.get('yet_to_test') or [])}")
+    lines += ["", f"## Full coverage ledger for {story_id}",
+              f"- reported stop reason: **{matching.get('stop_reason', '?')}**",
+              f"- TESTED ({len(matching.get('tested') or [])}): "
+              + ("; ".join(matching.get("tested") or []) or "(none)"),
+              f"- YET-TO-TEST ({len(matching.get('yet_to_test') or [])}): "
+              + ("; ".join(matching.get("yet_to_test") or []) or "(none)"), ""]
+    if data.get("fix_rounds"):
+        lines += ["## Dev-fix receipts", ""]
+        for item in data["fix_rounds"]:
+            lines.append(
+                f"- round {item.get('round')}: fixed={item.get('fixed')}; "
+                f"files={'; '.join(item.get('files') or [])}; residual={len(item.get('residual') or [])}; "
+                f"reason={_clip(item.get('reason'), 180)}")
+        lines.append("")
+    lines += [f"## Complete step-by-step evidence for {story_id} (reported status: {story.get('status')})",
+              f"- Story video: {story.get('video') or '(none)'}",
+              f"- Explicit recorder-contract records: {len(story.get('artifact_evidence') or [])}", "",
+              "| # | reasoning (WHY) | action | expected | ACTUAL | verdict | claimed-covers | screenshot |",
+              "|---|---|---|---|---|---|---|---|"]
+    for index, step in enumerate(story.get("steps") or []):
+        shot = Path(step.get("screenshot") or "").name or "-"
+        lines.append(
+            f"| {index} | {_clip(step.get('reasoning'), 180)} | {_clip(step.get('action'), 160)} | "
+            f"{_clip(step.get('expected'), 240)} | {_clip(step.get('actual'), 1200)} | "
+            f"{step.get('verdict', '?')} | {_clip('; '.join(step.get('covers') or []), 300)} | {shot} |")
+    return "\n".join(lines)
 
 
 def _clip(s, n=90):
@@ -247,6 +332,153 @@ def _one_review(evidence_dir, doss_md, rubric, lens_name):
     return v
 
 
+def _audit_task_key(story_id, lens, focused, rubric) -> str:
+    raw = json.dumps({
+        "schema": 2, "story": story_id, "lens": lens, "focused": focused,
+        "rubric": rubric, "model": AUDITOR_MODEL,
+    }, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _load_audit_checkpoint(path, signature):
+    try:
+        value = json.loads(path.read_text())
+        if value.get("schema") == "aos.audit-checkpoint/1" and value.get("signature") == signature:
+            return dict(value.get("votes") or {})
+    except Exception:
+        pass
+    return {}
+
+
+def _write_audit_checkpoint(path, signature, votes):
+    document = {"schema": "aos.audit-checkpoint/1", "signature": signature,
+                "votes": votes}
+    raw = (json.dumps(document, indent=2, sort_keys=True, default=str) + "\n").encode()
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _storywise_review(evidence_dir, data, rubric, ensemble, lenses=None, checkpoint=True):
+    """Run the same skeptical jury independently over every story, concurrently but capacity-bounded.
+
+    The release rule remains stronger than a flat whole-run vote: every juror must accept every story.  One
+    rejection or split marks the entire run not accepted.  A compact manifest in each focused prompt preserves
+    cross-story context while keeping the raw evidence slice small enough to inspect rather than truncate.
+    """
+    stories = list(data.get("stories") or [])
+    lens_names = list(lenses) if lenses else list(_LENSES)
+    lens_names = (lens_names * ((ensemble // max(1, len(lens_names))) + 1))[:max(1, ensemble)]
+    tasks = []
+    for story_index, story in enumerate(stories):
+        story_id = str(story.get("id") or story.get("title") or f"story-{story_index + 1}")
+        focused = _story_dossier(data, story)
+        for lens_index, lens in enumerate(lens_names):
+            tasks.append((story_index, lens_index, story_id, focused, lens,
+                          _audit_task_key(story_id, lens, focused, rubric)))
+    signature = hashlib.sha256(json.dumps(
+        {"schema": 2, "task_keys": [task[-1] for task in tasks]},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    checkpoint_path = Path(evidence_dir) / "audit-checkpoint.json"
+    checkpoint_votes = (_load_audit_checkpoint(checkpoint_path, signature) if checkpoint else {})
+    reused_keys = set(checkpoint_votes)
+    try:
+        workers = max(1, min(len(tasks), int(os.environ.get("AOS_AUDITOR_PARALLEL", "6"))))
+    except ValueError:
+        workers = min(6, max(1, len(tasks)))
+    votes = {}
+    for story_index, lens_index, story_id, _focused, _lens, key in tasks:
+        cached = checkpoint_votes.get(key)
+        if isinstance(cached, dict) and isinstance(cached.get("verdict"), dict):
+            votes[(story_index, lens_index)] = (story_id, dict(cached["verdict"]))
+
+    def run_batch(batch):
+        pending = [task for task in batch if (task[0], task[1]) not in votes]
+        if not pending:
+            return
+        with ThreadPoolExecutor(max_workers=min(workers, len(pending)),
+                                thread_name_prefix="qa-audit") as pool:
+            futures = {
+                pool.submit(_one_review, evidence_dir, focused, rubric, lens):
+                    (story_index, lens_index, story_id, key)
+                for story_index, lens_index, story_id, focused, lens, key in pending
+            }
+            for future in as_completed(futures):
+                story_index, lens_index, story_id, key = futures[future]
+                persist = True
+                try:
+                    verdict = future.result()
+                except Exception as exc:
+                    persist = False  # transient provider/transport failure is retried on the next invocation
+                    verdict = {
+                        "passed_audit": None, "score": None, "lens": lens_names[lens_index],
+                        "skipped_flows": [], "unbacked_claims": [], "vague_reporting": [],
+                        "evidence_gaps": [f"auditor failed: {str(exc)[:300]}"],
+                        "summary": "focused auditor failed; evidence is inconclusive",
+                        "recommendation": "reject",
+                    }
+                votes[(story_index, lens_index)] = (story_id, verdict)
+                if checkpoint and persist:
+                    checkpoint_votes[key] = {"story": story_id, "lens": lens_names[lens_index],
+                                             "verdict": verdict}
+                    _write_audit_checkpoint(checkpoint_path, signature, checkpoint_votes)
+
+    # Fail-fast only for expenditure, never for acceptance: every story gets the complete skeptical prompt.
+    # A skeptic rejection already blocks release, so the two perspective repeats add no release assurance for
+    # that story.  Stories the skeptic accepts still require the full unanimous panel.
+    run_batch([task for task in tasks if task[1] == 0])
+    followup_story_indexes = {
+        story_index for story_index in range(len(stories))
+        if votes.get((story_index, 0), ({}, {}))[1].get("passed_audit") is True
+    }
+    run_batch([task for task in tasks if task[1] > 0 and task[0] in followup_story_indexes])
+
+    panels = []
+    for story_index, story in enumerate(stories):
+        story_id = str(story.get("id") or story.get("title") or f"story-{story_index + 1}")
+        jurors = [votes[(story_index, index)][1] for index in range(len(lens_names))
+                  if (story_index, index) in votes]
+        panel = _aggregate(jurors) if len(jurors) > 1 else jurors[0]
+        panels.append({"story": story_id, **panel, "jurors": jurors})
+
+    def prefixed(key):
+        return [f"[{panel['story']}] {item}" for panel in panels for item in (panel.get(key) or [])]
+
+    accepted = [panel for panel in panels if panel.get("passed_audit") is True
+                and not panel.get("close_call")]
+    all_accepted = bool(panels) and len(accepted) == len(panels)
+    scores = [panel.get("score") for panel in panels
+              if isinstance(panel.get("score"), (int, float))]
+    return {
+        "passed_audit": True if all_accepted else False,
+        "close_call": any(bool(panel.get("close_call")) for panel in panels),
+        "score": round(sum(scores) / len(scores), 1) if scores else None,
+        "jury_vote": (f"{len(accepted)} / {len(panels)} story panels unanimously accepted; "
+                      f"{sum(len(panel['jurors']) for panel in panels)} focused juror decisions"),
+        "skipped_flows": prefixed("skipped_flows"),
+        "unbacked_claims": prefixed("unbacked_claims"),
+        "vague_reporting": prefixed("vague_reporting"),
+        "evidence_gaps": prefixed("evidence_gaps"),
+        "summary": (f"All {len(panels)} story panels unanimously accepted the focused evidence."
+                    if all_accepted else
+                    f"Only {len(accepted)} of {len(panels)} story panels unanimously accepted; release remains blocked."),
+        "recommendation": "accept" if all_accepted else "redo-specific-flows",
+        "story_audits": panels,
+        "audit_strategy": "story-specific-unanimous-jury",
+        "jurors_per_story": len(lens_names),
+        "juror_decisions": sum(len(panel["jurors"]) for panel in panels),
+        "checkpoint": str(checkpoint_path) if checkpoint else None,
+        "checkpoint_reused": len(reused_keys.intersection(task[-1] for task in tasks)),
+        "parallel_workers": workers,
+    }
+
+
 def _aggregate(verdicts):
     """Fuse jury verdicts. Conservative + skeptical: ACCEPT only on a UNANIMOUS accept; ANY dissent → not
     accepted + close_call → escalate. Union the finding lists so nothing a single juror caught is lost."""
@@ -294,8 +526,15 @@ def review(work, rubric=None, write=True, ensemble=None, lenses=None):
     n = int(ensemble if ensemble is not None else os.environ.get("AOS_AUDITOR_ENSEMBLE", "3"))
     lens_names = list(lenses) if lenses else list(_LENSES)
     lens_names = (lens_names * ((n // len(lens_names)) + 1))[:max(1, n)]
-    verdicts = [_one_review(evidence_dir, doss["md"], rubric, ln) for ln in lens_names]
-    verdict = _aggregate(verdicts) if len(verdicts) > 1 else verdicts[0]
+    storywise = (len(doss["data"].get("stories") or []) > 1
+                 and os.environ.get("AOS_AUDITOR_STORYWISE", "1").strip().lower()
+                 not in {"0", "false", "no", "off"})
+    if storywise:
+        verdict = _storywise_review(
+            evidence_dir, doss["data"], rubric, max(1, n), lenses=lenses, checkpoint=write)
+    else:
+        verdicts = [_one_review(evidence_dir, doss["md"], rubric, ln) for ln in lens_names]
+        verdict = _aggregate(verdicts) if len(verdicts) > 1 else verdicts[0]
     if write:
         try:
             (evidence_dir / "audit.json").write_text(json.dumps(verdict, indent=2, default=str))

@@ -18,13 +18,12 @@ import json
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402,F401  (factory convention: audit trail module on path)
+import workstreamview  # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection
 
 # Redaction: reuse the canonical scrubber if present, else a basic fallback for common secret shapes.
 try:
@@ -58,9 +57,9 @@ def _snip(text, n):
     return _scrub(text[:n])
 
 
-def overview(tid):
-    """Aggregate observability across the tenant's owned products."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+def overview(tid, org_id=0):
+    """Aggregate observability across the tenant's owned products plus live controller workstreams."""
+    with tenant_connection(tid) as c, c.cursor() as cur:
         # headline aggregates (scoped to owned products via the join)
         cur.execute("""SELECT count(DISTINCT t.run_id), count(*),
                           count(*) FILTER (WHERE t.rc IS NOT NULL AND t.rc<>0),
@@ -82,7 +81,7 @@ def overview(tid):
         cur.execute("""SELECT t.product, t.stage, t.run_id, t.ts, t.output
                        FROM traces t JOIN tenant_products tp ON tp.product=t.product
                        WHERE tp.tenant_id=%s AND t.rc IS NOT NULL AND t.rc<>0
-                       ORDER BY t.ts DESC LIMIT 10""", (tid,))
+                       ORDER BY t.ts DESC, t.id DESC LIMIT 10""", (tid,))
         recent_errors = [{"product": p, "stage": st, "run_id": rid,
                           "ts": ts.isoformat() if ts else None, "snippet": _snip(o, 160)}
                          for p, st, rid, ts, o in cur.fetchall()]
@@ -91,25 +90,40 @@ def overview(tid):
         cur.execute("""SELECT t.product, t.stage, t.role, t.ts, t.rc
                        FROM traces t JOIN tenant_products tp ON tp.product=t.product
                        WHERE tp.tenant_id=%s AND t.kind='agent'
-                       ORDER BY t.ts DESC LIMIT 15""", (tid,))
+                       ORDER BY t.ts DESC, t.id DESC LIMIT 15""", (tid,))
         recent_activity = [{"product": p, "stage": st, "role": role,
                             "ts": ts.isoformat() if ts else None, "ok": (rc == 0 or rc is None)}
                            for p, st, role, ts, rc in cur.fetchall()]
+    workstreams = workstreamview.active_workstreams(tid, org_id)
+    ws_activity = [{
+        "product": w.get("product") or w.get("label"),
+        "stage": w.get("phase"),
+        "role": "controller",
+        "ts": None,
+        "ok": True,
+        "workstream": True,
+        "thread_id": w.get("thread_id"),
+        "can_cancel": w.get("can_cancel"),
+        "cancel_action": w.get("cancel_action"),
+        "status": w.get("status") or ("running" if w.get("running") else w.get("awaiting")),
+    } for w in workstreams if w.get("running") or w.get("awaiting")]
     return {
         "runs": runs_n or 0,
         "steps": steps_n or 0,
         "errors": errs or 0,
         "cost_usd": round(float(cost or 0), 4),
         "tokens": int(toks or 0),
+        "workstreams": workstreams,
+        "in_flight_workstreams": sum(1 for w in workstreams if w.get("running")),
         "by_stage": by_stage,
         "recent_errors": recent_errors,
-        "recent_activity": recent_activity,
+        "recent_activity": ws_activity + recent_activity,
     }
 
 
 def runs(tid):
     """The tenant's runs grouped by run_id (owned products only), newest first, limit 50."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""SELECT t.run_id, min(t.product), count(DISTINCT t.stage),
                           sum(COALESCE(t.cost_usd,0)),
                           sum(COALESCE(t.tokens_in,0)+COALESCE(t.tokens_out,0)),
@@ -127,7 +141,7 @@ def runs(tid):
 
 def replay(tid, run_id):
     """Ownership-checked step-by-step timeline for one run, with redacted prompts/outputs."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         # ownership: the run's product(s) must belong to this tenant
         cur.execute("""SELECT 1 FROM traces t
                        JOIN tenant_products tp ON tp.product=t.product
@@ -136,7 +150,7 @@ def replay(tid, run_id):
             return {"error": "not your run"}
         cur.execute("""SELECT stage, role, rc, cost_usd, tokens_in, tokens_out, elapsed_s, ts,
                           model, prompt, output
-                       FROM traces WHERE run_id=%s ORDER BY ts""", (run_id,))
+                       FROM traces WHERE run_id=%s ORDER BY ts, id""", (run_id,))
         return [{"stage": st, "role": r, "rc": rc,
                  "cost_usd": round(float(co or 0), 4) if co is not None else None,
                  "tokens_in": ti, "tokens_out": to, "elapsed_s": e,
@@ -156,7 +170,7 @@ def _selftest():
     foreign_prod = "not-" + prod
     ok = False
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                         (prod, tid))
             # two healthy stages + one failure whose output embeds a fake secret to prove redaction
@@ -172,7 +186,6 @@ def _selftest():
             # a run owned by NOBODY this tenant owns — for the isolation check
             cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,rc,prompt,output)
                            VALUES (%s,%s,'SPEC','planner','agent',0,'p','o')""", (foreign_run, foreign_prod))
-            c.commit()
 
         ov = overview(tid)
         rs = runs(tid)
@@ -201,11 +214,10 @@ def _selftest():
         print(f"replay QA output: {next((s['output'] for s in tl if s['stage']=='QA'), '')!r}")
         print("PASS: tenant observability overview+runs+replay+redaction+isolation ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM traces WHERE product IN (%s,%s)", (prod, foreign_prod))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 
@@ -213,7 +225,8 @@ def _main(a):
     if not a or a[0] == "selftest":
         _selftest()
     elif a[0] == "json" and len(a) > 1:
-        print(json.dumps({"overview": overview(a[1]), "runs": runs(a[1])}, indent=2))
+        print(json.dumps({"overview": overview(a[1], int(a[2]) if len(a) > 2 else 0), "runs": runs(a[1])},
+                         indent=2))
     else:
         sys.exit("usage: traceview.py json <tenant_id> | selftest")
 

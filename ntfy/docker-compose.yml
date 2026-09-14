@@ -22,6 +22,12 @@ services:
     # (HTTPS 443 -> 127.0.0.1:8080), so no direct external port binding is needed.
     ports:
       - "127.0.0.1:8080:80"
+    mem_limit: ${AOS_NTFY_MEMORY_LIMIT:-512m}
+    memswap_limit: ${AOS_NTFY_MEMORY_SWAP_LIMIT:-768m}
+    mem_reservation: ${AOS_NTFY_MEMORY_RESERVATION:-64m}
+    cpus: ${AOS_NTFY_CPUS:-1.0}
+    pids_limit: ${AOS_NTFY_PIDS_LIMIT:-128}
+    init: true
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://localhost:80/v1/health || exit 1"]

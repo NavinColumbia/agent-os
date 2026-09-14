@@ -24,13 +24,10 @@ import statistics
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402  (kept consistent with sibling scripts; available for future use)
-
-from aoscfg import ENV, DB
+from dbpool import connection  # noqa: E402
 
 # Sensible point-estimate fallbacks when there's no history for a kind: (cost_usd, minutes, tokens).
 # NOTE: `research` is a first-class kind — a research run is a real, priced job (a fleet of ~6-8 parallel web
@@ -63,7 +60,7 @@ def _history(kind):
     A 'product' is one build; we sum its trace rows, then collect the totals across products so we
     can take a median. Only completed builds (cost > 0) count, so half-finished runs don't drag it down.
     """
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute(
             """SELECT t.product,
                       sum(t.cost_usd)::float            AS cost,
@@ -99,7 +96,7 @@ def _research_history():
     Only sanely-stamped, completed runs count (a still-running / mis-stamped row must not drag the median).
     Returns a list of minutes (possibly empty); never raises the caller out of its fallback path."""
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute(
                 """SELECT EXTRACT(EPOCH FROM (finished_at - started_at)) / 60.0
                    FROM research_runs

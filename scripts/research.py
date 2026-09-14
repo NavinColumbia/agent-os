@@ -19,11 +19,10 @@ options) is identical, so the console UX never changes.
 Run with the agent-os venv python. No web server — DB + a daemon thread, like the orchestrator.
 """
 import os
+import re
 import sys
 import threading
 from pathlib import Path
-
-import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
@@ -32,6 +31,7 @@ import audit          # noqa: E402
 import factory        # noqa: E402
 import research_fleet  # noqa: E402
 import research_org   # noqa: E402  — the durable ORCHESTRA org-run engine (default)
+from dbpool import connection, tenant_connection  # noqa: E402
 
 
 def orchestra_on():
@@ -39,11 +39,36 @@ def orchestra_on():
     AOS_ORCHESTRA=0 to fall back to the legacy in-process research_fleet path."""
     return os.environ.get("AOS_ORCHESTRA", "1").strip().lower() not in ("0", "false", "off", "no")
 
-from aoscfg import ENV, DB
 
+_NON_ANSWER_PATTERNS = [
+    re.compile(r"\bcannot\s+substantively\s+answer\b", re.I),
+    re.compile(r"\bcurrent\s+findings?\s+(?:are|is)\s+insufficient\b", re.I),
+    re.compile(r"\binsufficient\s+(?:evidence|research|findings)\b", re.I),
+    re.compile(r"\bno\s+recommendation\s+can\s+be\s+made\b", re.I),
+    re.compile(r"\bnot\s+materially\s+relevant\s+to\b", re.I),
+    re.compile(r"\brequires?\s+new\s+public.*research\b", re.I | re.S),
+]
+
+
+def _report_non_answer_reason(report_text, question=""):
+    """Return a reason when a synthesized report is honest but not decision-grade.
+
+    A non-answer report is useful as an internal diagnostic, but it must not become CEO option cards. The
+    controller should retry/fail visibly instead of asking the CEO to choose between "do research" options.
+    """
+    text = (report_text or "").strip()
+    if len(text) < 120:
+        return "research_report_too_short"
+    hits = [p.pattern for p in _NON_ANSWER_PATTERNS if p.search(text)]
+    unknowns = len(re.findall(r"(?im)^\s*(?:#{2,4}\s*)?.{0,60}\bUnknown\b", text))
+    if hits and unknowns >= 2:
+        return "research_report_non_answer"
+    if len(hits) >= 2:
+        return "research_report_insufficient_evidence"
+    return ""
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS research_runs (
             id BIGSERIAL PRIMARY KEY, tenant_id TEXT, org_id TEXT, thread_id BIGINT,
             question TEXT, status TEXT DEFAULT 'running', report_path TEXT,
@@ -51,7 +76,6 @@ def _ensure():
         cur.execute("""CREATE TABLE IF NOT EXISTS research_options (
             id BIGSERIAL PRIMARY KEY, run_id BIGINT, title TEXT, summary TEXT,
             recommended BOOLEAN DEFAULT false, chosen BOOLEAN DEFAULT false)""")
-        c.commit()
 
 
 def start(tenant_id, org_id, thread_id, question, api_key=None, engine=None):
@@ -92,22 +116,22 @@ def start(tenant_id, org_id, thread_id, question, api_key=None, engine=None):
             # condition — label it so downstream never mis-renders it as a billing "upgrade your plan" message.
             block = f"internal_error: quota check failed ({str(e)[:100]})"
     status = "failed" if block else "running"
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO research_runs (tenant_id, org_id, thread_id, question, status)
                        VALUES (%s,%s,%s,%s,%s) RETURNING id""",
                     (tenant_id, org_id, thread_id, question, status))
         run_id = cur.fetchone()[0]
-        c.commit()
     if block:
         audit.append(actor="research", action="ResearchRunBlocked", resource=str(run_id),
-                     decision="blocked", payload={"reason": block, "tenant": tenant_id})
+                     decision="blocked", payload={"reason": block, "tenant": tenant_id},
+                     tenant_id=tenant_id)
         # Surface the REAL block reason (e.g. 'consent_required') alongside the terminal status, so a caller
         # that only sees this return — or polls run_state and gets status='failed' — can still propagate an
         # ACTIONABLE reason to the user instead of an opaque 'failed'. The thread is NOT started (no spend).
         return {"run_id": run_id, "status": "failed", "error": block}
     audit.append(actor="research", action="ResearchRunStart", resource=str(run_id),
                  decision="executed", payload={"question": (question or "")[:160], "tenant": tenant_id,
-                                               "engine": engine})
+                                               "engine": engine}, tenant_id=tenant_id)
     threading.Thread(target=_run, args=(run_id, question, api_key, engine, tenant_id, org_id),
                      daemon=True).start()
     return {"run_id": run_id}
@@ -120,39 +144,57 @@ def _run(run_id, question, api_key=None, engine="orchestra", tenant_id=None, org
     in-process path. Both land the report at the same path, so everything below is engine-agnostic.
     The DB run_id is threaded into either engine so the workspace is per-run isolated."""
     try:
-        if engine == "orchestra":
-            res = research_org.run_research(question, "REPORT.md", api_key=api_key,
-                                            research_run_id=run_id, tenant_id=tenant_id,
-                                            org_id=org_id)
-        else:
-            res = research_fleet.research(question, "REPORT.md", api_key=api_key, run_id=run_id)
+        def _execute(selected_engine):
+            if selected_engine == "orchestra":
+                return research_org.run_research(question, "REPORT.md", api_key=api_key,
+                                                 research_run_id=run_id, tenant_id=tenant_id,
+                                                 org_id=org_id)
+            return research_fleet.research(question, "REPORT.md", api_key=api_key, run_id=run_id)
+
+        res = _execute(engine)
         report_path = res.get("report")
         report_text = ""
         try:
             report_text = Path(report_path).read_text()
         except Exception:
             report_text = ""
+        if not (report_text or "").strip():
+            raise RuntimeError(f"research report missing or empty at {report_path}")
+        non_answer = _report_non_answer_reason(report_text, question)
+        if non_answer and engine == "orchestra":
+            audit.append(actor="research", action="ResearchRunFallback", resource=str(run_id),
+                         decision="retry_fleet", payload={"reason": non_answer, "report": report_path},
+                         tenant_id=tenant_id)
+            res = _execute("fleet")
+            report_path = res.get("report")
+            try:
+                report_text = Path(report_path).read_text()
+            except Exception:
+                report_text = ""
+            if not (report_text or "").strip():
+                raise RuntimeError(f"research fallback report missing or empty at {report_path}")
+            non_answer = _report_non_answer_reason(report_text, question)
+        if non_answer:
+            raise RuntimeError(non_answer)
         # Persist the report path WITHOUT flipping status yet: the controller/UI polls run_state() and the
         # moment it sees status='done' it reads st['options'], so 'done' must NEVER be visible before the
         # option cards exist. Distill options FIRST, confirm >=1 row was stored, THEN mark 'done' — so a
         # 'done' status GUARANTEES the SELECTABLE cards are already queryable (no done-with-empty dead-end).
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tenant_id) as c, c.cursor() as cur:
             cur.execute("UPDATE research_runs SET report_path=%s WHERE id=%s", (report_path, run_id))
-            c.commit()
-        n_opts = _extract_options(run_id, report_text)
+        n_opts = _extract_options(run_id, report_text, tenant_id)
         if not n_opts:  # belt-and-suspenders: _extract_options always stores a fallback, but never flip
             raise RuntimeError("option distillation produced zero cards")  # 'done' on an empty result set.
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tenant_id) as c, c.cursor() as cur:
             cur.execute("UPDATE research_runs SET status='done', finished_at=now() WHERE id=%s", (run_id,))
-            c.commit()
         audit.append(actor="research", action="ResearchRunDone", resource=str(run_id),
-                     decision="executed", payload={"report": report_path, "options": n_opts})
+                     decision="executed", payload={"report": report_path, "options": n_opts},
+                     tenant_id=tenant_id)
     except Exception as e:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tenant_id) as c, c.cursor() as cur:
             cur.execute("UPDATE research_runs SET status='failed', finished_at=now() WHERE id=%s", (run_id,))
-            c.commit()
         audit.append(actor="research", action="ResearchRunFailed", resource=str(run_id),
-                     decision="failed", payload={"error": str(e)[:300]})
+                     decision="failed", payload={"error": str(e)[:300]}, tenant_id=tenant_id)
 
 
 def _parse_options(text):
@@ -193,7 +235,7 @@ def _parse_options(text):
     return out
 
 
-def _extract_options(run_id, report_text):
+def _extract_options(run_id, report_text, tenant_id):
     """Distill the synthesized report into 3 DISTINCT strategic option cards via a research-growth agent.
     Marks the recommended one. If parsing yields <2, falls back to a single option from the report head."""
     repo = factory.PRODUCTS
@@ -220,21 +262,20 @@ def _extract_options(run_id, report_text):
     if not any(o["recommended"] for o in opts):        # ensure exactly one recommended
         opts[0]["recommended"] = True
     seen_rec = False
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         for o in opts:
             rec = bool(o["recommended"]) and not seen_rec
             if rec:
                 seen_rec = True
             cur.execute("""INSERT INTO research_options (run_id, title, summary, recommended)
                            VALUES (%s,%s,%s,%s)""", (run_id, o["title"], o["summary"], rec))
-        c.commit()
     return len(opts)
 
 
 def run_state(tenant_id, run_id):
     """Full state for a run: status + the SELECTABLE option cards. Scoped by tenant_id so a tenant can
     never read another tenant's question or option cards (IDOR hardening, mirrors designview.gallery)."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("SELECT status, question FROM research_runs WHERE id=%s AND tenant_id=%s",
                     (run_id, tenant_id))
         row = cur.fetchone()
@@ -253,18 +294,18 @@ def run_state(tenant_id, run_id):
 def select(tenant_id, run_id, option_id):
     """Mark an option chosen for this run; return the chosen option dict. Ownership via tenant match: the
     UPDATE only touches an option whose run belongs to tenant_id, so no cross-tenant caller can flip it."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("""UPDATE research_options SET chosen=true WHERE id=%s AND run_id=%s
                        AND run_id IN (SELECT id FROM research_runs WHERE tenant_id=%s)""",
                     (option_id, run_id, tenant_id))
         if cur.rowcount == 0:
             raise ValueError(f"no option {option_id} for run {run_id}")
-        c.commit()
         cur.execute("""SELECT id, title, summary, recommended, chosen FROM research_options
                        WHERE id=%s""", (option_id,))
         r = cur.fetchone()
     audit.append(actor="research", action="ResearchOptionChosen", resource=str(run_id),
-                 decision="executed", payload={"option_id": option_id, "title": r[1], "tenant": tenant_id})
+                 decision="executed", payload={"option_id": option_id, "title": r[1], "tenant": tenant_id},
+                 tenant_id=tenant_id)
     return {"id": r[0], "title": r[1], "summary": r[2], "recommended": r[3], "chosen": r[4]}
 
 
@@ -284,7 +325,10 @@ def _selftest():
         print("FAIL: _parse_options"); sys.exit(1)
 
     tmp = Path(tempfile.mkdtemp()) / "REPORT.md"
-    tmp.write_text("# Research report\nKey finding: creators are underserved. Three paths exist.\n")
+    tmp.write_text("# Research report\n\n"
+                   "Key finding: creators are underserved by current tools, especially around onboarding, "
+                   "monetization, retention, and low-friction publishing workflows. Three viable strategic "
+                   "paths exist and can be compared on speed, cost, and differentiation.\n")
     real_research, real_agent = research_fleet.research, factory.agent
     real_org = research_org.run_research
     # ENGINE ROUTING under test: default (AOS_ORCHESTRA on) must dispatch the ORCHESTRA org run;
@@ -379,13 +423,12 @@ def _selftest():
     finally:
         research_fleet.research, factory.agent = real_research, real_agent
         research_org.run_research = real_org
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("""DELETE FROM research_options WHERE run_id IN
                            (SELECT id FROM research_runs WHERE tenant_id=%s)""", (tid,))
             cur.execute("DELETE FROM research_runs WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
         try:
             tmp.unlink()
         except Exception:

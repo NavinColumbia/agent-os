@@ -34,6 +34,25 @@ def run_company_org(vision, functions, *, tenant="company", workers=2, drive_bud
 
     run = store.start_run(tenant, vision)
     rid = run["run_id"]
+    workstream_key = f"orchestra:{rid}"
+    try:
+        import workstreamspine
+        workstreamspine.ensure_workstream(
+            tenant, workstream_key, str(vision),
+            {"durable_run_terminal": "the orchestra run reaches a terminal state",
+             "root_aggregation": "the CEO coordinator returns an aggregate report",
+             "function_outputs": "staffed functions report their outputs to the root"},
+            accountable_owner="ceo-coordinator", manager_owner="controller",
+            backup_owner="chief-of-staff", created_by="company-runtime",
+            risk="medium", update_cadence_s=900)
+        workstreamspine.record_progress(
+            tenant, workstream_key, "company_run_started",
+            {"run_id": rid, "functions_planned": len(functions or [])},
+            actor="company-runtime", substantive=True)
+    except Exception:
+        # The durable orchestra remains available during additive migration or
+        # control-plane maintenance; the next lifecycle event repairs the spine.
+        pass
     ceo = store.spawn_actor(rid, tenant, "CEO-Coordinator", "ceo-coordinator", kind="supervisor",
                             memory={"context": {"functions": functions}, "repo": "."})
     store.emit(rid, tenant, None, ceo["actor_id"], "task", {"task": vision})
@@ -74,7 +93,18 @@ def run_company_org(vision, functions, *, tenant="company", workers=2, drive_bud
                        for w in acts if w.get("supervisor_id") == a["actor_id"]]
             func_reports.append({"role": a.get("role"), "result": a.get("result"),
                                  "outputs": [o for o in outputs if o]})
-    return {"run_id": rid, "status": (store.run(rid, tenant) or {}).get("status"),
+    final_status = (store.run(rid, tenant) or {}).get("status")
+    try:
+        import workstreamspine
+        workstreamspine.record_progress(
+            tenant, workstream_key, "company_run_terminal",
+            {"run_id": rid, "status": final_status, "actors": len(acts),
+             "function_reports": len(func_reports),
+             "ceo_report_present": any(a.get("actor_id") == ceo_id and bool(a.get("result")) for a in acts)},
+            actor="company-runtime", substantive=True)
+    except Exception:
+        pass
+    return {"run_id": rid, "status": final_status,
             "ceo_report": next((a.get("result") for a in acts if a["actor_id"] == ceo_id), None),
             "functions": func_reports, "actors": len(acts)}
 

@@ -16,13 +16,10 @@ import sys
 import time
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import notify  # noqa: E402
-
-from aoscfg import ENV, DB
+from dbpool import connection  # noqa: E402
 
 # label -> pgrep pattern (specific enough not to match fleet.py itself)
 PROCS = [
@@ -53,7 +50,7 @@ def snapshot():
         n = _running(pat)
         out.append(f"  {'🟢' if n else '⚪'} {label:18} {('×'+str(n)) if n else 'idle'}")
 
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         # 2) in-flight / recent products (from factory agent activity)
         cur.execute("""SELECT resource, max(ts) AS last, count(*) AS steps,
                               (array_agg(action ORDER BY id DESC))[1] AS last_action,
@@ -80,7 +77,9 @@ def snapshot():
         # 4) throughput
         cur.execute("SELECT count(*) FROM audit_log WHERE ts > now() - interval '10 minutes'")
         last10 = cur.fetchone()[0]
-        cur.execute("SELECT count(*) FROM audit_log WHERE decision='deny' AND ts > now() - interval '1 hour'")
+        cur.execute("""SELECT count(*) FROM audit_log
+                       WHERE decision='deny' AND ts > now() - interval '1 hour'
+                         AND COALESCE(payload->>'_selftest','false') <> 'true'""")
         denies = cur.fetchone()[0]
     out.append(f"\n\033[1mThroughput\033[0m  {last10} actions / last 10 min · "
                f"{denies} policy denials / last hour")

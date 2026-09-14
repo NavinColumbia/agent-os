@@ -49,12 +49,12 @@ import factory   # noqa: E402  — the LLM call (retries 529/overload, fails ove
 # homework (STANDARDS-verification.md rule 5). Override per-deployment with the env vars.
 STORY_ROLE = os.environ.get("AOS_STORY_ROLE", "qa-security")
 JUDGE_ROLE = os.environ.get("AOS_STORY_JUDGE_ROLE", "product-manager")
-MAX_ROUNDS = int(os.environ.get("AOS_STORY_MAX_ROUNDS", "4"))   # bounded saturation rounds
+MAX_ROUNDS = int(os.environ.get("AOS_STORY_MAX_ROUNDS", "3"))   # bounded live saturation rounds
 # HIGH safety backstop on corpus SIZE (not a quality terminator). Coverage stays AI-driven within the rounds,
 # but a tiny surface must not saturate to 100+ stories (observed: 113 for a Pomodoro timer -> hours of browser
 # QA). Once the corpus passes this bound we stop generating MORE and let the judge close out — logged honestly,
 # overridable, 0 = unlimited. This is a backstop the way the North Star allows: high, reported, never silent.
-SATURATE_MAX = int(os.environ.get("AOS_STORY_SATURATE_MAX", "40"))
+SATURATE_MAX = int(os.environ.get("AOS_STORY_SATURATE_MAX", "12"))
 
 # The coverage matrix every critique/judge call reasons over: per SURFACE × PERSONA × CATEGORY.
 CATEGORIES = ("happy", "edge", "empty", "error", "denied", "abuse", "latency", "a11y")
@@ -361,7 +361,8 @@ def _story_digest(stories: list) -> str:
                      for s in stories)
 
 
-def _build_prompt(vision: str, product_summary: str, existing: list = None, gaps: list = None) -> str:
+def _build_prompt(vision: str, product_summary: str, existing: list = None, gaps: list = None,
+                  story_limit: int = None) -> str:
     """The enumeration prompt. Holds the ORIGINAL VISION + product summary in context and demands
     EXHAUSTIVE coverage (every persona × category matrix), returned as a strict JSON array the QA loop
     can drive. `existing` (already-known story titles) + `gaps` (self-critique findings) support the
@@ -374,6 +375,9 @@ def _build_prompt(vision: str, product_summary: str, existing: list = None, gaps
     if gaps:
         aim = ("\n\n=== KNOWN COVERAGE GAPS (from the coverage self-critique — every new story should close "
                "one of these) ===\n- " + "\n- ".join(str(g) for g in gaps[:40]))
+    bound = (f"HARD LIVE SAFETY BUDGET: return AT MOST {int(story_limit)} stories in this response. "
+             "Prioritize the highest-risk end-to-end behaviors and combine closely related variants into "
+             "one story; never exceed this number.\n\n" if story_limit and story_limit > 0 else "")
     return (
         "You are enumerating the COMPLETE set of customer behaviors (user-stories) for a product, so an "
         "automated QA fleet can exhaustively exercise it and judge expected-vs-actual against the original "
@@ -382,7 +386,7 @@ def _build_prompt(vision: str, product_summary: str, existing: list = None, gaps
         f"{vision.strip()}\n\n"
         "=== PRODUCT SUMMARY (what actually exists to test) ===\n"
         f"{product_summary.strip()}\n\n"
-        "=== WHAT TO PRODUCE ===\n"
+        "=== WHAT TO PRODUCE ===\n" + bound +
         "Enumerate EVERY meaningful thing a real customer could try. Cover, explicitly and exhaustively:\n"
         "  - every PERSONA (new/returning/admin/guest/power-user/unauthorized/abusive/etc. as the product implies)\n"
         "  - HAPPY paths (the core value delivered end-to-end)\n"
@@ -394,7 +398,8 @@ def _build_prompt(vision: str, product_summary: str, existing: list = None, gaps
         "  - LATENCY (slow backend/network perception, human-pace dwell, long-running work, timeouts)\n"
         "  - A11Y (keyboard-only navigation, screen-reader labels, focus order, mobile viewport)\n"
         "Think adversarially: hunt the ways a real user or attacker breaks it. Do not stop early — a thin "
-        "list is a failure. Enumerate as many distinct stories as the vision genuinely warrants.\n\n"
+        "list is a failure. Within the hard budget, choose the smallest set that maximizes distinct risk and "
+        "journey coverage.\n\n"
         "=== OUTPUT FORMAT (STRICT) ===\n"
         "Reply with ONLY a JSON array (no prose, no markdown fence). Each element:\n"
         "{\n"
@@ -411,7 +416,7 @@ def _build_prompt(vision: str, product_summary: str, existing: list = None, gaps
 
 
 def generate_stories(vision: str, product_summary: str, role: str = None, existing: list = None,
-                     repo: str = None, gaps: list = None) -> list:
+                     repo: str = None, gaps: list = None, story_limit: int = None) -> list:
     """Generate a user-story coverage set for a product, via ONE role-specialized AI call.
 
     Args:
@@ -431,7 +436,8 @@ def generate_stories(vision: str, product_summary: str, role: str = None, existi
     NOTE: one completion physically caps at a few dozen stories — for the SATURATED corpus the review
     demanded, call `saturate_stories` (which loops this + critique + an independent coverage judge)."""
     role = role or STORY_ROLE
-    text = _ai_text(role, repo, _build_prompt(vision, product_summary, existing, gaps))
+    story_limit = SATURATE_MAX if story_limit is None else int(story_limit)
+    text = _ai_text(role, repo, _build_prompt(vision, product_summary, existing, gaps, story_limit))
     if text is None:
         return []
     try:
@@ -442,6 +448,11 @@ def generate_stories(vision: str, product_summary: str, role: str = None, existi
             print(f"[story_gen] parse miss: {e}. REPLY HEAD:\n{text[:400]!r}", flush=True)
             return []
     stories = _normalize(raw)
+    enumerated = len(stories)
+    if story_limit > 0 and enumerated > story_limit:
+        stories = stories[:story_limit]
+        print(f"[story_gen] generation safety cap: accepted {len(stories)} of {enumerated} returned stories",
+              flush=True)
     print(f"[story_gen] generated {len(stories)} user-stories (role={role})", flush=True)
     return stories
 
@@ -552,7 +563,7 @@ def saturate_stories(vision: str, product_summary: str, *, product: str = None, 
         product: the product slug keying the story_corpus table. None -> in-memory only (no persistence).
         role / judge_role: enumerator+critic vs independent judge roles (default qa-security vs
                            product-manager — never the same homework-grader).
-        max_rounds: bound on generate->critique->expand cycles (default AOS_STORY_MAX_ROUNDS=4).
+        max_rounds: bound on generate->critique->expand cycles (default AOS_STORY_MAX_ROUNDS=3).
         persist: set False to skip the corpus write (e.g. dry runs).
 
     Returns the merged story list (contract shape; unique ids). Returns [] only when every generation
@@ -581,8 +592,12 @@ def saturate_stories(vision: str, product_summary: str, *, product: str = None, 
             save_stories(product, stories, replace=True)   # collapse any prior bloat to the capped set
         return stories
     for rnd in range(1, max_rounds + 1):
+        remaining = max(0, SATURATE_MAX - len(stories)) if SATURATE_MAX else 0
+        if SATURATE_MAX and remaining == 0:
+            break
         new = generate_stories(vision, product_summary, role=role,
-                               existing=[s["title"] for s in stories], repo=repo, gaps=gaps)
+                               existing=[s["title"] for s in stories], repo=repo, gaps=gaps,
+                               story_limit=remaining if SATURATE_MAX else 0)
         before = len(stories)
         stories = _assign_ids(_merge(stories, new))
         print(f"[story_gen] saturation round {rnd}/{max_rounds}: +{len(stories) - before} new "
@@ -594,9 +609,11 @@ def saturate_stories(vision: str, product_summary: str, *, product: str = None, 
             saturated = True
             break
         if SATURATE_MAX and len(stories) >= SATURATE_MAX:    # HIGH backstop: enough breadth; stop growing
+            capped_n = min(len(stories), SATURATE_MAX)
             print(f"[story_gen] saturation backstop hit ({len(stories)} >= AOS_STORY_SATURATE_MAX="
-                  f"{SATURATE_MAX}) — stopping generation; testing the {len(stories)} enumerated stories "
-                  f"(coverage within each still AI-driven). Raise/zero the env to go deeper.", flush=True)
+                  f"{SATURATE_MAX}) — stopping generation; testing {capped_n} of "
+                  f"{len(stories)} enumerated stories (coverage within each still AI-driven). "
+                  f"Raise/zero the env to go deeper.", flush=True)
             break
         gaps = critique_gaps(vision, product_summary, stories, role=role, repo=repo)
         gaps += [m for m in verdict.get("missing", []) if m not in gaps]

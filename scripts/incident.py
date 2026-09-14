@@ -9,21 +9,24 @@ a human decides with a written analysis in hand (not just a raw alert).
 
     incident.py investigate '<issue-json>'    # produce an RCA for an incident
     incident.py selftest                       # offline (context-gathering, no model call)
-Run with the agent-os venv python. Uses the headless `claude` CLI.
+Run with the agent-os venv python. Uses the governed factory agent path (Codex-first by default).
 """
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-ROOT = Path.home() / "projects" / "agent-os"
+ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
+from dbpool import connection  # noqa: E402
 
 INCIDENTS = ROOT / "docs" / "incidents"
-LOGS = ["/tmp/dashboard.log", "/tmp/scheduler.log", "/tmp/watchdog.log", "/tmp/api.log", "/tmp/factory-splitbill2.log"]
+_SERVICE_LOGS = Path(__file__).resolve().parents[1] / "logs" / "services"
+LOGS = [str(_SERVICE_LOGS / name) for name in ("dashboard.log", "scheduler.log", "watchdog.log", "api.log")]
+# Compatibility evidence from processes launched before shared service logging was introduced.
+LOGS.append("/tmp/factory-splitbill2.log")
 
 
 def _context(db_recent=12):
@@ -36,11 +39,7 @@ def _context(db_recent=12):
             if tail:
                 parts.append(f"### {lp}\n" + "\n".join(tail))
     try:
-        import psycopg
-        ENV = ROOT / ".env.local"
-        DB = next((l.split("=", 1)[1].strip() for l in ENV.read_text().splitlines()
-                   if l.strip().startswith("DATABASE_URL=")), None)
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("""SELECT to_char(ts,'HH24:MI:SS'), actor, action, resource, decision
                            FROM audit_log ORDER BY id DESC LIMIT %s""", (db_recent,))
             rows = [" ".join(str(x) for x in r) for r in cur.fetchall()]
@@ -62,8 +61,24 @@ def investigate(issue, timeout=240):
         "## Recommended next action (ONE concrete, safe step)\n## Needs human approval? (yes/no + why)\n"
         "Be specific and brief. Do not invent facts not supported by the context."
     )
-    p = subprocess.run(["claude", "-p", prompt], capture_output=True, text=True, timeout=timeout)
-    rca = (p.stdout or "").strip() or "(no analysis produced)"
+    try:
+        import factory
+        prev = (getattr(factory._ctx, "run", None), getattr(factory._ctx, "product", None),
+                getattr(factory._ctx, "stage", None))
+        factory._ctx.run, factory._ctx.product, factory._ctx.stage = (
+            f"incident-{int(time.time())}", "agent-os", "INCIDENT")
+        r = factory.agent("incident-commander", str(ROOT), prompt, timeout=timeout,
+                          tools=[], light=True)
+        rca = ((r or {}).get("out_full") or (r or {}).get("out") or "").strip()
+        if not rca:
+            rca = f"(no analysis produced; agent result: {json.dumps(r, default=str)[:500]})"
+    except Exception as e:
+        rca = f"(incident analysis failed before producing an RCA: {e})"
+    finally:
+        try:
+            factory._ctx.run, factory._ctx.product, factory._ctx.stage = prev
+        except Exception:
+            pass
     ts = time.strftime("%Y%m%d-%H%M%S")
     safe_sig = issue.get("sig", "incident").replace(":", "_").replace("/", "_")
     path = INCIDENTS / f"{ts}-{safe_sig}.md"

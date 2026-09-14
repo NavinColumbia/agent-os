@@ -18,9 +18,11 @@ Escalates (pages you, no auto-action): deadlock, build stall, SLA breach, denial
 Run with the agent-os venv python.
 """
 import json
+import math
+import os
+import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 HOME = str(Path.home())
@@ -28,39 +30,57 @@ ROOT = Path.home() / "projects" / "agent-os"
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
+import service_recovery  # noqa: E402
+from aoscfg import get as cfg_get  # noqa: E402
 
 VENV = str(ROOT / ".venv" / "bin" / "python")
-# daemon name -> (relaunch command, pgrep pattern)
+# Watchdog-facing name -> exact service-recovery registry name.
 DAEMONS = {
-    "dashboard": (f"cd {ROOT} && exec {VENV} scripts/dashboard.py serve 8092", "dashboard.py serve"),
-    "api":       (f"cd {ROOT} && exec {VENV} scripts/api.py serve 8090", "api.py serve"),
-    "console":   (f"cd {ROOT} && exec {VENV} scripts/console.py serve 8099", "console.py serve"),
-    "frontdoor": (f"cd {ROOT} && exec {VENV} scripts/frontdoor.py serve 8093", "frontdoor.py serve"),
+    "dashboard": "dashboard",
+    "api": "api",
+    "console": "console",
+    # Public sales boundary. This is intentionally a separate allowlisted server, never the tenant console.
+    "assurance": "assurance",
+    "frontdoor": "frontdoor",
     # THE central execution daemon: drives every build to completion + fast-reaps hung claude (15s tick). In
     # PARK mode a completed/crashed phase advances ONLY via jobd.resume_stalled — if jobd dies mid-run, every
     # build silently freezes. It MUST be supervised like the rest (was the biggest unsupervised SPOF).
-    "jobd":      (f"cd {ROOT} && exec {VENV} scripts/jobd.py serve 15", "jobd.py serve"),
-    "ticker":    (f"exec bash {ROOT}/scripts/ticker.sh", "ticker.sh"),
-    "listener":  (f"bash {ROOT}/scripts/bridge.sh start", "reply_listener.py"),
+    "jobd": "jobd",
+    # Transcodes closed raw QA recordings after explorers release their scarce browser slot.
+    "evidence-publisher": "evidence-publisher",
+    "ticker": "ticker",
+    "dispatcher": "dispatcher",
+    "statuspage": "statuspage",
+    "metrics": "metrics",
     # closes the phone->controller loop: feeds CEO ntfy replies into loopcontroller.say (the real e2e loop)
-    "replybridge": (f"cd {ROOT} && exec {VENV} scripts/replybridge.py serve", "replybridge.py serve"),
-    # CEO Cockpit — served as supervised services so they stay up like every other daemon (the watchdog
-    # restarts them if they die). realapi = the real agent-os data backend; cockpit-web = the frontend.
-    "cockpit-api": (f"exec {VENV} {HOME}/projects/products/1-ceo-cockpit/realapi/server.py 8766", "realapi/server.py"),
-    "cockpit-web": (f"cd {HOME}/projects/products/1-ceo-cockpit && exec python3 -m http.server 8871 --bind 127.0.0.1", "http.server 8871"),
+    "replybridge": "replybridge",
 }
+# Optional surfaces are expected only when their backing asset/channel exists. Treating an intentionally
+# absent demo site, legacy cockpit, or ntfy listener as a production outage made a fresh public install page
+# the operator forever even though the CEO console and execution plane were healthy.
+if (Path.home() / "projects" / "products" / "noupload" / "dist").is_dir():
+    DAEMONS["noupload-static"] = "noupload-static"
+if (Path.home() / "projects" / "products" / "1-ceo-cockpit").is_dir():
+    DAEMONS.update({"cockpit-api": "cockpit-api", "cockpit-web": "cockpit-web"})
+_ntfy_topic = str(cfg_get("NTFY_TOPIC", "") or "")
+if _ntfy_topic and "CHANGE-ME" not in _ntfy_topic:
+    DAEMONS["listener"] = "reply-listener"
 CONTAINERS = {"postgres", "ntfy", "cerbos"}
 
 
-def _spawn(cmd, log):
-    """Launch a detached, session-leading background process (survives this call)."""
-    f = open(log, "a")
-    subprocess.Popen(["bash", "-c", cmd], stdout=f, stderr=f, stdin=subprocess.DEVNULL,
-                     start_new_session=True, cwd=str(ROOT))
+def _finite_timeout(name, default, maximum):
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = float(default)
+    if not math.isfinite(value):
+        value = float(default)
+    return min(float(maximum), max(.1, value))
 
 
-def _pgrep(pat):
-    return int(subprocess.run(["pgrep", "-fc", pat], capture_output=True, text=True).stdout.strip() or "0")
+PROBE_TIMEOUT_S = _finite_timeout("AOS_RESPONDER_PROBE_TIMEOUT_S", 10, 20)
+ACTION_TIMEOUT_S = _finite_timeout("AOS_RESPONDER_ACTION_TIMEOUT_S", 60, 90)
+SNAPSHOT_TIMEOUT_S = _finite_timeout("AOS_RESPONDER_SNAPSHOT_TIMEOUT_S", 180, 300)
 
 
 def _audit(action, target, ok, detail=""):
@@ -68,53 +88,89 @@ def _audit(action, target, ok, detail=""):
                  decision="healed" if ok else "failed", payload={"detail": detail[:160]})
 
 
-def restart_daemon(name):
-    cmd, pat = DAEMONS[name]
-    _spawn(cmd, f"/tmp/{name}.log")
-    time.sleep(2.5)
-    ok = _pgrep(pat) > 0
-    _audit("RestartDaemon", name, ok)
-    return {"action": f"restart daemon {name}", "ok": ok}
+def restart_daemon(name, replace=False):
+    service = DAEMONS.get(name)
+    if not service:
+        _audit("RestartDaemon", name, False, "daemon is not in exact service registry")
+        return {"action": f"restart daemon {name}", "ok": False,
+                "error": "daemon is not in exact service registry"}
+    try:
+        result = (service_recovery.replace(service) if replace
+                  else service_recovery.ensure(service))
+    except Exception as exc:
+        _audit("RestartDaemon", name, False, str(exc))
+        return {"action": f"restart daemon {name}", "ok": False, "error": str(exc)[:200]}
+    ok = result.get("state") == "healthy"
+    _audit("RestartDaemon", name, ok, json.dumps(result, sort_keys=True)[:160])
+    return {"action": f"restart daemon {name}", "ok": ok, "result": result}
 
 
 def restart_container(svc):
     d = ROOT / svc
-    direct = subprocess.run(["docker", "info"], capture_output=True)
+    try:
+        direct = subprocess.run(["docker", "info"], capture_output=True, timeout=PROBE_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _audit("RestartContainer", svc, False, f"docker probe failed: {exc}")
+        return {"action": f"restart container {svc}", "ok": False, "error": str(exc)[:200]}
     base = ["docker", "compose", "up", "-d"] if direct.returncode == 0 else None
-    if base:
-        p = subprocess.run(base, cwd=str(d), capture_output=True, text=True)
-    else:
-        p = subprocess.run(["sg", "docker", "-c", f"cd {d} && docker compose up -d"], capture_output=True, text=True)
+    try:
+        if base:
+            p = subprocess.run(base, cwd=str(d), capture_output=True, text=True,
+                               timeout=ACTION_TIMEOUT_S)
+        else:
+            p = subprocess.run(["sg", "docker", "-c", f"cd {d} && docker compose up -d"],
+                               capture_output=True, text=True, timeout=ACTION_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _audit("RestartContainer", svc, False, f"docker compose failed: {exc}")
+        return {"action": f"restart container {svc}", "ok": False, "error": str(exc)[:200]}
     ok = p.returncode == 0
     _audit("RestartContainer", svc, ok, p.stderr)
     return {"action": f"restart container {svc}", "ok": ok}
 
 
 def free_disk():
-    freed = []
+    freed, failures = [], []
     try:
         import objstore
         n = objstore.gc()
         freed.append(f"objstore gc: {n}")
     except Exception as e:
-        freed.append(f"objstore gc skipped: {e}")
+        failures.append(f"objstore gc failed: {e}")
     try:
         import retention
         retention.sweep()
         freed.append("retention swept")
-    except Exception:
-        pass
+    except Exception as exc:
+        failures.append(f"retention failed: {exc}")
     # prune snapshots harder (keep 5)
     snaps = sorted((ROOT / "backups").glob("agent-os-*.aosnap"))
     for old in snaps[:-5] if len(snaps) > 5 else []:
-        old.unlink(missing_ok=True); freed.append(f"pruned {old.name}")
-    _audit("FreeDisk", "/", True, "; ".join(freed))
-    return {"action": "free disk (gc+retention+prune)", "ok": True, "detail": freed}
+        try:
+            old.unlink(missing_ok=True); freed.append(f"pruned {old.name}")
+        except OSError as exc:
+            failures.append(f"prune {old.name} failed: {exc}")
+    try:
+        usage = shutil.disk_usage("/")
+        used_pct = 100.0 * usage.used / usage.total
+        ok = used_pct < 80.0
+        if not ok:
+            failures.append(f"disk remains {used_pct:.1f}% used")
+    except OSError as exc:
+        ok = False
+        failures.append(f"disk verification failed: {exc}")
+    detail = "; ".join([*freed, *failures])
+    _audit("FreeDisk", "/", ok, detail)
+    return {"action": "free disk (gc+retention+prune)", "ok": ok,
+            "detail": freed, "failures": failures}
 
 
 def take_snapshot():
-    p = subprocess.run([VENV, "platform/snapshot.py", "export"], cwd=str(ROOT),
-                       capture_output=True, text=True, timeout=180)
+    try:
+        p = subprocess.run([VENV, "platform/snapshot.py", "export"], cwd=str(ROOT),
+                           capture_output=True, text=True, timeout=SNAPSHOT_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _audit("TakeSnapshot", "backup", False, f"snapshot failed: {exc}")
+        return {"action": "take snapshot", "ok": False, "error": str(exc)[:200]}
     ok = "snapshot ->" in (p.stdout + p.stderr)
     _audit("TakeSnapshot", "backup", ok)
     return {"action": "take snapshot", "ok": ok}
@@ -125,6 +181,8 @@ def classify(issue):
     judgement/approval call — page a human), or 'unknown' (novel — hand to the reasoning incident agent)."""
     sig, msg = issue.get("sig", ""), issue.get("msg", "").lower()
     if sig.startswith("daemon:") and sig.split(":", 1)[1] in DAEMONS:
+        return "auto"
+    if sig == "heartbeat:ticker":
         return "auto"
     if "is down" in msg and any(s in msg for s in CONTAINERS):
         return "auto"
@@ -142,8 +200,10 @@ def remediate(issue):
     if sig.startswith("daemon:"):
         name = sig.split(":", 1)[1]
         if name in DAEMONS:
-            return restart_daemon(name)
+            return restart_daemon(name, replace=True)
         return None  # e.g. watchdog itself — escalate
+    if sig == "heartbeat:ticker":
+        return restart_daemon("ticker", replace=True)
     if "is down" in msg:   # a component health check failed
         for svc in CONTAINERS:
             if svc in msg:

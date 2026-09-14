@@ -1,0 +1,10 @@
+# Copy to C:\Users\<you>\.wslconfig on Windows, then run `wsl --shutdown`.
+# This is an external host setting; placing this example in the repo does not change the running VM.
+[wsl2]
+memory=16GB
+processors=8
+swap=8GB
+localhostForwarding=true
+
+[experimental]
+autoMemoryReclaim=gradual

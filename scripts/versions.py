@@ -16,37 +16,35 @@ import sys
 import tarfile
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit    # noqa: E402
 import factory  # noqa: E402  (factory.PRODUCTS = the products dir)
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 VSTORE = factory.PRODUCTS.parent / "_versions"   # where snapshot tar.gz files live
 SKIP = {".git", "__pycache__", "node_modules"}   # never snapshot these
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS product_versions (
             id BIGSERIAL PRIMARY KEY, tenant_id TEXT, product TEXT, version INT, label TEXT,
             snapshot_path TEXT, created_at TIMESTAMPTZ DEFAULT now())""")
-        c.commit()
 
 
 def _owns(tid, product):
     """True iff `product` belongs to tenant `tid` per tenant_products."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM tenant_products WHERE product=%s AND tenant_id=%s", (product, tid))
         return cur.fetchone() is not None
 
 
-def _next_version(product):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM product_versions WHERE product=%s", (product,))
+def _next_version(tid, product):
+    with tenant_connection(tid) as c, c.cursor() as cur:
+        cur.execute("""SELECT COALESCE(MAX(version), 0) + 1 FROM product_versions
+                       WHERE tenant_id=%s AND product=%s""", (tid, product))
         return cur.fetchone()[0]
 
 
@@ -88,14 +86,13 @@ def snapshot(tid, product, label=""):
     if not repo.is_dir():
         return {"error": "no repo"}
     VSTORE.mkdir(parents=True, exist_ok=True)
-    version = _next_version(product)
+    version = _next_version(tid, product)
     snap = VSTORE / f"{product}.v{version}.tar.gz"
     with tarfile.open(snap, "w:gz") as tar:
         tar.add(repo, arcname=".", filter=_tar_filter)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO product_versions (tenant_id, product, version, label, snapshot_path)
                        VALUES (%s,%s,%s,%s,%s)""", (tid, product, version, label, str(snap)))
-        c.commit()
     return {"version": version, "label": label, "snapshot_path": str(snap)}
 
 
@@ -104,7 +101,7 @@ def versions(tid, product):
     _ensure()
     if not _owns(tid, product):
         return []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""SELECT version, label, created_at, snapshot_path FROM product_versions
                        WHERE tenant_id=%s AND product=%s ORDER BY version DESC""", (tid, product))
         rows = cur.fetchall()
@@ -122,7 +119,7 @@ def rollback(tid, product, version):
     if not _owns(tid, product):
         return {"error": "not owner"}
     repo = factory.PRODUCTS / product
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""SELECT snapshot_path FROM product_versions
                        WHERE tenant_id=%s AND product=%s AND version=%s""", (tid, product, version))
         row = cur.fetchone()
@@ -173,7 +170,7 @@ def rollback(tid, product, version):
         if stash is not None and stash.exists():
             shutil.rmtree(stash, ignore_errors=True)
     audit.append(actor="versions", action="Rollback", resource=product, decision="executed",
-                 payload={"tenant_id": tid, "restored_version": version})
+                 payload={"tenant_id": tid, "restored_version": version}, tenant_id=tid)
     return {"ok": True, "restored_version": version}
 
 
@@ -194,9 +191,8 @@ def _selftest():
         git.mkdir(parents=True, exist_ok=True)
         git_marker.write_text("ref: refs/heads/main")
         f.write_text("v1")
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s)", (product, tid))
-            c.commit()
 
         s1 = snapshot(tid, product)                         # v1
         f.write_text("v2")
@@ -222,12 +218,11 @@ def _selftest():
               if ok else "FAIL")
         sys.exit(0 if ok else 1)
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM product_versions WHERE tenant_id=%s OR product IN (%s,%s)",
                         (tid, product, foreign))
             cur.execute("DELETE FROM tenant_products WHERE product IN (%s,%s)", (product, foreign))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
         for pat in (f"{product}.v*.tar.gz", f"{foreign}.v*.tar.gz"):
             for t in VSTORE.glob(pat):
                 t.unlink(missing_ok=True)

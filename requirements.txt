@@ -3,9 +3,11 @@ requests
 psycopg[binary]
 nats-py
 faster-whisper
+huggingface-hub<1.0
 dbos
 cryptography
 inspect-ai
+click==8.2.1
 opentelemetry-sdk
 opentelemetry-api
 psycopg_pool>=3.2

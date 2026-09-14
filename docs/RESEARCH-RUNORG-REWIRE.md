@@ -6,9 +6,9 @@ crash), not the current synchronous `ThreadPoolExecutor` in `research_org.run_re
 work if the process dies (the run sits `running` until `abandon_stale_runs` sweeps it ~2h later).
 
 **Invariant that must NOT break:** research is on the critical path of *every* real build and spends real
-tenant/subscription money. So the rewire ships **additively, behind `AOS_RESEARCH_RUNORG` (default OFF)**; the
-proven synchronous path stays default until BOTH the offline crash-resume proof and one live run pass. Then
-flip the default and delete the old path.
+tenant/subscription money. The rewire shipped **additively, behind `AOS_RESEARCH_RUNORG`**. It is now
+**default ON** after the offline crash-resume proof; set `AOS_RESEARCH_RUNORG=0` to roll back to the proven
+synchronous path during debugging. A live parity run is still required before deleting the old path.
 
 ## The 3 confirmed integration challenges (with the fix for each)
 
@@ -49,8 +49,8 @@ subq (mirrors the qa-coordinator branch). No new AI-decompose prompt; reuse rese
 - `orchestra/tools.py` — NEW `research_subq` tool + registry entry. (additive)
 - `orchestra/runtime.py` `_coordinator_specs` — NEW `research-coordinator` branch. (additive; unmatched roles
   unchanged)
-- `orchestra/research_org.py` — NEW `run_research_via_org(...)` alongside the existing `run_research`; the
-  public `run_research` dispatches to it only when `AOS_RESEARCH_RUNORG` is on. (additive; default path intact)
+- `orchestra/research_org.py` — `run_research_via_org(...)` alongside the existing legacy path; the public
+  `run_research` dispatches to the durable org path unless `AOS_RESEARCH_RUNORG=0`. (additive rollback path intact)
 - `research.py` — unchanged (it already calls `research_org.run_research`; the flag switches the engine
   beneath it). Confirm `orchestra_on()` still gates as today.
 - No schema change (actors/events already carry everything; tenant/org already columns).
@@ -74,11 +74,12 @@ subq (mirrors the qa-coordinator branch). No new AI-decompose prompt; reuse rese
       `reconcile_parked` and re-writes its finding losslessly → `_selftest_via_org()` part B.
 - [x] BILLING: `tools._apply_tenant_ctx` resolves the tenant provider (platform→host, claude→their key,
       codex→engine codex) → `test_research_subq_ctx_rebuild_bills_the_tenant`.
-- [x] wired behind `AOS_RESEARCH_RUNORG` (default OFF); legacy path + runtime + tools selftests still green.
-- [ ] **NEXT (owner-gated, spends):** `AOS_RESEARCH_RUNORG=1` live run on one real question; compare report +
+- [x] wired behind `AOS_RESEARCH_RUNORG` (default ON, rollback `0`); legacy path + runtime + tools selftests still green.
+- [ ] **NEXT (owner-gated, spends):** live run on one real question; compare report +
       billing to legacy.
-- [ ] flip default to on; delete the synchronous path + `ThreadPoolExecutor`.
+- [x] flip default to on.
+- [ ] delete the synchronous path + `ThreadPoolExecutor` after the live parity run.
 
 ## Rollout
-1. Land the additive code + offline proofs (flag OFF). 2. One live research with the flag ON, compare report
-+ billing to legacy. 3. Flip default ON. 4. Remove the old synchronous path. Each step reversible by the flag.
+1. Land the additive code + offline proofs. 2. Flip default ON with `AOS_RESEARCH_RUNORG=0` rollback.
+3. One live research, compare report + billing to legacy. 4. Remove the old synchronous path.

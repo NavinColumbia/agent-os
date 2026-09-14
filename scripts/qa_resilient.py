@@ -6,7 +6,7 @@ going regardless of time/rounds." A subscription plan rate-limits a long QA swee
 storms; a WSL reboot can drop Postgres; the isolated agent creds go stale when the host session logs out.
 This wrapper makes ONE QA run of a connected product survive all three:
 
-  * BEFORE each attempt: re-sync creds by content and PROVE an isolated-config `claude -p` call authenticates.
+  * BEFORE each attempt: resolve the active provider and prove its local auth without spending a model turn.
     If auth is DOWN, it does NOT burn a doomed run — it writes NEED_LOGIN to the status file and exits 3 so
     the supervising agent can prompt the owner to re-login, then relaunch.
   * DB outage: wait (bounded) for Postgres to come back (self-heal restarts it) before starting.
@@ -70,26 +70,65 @@ def _wait_db(max_wait_s=600):
     return False
 
 
-def _auth_ok():
-    """Re-sync the isolated agent creds by content, then PROVE a `claude -p` call authenticates under that
-    config. Returns True only on a real rc==0 reply — so a stale/logged-out token is caught BEFORE a run."""
+def _cli_auth_ok(engine):
+    """No-spend CLI auth probe for subscription/platform engines."""
+    engine = (engine or "").lower()
+    if engine == "codex":
+        if os.environ.get("OPENAI_API_KEY"):
+            return True
+        try:
+            r = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=20)
+            return r.returncode == 0 and "logged in" in ((r.stdout or "") + (r.stderr or "")).lower()
+        except Exception:
+            return False
     try:
         import factory
-        cfg = factory._agent_config_dir()             # syncs host creds -> isolated by content
+        factory._agent_config_dir()             # syncs host creds -> isolated by content
+        cfg = str(factory._AGENT_CONFIG_DIR)
     except Exception:
-        return False
+        cfg = None
     try:
-        r = subprocess.run(["claude", "-p", "Reply with the single word OK"],
-                           capture_output=True, text=True, timeout=90,
-                           env={**os.environ, "CLAUDE_CONFIG_DIR": str(cfg)})
-        out = ((r.stdout or "") + (r.stderr or "")).lower()
-        if r.returncode == 0 and "ok" in out:
-            return True
-        # a login/auth failure signature => NEED_LOGIN (distinct from a transient overload)
-        return not any(s in out for s in ("not logged in", "unauthor", "login", "invalid api key",
-                                          "authentication", "expired"))
+        env = {**os.environ}
+        if cfg:
+            env["CLAUDE_CONFIG_DIR"] = cfg
+        r = subprocess.run(["claude", "auth", "status", "--json"],
+                           capture_output=True, text=True, timeout=20, env=env)
+        if r.returncode != 0:
+            return False
+        try:
+            return bool(json.loads(r.stdout or "{}").get("loggedIn"))
+        except Exception:
+            return "logged" in ((r.stdout or "") + (r.stderr or "")).lower()
     except Exception:
         return False
+
+
+def _auth_ok(tenant=None):
+    """Resolve the active provider and prove credentials without a model call. API-key providers are
+    credentialed by the stored key; subscription/platform providers are checked with CLI auth status."""
+    if tenant and tenant not in ("demo", "platform"):
+        try:
+            import tenantproviders
+            r = tenantproviders.resolve(tenant) or {}
+            if r.get("auth_mode") == "api_key":
+                return bool(r.get("key"))
+            if r.get("auth_mode") == "subscription":
+                return _cli_auth_ok(r.get("engine"))
+            if r.get("provider"):
+                return bool(r.get("key"))
+        except Exception:
+            return False
+    try:
+        import factory
+        engine = getattr(factory, "DEFAULT_ENGINE", os.environ.get("AOS_DEFAULT_ENGINE", "codex"))
+    except Exception:
+        engine = os.environ.get("AOS_DEFAULT_ENGINE", "codex")
+    return _cli_auth_ok(engine)
+
+
+def _legacy_auth_ok():
+    """Back-compat alias for old callers/tests."""
+    return _auth_ok()
 
 
 def _verdict_is_contaminated(verdict_json_path):
@@ -143,6 +182,14 @@ def _conc_ceiling():
         return _CONC_START
 
 
+def _active_engine_for_degradation():
+    try:
+        import factory
+        return (getattr(factory, "DEFAULT_ENGINE", None) or os.environ.get("AOS_DEFAULT_ENGINE", "codex")).lower()
+    except Exception:
+        return os.environ.get("AOS_DEFAULT_ENGINE", "codex").lower()
+
+
 def _measure_degradation(product, since_ts):
     """MEASURED provider health for the attempt that just ran: the fraction of its QA model calls that either
     errored or fell back to the Codex engine. Returns (rate, calls) — rate is None when there is no evidence
@@ -152,13 +199,16 @@ def _measure_degradation(product, since_ts):
         import psycopg
         with psycopg.connect(aoscfg.DB) as c, c.cursor() as cur:
             cur.execute("""SELECT count(*),
-                                  count(*) FILTER (WHERE rc <> 0 OR coalesce(model,'') ILIKE '%%codex%%')
+                                  count(*) FILTER (WHERE rc <> 0),
+                                  count(*) FILTER (WHERE coalesce(model,'') ILIKE '%%codex%%')
                              FROM traces
                             WHERE kind='agent' AND product=%s AND run_id LIKE 'qa-%%'
                               AND ts > to_timestamp(%s)""", (product, since_ts))
-            calls, bad = cur.fetchone()
+            calls, rc_bad, codex_calls = cur.fetchone()
         if not calls:
             return None, 0
+        # Codex used to be a failover signal. In a Codex-primary system it is the healthy path.
+        bad = rc_bad if _active_engine_for_degradation() == "codex" else (rc_bad or 0) + (codex_calls or 0)
         return (bad or 0) / float(calls), int(calls)
     except Exception:
         return None, 0
@@ -253,7 +303,7 @@ def run(product, tenant="demo", max_attempts=30):
                 return 4
 
         # 2) creds must authenticate (catches a logged-out host session BEFORE a doomed run)
-        if not _auth_ok():
+        if not _auth_ok(tenant):
             _status(phase="need_login", attempt=attempt,
                     message="isolated agent creds not authenticating — owner must /login, then relaunch")
             print("QA_RESILIENT need_login", flush=True)

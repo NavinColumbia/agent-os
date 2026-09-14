@@ -39,7 +39,7 @@ nano .env.local
 ```bash
 cd ntfy     && docker compose up -d && cd ..
 cd postgres && docker compose up -d && cd ..
-cd nats     && docker compose up -d && cd ..
+cd cerbos   && docker compose up -d && cd ..
 bash scripts/bridge.sh start          # ntfy reply listener
 ```
 
@@ -47,7 +47,7 @@ bash scripts/bridge.sh start          # ntfy reply listener
 ```bash
 bash scripts/constraint_smoke_test.sh                 # Step 1  → 8/8
 bash scripts/crash_recovery_test.sh                   # Step 3  → state survives kill -9
-.venv/bin/python scripts/nats_roundtrip_test.py       # Step 4  → round-trip
+.venv/bin/python scripts/orchestra/bus.py             # Step 4  → durable communication round-trip
 ```
 
 ## 5. Reach + phone + voice (need your action)

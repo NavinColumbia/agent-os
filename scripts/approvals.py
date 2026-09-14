@@ -11,17 +11,16 @@ applies the SAFE side of each decision and records it in the tamper-evident audi
     approvals.py selftest
 Run with the agent-os venv python.  Data/logic module only — binds no server.
 """
+import os
 import sys
 from pathlib import Path
-
-import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit    # noqa: E402
 import consent  # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
 
-from aoscfg import ENV, DB
 PRODUCTS = Path.home() / "projects" / "products"
 
 # Optional collaborators — present in this factory, but degrade gracefully if absent.
@@ -31,8 +30,12 @@ except Exception:       # pragma: no cover
     killswitch = None
 
 
+def _conn(tid=None):
+    return tenant_connection(tid) if tid else connection()
+
+
 def _tenant_products(tid):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s", (tid,))
         return [r[0] for r in cur.fetchall()]
 
@@ -43,7 +46,7 @@ def _paused_apps(tid):
     if not prods:
         return []
     halted = {}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT scope, reason FROM kill_switch WHERE scope IN ('global', %s) OR scope = ANY(%s)",
                     (tid, prods))
         for scope, reason in cur.fetchall():
@@ -71,7 +74,7 @@ def _blocked_builds(tid):
     if not prods:
         return []
     out = []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         # The most recent ProductComplete per product over the last 7 days; surface it only if that
         # latest verdict is still BLOCKED (a since-LAUNCHED build has a newer, higher-id LAUNCHED row).
         cur.execute("""
@@ -97,7 +100,7 @@ def _hire_requests(tid):
     tenant's hires). NULL-tenant rows are shared-pool/platform hires with no owning company — surfaced to no
     CEO inbox (an operator concern), never to a random tenant."""
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             cur.execute("""SELECT id, requester, need_role, reason FROM hire_requests
                            WHERE status='open' AND tenant_id = %s ORDER BY id""", (tid,))
             return [{"id": r[0], "requester": r[1], "need_role": r[2], "reason": r[3] or ""}
@@ -116,7 +119,7 @@ def _dead_letters(tid):
     prods = set(_tenant_products(tid))
     if not prods:
         return []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tid) as c, c.cursor() as cur:
         cur.execute("""SELECT id, title, role, last_error, attempts, assignee FROM tasks
                        WHERE status='dead' ORDER BY id""")
         rows = cur.fetchall()
@@ -130,11 +133,61 @@ def _dead_letters(tid):
     return out
 
 
+def _controller_gates(tid, execution_scope=None):
+    """Controller workstreams parked on a CEO gate.
+
+    Proactive comms already pages these, but the linked Approvals screen must also show the actual item and
+    provide a response path. Otherwise a CEO sees an urgent notification that opens to "All clear".
+    """
+    try:
+        with tenant_connection(tid) as c, c.cursor() as cur:
+            cur.execute("""SELECT thread_id, phase, awaiting, product
+                           FROM controller_state
+                           WHERE tenant_id=%s
+                             AND (%s::text IS NULL OR execution_scope=%s)
+                             AND awaiting IN ('user_feedback','user_approval','credentials')
+                             AND phase <> 'DELIVER'
+                             AND NOT EXISTS (
+                                   SELECT 1 FROM controller_jobs cj
+                                   WHERE cj.thread_id=controller_state.thread_id AND cj.status='cancelled'
+                                     AND cj.id = (SELECT max(id) FROM controller_jobs
+                                                  WHERE thread_id=controller_state.thread_id))
+                           ORDER BY updated_at DESC""", (tid, execution_scope, execution_scope))
+            rows = cur.fetchall()
+        try:
+            import killswitch
+            rows = [r for r in rows if not killswitch.is_halted(f"thread-{r[0]}").get("halted")]
+        except Exception:
+            pass
+        out = []
+        for thread_id, phase, awaiting, product in rows:
+            what = {"user_approval": "pick a direction or approve the plan",
+                    "user_feedback": "review and respond",
+                    "credentials": "connect a model provider"}.get(awaiting, "respond")
+            out.append({
+                "id": f"ceo_gate:{thread_id}",
+                "kind": "ceo_decision",
+                "ref": str(thread_id),
+                "title": f"Your build is waiting on you ({phase})",
+                "detail": f"{product or 'This workstream'} needs you to {what}.",
+                "severity": "high",
+                "action_label": "Respond",
+            })
+        return out
+    except Exception:
+        return []
+
+
 def _retry_build(product):
     """Re-run a blocked build the same way the self-heal sweep does: a DETACHED resume process
     (`factory.py build <product> "" <kind>`) that skips the SPEC/BUILD checkpoints and re-runs QA/
     REVIEW/LAUNCH. Returns True if a process was actually launched; False if we fell back to the
     audit-marker-only path (a resume sweep / operator picks it up). Never raises."""
+    # Acceptance/selftests must never launch a detached build.  The old
+    # approvals selftest did exactly that and then used an unsafe broad pkill
+    # to clean it up, turning a no-spend scorecard into live process pressure.
+    if os.environ.get("AOS_SELFTEST", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
     try:
         import subprocess
         import factory
@@ -149,7 +202,7 @@ def _retry_build(product):
         return False
 
 
-def inbox(tid):
+def inbox(tid, execution_scope=None):
     """Aggregate everything awaiting a human decision for this tenant into ONE list."""
     items = []
 
@@ -199,12 +252,14 @@ def inbox(tid):
             "action_label": "Approve / Deny",
         })
 
+    items.extend(_controller_gates(tid, execution_scope=execution_scope))
+
     # AI -> CEO questions: an agent hit something only the CEO can answer (a choice, a credential, a
     # judgment call) and PAUSED. Surfacing them here is the 'ask-the-CEO' loop (B1) — without this the
     # question only push-notified and the CEO had nowhere in-product to answer, so the phase stayed blocked.
     try:
         import agent_request
-        for r in (agent_request.open_requests(tid) or []):
+        for r in (agent_request.open_requests(tid, execution_scope=execution_scope) or []):
             items.append({
                 "id": f"question:{r['id']}",
                 "kind": "question",
@@ -253,13 +308,12 @@ def decide(tid, kind, ref, verdict):
 
     elif kind == "hire_request":
         new = "fulfilled" if verdict == "approve" else "denied"
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             # OWNERSHIP: only the owning tenant may decide its hire (cross-tenant write guard).
             cur.execute("UPDATE hire_requests SET status=%s WHERE id=%s AND tenant_id=%s",
                         (new, int(ref), tid))
             if cur.rowcount == 0:
                 raise ValueError(f"hire_request {ref} is not owned by tenant {tid}")
-            c.commit()
 
     elif kind == "blocked_build":
         if ref not in _tenant_products(tid):
@@ -267,15 +321,15 @@ def decide(tid, kind, ref, verdict):
         if verdict in ("approve", "retry"):
             queued = _retry_build(ref)
             audit.append(actor="approvals", action="BuildRetryRequested", resource=ref,
-                         decision="retry", payload={"tenant": tid, "relaunched": queued})
+                         decision="retry", payload={"tenant": tid, "relaunched": queued}, tenant_id=tid)
             return {"ok": True, "queued": True, "kind": kind, "ref": ref, "verdict": verdict}
         else:  # 'deny'/'drop'
             audit.append(actor="approvals", action="BuildAbandoned", resource=ref,
-                         decision="abandon", payload={"tenant": tid})
+                         decision="abandon", payload={"tenant": tid}, tenant_id=tid)
             return {"ok": True, "kind": kind, "ref": ref, "verdict": verdict}
 
     elif kind == "dead_letter":
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn(tid) as c, c.cursor() as cur:
             # OWNERSHIP: the dead task's product (embedded in assignee '<role>@<product>') must be the
             # tenant's — else a tenant could retry/drop ANOTHER tenant's task by id (cross-tenant write).
             cur.execute("SELECT assignee FROM tasks WHERE id=%s", (int(ref),))
@@ -294,11 +348,14 @@ def decide(tid, kind, ref, verdict):
         raise ValueError(f"unknown decision kind: {kind}")
 
     audit.append(actor="approvals", action="DecisionApplied", resource=f"{kind}:{ref}",
-                 decision=verdict, payload={"tenant": tid, "kind": kind, "ref": str(ref)})
+                 decision=verdict, payload={"tenant": tid, "kind": kind, "ref": str(ref)}, tenant_id=tid)
     return {"ok": True, "kind": kind, "ref": ref, "verdict": verdict}
 
 
 def _selftest():
+    # Standalone `approvals.py selftest` must be no-spend too; do not rely on a
+    # parent harness to provide the marker before exercising retry approval.
+    os.environ["AOS_SELFTEST"] = "1"
     import billing
     reg = billing.signup("approvals-selftest", "free")
     tid = reg["tenant_id"]
@@ -307,16 +364,17 @@ def _selftest():
     blk_product = f"approvals-selftest-blocked-{tid}"
     try:
         # An item we fully control: an OPEN hire_request (global, surfaces in every tenant's inbox).
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn(tid) as c, c.cursor() as cur:
             cur.execute("""INSERT INTO hire_requests (requester, need_role, reason, status, tenant_id)
                            VALUES (%s,%s,%s,'open',%s) RETURNING id""",
                         ("approvals-selftest", "qa-bot", "selftest hire", tid))
             hire_id = cur.fetchone()[0]
             # A dead-lettered task OWNED BY THIS TENANT (assignee '<role>@<product>' where product is the
             # tenant's) — so it surfaces for THIS tenant only, not globally (tests the isolation fix).
-            cur.execute("""INSERT INTO tasks (assignee, requester, role, title, status, attempts, max_retry)
-                           VALUES (%s,'approvals-selftest','qa-bot','selftest dead task','dead',3,3)
-                           RETURNING id""", (f"qa-bot@{blk_product}",))
+            cur.execute("""INSERT INTO tasks
+                              (tenant_id,assignee,requester,role,title,status,attempts,max_retry)
+                           VALUES (%s,%s,'approvals-selftest','qa-bot','selftest dead task','dead',3,3)
+                           RETURNING id""", (tid, f"qa-bot@{blk_product}"))
             dead_id = cur.fetchone()[0]
             # A blocked build the tenant owns, recorded as a ProductComplete BLOCKED_AT_REVIEW row.
             cur.execute("""INSERT INTO tenant_products (product, tenant_id)
@@ -324,7 +382,8 @@ def _selftest():
             c.commit()
         audit.append(actor="factory:controller", action="ProductComplete", resource=blk_product,
                      decision="BLOCKED_AT_REVIEW",
-                     payload={"blocker": "reviewer still REQUEST-CHANGES", "tenant": tid})
+                     payload={"blocker": "reviewer still REQUEST-CHANGES", "tenant": tid},
+                     tenant_id=tid)
 
         box = inbox(tid)
         kinds = {i["kind"] for i in box["items"]}
@@ -343,7 +402,7 @@ def _selftest():
 
         # Resolve the hire_request and verify it leaves the inbox.
         decide(tid, "hire_request", hire_id, "approve")
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn(tid) as c, c.cursor() as cur:
             cur.execute("SELECT status FROM hire_requests WHERE id=%s", (hire_id,))
             hire_status = cur.fetchone()[0]
         hire_resolved = hire_status == "fulfilled" and \
@@ -351,7 +410,7 @@ def _selftest():
 
         # Retry the dead task and verify it's no longer dead.
         decide(tid, "dead_letter", dead_id, "retry")
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn(tid) as c, c.cursor() as cur:
             cur.execute("SELECT status FROM tasks WHERE id=%s", (dead_id,))
             task_status = cur.fetchone()[0]
         dead_resolved = task_status == "pending" and \
@@ -364,14 +423,14 @@ def _selftest():
 
         # Retry the blocked build: decide() returns ok+queued and writes a BuildRetryRequested audit.
         blk_decided = decide(tid, "blocked_build", blk_product, "approve")
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn(tid) as c, c.cursor() as cur:
             cur.execute("""SELECT count(*) FROM audit_log
                            WHERE action='BuildRetryRequested' AND resource=%s""", (blk_product,))
             retry_audited = cur.fetchone()[0] >= 1
         blocked_retried = blk_decided.get("ok") and retry_audited
         # A LATER LAUNCHED ProductComplete means it's since-fixed -> the item must DISAPPEAR.
         audit.append(actor="factory:controller", action="ProductComplete", resource=blk_product,
-                     decision="LAUNCHED", payload={"stages": 5})
+                     decision="LAUNCHED", payload={"stages": 5}, tenant_id=tid)
         blocked_cleared = not any(i["kind"] == "blocked_build" and i["ref"] == blk_product
                                   for i in inbox(tid)["items"])
 
@@ -385,14 +444,12 @@ def _selftest():
         print("PASS: approvals inbox aggregates + decide() resolves each kind ✅" if ok else "FAIL")
         rc = 0 if ok else 1
     finally:
-        # The 'approve' decision launched a REAL detached resume build for this throwaway product;
-        # reap it (and its scratch repo/log) FIRST so it can't write more rows after we clean up.
+        # AOS_SELFTEST makes _retry_build model/process-free, so cleanup never
+        # needs broad command-line matching or process signalling.
         import shutil
-        import subprocess
-        subprocess.run(["pkill", "-f", f"factory.py build {blk_product}"], check=False)
         shutil.rmtree(PRODUCTS / blk_product, ignore_errors=True)
         Path(f"/tmp/retry-{blk_product}.log").unlink(missing_ok=True)
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn(tid) as c, c.cursor() as cur:
             if dead_id is not None:
                 cur.execute("DELETE FROM tasks WHERE id=%s", (dead_id,))
             if hire_id is not None:

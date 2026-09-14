@@ -216,6 +216,28 @@ Target **WCAG 2.1 Level AA** from launch. Retrofitting is far more expensive tha
 | **Annually** | Full privacy policy review. Verify data retention policies. Check for new regional laws. Review ToS. Evaluate API version retirement candidates. |
 | **On any incident** | GDPR breach: 72-hour notification window to supervisory authority without exception. |
 
+### 3.5 App Store Privacy Labeling Requirements
+
+Every app published through the platform — the factory app itself and each derived app a user submits — must carry accurate, current store privacy disclosures. Two named artifacts govern this:
+
+- **Apple App Privacy Nutrition Labels** — the App Store Connect declaration (see §1.1) covering every data type collected, whether each type is **linked** to the user's identity, and whether it is used for **tracking** across other apps and websites (which additionally requires App Tracking Transparency consent). Grouped into Apple's three buckets: *Data Used to Track You*, *Data Linked to You*, and *Data Not Linked to You*.
+- **Google Play Data Safety declaration** — the Play Console Data Safety form (see §1.2), mandatory even when the app collects zero data, covering data **collected** vs **shared**, the purpose per data type, whether each collection is optional, and the app's security practices (encryption in transit, a data-deletion request path).
+
+**Required disclosures.** For each SDK, API, and code path that touches user data, declare in both stores:
+
+1. Every **data category** collected (identifiers, contacts, location, financial info, usage/diagnostics, user content, purchases, etc.), mapped to Apple's and Google's respective taxonomies.
+2. The **purpose** of each collection (app functionality, analytics, advertising/marketing, personalization).
+3. **Tracking** use and third-party **sharing** — including data sent to third-party AI providers (see §2). A named AI sub-processor that receives user prompts or files is a disclosed data flow, not an exemption.
+4. Whether each data type is **linked to identity** and whether the collection is **optional**.
+
+**Accuracy and consistency with actual behavior.** Declared labels must match the app's **actual runtime behavior**. Reconcile every declaration against the real data-flow map — the set of active third-party SDKs and exactly what each transmits — before submission (cross-check the §3.4 quarterly SDK audit). A mismatch between the Google Data Safety form and observed collection triggers automated flagging and can result in removal (see §8.1); an inaccurate Apple label is a misrepresentation reviewable under Guideline 5.1.2 and grounds for rejection or takedown. Any exemption claim (on-device-only processing, or processing on first-party infrastructure — see §2, item 6) must be evidenced by the data-flow map before it is asserted; an unqualified "no data collected" declaration over a server-side path is false and must not ship.
+
+**Update cadence on data-practice changes.** Re-verify and, where changed, re-file both declarations on every **data-practice change**: adding or updating an SDK or AI provider, adding a data type or a new purpose, or enabling a formerly optional collection by default. This is an **every-release gate** (fold into the §3.4 release checklist — no submission proceeds until the Data Safety form and the Apple privacy labels/manifest are reconciled with the shipped build), with a **quarterly** full reconciliation against the active-SDK audit and an **annual** review alongside the privacy-policy review.
+
+**Named owner / accountability.** A single named **Privacy Label Owner** (the Data Protection Officer, or the compliance lead where no DPO is appointed) is accountable for keeping both stores' declarations current and accurate. The Privacy Label Owner signs off on the reconciliation before each submission and maintains the mapping of *data category → SDK/code path → store declaration* as the audit record. For derived apps that users publish under their own developer accounts, the platform surfaces a pre-filled, per-build labeling summary and this same reconciliation checklist, but the **publishing user remains the accountable party** for their own app's store declaration.
+
+Sources: [Apple — App privacy details on the App Store](https://developer.apple.com/app-store/app-privacy-details/) · [Google Play — Provide information for Google Play's Data safety section](https://support.google.com/googleplay/android-developer/answer/10787469)
+
 ---
 
 ## 4. First-Run Onboarding & Setup

@@ -15,14 +15,13 @@ import json
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit    # noqa: E402,F401  (governance convention: every surface imports the audit chain)
 import factory  # noqa: E402
+import workstreamview  # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 PIPELINE = ["SPEC", "BUILD", "QA", "REVIEW", "LAUNCH"]   # the governed line, for grouping
 _SKIP = {".git", "__pycache__", "node_modules", ".venv", ".pytest_cache", ".mypy_cache"}
 
@@ -95,7 +94,7 @@ def list_projects(tid, org_id=0):
     """A tenant's products, newest first: result + readiness + progress + spend. When org_id is set,
     scoped to the active org ('This org' nav); 0 = the whole tenant."""
     out = []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         prods = _scoped_products(cur, tid, org_id)
         for product in prods:
             cur.execute("""SELECT count(DISTINCT stage), sum(COALESCE(cost_usd,0)),
@@ -114,18 +113,40 @@ def list_projects(tid, org_id=0):
                 "tokens": int(toks or 0),
                 "last_ts": last.strftime("%Y-%m-%d %H:%M:%S") if last else None,
             })
+    seen = {p["product"] for p in out}
+    for w in workstreamview.active_workstreams(tid, org_id):
+        product = w.get("product")
+        if product and product in seen:
+            continue
+        label = product or w["label"]
+        out.append({
+            "product": label,
+            "result": "building" if w.get("running") else f"awaiting_{w.get('awaiting') or 'work'}",
+            "ready": False,
+            "failed": False,
+            "stages_done": 0,
+            "cost_usd": 0.0,
+            "tokens": 0,
+            "last_ts": None,
+            "provisional": True,
+            "thread_id": w.get("thread_id"),
+            "phase": w.get("phase"),
+            "status": w.get("status"),
+            "can_cancel": bool(w.get("can_cancel")),
+            "cancel_action": w.get("cancel_action"),
+        })
     return out
 
 
 def project_detail(tid, product):
     """Ownership-checked drill-in: per-stage run, spend, on-disk artifacts. Refuses others' products."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM tenant_products WHERE tenant_id=%s AND product=%s", (tid, product))
         if not cur.fetchone():
             return {"error": "not your product"}
         cur.execute("""SELECT stage, role, rc, COALESCE(cost_usd,0), COALESCE(elapsed_s,0), ts,
                               COALESCE(tokens_in,0)+COALESCE(tokens_out,0)
-                       FROM traces WHERE product=%s AND kind='agent' ORDER BY ts ASC""", (product,))
+                       FROM traces WHERE product=%s AND kind='agent' ORDER BY ts ASC, id ASC""", (product,))
         rows = cur.fetchall()
         stages = []
         cost = toks = 0.0
@@ -160,7 +181,7 @@ def _selftest():
     prod = tid.replace("t-", "")[:6] + "-projview"
     repo = factory.PRODUCTS / prod
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                         (prod, tid))
             for st, cost in (("SPEC", 0.12), ("BUILD", 0.88)):
@@ -168,7 +189,6 @@ def _selftest():
                                                    tokens_in, tokens_out, elapsed_s, prompt, output, model)
                                VALUES (%s,%s,%s,'builder','agent',0,%s,1000,2000,20,'p','o','m')""",
                             (f"run-{prod}", prod, st, cost))
-            c.commit()
         # tiny on-disk repo so files/loc/detail have something real to scan
         repo.mkdir(parents=True, exist_ok=True)
         (repo / "main.py").write_text("print('hello')\nx = 1\n")
@@ -192,11 +212,10 @@ def _selftest():
               f"files={len(det['files'])} loc={det['loc']} ownership_block={denied.get('error')}")
         print("PASS: projects list + detail (stages/cost/files) + ownership guard ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM traces WHERE product=%s", (prod,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
         shutil.rmtree(repo, ignore_errors=True)
     sys.exit(0 if ok else 1)
 

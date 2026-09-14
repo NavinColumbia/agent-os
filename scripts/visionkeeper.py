@@ -25,18 +25,22 @@ on demand if missing/stale) so a build starts from the CEO's intent, not a blank
 import json
 import os
 import sys
+import hashlib
+import tempfile
 from pathlib import Path
-
-import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
-from aoscfg import DB  # noqa: E402
+import aoscfg  # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
+
+DB = aoscfg.DB  # compatibility for older tests/tools; runtime paths use dbpool.
 
 _REPO = SCRIPTS.parent
 _REQ_DOC = _REPO / "docs" / "SYSTEM-REQUIREMENTS.md"
 STALE_S = int(os.environ.get("AOS_VISION_STALE_S", "86400"))     # refine on read if older than a day
+REFINE_TIMEOUT_S = max(10, min(75, int(os.environ.get("AOS_VISION_REFINE_TIMEOUT_S", "60"))))
 
 # The CEO's STANDING directive — seeded once, editable. This is the vision the refiner always answers to so
 # the CEO never has to restate it. (Sourced from the owner's own words.)
@@ -46,7 +50,10 @@ SEED_VISION = (
     "end, coordinate through rich, human-like communication, and hold a quality bar that ASTONISHES a skeptic "
     "(zero bugs reach a human; nothing fails invisibly). Humans (me) should be involved ONLY where absolutely "
     "necessary, and the system must tell me UP FRONT everything it needs from me — credentials, accounts, "
-    "credit/budget, legal/compliance, and any approvals or emails — rather than interrupting me mid-build."
+    "credit/budget, legal/compliance, and any approvals or emails — rather than interrupting me mid-build. "
+    "Agent OS itself is a commercial, hosted multi-tenant product that must be simple for non-technical "
+    "customers, portable for enterprise self-hosting or customer-cloud deployment, profitable from early "
+    "customers, and architected to scale reliably toward millions of users without premature rewrites."
 )
 
 # The shape the refiner must return — a spec the controller can build from, and that names the human touch
@@ -62,11 +69,14 @@ _REFINE_SYS = (
     '"prerequisites":[{"item":"what the CEO must provide/do","kind":"credential|account|budget|legal|approval|email|other","why":"...","when":"before_start|before_launch|as_needed"}],'
     '"next_capabilities":["the most valuable things to build next, sharpest first"],'
     '"open_questions":["only genuinely CEO-level questions; keep few — infer the rest"]}'
+    "\nThe platform's commercial hosted multi-tenant distribution and enterprise self-host/customer-cloud "
+    "portability are explicit parts of the standing vision. Never list building or selling Agent OS as a "
+    "public SaaS product as a non-goal."
 )
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS ceo_vision (
                          tenant_id    TEXT NOT NULL,
                          scope        TEXT NOT NULL,
@@ -74,7 +84,6 @@ def _ensure():
                          requirements JSONB,
                          updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
                          PRIMARY KEY (tenant_id, scope))""")
-        c.commit()
 
 
 def _parse_json(text):
@@ -100,14 +109,13 @@ def get(tenant, scope="meta"):
     """Current vision + refined requirements for a scope. Seeds the meta vision from SEED_VISION on first use
     so the CEO's directive is always present without being restated. Returns {vision, requirements, age_s}."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant) as c, c.cursor() as cur:
         cur.execute("""SELECT vision, requirements, EXTRACT(EPOCH FROM now()-updated_at)::INT
                        FROM ceo_vision WHERE tenant_id=%s AND scope=%s""", (tenant, scope))
         row = cur.fetchone()
         if not row and scope == "meta":
             cur.execute("""INSERT INTO ceo_vision (tenant_id, scope, vision) VALUES (%s,'meta',%s)
                            ON CONFLICT DO NOTHING""", (tenant, SEED_VISION))
-            c.commit()
             return {"vision": SEED_VISION, "requirements": None, "age_s": None}
     if not row:
         return {"vision": "", "requirements": None, "age_s": None}
@@ -118,11 +126,10 @@ def set_vision(tenant, vision, scope="meta"):
     """Set the raw vision for a scope (the CEO's words, or an org's vague product idea). Refine turns it into
     a requirements spec — this just stores intent."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO ceo_vision (tenant_id, scope, vision, updated_at)
                        VALUES (%s,%s,%s, now()) ON CONFLICT (tenant_id, scope)
                        DO UPDATE SET vision=EXCLUDED.vision, updated_at=now()""", (tenant, scope, vision))
-        c.commit()
     return {"tenant": tenant, "scope": scope, "vision": vision}
 
 
@@ -153,51 +160,61 @@ def refine(tenant, scope="meta", org_id=None, hint=None, api_key=None):
         ctx.update(_system_state())
     else:
         ctx["scope"] = cur_scope
-    if api_key is not None:
-        factory._ctx.api_key = api_key
-    factory._ctx.tenant = tenant if tenant not in (None, "platform") else None
     prompt = _REFINE_SYS + "\n\nCONTEXT:\n" + json.dumps(ctx, default=str)[:8000]
-    # light=True: a constrained, tool-free reasoning call — no WebSearch/file-edit tools to derail a
-    # "reply ONLY JSON" instruction, and cheaper/faster than a full heavy agent for a synthesis task.
-    res = factory.agent("chief-of-staff", str(_REPO), prompt, light=True)
+    missing = object()
+    old_api = getattr(factory._ctx, "api_key", missing)
+    old_tenant = getattr(factory._ctx, "tenant", missing)
+    try:
+        if api_key is not None:
+            factory._ctx.api_key = api_key
+        factory._ctx.tenant = tenant if tenant not in (None, "platform") else None
+        # Keep the complete operation inside the scheduler's 120s lease. Light mode is tool-free/read-only
+        # for this role; retries belong to the next durable schedule occurrence, not an invisible long loop.
+        res = factory.agent("chief-of-staff", str(_REPO), prompt, light=True,
+                            timeout=REFINE_TIMEOUT_S, retries=0)
+    finally:
+        for name, prior in (("api_key", old_api), ("tenant", old_tenant)):
+            if prior is missing:
+                try:
+                    delattr(factory._ctx, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(factory._ctx, name, prior)
     raw = (res.get("out_full") or res.get("out") or "") if isinstance(res, dict) else str(res)  # full, not preview
     req = _parse_json(raw)
     if not req or not req.get("goals"):
-        # FAIL-SOFT: a parse miss must NEVER destroy a previously-good spec. Keep the prior requirements +
-        # doc untouched; just record the error (with a raw snippet to diagnose) and return what we had.
+        # A parse miss must never destroy a previously-good spec OR refresh its age. Refreshing updated_at on
+        # failure suppressed the next automatic retry for a full day while presenting stale requirements as
+        # freshly refined. Leave canonical state/doc untouched; the scheduler records this occurrence.
         prior = st.get("requirements")
-        _ensure()
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""INSERT INTO ceo_vision (tenant_id, scope, vision, requirements, updated_at)
-                           VALUES (%s,%s,%s,%s, now()) ON CONFLICT (tenant_id, scope) DO UPDATE
-                           SET requirements=COALESCE(ceo_vision.requirements, EXCLUDED.requirements),
-                               updated_at=now()""",
-                        (tenant, cur_scope, vision,
-                         json.dumps(prior or {"_last_refine_error": "unparseable reply", "_raw": raw[:400]})))
-            c.commit()
         return prior or {"_last_refine_error": "agent reply was not parseable JSON", "_raw": raw[:400]}
+    body = _render_requirements_doc(vision, req) if cur_scope == "meta" else ""
+    persisted = dict(req)
+    if body:
+        persisted["_document_digest"] = hashlib.sha256(body.encode()).hexdigest()
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO ceo_vision (tenant_id, scope, vision, requirements, updated_at)
                        VALUES (%s,%s,%s,%s, now()) ON CONFLICT (tenant_id, scope)
                        DO UPDATE SET requirements=EXCLUDED.requirements, updated_at=now()""",
-                    (tenant, cur_scope, vision, json.dumps(req)))
-        c.commit()
+                    (tenant, cur_scope, vision, json.dumps(persisted)))
     if cur_scope == "meta":
-        _write_requirements_doc(vision, req)
-    return req
+        # Database is canonical; the document is an atomically replaced, digest-bound projection. If the
+        # filesystem write fails, raise so the schedule is visibly failed and retries instead of greenwashing
+        # a DB/doc split. A later retry reconstructs the projection from canonical requirements.
+        _write_requirements_doc(vision, persisted)
+    return persisted
 
 
-def _write_requirements_doc(vision, req):
-    """Maintain docs/SYSTEM-REQUIREMENTS.md — the LIVING system spec the refiner owns (the North Star stays
-    the fixed constitution; this is the evolving requirements the controller/roadmap build toward)."""
+def _render_requirements_doc(vision, req):
     def _bullets(xs):
         return "\n".join(f"- {x}" for x in (xs or [])) or "- (none yet)"
     pre = req.get("prerequisites") or []
     pre_lines = "\n".join(
         f"- **{p.get('item','?')}** ({p.get('kind','other')}, {p.get('when','as_needed')}) — {p.get('why','')}"
         for p in pre) or "- (none identified yet)"
-    body = f"""# System Requirements (living — maintained by visionkeeper)
+    return f"""# System Requirements (living — maintained by visionkeeper)
 
 > Auto-refined by the CEO's requirements-provider agent. The fixed constitution is `NORTH-STAR.md`; this is the
 > evolving spec the controller and roadmap answer to. Do not hand-edit the sections below — run
@@ -227,10 +244,41 @@ def _write_requirements_doc(vision, req):
 ## Open questions (CEO-level only)
 {_bullets(req.get('open_questions'))}
 """
+
+
+def _write_requirements_doc(vision, req):
+    """Atomically project canonical requirements to the living document with a verifiable digest."""
+    body = _render_requirements_doc(vision, req)
+    digest = hashlib.sha256(body.encode()).hexdigest()
+    expected = req.get("_document_digest")
+    if expected and expected != digest:
+        raise ValueError("requirements document digest does not match canonical requirements")
+    content = body + f"\n<!-- requirements-digest: {digest} -->\n"
+    _REQ_DOC.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = None
     try:
-        _REQ_DOC.write_text(body)
-    except Exception:
-        pass
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=_REQ_DOC.parent,
+                                         prefix=f".{_REQ_DOC.name}.", delete=False) as tmp:
+            tmp_name = tmp.name
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, _REQ_DOC)
+        tmp_name = None
+        try:
+            dfd = os.open(_REQ_DOC.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
 
 
 def requirements_for_controller(tenant, org_id=None, hint=None, api_key=None, allow_refine=True):
@@ -261,6 +309,7 @@ def _selftest():
     import factory
     tid = f"vk-selftest-{uuid.uuid4().hex[:8]}"
     real_agent = factory.agent
+    original_doc = _REQ_DOC.read_text() if _REQ_DOC.exists() else None
     calls = {"n": 0}
 
     def fake_agent(role, repo, task, **k):
@@ -313,9 +362,15 @@ def _selftest():
               if ok else "FAIL")
     finally:
         factory.agent = real_agent
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        if original_doc is None:
+            try:
+                _REQ_DOC.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            _REQ_DOC.write_text(original_doc)
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM ceo_vision WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

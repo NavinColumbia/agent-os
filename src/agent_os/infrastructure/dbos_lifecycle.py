@@ -201,6 +201,21 @@ def _scope_dbos_transaction(organization_id: str) -> None:
     )
 
 
+def _finish_dbos_transaction(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Restore the runtime role before DBOS records its transaction output.
+
+    A DBOS transaction writes its bookkeeping row after the decorated function
+    returns but before the surrounding SQL transaction commits.  Leaving
+    ``SET LOCAL ROLE agentos_app`` active would make that internal write run as
+    the tenant-facing role, which intentionally has no access to DBOS tables.
+    """
+
+    bind = DBOS.sql_session.get_bind()
+    if bind.dialect.name == "postgresql":
+        DBOS.sql_session.execute(text("RESET ROLE"))
+    return result
+
+
 class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
     """DBOS/Postgres bootstrap implementation of :class:`WorkflowEngine`."""
 
@@ -250,7 +265,7 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
             if existing is not None:
                 if _canonical(existing) != _canonical(initial.to_dict()):
                     raise ValueError("run identity already exists with different initial state")
-                return {"created": False, "state": existing}
+                return _finish_dbos_transaction({"created": False, "state": existing})
             now = _now()
             DBOS.sql_session.execute(insert(runs).values(
                 organization_id=initial.organization_id,
@@ -267,7 +282,7 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
                 created_at=now,
                 updated_at=now,
             ))
-            return {"created": True, "state": initial.to_dict()}
+            return _finish_dbos_transaction({"created": True, "state": initial.to_dict()})
 
         @DBOS.transaction(name="agent_os_v2_apply_lifecycle_event")
         def apply_lifecycle_event(
@@ -293,7 +308,9 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
                     runs.c.organization_id == organization_id,
                     runs.c.run_id == run_id,
                 ))).scalar_one()
-                return {"duplicate": True, "state": current, "commands": []}
+                return _finish_dbos_transaction(
+                    {"duplicate": True, "state": current, "commands": []}
+                )
 
             run_key = and_(
                 runs.c.organization_id == organization_id,
@@ -310,7 +327,9 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
 
             decision = plan_transition(current, event)
             if decision.transition.duplicate:
-                return {"duplicate": True, "state": current.to_dict(), "commands": []}
+                return _finish_dbos_transaction(
+                    {"duplicate": True, "state": current.to_dict(), "commands": []}
+                )
             next_state = decision.transition.state
             changed = DBOS.sql_session.execute(update(runs).where(and_(
                 run_key,
@@ -398,7 +417,11 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
                     event=mission_raw,
                     created_at=now,
                 ))
-            return {"duplicate": False, "state": next_state.to_dict(), "commands": envelopes}
+            return _finish_dbos_transaction({
+                "duplicate": False,
+                "state": next_state.to_dict(),
+                "commands": envelopes,
+            })
 
         @DBOS.workflow(name="agent_os_v2_start_lifecycle")
         def start_lifecycle(

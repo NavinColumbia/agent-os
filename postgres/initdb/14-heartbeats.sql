@@ -12,5 +12,7 @@ CREATE TABLE IF NOT EXISTS watchdog_alerts (
     signature  TEXT PRIMARY KEY,
     level      TEXT NOT NULL,
     first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_sent  TIMESTAMPTZ
+    last_sent  TIMESTAMPTZ,
+    last_attempt TIMESTAMPTZ,
+    delivery_status TEXT
 );

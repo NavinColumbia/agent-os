@@ -20,45 +20,59 @@ this role's accumulated lessons. Every distill() is an AI call (cost is not a co
 """
 import os
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import psycopg  # noqa: E402
 import trace as _trace  # noqa: E402  — shared .env.local DATABASE_URL
+from dbpool import connection, tenant_connection  # noqa: E402
 
 DB = _trace.DB
 _CO_LIMIT = int(os.environ.get("AOS_MEMORY_CO_LIMIT", "10"))       # company-memory items injected per brief
 _LESSON_LIMIT = int(os.environ.get("AOS_MEMORY_LESSON_LIMIT", "6"))  # role lessons injected per brief
+_ensured = False
+_ensure_lock = threading.Lock()
+
+
+def _conn():
+    return connection()
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS company_memory (
-            id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, org_id TEXT,
-            kind TEXT NOT NULL, text TEXT NOT NULL, weight INT DEFAULT 1,
-            ts TIMESTAMPTZ DEFAULT now())""")
-        cur.execute("CREATE INDEX IF NOT EXISTS company_memory_scope ON company_memory (tenant_id, org_id, ts DESC)")
-        cur.execute("""CREATE TABLE IF NOT EXISTS role_lessons (
-            id BIGSERIAL PRIMARY KEY, role TEXT NOT NULL, lesson TEXT NOT NULL UNIQUE,
-            source TEXT, uses INT DEFAULT 0, ts TIMESTAMPTZ DEFAULT now())""")
-        # MEMORY-LAYER (item 9) additive columns — safe defaults keep existing rows/callers identical:
-        #   visibility 'shared' => today's single-pool behaviour; provenance columns default NULL.
-        for col, ddl in (("visibility", "visibility TEXT NOT NULL DEFAULT 'shared'"),
-                         ("role_scope", "role_scope TEXT"), ("author_actor", "author_actor TEXT"),
-                         ("run_id", "run_id TEXT"), ("sources", "sources JSONB"), ("audit_id", "audit_id BIGINT")):
-            cur.execute(f"ALTER TABLE company_memory ADD COLUMN IF NOT EXISTS {ddl}")
-        for col, ddl in (("tenant_id", "tenant_id TEXT"), ("run_id", "run_id TEXT"),
-                         ("author_actor", "author_actor TEXT"), ("audit_id", "audit_id BIGINT")):
-            cur.execute(f"ALTER TABLE role_lessons ADD COLUMN IF NOT EXISTS {ddl}")
-        # item 10: durable coordinator PLAN + per-phase SUMMARY, distinct from event history so a context
-        # truncation can't lose the plan. Single-writer = the coordinator actor; history immutable.
-        cur.execute("""CREATE TABLE IF NOT EXISTS memory_checkpoints (
-            id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, run_id TEXT NOT NULL,
-            actor_id TEXT, kind TEXT NOT NULL, phase TEXT, seq INT,
-            content TEXT NOT NULL, superseded_by BIGINT, audit_id BIGINT,
-            ts TIMESTAMPTZ DEFAULT now())""")
-        cur.execute("CREATE INDEX IF NOT EXISTS memory_checkpoints_run ON memory_checkpoints (run_id, kind, seq)")
-        c.commit()
+    global _ensured
+    if _ensured:
+        return
+    with _ensure_lock:
+        if _ensured:
+            return
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS company_memory (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, org_id TEXT,
+                kind TEXT NOT NULL, text TEXT NOT NULL, weight INT DEFAULT 1,
+                ts TIMESTAMPTZ DEFAULT now())""")
+            cur.execute("CREATE INDEX IF NOT EXISTS company_memory_scope ON company_memory (tenant_id, org_id, ts DESC)")
+            cur.execute("""CREATE TABLE IF NOT EXISTS role_lessons (
+                id BIGSERIAL PRIMARY KEY, role TEXT NOT NULL, lesson TEXT NOT NULL UNIQUE,
+                source TEXT, uses INT DEFAULT 0, ts TIMESTAMPTZ DEFAULT now())""")
+            # MEMORY-LAYER (item 9) additive columns — safe defaults keep existing rows/callers identical:
+            #   visibility 'shared' => today's single-pool behaviour; provenance columns default NULL.
+            for col, ddl in (("visibility", "visibility TEXT NOT NULL DEFAULT 'shared'"),
+                             ("role_scope", "role_scope TEXT"), ("author_actor", "author_actor TEXT"),
+                             ("run_id", "run_id TEXT"), ("sources", "sources JSONB"), ("audit_id", "audit_id BIGINT")):
+                cur.execute(f"ALTER TABLE company_memory ADD COLUMN IF NOT EXISTS {ddl}")
+            for col, ddl in (("tenant_id", "tenant_id TEXT"), ("run_id", "run_id TEXT"),
+                             ("author_actor", "author_actor TEXT"), ("audit_id", "audit_id BIGINT")):
+                cur.execute(f"ALTER TABLE role_lessons ADD COLUMN IF NOT EXISTS {ddl}")
+            # item 10: durable coordinator PLAN + per-phase SUMMARY, distinct from event history so a context
+            # truncation can't lose the plan. Single-writer = the coordinator actor; history immutable.
+            cur.execute("""CREATE TABLE IF NOT EXISTS memory_checkpoints (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, run_id TEXT NOT NULL,
+                actor_id TEXT, kind TEXT NOT NULL, phase TEXT, seq INT,
+                content TEXT NOT NULL, superseded_by BIGINT, audit_id BIGINT,
+                ts TIMESTAMPTZ DEFAULT now())""")
+            cur.execute("CREATE INDEX IF NOT EXISTS memory_checkpoints_run ON memory_checkpoints (run_id, kind, seq)")
+            c.commit()
+        _ensured = True
 
 
 def _audit(action, resource, payload, tenant_id=None):
@@ -86,14 +100,13 @@ def remember(tenant_id, org_id, kind, text, *, visibility="shared", role_scope=N
     aid = _audit("MemoryWrite", f"company_memory:{kind}",
                  {"tenant": str(tenant_id), "org": org_id, "kind": kind, "visibility": visibility,
                   "author_actor": author_actor, "run_id": run_id}, tenant_id=str(tenant_id))
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(str(tenant_id)) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO company_memory
                        (tenant_id, org_id, kind, text, visibility, role_scope, author_actor, run_id, sources, audit_id)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (str(tenant_id), str(org_id) if org_id else None, kind, text[:1000], visibility,
                      role_scope, str(author_actor) if author_actor else None, str(run_id) if run_id else None,
                      _json.dumps(sources) if sources else None, aid))
-        c.commit()
 
 
 def recall(tenant_id, org_id=None, limit=_CO_LIMIT, role=None):
@@ -102,7 +115,7 @@ def recall(tenant_id, org_id=None, limit=_CO_LIMIT, role=None):
     if not tenant_id:
         return []
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(str(tenant_id)) as c, c.cursor() as cur:
         cur.execute("""SELECT kind, text FROM company_memory
                        WHERE tenant_id=%s AND (org_id=%s OR org_id IS NULL)
                          AND visibility='shared'
@@ -123,38 +136,53 @@ def checkpoint(tenant_id, run_id, kind, content, *, actor_id=None, phase=None, s
     aid = _audit("MemoryCheckpoint", f"memory_checkpoints:{kind}",
                  {"tenant": str(tenant_id), "run_id": str(run_id), "kind": kind, "phase": phase,
                   "author_actor": actor_id}, tenant_id=str(tenant_id))
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(str(tenant_id)) as c, c.cursor() as cur:
         if seq is None:
-            cur.execute("SELECT COALESCE(MAX(seq),0)+1 FROM memory_checkpoints WHERE run_id=%s AND kind=%s",
-                        (str(run_id), kind))
+            cur.execute("""SELECT COALESCE(MAX(seq),0)+1 FROM memory_checkpoints
+                           WHERE tenant_id=%s AND run_id=%s AND kind=%s""",
+                        (str(tenant_id), str(run_id), kind))
             seq = cur.fetchone()[0]
         cur.execute("""INSERT INTO memory_checkpoints (tenant_id, run_id, actor_id, kind, phase, seq, content, audit_id)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                     (str(tenant_id), str(run_id), str(actor_id) if actor_id else None, kind, phase, seq,
                      str(content)[:8000], aid))
         cid = cur.fetchone()[0]
-        c.commit()
         return cid
 
 
-def plan(run_id):
-    """The latest PLAN checkpoint for a run (None if the coordinator hasn't recorded one)."""
+def plan(run_id, tenant_id=None):
+    """The latest PLAN checkpoint for a run (None if the coordinator hasn't recorded one).
+
+    tenant_id is optional for back-compat/operator tooling. Tenant-facing callers should pass it so the read
+    is compatible with transaction-local app.tenant_id under RLS."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT content FROM memory_checkpoints WHERE run_id=%s AND kind='plan'
-                       ORDER BY seq DESC, ts DESC LIMIT 1""", (str(run_id),))
+    conn = tenant_connection(str(tenant_id)) if tenant_id else _conn()
+    with conn as c, c.cursor() as cur:
+        if tenant_id:
+            cur.execute("""SELECT content FROM memory_checkpoints
+                           WHERE tenant_id=%s AND run_id=%s AND kind='plan'
+                           ORDER BY seq DESC, ts DESC LIMIT 1""", (str(tenant_id), str(run_id)))
+        else:
+            cur.execute("""SELECT content FROM memory_checkpoints WHERE run_id=%s AND kind='plan'
+                           ORDER BY seq DESC, ts DESC LIMIT 1""", (str(run_id),))
         row = cur.fetchone()
         return row[0] if row else None
 
 
-def summaries(run_id, limit=20):
+def summaries(run_id, limit=20, tenant_id=None):
     """The LIVE per-phase SUMMARY checkpoints for a run, in order (superseded/compacted-away rows excluded) —
-    the compaction unit item 11 reuses."""
+    the compaction unit item 11 reuses. tenant_id should be passed on tenant-facing reads for RLS."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT phase, content FROM memory_checkpoints
-                       WHERE run_id=%s AND kind='phase_summary' AND superseded_by IS NULL
-                       ORDER BY seq ASC, ts ASC LIMIT %s""", (str(run_id), limit))
+    conn = tenant_connection(str(tenant_id)) if tenant_id else _conn()
+    with conn as c, c.cursor() as cur:
+        if tenant_id:
+            cur.execute("""SELECT phase, content FROM memory_checkpoints
+                           WHERE tenant_id=%s AND run_id=%s AND kind='phase_summary' AND superseded_by IS NULL
+                           ORDER BY seq ASC, ts ASC LIMIT %s""", (str(tenant_id), str(run_id), limit))
+        else:
+            cur.execute("""SELECT phase, content FROM memory_checkpoints
+                           WHERE run_id=%s AND kind='phase_summary' AND superseded_by IS NULL
+                           ORDER BY seq ASC, ts ASC LIMIT %s""", (str(run_id), limit))
         return [{"phase": p, "content": t} for p, t in cur.fetchall()]
 
 
@@ -168,10 +196,10 @@ def compact_summaries(tenant_id, run_id, keep_last=None):
     sizes justify it."""
     keep_last = int(keep_last if keep_last is not None else os.environ.get("AOS_MEMORY_KEEP_LAST", "6"))
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(str(tenant_id)) as c, c.cursor() as cur:
         cur.execute("""SELECT id, phase, content FROM memory_checkpoints
-                       WHERE run_id=%s AND kind='phase_summary' AND superseded_by IS NULL
-                       ORDER BY seq ASC, ts ASC""", (str(run_id),))
+                       WHERE tenant_id=%s AND run_id=%s AND kind='phase_summary' AND superseded_by IS NULL
+                       ORDER BY seq ASC, ts ASC""", (str(tenant_id), str(run_id)))
         rows = cur.fetchall()
     if len(rows) <= keep_last:
         return {"compacted": 0, "new_id": None}
@@ -189,10 +217,9 @@ def compact_summaries(tenant_id, run_id, keep_last=None):
     if not rolled:
         rolled = "COMPACTED earlier phases:\n" + joined[:4000]
     new_id = checkpoint(tenant_id, run_id, "phase_summary", rolled, phase="(compacted)")
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(str(tenant_id)) as c, c.cursor() as cur:
         cur.execute("UPDATE memory_checkpoints SET superseded_by=%s WHERE id = ANY(%s)",
                     (new_id, [r[0] for r in old]))
-        c.commit()
     return {"compacted": len(old), "new_id": new_id}
 
 
@@ -206,26 +233,33 @@ def add_lesson(role, lesson, source=None, *, tenant_id=None, run_id=None, author
     aid = _audit("MemoryLesson", f"role_lessons:{role}",
                  {"role": role, "tenant": tenant_id, "run_id": run_id, "author_actor": author_actor,
                   "source": source}, tenant_id=str(tenant_id) if tenant_id else None)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    conn = tenant_connection(str(tenant_id)) if tenant_id else _conn()
+    with conn as c, c.cursor() as cur:
         cur.execute("""INSERT INTO role_lessons (role, lesson, source, tenant_id, run_id, author_actor, audit_id)
                        VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (lesson) DO NOTHING""",
                     (role, lesson[:500], source, str(tenant_id) if tenant_id else None,
                      str(run_id) if run_id else None, str(author_actor) if author_actor else None, aid))
-        c.commit()
 
 
-def lessons_for(role, limit=_LESSON_LIMIT):
-    """The most-used, newest lessons for a role."""
+def lessons_for(role, limit=_LESSON_LIMIT, tenant_id=None):
+    """The most-used, newest lessons for a role.
+
+    tenant_id includes both tenant-scoped lessons and shared fleet lessons (tenant_id NULL). Shared lessons
+    require a reviewed RLS policy, so role_lessons is intentionally excluded from generic policy generation."""
     if not role:
         return []
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT lesson FROM role_lessons WHERE role=%s
-                       ORDER BY uses DESC, ts DESC LIMIT %s""", (role, limit))
+    conn = tenant_connection(str(tenant_id)) if tenant_id else _conn()
+    with conn as c, c.cursor() as cur:
+        if tenant_id:
+            cur.execute("""SELECT lesson FROM role_lessons WHERE role=%s AND (tenant_id=%s OR tenant_id IS NULL)
+                           ORDER BY uses DESC, ts DESC LIMIT %s""", (role, str(tenant_id), limit))
+        else:
+            cur.execute("""SELECT lesson FROM role_lessons WHERE role=%s
+                           ORDER BY uses DESC, ts DESC LIMIT %s""", (role, limit))
         rows = [r[0] for r in cur.fetchall()]
         if rows:                                      # count the read as a use (popular lessons float up)
             cur.execute("UPDATE role_lessons SET uses=uses+1 WHERE role=%s AND lesson = ANY(%s)", (role, rows))
-            c.commit()
     return rows
 
 
@@ -276,7 +310,7 @@ def brief_context(tenant_id, org_id, role):
         parts.append("WHAT YOU ALREADY KNOW ABOUT THIS COMPANY (honor these — do not re-decide settled "
                      "things or contradict stated preferences):\n"
                      + "\n".join(f"  - [{m['kind']}] {m['text']}" for m in mem))
-    les = lessons_for(role) if role else []
+    les = lessons_for(role, tenant_id=tenant_id) if role else []
     if les:
         parts.append("LESSONS YOUR ROLE HAS LEARNED THE HARD WAY (apply them):\n"
                      + "\n".join(f"  - {l}" for l in les))
@@ -332,7 +366,7 @@ def _selftest():
         seen_other = "connection pooling" in " | ".join(m["text"] for m in recall(tid, "1", role="designer"))
         chk(seen_be and not seen_other, "role-scoped memory reaches its role, not others")
         # provenance actually persisted
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM company_memory WHERE tenant_id=%s AND author_actor='42'", (tid,))
             chk(cur.fetchone()[0] == 1, "provenance (author_actor) persisted on the write")
 
@@ -393,7 +427,7 @@ def _selftest():
               "injected into agent briefs; two-tier visibility + role-scope + provenance + plan/summary "
               "checkpoints ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("DELETE FROM company_memory WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM role_lessons WHERE role LIKE 'role-%%' OR role LIKE 'norole-%%'")
             cur.execute("DELETE FROM memory_checkpoints WHERE tenant_id=%s", (tid,))

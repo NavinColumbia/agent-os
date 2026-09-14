@@ -7,56 +7,82 @@
 # Prereqs it does NOT install (prints how): docker engine, python3-venv. Everything else it does.
 #
 #   bash platform/rebuild.sh
-set -u
-ROOT="$HOME/projects/agent-os"
-CP="$HOME/projects/control-plane"
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${AOS_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+CP="${AOS_CONTROL_PLANE_ROOT:-$(cd "$ROOT/.." && pwd)/control-plane}"
 say(){ printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 ok(){ printf '  \033[32m✓\033[0m %s\n' "$1"; }
 warn(){ printf '  \033[33m!\033[0m %s\n' "$1"; }
+die(){ warn "$1"; exit 1; }
 have(){ command -v "$1" >/dev/null 2>&1; }
 DK(){ if docker info >/dev/null 2>&1; then docker "$@"; else sg docker -c "docker $*"; fi; }
 
+env_value(){ sed -n "s/^$1=//p" "$ROOT/.env.local" | tail -n 1; }
+set_env_value(){
+  local key="$1" value="$2"
+  if grep -q "^${key}=" "$ROOT/.env.local"; then
+    sed -i -E "s#^${key}=.*#${key}=${value}#" "$ROOT/.env.local"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$ROOT/.env.local"
+  fi
+}
+ensure_secret(){
+  local key="$1" generated="$2" current
+  current="$(env_value "$key")"
+  if [[ -z "$current" ]] || [[ "$current" == *CHANGE-ME* ]]; then
+    set_env_value "$key" "$generated"
+    ok "generated $key"
+  fi
+}
+
 say "0. Prerequisites"
-have docker || { warn "docker MISSING — curl -fsSL https://get.docker.com | sudo sh ; sudo usermod -aG docker \$USER ; sudo service docker start"; exit 1; }
+have docker || die "docker MISSING — install Docker Engine + Compose first"
 DK info >/dev/null 2>&1 || { sudo service docker start >/dev/null 2>&1 || true; sleep 3; }
-DK info >/dev/null 2>&1 && ok "docker reachable" || { warn "docker daemon not reachable"; exit 1; }
-have python3 || { warn "python3 MISSING"; exit 1; }
+DK info >/dev/null 2>&1 && ok "docker reachable" || die "docker daemon not reachable"
+have python3 || die "python3 MISSING"
+have openssl || die "openssl MISSING"
 
 say "1. Secrets / config (generate if absent — never overwrite)"
-[ -f "$ROOT/postgres/.env" ] || { echo "POSTGRES_PASSWORD=$(openssl rand -hex 18)" > "$ROOT/postgres/.env"; ok "generated postgres/.env"; }
+[ -f "$ROOT/postgres/.env" ] || { umask 077; printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 18)" > "$ROOT/postgres/.env"; ok "generated postgres/.env"; }
 if [ ! -f "$ROOT/.env.local" ]; then
-  PW=$(grep -oE 'POSTGRES_PASSWORD=.*' "$ROOT/postgres/.env" | cut -d= -f2)
   cp "$ROOT/.env.example" "$ROOT/.env.local"
-  # point DATABASE_URL at the freshly generated password + local port
-  if grep -q '^DATABASE_URL=' "$ROOT/.env.local"; then
-    sed -i -E "s#^DATABASE_URL=.*#DATABASE_URL=postgresql://agentos:${PW}@127.0.0.1:5433/agentos#" "$ROOT/.env.local"
-  else
-    echo "DATABASE_URL=postgresql://agentos:${PW}@127.0.0.1:5433/agentos" >> "$ROOT/.env.local"
-  fi
-  warn ".env.local created — review NTFY_TOPIC / AOS_API_TOKEN before going live"
+  ok ".env.local created"
 else ok ".env.local present (kept)"; fi
-[ -f "$ROOT/ntfy/.env" ] || cp "$ROOT/ntfy/.env.example" "$ROOT/ntfy/.env" 2>/dev/null || true
-if ! grep -q '^AOSNAP_PASS=' "$ROOT/.env.local" 2>/dev/null; then
-  printf '\n# Encrypted-snapshot passphrase (STORE A COPY OFFLINE for disaster recovery)\nAOSNAP_PASS=%s\n' "$(openssl rand -hex 24)" >> "$ROOT/.env.local"
-  warn "generated AOSNAP_PASS in .env.local — save a copy offline (without it, snapshots are unrecoverable)"
+chmod 600 "$ROOT/.env.local" "$ROOT/postgres/.env"
+PW="$(sed -n 's/^POSTGRES_PASSWORD=//p' "$ROOT/postgres/.env" | tail -n 1)"
+database_url="$(env_value DATABASE_URL)"
+if [[ -z "$database_url" ]] || [[ "$database_url" == *CHANGE-ME* ]]; then
+  set_env_value DATABASE_URL "postgresql://agentos:${PW}@127.0.0.1:5433/agentos"
+  ok "DATABASE_URL bound to generated local Postgres credential"
 fi
+ensure_secret AOS_API_TOKEN "$(openssl rand -hex 32)"
+ensure_secret AUDIT_HMAC_KEY "$(openssl rand -hex 32)"
+ensure_secret VAULT_KEY "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')"
+ensure_secret AOSNAP_PASS "$(openssl rand -hex 24)"
+ensure_secret NTFY_TOPIC "aos-$(openssl rand -hex 24)"
+[ -f "$ROOT/ntfy/.env" ] || cp "$ROOT/ntfy/.env.example" "$ROOT/ntfy/.env" 2>/dev/null || true
 
 say "2. Python venv + deps"
-[ -x "$ROOT/.venv/bin/python" ] || python3 -m venv "$ROOT/.venv" 2>/dev/null || warn "venv failed (sudo apt-get install python3-venv)"
+[ -x "$ROOT/.venv/bin/python" ] || python3 -m venv "$ROOT/.venv" 2>/dev/null || die "venv failed (install python3-venv)"
 "$ROOT/.venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
-"$ROOT/.venv/bin/pip" install -q -r "$ROOT/requirements.txt" && ok "deps installed" || warn "pip install failed"
+"$ROOT/.venv/bin/pip" install -q -r "$ROOT/requirements.txt" && ok "deps installed" || die "pip install failed"
 
 say "3. Bring up the stack (containers)"
 for s in postgres nats ntfy cerbos; do
-  ( cd "$ROOT/$s" && DK compose up -d ) >/dev/null 2>&1 && ok "$s up" || warn "$s failed"
+  ( cd "$ROOT/$s" && DK compose up -d ) >/dev/null 2>&1 && ok "$s up" || die "$s failed"
 done
 
 say "4. Wait for Postgres, then migrate"
 for i in $(seq 1 30); do
   DK exec agentos-postgres pg_isready -U agentos -d agentos >/dev/null 2>&1 && break; sleep 2
 done
-DK exec agentos-postgres pg_isready -U agentos -d agentos >/dev/null 2>&1 && ok "postgres ready" || warn "postgres not ready"
-bash "$ROOT/platform/migrate.sh" >/dev/null 2>&1 && ok "schema migrated (all initdb SQL)" || warn "migrate failed"
+DK exec agentos-postgres pg_isready -U agentos -d agentos >/dev/null 2>&1 && ok "postgres ready" || die "postgres not ready"
+bash "$ROOT/platform/migrate.sh" >/tmp/agentos-migrate.log 2>&1 && ok "schema migrated (ordered + quiescence checked)" || {
+  tail -n 20 /tmp/agentos-migrate.log; die "migrate failed"; }
+"$ROOT/.venv/bin/python" "$ROOT/scripts/rls_readiness.py" rollout-gate \
+  >/tmp/agentos-rls-rollout.log 2>&1 && ok "RLS rollout gate passed" || {
+  tail -n 30 /tmp/agentos-rls-rollout.log; die "RLS rollout gate failed"; }
 
 say "5. Seed the org (skills + roles)"
 "$ROOT/.venv/bin/python" "$ROOT/scripts/skills.py" seed >/dev/null 2>&1 && ok "skills seeded" || warn "skills seed failed"
@@ -93,7 +119,7 @@ say "6. Prove the box (full self-test)"
 if bash "$ROOT/scripts/selftest.sh" >/tmp/rebuild-selftest.log 2>&1; then
   ok "$(grep -E 'SELFTEST: ' /tmp/rebuild-selftest.log | tail -1)"
 else
-  warn "self-test had failures — see /tmp/rebuild-selftest.log"; tail -3 /tmp/rebuild-selftest.log
+  warn "self-test had failures — see /tmp/rebuild-selftest.log"; tail -20 /tmp/rebuild-selftest.log; exit 1
 fi
 
 printf '\n\033[1mrebuild.sh done.\033[0m Stack is up + proven. Run scripts/recover.sh for phone/Tailscale reach\n'

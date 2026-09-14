@@ -1,153 +1,132 @@
 #!/usr/bin/env bash
-# recover.sh — bring the whole agent-os stack back after a WSL/Windows restart.
-# Idempotent: safe to run anytime; skips what's already healthy. Run as swami.
+# recover.sh — WSL boot auto-recovery for the Agent OS control plane.
 #
-#   bash ~/projects/agent-os/scripts/recover.sh
-#
-# DATA is never lost on reboot (Postgres pgdata, NATS data, git, checkpoints are on disk).
-# This only restarts the RUNNING pieces: docker daemon, tailscaled, containers, reply listener.
+# Recovery is intentionally conservative. Host services are reconciled through
+# service_recovery.py, which binds ownership to an exact process generation and
+# exact argv. A healthy legacy/unowned process is never killed or duplicated.
 set -u
-ROOT="$HOME/projects/agent-os"
+
+ROOT="${AOS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PY="$ROOT/.venv/bin/python"
+RECOVERY="$ROOT/scripts/service_recovery.py"
+
 ok(){ printf '  \033[32m✓\033[0m %s\n' "$1"; }
 warn(){ printf '  \033[33m!\033[0m %s\n' "$1"; }
 hdr(){ printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
+docker_run() {
+  if docker info >/dev/null 2>&1; then
+    docker "$@"
+    return
+  fi
+  local command
+  printf -v command '%q ' docker "$@"
+  sg docker -c "$command"
+}
+
+recover_service() {
+  local name="$1" label="$2" output rc
+  output="$($PY "$RECOVERY" repair "$name" 2>&1)"
+  rc=$?
+  if printf '%s' "$output" | grep -q '"state": "healthy"'; then
+    ok "$label"
+  elif printf '%s' "$output" | grep -Eq '"state": "(legacy_adoption_deferred|unowned_readiness_deferred)"'; then
+    warn "$label is legacy/unowned but was left untouched (safe adoption deferred)"
+  else
+    warn "$label failed recovery (rc=$rc): $output"
+    return 1
+  fi
+}
+
 hdr "1. Docker daemon"
-if docker info >/dev/null 2>&1 || sg docker -c "docker info" >/dev/null 2>&1; then ok "already running"
-else sudo service docker start >/dev/null 2>&1 && sleep 3 && ok "started" || warn "failed to start docker"; fi
-DK(){ sg docker -c "$*"; }   # run docker in the docker group
-
-hdr "2. Tailscale"
-if pgrep -x tailscaled >/dev/null; then ok "tailscaled running"
+if docker_run info >/dev/null 2>&1; then
+  ok "already running"
+elif sudo service docker start >/dev/null 2>&1; then
+  sleep 3
+  docker_run info >/dev/null 2>&1 && ok "started" || warn "daemon started but is not ready"
 else
-  sudo mkdir -p /var/run/tailscale /var/lib/tailscale
-  sudo sh -c 'setsid tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 </dev/null &'
-  sleep 3; pgrep -x tailscaled >/dev/null && ok "tailscaled started (auto-reconnects + resumes serve from saved state)" || warn "tailscaled failed"
+  warn "failed to start Docker"
 fi
-# state has wantRunning=true + serve config, so it reconnects on its own; nudge up just in case.
-sudo tailscale up --operator="$USER" --hostname=nyaan >/dev/null 2>&1 || true
-tailscale status >/dev/null 2>&1 && ok "tailnet up ($(tailscale ip -4 2>/dev/null | head -1))" || warn "tailnet not up yet"
-tailscale serve status 2>/dev/null | grep -q ts.net && ok "serve (HTTPS) active" || warn "serve not active — run: tailscale serve --bg --https=443 http://127.0.0.1:8080"
 
-hdr "3. Containers (restart:unless-stopped should auto-start; ensure anyway)"
+hdr "2. Optional private Tailscale edge"
+if command -v tailscale >/dev/null 2>&1; then
+  if pgrep -x tailscaled >/dev/null 2>&1; then
+    ok "tailscaled running"
+  else
+    sudo mkdir -p /var/run/tailscale /var/lib/tailscale
+    sudo sh -c 'setsid tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 </dev/null &' || true
+    sleep 3
+    pgrep -x tailscaled >/dev/null 2>&1 && ok "tailscaled started" || warn "tailscaled failed"
+  fi
+  sudo tailscale up --operator="$USER" --hostname=nyaan >/dev/null 2>&1 || true
+  tailscale status >/dev/null 2>&1 && ok "tailnet connected" || warn "tailnet not connected"
+else
+  warn "Tailscale not installed; public edge may still be provided by Caddy"
+fi
+
+hdr "3. Container dependencies"
 for stack in ntfy postgres cerbos; do
-  DK "cd $ROOT/$stack && docker compose up -d" >/dev/null 2>&1 && ok "$stack up" || warn "$stack failed"
+  if docker_run compose --project-directory "$ROOT/$stack" up -d >/dev/null 2>&1; then
+    ok "$stack up"
+  else
+    warn "$stack failed"
+  fi
 done
 
-hdr "4. Reply listener (host process)"
-bash "$ROOT/scripts/bridge.sh" start >/dev/null 2>&1
-pgrep -f reply_listener.py >/dev/null && ok "listener running" || warn "listener not running"
+hdr "4. Non-database host services"
+recover_service noupload-static "NoUpload static site" || true
 
-hdr "4b. NoUpload static site (private over Tailscale :8443)"
-NU_DIST="$HOME/projects/products/noupload/dist"
-if [ -d "$NU_DIST" ]; then
-  if pgrep -f "http.server 5000" >/dev/null; then ok "static server running"
-  else
-    ( cd "$NU_DIST" && setsid bash -c "exec python3 -m http.server 5000 --bind 127.0.0.1" >/tmp/noupload_serve.log 2>&1 </dev/null & )
-    sleep 1; pgrep -f "http.server 5000" >/dev/null && ok "static server started" || warn "static server failed"
+# Do not launch database clients while Postgres is merely 'starting'. This
+# barrier is bounded so boot cannot hang forever, but failure is fail-closed:
+# no DB-dependent host process is started against an unavailable database.
+POSTGRES_READY=0
+for _attempt in $(seq 1 12); do
+  if docker_run exec agentos-postgres pg_isready -U agentos -d agentos >/dev/null 2>&1; then
+    POSTGRES_READY=1
+    break
   fi
-  tailscale serve status 2>/dev/null | grep -q 8443 || tailscale serve --bg --https=8443 http://127.0.0.1:5000 >/dev/null 2>&1
-  ok "exposed at https://nyaan.tail502e3f.ts.net:8443"
-else
-  warn "noupload dist/ not built (run: cd ~/projects/products/noupload && npm run build)"
-fi
+  sleep 5
+done
 
-hdr "4i. HTTP API (127.0.0.1:8090, Bearer auth)"
-# Boot precondition: api.py fail-closes (sys.exit) if AOS_API_TOKEN is empty, so report that at
-# the source instead of standing up a dead process behind a green check.
+if [ "$POSTGRES_READY" -ne 1 ]; then
+  warn "Postgres was not ready after 60 seconds; DB-dependent host services were not started"
+  exit 1
+fi
+ok "Postgres ready"
+
+hdr "5. Database-dependent host services"
 if ! grep -qE '^AOS_API_TOKEN=.+' "$ROOT/.env.local" 2>/dev/null; then
-  warn "AOS_API_TOKEN unset/empty in .env.local — API will refuse to start (fail-closed auth)"
+  warn "AOS_API_TOKEN is unset; authenticated API recovery will fail closed"
 fi
-if pgrep -f "api.py serve" >/dev/null; then ok "API already running"
-else
-  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/api.py serve 8090" >/tmp/api.log 2>&1 </dev/null & )
-  sleep 1; pgrep -f "api.py serve" >/dev/null && ok "API on 127.0.0.1:8090" || warn "API failed (check AOS_API_TOKEN / /tmp/api.log)"
-fi
+recover_service api "API on 127.0.0.1:8090" || true
+recover_service dashboard "mission-control dashboard" || true
+recover_service jobd "durable controller worker" || true
+recover_service evidence-publisher "deferred QA evidence publisher" || true
+recover_service frontdoor "self-serve front door" || true
+recover_service console "tenant CEO console" || true
+recover_service assurance "public Release Assurance intake" || true
+recover_service statuspage "public status page" || true
+recover_service metrics "Prometheus metrics exporter" || true
+recover_service ticker "scheduler ticker" || true
+recover_service watchdog "health watchdog" || true
+recover_service dispatcher "agent dispatcher" || true
+recover_service reply-listener "phone reply listener" || true
+recover_service replybridge "reply bridge" || true
+recover_service cockpit-api "CEO cockpit API" || true
+recover_service cockpit-web "CEO cockpit web app" || true
 
-hdr "4d. Mission-control dashboard (127.0.0.1:8092)"
-if pgrep -f "dashboard.py serve" >/dev/null; then ok "dashboard already running"
-else
-  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/dashboard.py serve 8092" >/tmp/dashboard.log 2>&1 </dev/null & )
-  sleep 1; pgrep -f "dashboard.py serve" >/dev/null && ok "dashboard started" || warn "dashboard failed"
-fi
-
-hdr "4d2. Central controller execution daemon (jobd — owns driving builds so fleet work never dies with its caller)"
-if pgrep -f "jobd.py serve" >/dev/null; then ok "jobd already running"
-else
-  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/jobd.py serve 15" >/tmp/jobd.log 2>&1 </dev/null & )
-  sleep 1; pgrep -f "jobd.py serve" >/dev/null && ok "jobd started (15s tick)" || warn "jobd failed"
-fi
-tailscale serve status 2>/dev/null | grep -q 9443 || tailscale serve --bg --https=9443 http://127.0.0.1:8092 >/dev/null 2>&1
-ok "dashboard private over Tailscale: https://nyaan.tail502e3f.ts.net:9443"
-
-hdr "4f. Self-serve front door (127.0.0.1:8093)"
-if pgrep -f "frontdoor.py serve" >/dev/null; then ok "front door already running"
-else
-  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/frontdoor.py serve 8093" >/tmp/frontdoor.log 2>&1 </dev/null & )
-  sleep 1; pgrep -f "frontdoor.py serve" >/dev/null && ok "front door started" || warn "front door failed"
-fi
-tailscale serve status 2>/dev/null | grep -q 8095 || tailscale serve --bg --https=8095 http://127.0.0.1:8093 >/dev/null 2>&1
-ok "front door private over Tailscale: https://nyaan.tail502e3f.ts.net:8095"
-
-hdr "4h. Tenant CONSOLE — full CEO app, all 16 areas (127.0.0.1:8099)"
-if pgrep -f "console.py serve" >/dev/null; then ok "console already running"
-else
-  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/console.py serve 8099" >/tmp/console.log 2>&1 </dev/null & )
-  sleep 1; pgrep -f "console.py serve" >/dev/null && ok "console started" || warn "console failed"
-fi
-tailscale serve status 2>/dev/null | grep -q 8096 || tailscale serve --bg --https=8096 http://127.0.0.1:8099 >/dev/null 2>&1
-ok "console private over Tailscale: https://nyaan.tail502e3f.ts.net:8096"
-
-hdr "4g. Public status page (127.0.0.1:8097) + Prometheus metrics (127.0.0.1:9101)"
-if pgrep -f "statuspage.py serve" >/dev/null; then ok "status page already running"
-else
-  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/statuspage.py serve 8097" >/tmp/statuspage.log 2>&1 </dev/null & )
-  sleep 1; pgrep -f "statuspage.py serve" >/dev/null && ok "status page started" || warn "status page failed"
-fi
-if pgrep -f "metricsexport.py serve" >/dev/null; then ok "metrics exporter already running"
-else
-  ( cd "$ROOT" && setsid bash -c "exec .venv/bin/python scripts/metricsexport.py serve 9101" >/tmp/metricsexport.log 2>&1 </dev/null & )
-  sleep 1; pgrep -f "metricsexport.py serve" >/dev/null && ok "metrics exporter started" || warn "metrics exporter failed"
+hdr "6. Optional private routes"
+if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+  tailscale serve --bg --https=9443 http://127.0.0.1:8092 >/dev/null 2>&1 || true
+  tailscale serve --bg --https=8095 http://127.0.0.1:8093 >/dev/null 2>&1 || true
+  tailscale serve --bg --https=8096 http://127.0.0.1:8099 >/dev/null 2>&1 || true
+  ok "private dashboard, front door, and console routes reconciled"
 fi
 
-hdr "4c. Scheduler ticker (drives recurring jobs incl. daily encrypted snapshot)"
-if [ -f /tmp/agentos-ticker.pid ] && kill -0 "$(cat /tmp/agentos-ticker.pid 2>/dev/null)" 2>/dev/null; then
-  ok "ticker already running (pid $(cat /tmp/agentos-ticker.pid))"
-else
-  ( setsid bash "$ROOT/scripts/ticker.sh" >/dev/null 2>&1 </dev/null & )
-  sleep 2
-  [ -f /tmp/agentos-ticker.pid ] && kill -0 "$(cat /tmp/agentos-ticker.pid 2>/dev/null)" 2>/dev/null \
-    && ok "ticker started (every 15 min)" || warn "ticker failed"
-fi
+hdr "7. Health summary"
+curl -fsS --max-time 5 http://127.0.0.1:8080/v1/health >/dev/null 2>&1 \
+  && ok "ntfy healthy" || warn "ntfy unhealthy"
+curl -fsS --max-time 5 http://127.0.0.1:8099/health >/dev/null 2>&1 \
+  && ok "CEO console healthy" || warn "CEO console unhealthy"
 
-hdr "4e. Watchdog (pages you on stalls / outages / SLA breaches, every ~2 min)"
-if [ -f /tmp/agentos-watchdog.pid ] && kill -0 "$(cat /tmp/agentos-watchdog.pid 2>/dev/null)" 2>/dev/null; then
-  ok "watchdog already running (pid $(cat /tmp/agentos-watchdog.pid))"
-else
-  ( setsid bash "$ROOT/scripts/watchdog.sh" >/dev/null 2>&1 </dev/null & )
-  sleep 2
-  [ -f /tmp/agentos-watchdog.pid ] && kill -0 "$(cat /tmp/agentos-watchdog.pid 2>/dev/null)" 2>/dev/null \
-    && ok "watchdog started (every 2 min)" || warn "watchdog failed"
-fi
-
-hdr "4g. Dispatcher (wakes idle agents with queued work, every ~5 min)"
-if [ -f /tmp/agentos-dispatcher.pid ] && kill -0 "$(cat /tmp/agentos-dispatcher.pid 2>/dev/null)" 2>/dev/null; then
-  ok "dispatcher already running (pid $(cat /tmp/agentos-dispatcher.pid))"
-else
-  ( setsid bash "$ROOT/scripts/dispatcher.sh" >/dev/null 2>&1 </dev/null & )
-  sleep 2
-  [ -f /tmp/agentos-dispatcher.pid ] && kill -0 "$(cat /tmp/agentos-dispatcher.pid 2>/dev/null)" 2>/dev/null \
-    && ok "dispatcher started (every 5 min)" || warn "dispatcher failed"
-fi
-
-hdr "4b. Dev app servers (runnable apps on localhost)"
-"$ROOT/.venv/bin/python" "$ROOT/scripts/devserve.py" up-all >/dev/null 2>&1 \
-  && ok "dev app servers up ($("$ROOT/.venv/bin/python" "$ROOT/scripts/devserve.py" status 2>/dev/null | grep -c 'UP')) " \
-  || warn "devserve up-all failed"
-
-hdr "5. Health checks"
-curl -s --max-time 5 http://127.0.0.1:8080/v1/health 2>/dev/null | grep -q healthy && ok "ntfy healthy (local)" || warn "ntfy not healthy"
-DK "docker exec agentos-postgres pg_isready -U agentos -d agentos" >/dev/null 2>&1 && ok "postgres ready" || warn "postgres not ready"
-curl -s --max-time 8 https://nyaan.tail502e3f.ts.net/v1/health 2>/dev/null | grep -q healthy && ok "ntfy reachable over Tailscale HTTPS" || warn "tailnet ntfy not reachable (phone won't get pushes until fixed)"
-
-printf '\n\033[1mrecover.sh done.\033[0m If anything shows ! above, see SETUP_LOG.md.\n'
+printf '\n\033[1mrecover.sh complete.\033[0m Review any ! lines above.\n'

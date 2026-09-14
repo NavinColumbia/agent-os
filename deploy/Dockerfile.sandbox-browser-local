@@ -1,0 +1,10 @@
+FROM mcr.microsoft.com/playwright/python:v1.62.0-noble@sha256:51d31fdfacb0cff99a1a724152e34ae408d2bd4e7da310ff157450f49261cc59
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# The upstream image pins the browsers and OS dependencies. The Python package
+# is installed separately at the exactly matching version; the resulting local
+# image is executed by immutable image ID in the founder rehearsal.
+RUN python -m pip install --no-cache-dir playwright==1.62.0

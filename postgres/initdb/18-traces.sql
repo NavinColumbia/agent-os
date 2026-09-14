@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS traces (
     output    TEXT,
     rc        INT,
     elapsed_s REAL,
+    test_run  BOOLEAN NOT NULL DEFAULT FALSE, -- synthetic/offline verification; excluded from live health
     ts        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS traces_run_idx ON traces (run_id, id);

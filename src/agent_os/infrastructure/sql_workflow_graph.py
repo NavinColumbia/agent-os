@@ -391,6 +391,7 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox, ManagementW
                 run_key,
                 workflow_runs.c.state_version == row["state_version"],
             )).values(
+                workflow_version=mutation.state.workflow_version,
                 state_version=mutation.state.version,
                 state=mutation.state.to_dict(),
                 updated_at=_now(),

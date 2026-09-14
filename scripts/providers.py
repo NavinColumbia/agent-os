@@ -8,7 +8,7 @@ still governed identically by the capability manifest + sandbox + PDP + tamper-e
 that uniform governance over heterogeneous third-party agents is the product.
 
 Config (env or ~/projects/agent-os/.env.local):
-    AOS_PROVIDER=claude|openai|deepseek|together|ollama|<name>
+    AOS_PROVIDER=claude|hermes|openai|deepseek|together|ollama|<name>
     AOS_PROVIDER_BASE_URL=...   AOS_PROVIDER_MODEL=...   AOS_PROVIDER_KEY=...
 
     providers.py info
@@ -46,13 +46,33 @@ def _cfg():
 
 
 class ClaudeAgentProvider:
-    """Full agentic provider — runs a real Claude Code agent, governed by the repo manifest."""
+    """Full agentic provider — runs through factory.agent so governance/provider/budget/tracing apply."""
     kind = "agent"
     name = "claude"
 
     def run_agent(self, repo, prompt, timeout=240):
-        import agent_worker
-        return agent_worker.run_agent(repo, prompt, timeout)
+        import factory
+        prev = getattr(factory._ctx, "engine", None)
+        factory._ctx.engine = "claude"
+        try:
+            return factory.agent("builder", repo, prompt, timeout=timeout)
+        finally:
+            factory._ctx.engine = prev
+
+
+class HermesAgentProvider:
+    """Optional canary-gated Hermes specialist; factory retains all governance and fallback gates."""
+    kind = "agent"
+    name = "hermes"
+
+    def run_agent(self, repo, prompt, timeout=240, role="researcher"):
+        import factory
+        prev = getattr(factory._ctx, "engine", None)
+        factory._ctx.engine = "hermes"
+        try:
+            return factory.agent(role, repo, prompt, timeout=timeout, compact=True)
+        finally:
+            factory._ctx.engine = prev
 
 
 class OpenAICompatProvider:
@@ -78,6 +98,8 @@ def get_provider(cfg=None):
     name = cfg.get("AOS_PROVIDER", "claude")
     if name == "claude":
         return ClaudeAgentProvider()
+    if name == "hermes":
+        return HermesAgentProvider()
     base = cfg.get("AOS_PROVIDER_BASE_URL") or KNOWN.get(name)
     if not base:
         raise ValueError(f"unknown provider '{name}' and no AOS_PROVIDER_BASE_URL set")

@@ -19,16 +19,11 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit     # noqa: E402
 import factory   # noqa: E402
-
-DB = next((l.split("=", 1)[1].strip()
-           for l in __import__("aoscfg").ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from dbpool import connection, tenant_connection  # noqa: E402
 
 # The three audiences we prototype for, each with a one-line brief that steers its agent.
 SURFACES = {
@@ -43,14 +38,13 @@ _DESIGN_ROLE = next((r for r in ("frontend-engineer", "design-ux", "ux-designer"
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS design_artifacts (
             id BIGSERIAL PRIMARY KEY, org_id TEXT, product TEXT, kind TEXT DEFAULT 'screen',
             surface TEXT, title TEXT, html_path TEXT, status TEXT DEFAULT 'draft',
             created_at TIMESTAMPTZ DEFAULT now())""")
         # Scope every artifact by tenant as well as org (IDOR hardening), mirroring designview._ensure.
         cur.execute("ALTER TABLE design_artifacts ADD COLUMN IF NOT EXISTS tenant_id TEXT")
-        c.commit()
 
 
 def _placeholder_html(org_id, product, surface, plan) -> str:
@@ -73,9 +67,10 @@ def _placeholder_html(org_id, product, surface, plan) -> str:
             f"<p><b>Planned features:</b> {feats}</p></div></main></body></html>")
 
 
-def design_one(repo: Path, org_id: str, product: str, surface: str, plan: dict, api_key=None) -> dict:
+def design_one(repo: Path, tenant_id: str, org_id: str, product: str, surface: str, plan: dict, api_key=None) -> dict:
     """One frontend agent produces ONE prototype screen for one audience into design/<surface>.html."""
     factory._ctx.api_key = api_key
+    factory._ctx.tenant = tenant_id
     factory._ctx.product = repo.name
     factory._ctx.run = f"design-{repo.name}"
     factory._ctx.stage = f"DESIGN:{surface}"
@@ -109,10 +104,10 @@ def prototype(tenant_id: str, org_id: str, product: str, plan: dict, api_key=Non
     (repo / "design").mkdir(parents=True, exist_ok=True)
     audit.append(actor="design:lead", action="PrototypeStart", resource=repo.name,
                  decision="executed", payload={"org": org_id, "product": product,
-                                               "surfaces": list(SURFACES)})
+                                               "surfaces": list(SURFACES)}, tenant_id=tenant_id)
     results, workers = [], int(os.environ.get("AOS_FLEET_WORKERS", "3"))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(design_one, repo, org_id, product, s, plan, api_key) for s in SURFACES]
+        futs = [ex.submit(design_one, repo, tenant_id, org_id, product, s, plan, api_key) for s in SURFACES]
         for f in as_completed(futs):
             try:
                 results.append(f.result())
@@ -120,7 +115,7 @@ def prototype(tenant_id: str, org_id: str, product: str, plan: dict, api_key=Non
                 results.append({"ok": False, "error": str(e)})
     # one design_artifacts row per produced screen (status='review' — awaiting a human's call)
     surfaces = []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         for r in results:
             if not r.get("ok"):
                 continue
@@ -128,10 +123,9 @@ def prototype(tenant_id: str, org_id: str, product: str, plan: dict, api_key=Non
                              title, html_path, status) VALUES (%s,%s,%s,'screen',%s,%s,%s,'review')""",
                         (tenant_id, org_id, product, r["surface"], r["title"], r["html_path"]))
             surfaces.append(r["surface"])
-        c.commit()
     audit.append(actor="design:lead", action="PrototypeComplete", resource=repo.name,
                  decision="executed", payload={"org": org_id, "screens": len(surfaces),
-                                               "surfaces": surfaces})
+                                               "surfaces": surfaces}, tenant_id=tenant_id)
     print(f"[design] {org_id}/{product}: {len(surfaces)} screens -> {sorted(surfaces)}", flush=True)
     return {"screens": len(surfaces), "surfaces": surfaces}
 
@@ -166,7 +160,7 @@ def _selftest():
     ok = False
     try:
         res = prototype(tenant_id, org_id, "demo", {"features": ["x"]})
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tenant_id) as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM design_artifacts WHERE org_id=%s", (org_id,))
             n_rows = cur.fetchone()[0]
         gallery = designview.gallery(tenant_id, org_id)
@@ -190,9 +184,8 @@ def _selftest():
               if ok else "FAIL")
     finally:
         factory.agent, factory.PRODUCTS = real_agent, real_products
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM design_artifacts WHERE org_id=%s", (org_id,))
-            c.commit()
         shutil.rmtree(workdir, ignore_errors=True)
     sys.exit(0 if ok else 1)
 

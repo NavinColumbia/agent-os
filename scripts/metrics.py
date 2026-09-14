@@ -11,25 +11,22 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
-from aoscfg import ENV, DB
+from dbpool import connection  # noqa: E402
 
 
 def record(event, product=None, task_id=None, from_state=None, to_state=None,
            tokens_in=0, tokens_out=0, model=None, wall_clock_s=None, outcome=None):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""INSERT INTO org_metrics
             (event,product,task_id,from_state,to_state,tokens_in,tokens_out,model,wall_clock_s,outcome)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (event, product, task_id, from_state, to_state, tokens_in, tokens_out, model, wall_clock_s, outcome))
-        c.commit()
 
 
 def kpis(product=None):
     where = "WHERE product=%s" if product else ""
     args = (product,) if product else ()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute(f"SELECT count(*) FILTER (WHERE event='state_change' AND to_state='done') FROM org_metrics {where}", args)
         throughput = cur.fetchone()[0]
         # rework = state_changes that moved BACKWARD (to an earlier-than-current stage) or outcome='rework'

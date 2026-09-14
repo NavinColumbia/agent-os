@@ -141,10 +141,21 @@ class DockerSandboxRunner(SandboxRunner):
     ) -> None:
         resolved = shutil.which(docker_binary)
         image_digest = image.rpartition("@sha256:")[2]
+        local_image_digest = image.removeprefix("sha256:") if image.startswith("sha256:") else ""
+        registry_pinned = (
+            len(image_digest) == 64
+            and all(char in "0123456789abcdef" for char in image_digest)
+        )
+        local_id_pinned = (
+            len(local_image_digest) == 64
+            and all(char in "0123456789abcdef" for char in local_image_digest)
+        )
         if resolved is None:
             raise ValueError("Docker sandbox backend is configured but docker is unavailable")
-        if len(image_digest) != 64 or any(char not in "0123456789abcdef" for char in image_digest):
-            raise ValueError("sandbox image must be pinned by a lowercase sha256 digest")
+        if not registry_pinned and not local_id_pinned:
+            raise ValueError(
+                "sandbox image must be pinned by a registry digest or immutable local sha256 ID"
+            )
         if (
             timeout_seconds < 1 or pids_limit < 1 or max_files < 1
             or max_output_bundle_bytes < 1 or workspace_limit_bytes < max_output_bundle_bytes

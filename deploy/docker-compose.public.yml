@@ -1,0 +1,21 @@
+services:
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # The edge needs only its routing hostname. Do not copy database, billing,
+      # signing, vault, or provider credentials into the public-facing container.
+      AOS_PUBLIC_HOST: ${AOS_PUBLIC_HOST:?set AOS_PUBLIC_HOST in .env.local}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  caddy_data:
+  caddy_config:
+  caddy_logs:

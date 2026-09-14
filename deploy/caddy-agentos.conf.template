@@ -1,0 +1,2 @@
+[Service]
+EnvironmentFile=@@ROOT@@/.env.local

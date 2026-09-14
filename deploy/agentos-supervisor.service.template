@@ -1,0 +1,24 @@
+[Unit]
+Description=Agent OS exact-identity service supervisor
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=@@USER@@
+Group=@@GROUP@@
+WorkingDirectory=@@ROOT@@
+Environment=AOS_ROOT=@@ROOT@@
+EnvironmentFile=@@ROOT@@/.env.local
+ExecStart=@@ROOT@@/.venv/bin/python @@ROOT@@/scripts/service_recovery.py serve 10
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=45
+LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

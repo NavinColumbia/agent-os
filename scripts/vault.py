@@ -18,18 +18,16 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
 from cryptography.fernet import Fernet
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
 
-from aoscfg import ENV
-_cfg = {l.split("=", 1)[0].strip(): l.split("=", 1)[1].strip()
-        for l in ENV.read_text().splitlines() if l.strip() and not l.startswith("#") and "=" in l}
-DB = _cfg["DATABASE_URL"]
-_F = Fernet(_cfg["VAULT_KEY"].encode())
+from aoscfg import get  # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
+
+_F = Fernet(get("VAULT_KEY").encode())
 
 
 class AccessDenied(Exception):
@@ -39,6 +37,10 @@ class AccessDenied(Exception):
 # Sentinel stored for non-tenant (global/infra) secrets. tenant_id is part of the PK and
 # Postgres PK columns cannot be NULL, so global secrets carry the empty string.
 _GLOBAL = ""
+
+
+def _conn(owner=None):
+    return tenant_connection(owner) if owner else connection()
 
 
 def _tenant_of(product):
@@ -85,7 +87,7 @@ def _ensure_schema():
     global _SCHEMA_READY
     if _SCHEMA_READY:
         return
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("ALTER TABLE secrets ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT ''")
         # Backfill tenant_id for any rows written before this column existed.
         cur.execute("UPDATE secrets SET tenant_id=split_part(product,':',2) "
@@ -95,8 +97,7 @@ def _ensure_schema():
         if _read_pk(cur) != _EXPECTED_PK:
             cur.execute("ALTER TABLE secrets DROP CONSTRAINT IF EXISTS secrets_pkey")
             cur.execute("ALTER TABLE secrets ADD PRIMARY KEY (name, product, environment, tenant_id)")
-        c.commit()
-        # Verify against the live table AFTER commit. Only then is it safe to cache.
+        # Verify against the live table before caching.
         pk = _read_pk(cur)
     if pk != _EXPECTED_PK:
         raise RuntimeError(
@@ -111,7 +112,7 @@ def put_secret(name, product, environment, allowed_roles, value, ttl_seconds=Non
     _ensure_schema()
     owner = tenant_id if tenant_id is not None else _tenant_of(product)
     enc = _F.encrypt(value.encode())
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(owner) as c, c.cursor() as cur:
         cur.execute(
             """INSERT INTO secrets (name, product, environment, tenant_id, allowed_roles, value_enc, expires_at)
                VALUES (%s,%s,%s,%s,%s,%s, CASE WHEN %s::int IS NULL THEN NULL ELSE now()+(%s::int||' seconds')::interval END)
@@ -119,7 +120,6 @@ def put_secret(name, product, environment, allowed_roles, value, ttl_seconds=Non
                DO UPDATE SET allowed_roles=EXCLUDED.allowed_roles, value_enc=EXCLUDED.value_enc, expires_at=EXCLUDED.expires_at""",
             (name, product, environment, owner, list(allowed_roles), enc, ttl_seconds, ttl_seconds),
         )
-        c.commit()
     return True
 
 
@@ -142,7 +142,7 @@ def get_secret(name, product, environment, role, tenant_id=None):
         audit.append(actor=role, action="GetSecret", resource=resource, decision="deny",
                      payload={"reason": f"tenant bind failed: requester={tenant_id!r} owner={owner!r}"})
         raise AccessDenied(f"tenant mismatch for {resource}")
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(owner) as c, c.cursor() as cur:
         cur.execute(
             "SELECT allowed_roles, value_enc FROM secrets WHERE name=%s AND product=%s AND environment=%s "
             "AND tenant_id=%s AND (expires_at IS NULL OR expires_at > now())",
@@ -172,10 +172,9 @@ def delete_secrets_for_products(products):
     products = [p for p in products if p]
     if not products:
         return 0
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("DELETE FROM secrets WHERE product = ANY(%s)", (products,))
         n = cur.rowcount
-        c.commit()
     return n
 
 

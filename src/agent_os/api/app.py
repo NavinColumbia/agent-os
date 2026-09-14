@@ -318,7 +318,11 @@ class BillingCheckoutRequest(BaseModel):
     plan_id: str = Field(min_length=1, max_length=64)
 
 
-_HUMAN_EVENTS = {EventKind.WAIT_RESOLVED, EventKind.CANCEL_REQUESTED}
+_HUMAN_EVENTS = {
+    EventKind.WAIT_RESOLVED,
+    EventKind.RECOVERY_REQUESTED,
+    EventKind.CANCEL_REQUESTED,
+}
 _INTERNAL_ROLES = {"agent", "operator", "system"}
 _MAX_API_ARTIFACT_BYTES = 2 * 1024 * 1024
 _MAX_STRIPE_WEBHOOK_BYTES = 1_000_000
@@ -1696,6 +1700,21 @@ def create_app(
                         else "child workflow coordination requires an internal compound authority"
                     ),
                 )
+            if body.kind is WorkflowEventKind.NODE_RETRY_REQUESTED:
+                if not owner_authority:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="failed-node recovery requires owner authority",
+                    )
+                token_id = body.payload.get("token_id")
+                reason = body.payload.get("reason")
+                if (
+                    not isinstance(token_id, str)
+                    or not 1 <= len(token_id) <= 256
+                    or not isinstance(reason, str)
+                    or not 1 <= len(reason.strip()) <= 2_000
+                ):
+                    raise HTTPException(status_code=422, detail="node recovery request is invalid")
             if body.kind is WorkflowEventKind.RUN_CANCELLED and not owner_authority:
                 raise HTTPException(status_code=403, detail="graph cancellation requires owner authority")
             if body.kind is WorkflowEventKind.WAIT_RESUMED:
@@ -1752,7 +1771,10 @@ def create_app(
                             status_code=403,
                             detail="human response requires owner or named-recipient authority",
                         )
-            elif body.kind is not WorkflowEventKind.RUN_CANCELLED and not (
+            elif body.kind not in {
+                WorkflowEventKind.RUN_CANCELLED,
+                WorkflowEventKind.NODE_RETRY_REQUESTED,
+            } and not (
                 principal.roles & _INTERNAL_ROLES
             ):
                 raise HTTPException(status_code=403, detail="node execution events require an agent/operator")

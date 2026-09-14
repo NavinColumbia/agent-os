@@ -17,36 +17,33 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit     # noqa: E402
 import appguard  # noqa: E402  — enforcement layer; we register the cap with it if it has a setter
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS project_budget (
             tenant_id  TEXT,
             product    TEXT,
             cap_usd    NUMERIC,
             created_at TIMESTAMPTZ DEFAULT now(),
             PRIMARY KEY (tenant_id, product))""")
-        c.commit()
 
 
 def _owns(tid, product):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM tenant_products WHERE product=%s AND tenant_id=%s", (product, tid))
         return cur.fetchone() is not None
 
 
-def _spent(product):
+def _spent(tid, product):
     """Real $ spent on this product = sum(cost_usd) from traces (same source appguard uses)."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT coalesce(sum(cost_usd),0) FROM traces WHERE product=%s", (product,))
         return round(float(cur.fetchone()[0]), 2)
 
@@ -58,11 +55,10 @@ def set_budget(tid, product, cap_usd):
     if not _owns(tid, product):
         return {"ok": False, "error": "not_owned", "product": product}
     cap_usd = float(cap_usd)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO project_budget (tenant_id, product, cap_usd) VALUES (%s,%s,%s)
                        ON CONFLICT (tenant_id, product) DO UPDATE SET cap_usd=EXCLUDED.cap_usd""",
                     (tid, product, cap_usd))
-        c.commit()
     # appguard is the enforcement layer — register the cap there if it exposes a setter (it does).
     setter = getattr(appguard, "set_policy", None) or getattr(appguard, "set_cap", None) \
         or getattr(appguard, "configure", None)
@@ -72,7 +68,7 @@ def set_budget(tid, product, cap_usd):
         except TypeError:
             setter(product, cap_usd)
     audit.append(actor="projbudget", action="ProjectBudgetSet", resource=product, decision="set",
-                 payload={"tenant_id": tid, "cap_usd": cap_usd})
+                 payload={"tenant_id": tid, "cap_usd": cap_usd}, tenant_id=tid)
     return {"ok": True, "product": product, "cap_usd": cap_usd}
 
 
@@ -81,11 +77,11 @@ def get_budget(tid, product):
     _ensure()
     if not _owns(tid, product):
         return {"ok": False, "error": "not_owned", "product": product}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT cap_usd FROM project_budget WHERE tenant_id=%s AND product=%s", (tid, product))
         r = cur.fetchone()
     cap = float(r[0]) if r else None
-    spent = _spent(product)
+    spent = _spent(tid, product)
     pct = round(spent / cap * 100, 1) if cap else None
     remaining = round(cap - spent, 2) if cap is not None else None
     return {"product": product, "cap_usd": cap, "spent_usd": spent, "pct": pct, "remaining_usd": remaining}
@@ -94,7 +90,7 @@ def get_budget(tid, product):
 def list_budgets(tid):
     """Every product the tenant owns that has a cap OR any spend, with cap/spend/pct."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s ORDER BY product", (tid,))
         products = [r[0] for r in cur.fetchall()]
     out = []
@@ -113,13 +109,12 @@ def _selftest():
     ok = False
     try:
         _ensure()
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                         (prod, tid))
             for cost in (1.25, 0.75):   # real spend rows for the owned product -> $2.00
                 cur.execute("""INSERT INTO traces (run_id,product,stage,role,kind,cost_usd)
                                VALUES (%s,%s,'X','r','agent',%s)""", (f"pb-{prod}", prod, cost))
-            c.commit()
 
         set_res = set_budget(tid, prod, 5.0)
         b = get_budget(tid, prod)
@@ -130,7 +125,7 @@ def _selftest():
         # ownership guard: setting a budget on a product the tenant does NOT own must be refused.
         guard_res = set_budget(tid, foreign, 99.0)
         guard_ok = guard_res.get("ok") is False
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("SELECT 1 FROM project_budget WHERE tenant_id=%s AND product=%s", (tid, foreign))
             guard_ok = guard_ok and cur.fetchone() is None
 
@@ -142,13 +137,12 @@ def _selftest():
               f"foreign-set-blocked={guard_ok} listed={list_ok}")
         print("PASS: per-project budget cap set/read with ownership guard ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM project_budget WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM traces WHERE product=%s", (prod,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM app_policies WHERE app=%s", (prod,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

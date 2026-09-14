@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from decimal import Decimal
 from enum import Enum
 import hashlib
 import json
+import re
 from typing import Callable, Mapping, Sequence, Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from pydantic_ai import Agent, UsageLimits
+from pydantic_ai import Agent, BinaryContent, UsageLimits
 from pydantic_ai.models import Model
 
 from agent_os.application.command_worker import FatalCommandError
@@ -86,6 +89,9 @@ conditions. Never report completion without durable evidence IDs. If human autho
 required, return a correlated wait. If work cannot proceed, fail honestly and state whether retry is useful.
 Create new evidence through the bounded artifacts field. Cite an evidence ID only when it appears in the
 authoritative prior-token context; never invent one. Source code uses a source-bundle artifact with a files map.
+Artifacts proposed in the current output are persisted automatically by the authority layer and their durable
+IDs are appended before completion is committed. Therefore, do not ask a human or another node to persist a
+same-turn artifact first; propose it now and complete with the appropriate allowed condition.
 Proactively report risks, decisions, messages, delegations, missing specialists, and next actions. A hiring or
 external message is a proposal until the organization authority applies it. Your structured output is a
 proposal; deterministic workflow policy commits the transition.
@@ -144,9 +150,449 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             raise TypeError("model selector must return ModelSelection")
         return selected
 
+    def _prior_artifact_context(
+        self,
+        tenant_id: str,
+        state: WorkflowRunState,
+        *,
+        current_token_id: str,
+        preferred_artifact_labels: frozenset[str] = frozenset(),
+        preferred_artifact_ids: frozenset[str] = frozenset(),
+        preferred_source_paths: frozenset[str] = frozenset(),
+    ) -> list[dict[str, Any]]:
+        """Hydrate bounded, tenant-scoped text evidence for real agent handoffs."""
+
+        if self._artifact_store is None:
+            return []
+        candidates: list[tuple[int, int, dict[str, Any]]] = []
+        seen: set[str] = set()
+        labels_by_artifact: dict[str, set[str]] = {}
+        producer_by_artifact: dict[str, tuple[str, int]] = {}
+        for prior in state.tokens:
+            if prior.token_id == current_token_id:
+                continue
+            artifact_ids = prior.output.get("artifact_ids", {})
+            if not isinstance(artifact_ids, Mapping):
+                continue
+            for label, artifact_id in artifact_ids.items():
+                normalized_id = str(artifact_id)
+                labels_by_artifact.setdefault(normalized_id, set()).add(str(label))
+                producer_by_artifact[normalized_id] = (prior.node_id, prior.iteration)
+        textual_application_types = {
+            "application/json",
+            "application/vnd.agent-os.source-bundle+json",
+            "application/vnd.agent-os.sandbox-result+json",
+        }
+        for recency, prior in enumerate(reversed(state.tokens)):
+            if prior.token_id == current_token_id:
+                continue
+            for evidence_id in prior.evidence_ids:
+                if evidence_id in seen:
+                    continue
+                seen.add(evidence_id)
+                record = self._artifact_store.describe(tenant_id, evidence_id)
+                if record is None:
+                    continue
+                media_type = str(record.get("media_type") or "")
+                content = self._artifact_store.get(tenant_id, evidence_id)
+                producer_node_id, producer_iteration = producer_by_artifact.get(
+                    evidence_id, (prior.node_id, prior.iteration),
+                )
+                item: dict[str, Any] = {
+                    "artifact_id": evidence_id,
+                    "media_type": media_type,
+                    "byte_length": 0 if content is None else len(content),
+                    "producer_node_id": producer_node_id,
+                    "producer_iteration": producer_iteration,
+                }
+                artifact_labels = sorted(labels_by_artifact.get(evidence_id, ()))
+                if artifact_labels:
+                    item["labels"] = artifact_labels
+                is_textual = media_type.startswith("text/") or media_type in textual_application_types
+                if content is not None and is_textual:
+                    if media_type == "application/vnd.agent-os.source-bundle+json":
+                        bundle = self._source_bundle_text_context(
+                            content, preferred_paths=preferred_source_paths,
+                        )
+                        if bundle is None:
+                            item["content_omitted"] = "source bundle is not valid bounded JSON"
+                        else:
+                            item.update(bundle)
+                    else:
+                        try:
+                            decoded = content.decode("utf-8")
+                        except UnicodeDecodeError:
+                            item["content_omitted"] = "artifact is not valid UTF-8"
+                        else:
+                            hydration_limit = (
+                                40_000
+                                if "replacement-mission-program" in artifact_labels
+                                else 24_000
+                            )
+                            if len(decoded) <= hydration_limit:
+                                item["content"] = decoded
+                            else:
+                                item["content_omitted"] = (
+                                    f"artifact exceeds the {hydration_limit}-character "
+                                    "per-artifact hydration limit"
+                                )
+                elif content is not None:
+                    item["content_omitted"] = "binary evidence is available by durable artifact ID"
+                priority = 1
+                if evidence_id in preferred_artifact_ids:
+                    # The artifact named by the immediately preceding node is the
+                    # authoritative repair input.  Keep it ahead of artifacts it
+                    # references; otherwise a large dependency bundle can consume
+                    # the context budget before a rejected replacement program is
+                    # hydrated for correction.
+                    priority = -6
+                elif not preferred_artifact_ids and any(
+                    label in preferred_artifact_labels for label in artifact_labels
+                ):
+                    priority = -5
+                if media_type == "application/vnd.agent-os.source-bundle+json":
+                    priority = min(priority, 0)
+                    hydrated_files = item.get("source_bundle_text_files", {})
+                    if isinstance(hydrated_files, Mapping) and any(
+                        any(word in str(path).lower() for word in ("result", "report", "summary"))
+                        for path in hydrated_files
+                    ) and not preferred_artifact_ids:
+                        priority = -1
+                candidates.append((priority, recency, item))
+                if len(candidates) >= 64:
+                    break
+            if len(candidates) >= 64:
+                break
+        expanded_preferred = set(preferred_artifact_ids)
+        for _ in range(2):
+            discovered = set()
+            for _, _, item in candidates:
+                if item["artifact_id"] not in expanded_preferred:
+                    continue
+                discovered.update(self._artifact_references(item))
+            if discovered <= expanded_preferred:
+                break
+            expanded_preferred.update(discovered)
+        if expanded_preferred != set(preferred_artifact_ids):
+            rescored = []
+            for priority, recency, item in candidates:
+                if item["artifact_id"] in preferred_artifact_ids:
+                    priority = -6
+                elif item["artifact_id"] in expanded_preferred:
+                    priority = (
+                        -4 if item["media_type"] == "application/vnd.agent-os.source-bundle+json"
+                        else -3
+                    )
+                rescored.append((priority, recency, item))
+            candidates = rescored
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+        return [item for _, _, item in candidates]
+
+    @staticmethod
+    def _artifact_references(value: Any) -> set[str]:
+        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return set(re.findall(r"artifact-[0-9a-f]{64}", serialized))
+
+    @staticmethod
+    def _source_path_references(value: Any) -> set[str]:
+        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return {
+            match.replace("\\\\", "/").lstrip("./")
+            for match in re.findall(
+                r"(?:[A-Za-z0-9_.-]+[/\\\\])*[A-Za-z0-9_.-]+\."
+                r"(?:css|html|js|json|log|md|py|svg|txt)",
+                serialized,
+                flags=re.IGNORECASE,
+            )
+        }
+
+    @staticmethod
+    def _source_bundle_files(content: bytes) -> Mapping[str, Any] | None:
+        try:
+            raw = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("format") != "agent-os.source-bundle.v1"
+            or not isinstance(raw.get("files"), Mapping)
+        ):
+            return None
+        return raw["files"]
+
+    @classmethod
+    def _source_bundle_text_context(
+        cls, content: bytes, *, preferred_paths: frozenset[str] = frozenset(),
+    ) -> dict[str, Any] | None:
+        """Expose high-value text files from large sandbox bundles without base64 bloat."""
+
+        files = cls._source_bundle_files(content)
+        if files is None:
+            return None
+        candidates: list[tuple[int, str, str]] = []
+        omitted: list[dict[str, Any]] = []
+        for raw_path, specification in files.items():
+            path = str(raw_path)
+            if not isinstance(specification, Mapping):
+                omitted.append({"path": path, "reason": "invalid file specification"})
+                continue
+            encoding = specification.get("encoding")
+            raw_content = specification.get("content")
+            lowered = path.lower()
+            decoded_text: str | None = None
+            if encoding == "utf-8" and isinstance(raw_content, str):
+                decoded_text = raw_content
+            elif (
+                encoding == "base64"
+                and isinstance(raw_content, str)
+                and lowered.endswith((
+                    ".css", ".html", ".js", ".json", ".log", ".md", ".py", ".svg", ".txt",
+                ))
+            ):
+                try:
+                    decoded_bytes = base64.b64decode(raw_content, validate=True)
+                    if len(decoded_bytes) <= 256 * 1024:
+                        decoded_text = decoded_bytes.decode("utf-8")
+                except (ValueError, binascii.Error, UnicodeDecodeError):
+                    decoded_text = None
+            if decoded_text is None:
+                approximate_bytes = (
+                    len(raw_content) * 3 // 4
+                    if encoding == "base64" and isinstance(raw_content, str)
+                    else None
+                )
+                omitted.append({
+                    "path": path,
+                    "reason": "binary file available through attached image or durable artifact",
+                    "byte_length": approximate_bytes,
+                })
+                continue
+            if "result" in lowered and lowered.endswith(".json"):
+                try:
+                    result = json.loads(decoded_text)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(result, Mapping) and isinstance(result.get("checks"), list):
+                        checks = result["checks"]
+                        compact_result = {
+                            key: value for key, value in result.items() if key != "checks"
+                        }
+                        compact_result["passed_check_names"] = [
+                            str(check.get("name"))
+                            for check in checks
+                            if isinstance(check, Mapping) and check.get("status") == "pass"
+                        ]
+                        compact_result["failed_or_blocked_checks"] = [
+                            dict(check)
+                            for check in checks
+                            if isinstance(check, Mapping) and check.get("status") != "pass"
+                        ]
+                        compact_result["evidence_compaction"] = (
+                            "All non-passing checks retain full details; passing checks retain names."
+                        )
+                        decoded_text = json.dumps(
+                            compact_result,
+                            allow_nan=False,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+            explicitly_requested = any(
+                lowered == requested.lower()
+                or lowered.endswith("/" + requested.lower())
+                for requested in preferred_paths
+            )
+            priority = (
+                -1 if explicitly_requested
+                else 0 if any(word in lowered for word in ("result", "report", "summary", "run.log"))
+                else 1 if lowered.endswith((".js", ".py"))
+                else 2 if lowered.endswith((".css", ".html", ".json", ".log", ".md", ".txt"))
+                else 3
+            )
+            candidates.append((priority, path, decoded_text))
+        hydrated: dict[str, str] = {}
+        remaining = 24_000
+        for _, path, value in sorted(candidates, key=lambda item: (item[0], item[1])):
+            if remaining <= 0:
+                omitted.append({"path": path, "reason": "bundle text hydration limit reached"})
+                continue
+            selected = value[:remaining]
+            hydrated[path] = selected
+            remaining -= len(selected)
+            if len(selected) != len(value):
+                omitted.append({
+                    "path": path,
+                    "reason": "file truncated at bundle text hydration limit",
+                    "character_length": len(value),
+                })
+        return {
+            "source_bundle_text_files": hydrated,
+            "source_bundle_omitted_files": omitted[:64],
+        }
+
+    def _prior_image_context(
+        self,
+        tenant_id: str,
+        state: WorkflowRunState,
+        *,
+        current_token_id: str,
+    ) -> tuple[list[dict[str, Any]], list[BinaryContent]]:
+        """Attach a bounded representative screenshot set to visual-review turns."""
+
+        if self._artifact_store is None:
+            return [], []
+        candidates: list[tuple[int, int, str, str, bytes]] = []
+        seen_artifacts: set[str] = set()
+        for recency, prior in enumerate(reversed(state.tokens)):
+            if prior.token_id == current_token_id:
+                continue
+            for evidence_id in prior.evidence_ids:
+                if evidence_id in seen_artifacts:
+                    continue
+                seen_artifacts.add(evidence_id)
+                record = self._artifact_store.describe(tenant_id, evidence_id)
+                if record is None or record.get("media_type") != (
+                    "application/vnd.agent-os.source-bundle+json"
+                ):
+                    continue
+                content = self._artifact_store.get(tenant_id, evidence_id)
+                files = None if content is None else self._source_bundle_files(content)
+                if files is None:
+                    continue
+                for raw_path, specification in files.items():
+                    path = str(raw_path)
+                    lowered = path.lower()
+                    media_type = (
+                        "image/png" if lowered.endswith(".png")
+                        else "image/jpeg" if lowered.endswith((".jpg", ".jpeg"))
+                        else "image/webp" if lowered.endswith(".webp")
+                        else None
+                    )
+                    if media_type is None or not isinstance(specification, Mapping):
+                        continue
+                    if specification.get("encoding") != "base64":
+                        continue
+                    raw_data = specification.get("content")
+                    if not isinstance(raw_data, str):
+                        continue
+                    try:
+                        data = base64.b64decode(raw_data, validate=True)
+                    except (ValueError, binascii.Error):
+                        continue
+                    if not data or len(data) > 512 * 1024:
+                        continue
+                    image_priority = 0 if "/page-" in f"/{lowered}" else 1
+                    candidates.append((image_priority, recency, path, media_type, data))
+        metadata: list[dict[str, Any]] = []
+        attachments: list[BinaryContent] = []
+        digests: set[str] = set()
+        total_bytes = 0
+        for _, _, path, media_type, data in sorted(
+            candidates, key=lambda item: (item[0], item[1], item[2]),
+        ):
+            digest = hashlib.sha256(data).hexdigest()
+            if digest in digests or len(attachments) >= 3 or total_bytes + len(data) > 2 * 1024 * 1024:
+                continue
+            digests.add(digest)
+            total_bytes += len(data)
+            identifier = f"screenshot-{len(attachments) + 1}-{path.rsplit('/', 1)[-1]}"
+            metadata.append({
+                "identifier": identifier,
+                "source_path": path,
+                "media_type": media_type,
+                "byte_length": len(data),
+                "sha256": digest,
+            })
+            attachments.append(BinaryContent(
+                data=data, media_type=media_type, identifier=identifier,
+            ))
+        return metadata, attachments
+
     @staticmethod
     def _node(definition: WorkflowDefinition, node_id: str) -> WorkflowNode:
         return next(node for node in definition.nodes if node.node_id == node_id)
+
+    @staticmethod
+    def _compact_prior_output(output: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep routing/audit facts in prompt history; artifacts carry bulky detail."""
+
+        retained_keys = {
+            "summary",
+            "artifact_ids",
+            "human_response",
+            "validation_error",
+            "repair_required",
+            "rejected_artifact_id",
+            "rejected_evidence_ids",
+            "revision_reason",
+            "revision_evidence_ids",
+            "mission_program_revision",
+            "workflow_version",
+            "entry_node_id",
+            "exit_code",
+            "timed_out",
+            "stdout",
+            "stderr",
+            "output_error",
+            "output_artifact_id",
+            "result_artifact_id",
+            "source_artifact_id",
+            "deployment_id",
+            "receipt_artifact_id",
+            "verification_artifact_id",
+            "public_url",
+            "verified",
+            "status_code",
+            "content_type",
+            "content_sha256",
+            "expected_sha256",
+            "digest_matches",
+        }
+        compact = {
+            key: value for key, value in output.items()
+            if key in retained_keys
+        }
+        return compact
+
+    @staticmethod
+    def _compact_run_context(context: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep mission authority without duplicating the entire executable program per node."""
+
+        compact = dict(context)
+        mission_program = compact.get("mission_program")
+        if isinstance(mission_program, Mapping):
+            retained_keys = {
+                "format",
+                "revision",
+                "objective",
+                "authorized_budget_cents",
+                "success_measures",
+                "clarifications",
+                "replanning",
+            }
+            compact["mission_program"] = {
+                key: value for key, value in mission_program.items() if key in retained_keys
+            }
+            omitted = sorted(set(mission_program) - retained_keys)
+            if omitted:
+                compact["mission_program_omitted_sections"] = omitted
+        return compact
+
+    @staticmethod
+    def _needs_visual_evidence(
+        node: WorkflowNode, node_requirements: Mapping[str, Any],
+    ) -> bool:
+        visual_request = json.dumps(
+            dict(node_requirements), ensure_ascii=False, separators=(",", ":"),
+        ).lower()
+        review_request = f"{node.purpose} {node.owner_role or ''} {visual_request}".lower()
+        return (
+            any(term in visual_request for term in ("screenshot", "rendered image", "visual review"))
+            and any(term in review_request for term in (
+                "inspect", "review", "quality", "qa", "acceptance",
+            ))
+        )
 
     def execute_node(
         self,
@@ -237,6 +683,24 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
                 f"node kind {node.kind.value} requires an explicitly registered, idempotent handler"
             )
 
+        result_receipt_key = f"{idempotency_key}:agent-result"
+        if self._artifact_store is not None:
+            prior_receipt = self._artifact_store.find_by_idempotency_key(
+                tenant_id, result_receipt_key,
+            )
+            if prior_receipt is not None:
+                receipt_artifact_id = str(prior_receipt.get("artifact_id") or "")
+                receipt_content = self._artifact_store.get(tenant_id, receipt_artifact_id)
+                if receipt_content is None:
+                    raise FatalCommandError("persisted graph agent result receipt is unavailable")
+                try:
+                    replayed = json.loads(receipt_content)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise FatalCommandError("persisted graph agent result receipt is invalid") from exc
+                if not isinstance(replayed, Mapping):
+                    raise FatalCommandError("persisted graph agent result receipt is not an object")
+                return dict(replayed)
+
         outgoing = definition.outgoing(node.node_id)
         available_conditions = sorted({edge.condition for edge in outgoing if edge.condition != "always"})
         instructions = (
@@ -248,17 +712,50 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         if not isinstance(node_requirements, Mapping):
             raise FatalCommandError("agent node configuration agent_context must be an object")
         authoritative = {
-            "run_context": dict(state.context),
+            "run_context": self._compact_run_context(state.context),
             "action": dict(action.payload),
             "node_requirements": dict(node_requirements),
+            "current_token_input": {
+                "iteration": token.iteration,
+                "attempt": token.attempt,
+                "resumed_output": dict(token.output),
+            },
             "prior_tokens": [{
                 "node_id": prior.node_id,
                 "status": prior.status.value,
                 "iteration": prior.iteration,
                 "evidence_ids": list(prior.evidence_ids),
-                "output": dict(prior.output),
+                "output": self._compact_prior_output(prior.output),
             } for prior in state.tokens if prior.token_id != token.token_id],
         }
+        rejected_revision_exists = any(
+            prior.node_id == "revise"
+            and prior.output.get("repair_required") is True
+            for prior in state.tokens
+            if prior.token_id != token.token_id
+        )
+        if "replacement_artifact_label" in node_requirements and not rejected_revision_exists:
+            authoritative["current_workflow_definition"] = definition.to_dict()
+        if "replacement_artifact_label" in node_requirements:
+            authoritative["workflow_revision_submission"] = {
+                "initial_revision": (
+                    "Propose one complete agent-os.mission-program.v1 JSON artifact."
+                ),
+                "after_validation_rejection": {
+                    "format": "agent-os.mission-program-merge-patch.v1",
+                    "base_artifact_id": (
+                        "Use the exact rejected_artifact_id from the latest workflow.revise output."
+                    ),
+                    "patch": (
+                        "A nonempty RFC 7396 JSON Merge Patch containing only changed sections."
+                    ),
+                },
+                "authority": (
+                    "The runtime materializes a complete immutable candidate and reapplies the full "
+                    "schema, topology, tool, budget, revision, and tenant checks. Prefer a patch after "
+                    "rejection; do not rewrite unchanged program sections."
+                ),
+            }
         if self._organization_loader is not None:
             organization = self._organization_loader(tenant_id)
             active_agents = sorted(
@@ -286,6 +783,82 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
                 "active_agent_count": len(active_agents),
                 "directory_truncated": len(visible_agents) != len(active_agents),
             }
+        image_metadata: list[dict[str, Any]] = []
+        image_attachments: list[BinaryContent] = []
+        if self._needs_visual_evidence(node, node_requirements):
+            image_metadata, image_attachments = self._prior_image_context(
+                tenant_id, state, current_token_id=token.token_id,
+            )
+        if image_metadata:
+            authoritative["attached_images"] = image_metadata
+        authoritative["prior_artifacts"] = []
+        preferred_artifact_labels = frozenset({
+            str(node_requirements["replacement_artifact_label"])
+        }) if node_requirements.get("replacement_artifact_label") else frozenset()
+        # Explicit artifact IDs in the assigned node contract are stronger than
+        # incidental references from the immediately preceding routing node.
+        # Release nodes, for example, need the exact approved source bytes—not a
+        # newly admitted workflow program that merely points at those bytes.
+        preferred_artifact_ids = frozenset(self._artifact_references(node_requirements))
+        if not preferred_artifact_ids:
+            recent_references: set[str] = set()
+            referenced_tokens = 0
+            for prior in reversed(state.tokens):
+                if prior.token_id == token.token_id or prior.status is not TokenStatus.SUCCEEDED:
+                    continue
+                references = self._artifact_references(prior.output)
+                if not references:
+                    continue
+                recent_references.update(references)
+                referenced_tokens += 1
+                # A validator rejection identifies one complete authoritative
+                # repair input.  Ordinary acceptance nodes need a short window
+                # instead: fetch evidence, publication receipt, and released
+                # bytes are commonly produced by three adjacent nodes.
+                if (
+                    prior.node_id == "revise"
+                    and prior.output.get("repair_required") is True
+                ):
+                    break
+                if referenced_tokens >= 3 or len(recent_references) >= 8:
+                    break
+            preferred_artifact_ids = frozenset(recent_references)
+        for artifact in self._prior_artifact_context(
+            tenant_id,
+            state,
+            current_token_id=token.token_id,
+            preferred_artifact_labels=preferred_artifact_labels,
+            preferred_artifact_ids=preferred_artifact_ids,
+            preferred_source_paths=frozenset(
+                self._source_path_references(node_requirements)
+            ),
+        ):
+            authoritative["prior_artifacts"].append(artifact)
+            candidate_text = json.dumps(
+                authoritative,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            if len(candidate_text) <= self._context_character_limit:
+                continue
+            authoritative["prior_artifacts"].pop()
+            compact = {
+                key: value for key, value in artifact.items()
+                if key not in {"content", "source_bundle_text_files"}
+            }
+            compact["content_omitted"] = "overall model-context boundary reached"
+            authoritative["prior_artifacts"].append(compact)
+            if len(json.dumps(
+                authoritative,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )) > self._context_character_limit:
+                authoritative["prior_artifacts"].pop()
+                break
         context_text = json.dumps(
             authoritative, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
         )
@@ -312,8 +885,13 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
                 model=selection.name,
                 maximum_cost_cents=self._max_turn_budget_cents,
             )
+        user_prompt: str | list[str | BinaryContent] = (
+            f"Execute this node using the authoritative context below:\n{context_text}"
+        )
+        if image_attachments:
+            user_prompt = [user_prompt, *image_attachments]
         result = agent.run_sync(
-            f"Execute this node using the authoritative context below:\n{context_text}",
+            user_prompt,
             run_id=idempotency_key,
             metadata={
                 "tenant.id": tenant_id,
@@ -345,11 +923,30 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             if prior.token_id != token.token_id
             for evidence_id in prior.evidence_ids
         }
+        proposed_output = output.model_dump(mode="json")
+        rejected_evidence_ids = list(dict.fromkeys(
+            evidence_id for evidence_id in proposed_output.get("evidence_ids", ())
+            if evidence_id not in prior_evidence
+        ))
+        proposed_output["evidence_ids"] = [
+            evidence_id for evidence_id in proposed_output.get("evidence_ids", ())
+            if evidence_id in prior_evidence
+        ]
+        for decision in proposed_output.get("decisions", ()):
+            references = decision.get("evidence_ids", ())
+            rejected_evidence_ids.extend(
+                evidence_id for evidence_id in references
+                if evidence_id not in prior_evidence
+                and evidence_id not in rejected_evidence_ids
+            )
+            decision["evidence_ids"] = [
+                evidence_id for evidence_id in references if evidence_id in prior_evidence
+            ]
         raw = dict(persist_and_validate_artifacts(
             store=self._artifact_store,
             organization_id=tenant_id,
             idempotency_key=idempotency_key,
-            output=output.model_dump(mode="json"),
+            output=proposed_output,
             allowed_evidence_ids=prior_evidence,
         ))
         artifact_records = raw.get("artifacts", ())
@@ -363,6 +960,7 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             "summary": output.summary,
             "artifacts": list(artifact_records),
             "artifact_ids": artifact_ids,
+            "rejected_evidence_ids": rejected_evidence_ids,
             "organization_actions": {
                 "observations": list(output.observations),
                 "risks": list(output.risks),
@@ -374,4 +972,18 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             },
             "usage": usage,
         }
+        if self._artifact_store is not None:
+            receipt_content = json.dumps(
+                raw,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            self._artifact_store.put(
+                organization_id=tenant_id,
+                content=receipt_content,
+                media_type="application/vnd.agent-os.graph-node-result+json",
+                idempotency_key=result_receipt_key,
+            )
         return raw

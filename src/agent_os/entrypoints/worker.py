@@ -25,6 +25,7 @@ from agent_os.infrastructure.artifact_tool_nodes import ArtifactToolNodeHandlers
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.cloud_run_apps import CloudRunServiceDeployer
 from agent_os.infrastructure.cloud_run_sandbox import CloudRunJobSandboxRunner
+from agent_os.infrastructure.codex_cli_model import codex_cli_model
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.deployment_tool_nodes import DeploymentToolNodeHandlers
 from agent_os.infrastructure.docker_sandbox import DEFAULT_PYTHON_IMAGE, DockerSandboxRunner
@@ -108,6 +109,8 @@ class WorkerSettings:
     sandbox_image: str
     sandbox_timeout_seconds: int
     sandbox_workspace_root: str
+    sandbox_max_output_bytes: int
+    sandbox_workspace_limit_bytes: int
     sandbox_project_id: str
     sandbox_region: str
     sandbox_job_name: str
@@ -164,6 +167,24 @@ class WorkerSettings:
         ).strip()
         if sandbox_workspace_root and not os.path.isabs(sandbox_workspace_root):
             raise ValueError("AOS_V2_SANDBOX_WORKSPACE_ROOT must be absolute")
+        sandbox_max_output_bytes = _positive_int(
+            "AOS_V2_SANDBOX_MAX_OUTPUT_BYTES",
+            min(8 * 1024 * 1024, server.artifact_max_content_bytes),
+        )
+        sandbox_workspace_limit_bytes = _positive_int(
+            "AOS_V2_SANDBOX_WORKSPACE_LIMIT_BYTES",
+            max(32 * 1024 * 1024, sandbox_max_output_bytes),
+        )
+        if sandbox_max_output_bytes > min(
+            64 * 1024 * 1024, server.artifact_max_content_bytes
+        ):
+            raise ValueError(
+                "AOS_V2_SANDBOX_MAX_OUTPUT_BYTES exceeds the sandbox or artifact-store limit"
+            )
+        if not sandbox_max_output_bytes <= sandbox_workspace_limit_bytes <= 256 * 1024 * 1024:
+            raise ValueError(
+                "AOS_V2_SANDBOX_WORKSPACE_LIMIT_BYTES must cover output and not exceed 256 MiB"
+            )
         sandbox_project_id = os.getenv("AOS_V2_SANDBOX_PROJECT_ID", "").strip()
         sandbox_region = os.getenv("AOS_V2_SANDBOX_REGION", "").strip()
         sandbox_job_name = os.getenv("AOS_V2_SANDBOX_JOB_NAME", "").strip()
@@ -296,6 +317,8 @@ class WorkerSettings:
             sandbox_image=os.getenv("AOS_V2_SANDBOX_IMAGE", DEFAULT_PYTHON_IMAGE).strip(),
             sandbox_timeout_seconds=_positive_int("AOS_V2_SANDBOX_TIMEOUT_SECONDS", 300),
             sandbox_workspace_root=sandbox_workspace_root,
+            sandbox_max_output_bytes=sandbox_max_output_bytes,
+            sandbox_workspace_limit_bytes=sandbox_workspace_limit_bytes,
             sandbox_project_id=sandbox_project_id,
             sandbox_region=sandbox_region,
             sandbox_job_name=sandbox_job_name,
@@ -431,10 +454,29 @@ def run_worker(
             if settings.connector_secret_backend == "gcp"
             else FileConnectorSecretResolver(settings.connector_secret_directory)
         )
+        runtime_model = settings.model
+        if settings.model.startswith("codex-cli:"):
+            public = urlparse(settings.server.public_base_url)
+            local_host = public.hostname in {"127.0.0.1", "localhost", "::1"}
+            if (
+                settings.server.environment == "production"
+                or settings.server.billing_mode != "disabled"
+                or settings.server.identity_mode != "hmac"
+                or not local_host
+            ):
+                raise ValueError(
+                    "the subscription-backed Codex CLI model is restricted to an unpaid, "
+                    "HMAC-authenticated, loopback-only founder rehearsal"
+                )
+            runtime_model = codex_cli_model(
+                settings.model,
+                timeout_seconds=settings.request_timeout_seconds,
+            )
         tenant_model_resolver = TenantModelResolver(
             tenant_model_store,
             connector_secrets,
-            fallback_model=settings.model,
+            fallback_model=runtime_model,
+            fallback_name=settings.model,
         )
         named_tool_handlers.update(HTTPConnectorToolNodeHandlers(
             connector_registry,
@@ -451,6 +493,8 @@ def run_worker(
                 docker_binary=docker_binary,
                 timeout_seconds=settings.sandbox_timeout_seconds,
                 workspace_root=settings.sandbox_workspace_root or None,
+                max_output_bundle_bytes=settings.sandbox_max_output_bytes,
+                workspace_limit_bytes=settings.sandbox_workspace_limit_bytes,
             )
             named_tool_handlers.update(SandboxToolNodeHandlers(sandbox_runner).named_handlers())
         elif settings.sandbox_backend == "cloud-run-job":
@@ -463,11 +507,13 @@ def run_worker(
                 signing_service_account_email=settings.sandbox_signing_service_account,
                 sandbox_revision=settings.sandbox_revision,
                 timeout_seconds=settings.sandbox_timeout_seconds,
+                maximum_output_bytes=settings.sandbox_max_output_bytes,
+                maximum_workspace_bytes=settings.sandbox_workspace_limit_bytes,
             )
             named_tool_handlers.update(SandboxToolNodeHandlers(sandbox_runner).named_handlers())
         available_mission_tools = frozenset({
             "deploy.preview", "deploy.static", "deploy.service", "sandbox.run",
-            "connector.invoke",
+            "connector.invoke", "preview.fetch",
         }) & frozenset(named_tool_handlers)
         named_tool_handlers.update(
             WorkflowLaunchToolNodeHandlers(
@@ -477,7 +523,7 @@ def run_worker(
         )
         tool_router = GraphToolNodeRouter(named_tool_handlers)
         runtime = PydanticAgentRuntime(
-            settings.model,
+            runtime_model,
             request_limit=settings.request_limit,
             output_tokens_limit=settings.output_tokens_limit,
             request_timeout_seconds=settings.request_timeout_seconds,
@@ -507,6 +553,29 @@ def run_worker(
                     "active": item["active"],
                     "authentication_configured": item["auth_kind"] != "none",
                 } for item in connector_registry.list_connectors(tenant_id)],
+                "runtime_evidence_contract": {
+                    "sandbox_backend": settings.sandbox_backend,
+                    "sandbox_timeout_seconds": settings.sandbox_timeout_seconds,
+                    "sandbox_max_output_bytes": settings.sandbox_max_output_bytes,
+                    "sandbox_workspace_limit_bytes": settings.sandbox_workspace_limit_bytes,
+                    "artifact_max_content_bytes": settings.server.artifact_max_content_bytes,
+                    "sandbox_collection": (
+                        "Recursively packages regular /workspace files; excludes .git, "
+                        ".pytest_cache, and __pycache__; rejects symlinks; base64-encodes "
+                        "binary files into a canonical source-bundle artifact."
+                    ),
+                    "agent_handoff": (
+                        "Tenant-scoped prior text, JSON, HTML, and source-bundle evidence is "
+                        "hydrated into successor turns within the model-context boundary; large "
+                        "or binary evidence remains referenced by durable artifact ID."
+                    ),
+                    "preview_fetch": (
+                        "preview.fetch is a tenant-scoped controller HTTP verifier for an exact "
+                        "URL returned by deploy.preview. It refuses redirects and off-origin "
+                        "URLs, compares response bytes with the approved artifact, and persists "
+                        "status and SHA-256 evidence; generic sandboxes remain networkless."
+                    ),
+                },
             },
         ).execute
         lifecycle_handlers[CommandKind.CANCEL_ACTIVE_OPERATION] = MissionCancellationHandler(
@@ -526,7 +595,7 @@ def run_worker(
             workflow_result_waiter=engine.get_result,
         )
         graph_runtime = PydanticGraphNodeRuntime(
-            settings.model,
+            runtime_model,
             handlers=tool_router.handlers(),
             artifact_store=artifact_store,
             request_limit=settings.request_limit,
@@ -542,6 +611,7 @@ def run_worker(
             lifecycle_engine=engine,
             graph_engine=graph_engine,
             notification_handlers=notification_effects.graph_handlers(),
+            lifecycle_result_waiter=engine.get_result,
         ).graph_handlers()
         graph_effect_handlers.update(
             GraphOrganizationEffectHandler(engine, company_directory).handlers()

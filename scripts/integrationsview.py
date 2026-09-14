@@ -18,13 +18,10 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit   # noqa: E402
-
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 # Static marketplace. auth: oauth (OAuth handshake), api_key (paste a key), byo (bring-your-own key,
 # e.g. a model provider key the user pays for directly). api_key/byo connects store the secret in vault.
@@ -68,12 +65,11 @@ _NEEDS_SECRET = {"api_key", "byo"}
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS tenant_integrations (
             tenant_id TEXT NOT NULL, slug TEXT NOT NULL,
             status TEXT DEFAULT 'disconnected', connected_at TIMESTAMPTZ,
             meta JSONB DEFAULT '{}', PRIMARY KEY (tenant_id, slug))""")
-        c.commit()
 
 
 def catalog():
@@ -85,7 +81,7 @@ def status(tid):
     """The catalog merged with this tenant's tenant_integrations rows: every item carries
     'status' (connected/disconnected) and 'connected_at'."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT slug, status, connected_at FROM tenant_integrations WHERE tenant_id=%s", (tid,))
         rows = {s: (st, at) for s, st, at in cur.fetchall()}
     out = []
@@ -107,14 +103,14 @@ def connect(tid, slug, secret=None):
         import vault
         vault.put_secret(name=slug, product=f"tenant:{tid}", environment="prod",
                          allowed_roles=["builder", "factory"], value=secret)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO tenant_integrations (tenant_id, slug, status, connected_at)
                        VALUES (%s,%s,'connected', now())
                        ON CONFLICT (tenant_id, slug)
                        DO UPDATE SET status='connected', connected_at=now()""", (tid, slug))
-        c.commit()
     audit.append(actor=f"tenant:{tid}", action="IntegrationConnected", resource=slug,
-                 decision="connected", payload={"category": item["category"], "auth": item["auth"]})
+                 decision="connected", payload={"category": item["category"], "auth": item["auth"]},
+                 tenant_id=tid)
     return {"ok": True, "slug": slug, "status": "connected"}
 
 
@@ -124,14 +120,13 @@ def disconnect(tid, slug):
     if slug not in _BY_SLUG:
         return {"ok": False, "error": f"unknown integration '{slug}'"}
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO tenant_integrations (tenant_id, slug, status, connected_at)
                        VALUES (%s,%s,'disconnected', NULL)
                        ON CONFLICT (tenant_id, slug)
                        DO UPDATE SET status='disconnected', connected_at=NULL""", (tid, slug))
-        c.commit()
     audit.append(actor=f"tenant:{tid}", action="IntegrationDisconnected", resource=slug,
-                 decision="disconnected")
+                 decision="disconnected", tenant_id=tid)
     return {"ok": True, "slug": slug, "status": "disconnected"}
 
 
@@ -160,10 +155,9 @@ def _selftest():
               f"connect->{s1['stripe']['status']} disconnect->{s2['stripe']['status']}")
         print("PASS: integrations catalog + per-tenant connect/disconnect status ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM tenant_integrations WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

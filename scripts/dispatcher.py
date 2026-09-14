@@ -16,8 +16,6 @@ import sys
 import threading
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import appguard   # noqa: E402  — per-app circuit-breaker (pause state); gate dispatch so paused apps don't spend
@@ -25,10 +23,17 @@ import audit      # noqa: E402
 import directory  # noqa: E402
 import factory    # noqa: E402
 import notify      # noqa: E402
+import resourcepressure  # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
 
 from aoscfg import ENV, DB
 INBOX_WORKSPACE = factory.PRODUCTS / "_inbox"
-MAX_PER_TICK = int(os.environ.get("DISPATCH_MAX_PER_TICK", "2"))   # cost guard
+try:
+    _requested_batch = max(1, int(os.environ.get("DISPATCH_MAX_PER_TICK", "2")))
+    _batch_ceiling = max(1, int(os.environ.get("AOS_DISPATCH_CLAIM_MAX", "2")))
+except ValueError:
+    _requested_batch = _batch_ceiling = 2
+MAX_PER_TICK = min(_requested_batch, _batch_ceiling)  # unstarted claimed rows have no heartbeat; keep bounded
 BACKOFF_S = int(os.environ.get("AOS_TASK_BACKOFF_S", "120"))       # base retry backoff (×attempts)
 # Lease heartbeat: while a worker holds a claimed task it re-stamps locked_at on this cadence so a task
 # that legitimately runs longer than tasksweep's AOS_TASK_LEASE_S (default 1800s) is NOT reaped as if its
@@ -37,40 +42,100 @@ HEARTBEAT_S = int(os.environ.get("AOS_TASK_HEARTBEAT_S", "300"))
 # Circuit-breaker gate: how long to defer (not fail) a claimed task whose app appguard has PAUSED, before
 # re-checking. Cheap DB re-poll only — the agent is never invoked while paused, so no money is spent.
 PAUSE_DEFER_S = int(os.environ.get("AOS_PAUSE_DEFER_S", "600"))
+# Every interval improves a waiting task by one priority band, until priority 1. Therefore a finite old task
+# eventually ties newly-arriving priority-1 work and wins by created_at/id instead of starving forever.
+PRIORITY_AGING_S = max(1, int(os.environ.get("AOS_TASK_PRIORITY_AGING_S", "300")))
 
 
-def _pull(limit, assignee=None):
+def _conn(tenant_id=None):
+    return tenant_connection(tenant_id) if tenant_id else connection()
+
+
+def _tenant_for_app(app):
+    if not app:
+        return None
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM tenant_products WHERE product=%s ORDER BY created_at DESC LIMIT 1",
+                        (app,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _pull(limit, assignee=None, tenant_id="_platform"):
     """Atomically claim up to `limit` runnable highest-priority tasks (concurrent-dispatcher-safe).
     Runnable = pending AND past its backoff (`not_before`). Stamps `locked_at` so a crashed dispatcher's
     task can be lease-reclaimed by tasksweep instead of being orphaned in 'active' forever. The holding
     worker then refreshes locked_at on a heartbeat (see _Heartbeat) so only DEAD workers get reclaimed.
 
-    `assignee` (default None=whole queue, i.e. production) optionally scopes the claim to ONE assignee.
+    Claims always belong to one tenant. `assignee` optionally narrows that tenant queue to one agent.
     selftest passes its throwaway test assignee so it exercises the real claim SQL against its OWN row
     only — never claiming (and stranding in 'active') genuinely-pending production tasks, and staying
     deterministic regardless of how many real pending rows sort ahead of it under ORDER BY priority,id."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    if not tenant_id:
+        raise ValueError("tenant_id is required for task claims")
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute(f"""SELECT id, assignee, requester, title, priority,
-                              COALESCE(attempts,0), COALESCE(max_retry,3)
-                       FROM tasks WHERE status='pending' AND (not_before IS NULL OR not_before <= now())
+                              COALESCE(attempts,0), COALESCE(max_retry,3), tenant_id
+                       FROM tasks WHERE tenant_id=%(tenant)s AND status='pending'
+                         AND (not_before IS NULL OR not_before <= now())
                        {"AND assignee=%(ag)s" if assignee is not None else ""}
-                       ORDER BY priority, id FOR UPDATE SKIP LOCKED LIMIT %(lim)s""",
-                    {"ag": assignee, "lim": limit})
+                       ORDER BY GREATEST(1, priority - floor(
+                           GREATEST(0, EXTRACT(EPOCH FROM (now()-created_at))) / %(aging)s)::int),
+                           created_at, id
+                       FOR UPDATE SKIP LOCKED LIMIT %(lim)s""",
+                    {"tenant": tenant_id, "ag": assignee, "lim": limit,
+                     "aging": PRIORITY_AGING_S})
         rows = cur.fetchall()
         if rows:
-            cur.execute("UPDATE tasks SET status='active', locked_at=now() WHERE id = ANY(%s)",
-                        ([r[0] for r in rows],))
-        c.commit()
+            cur.execute("""UPDATE tasks SET status='active',locked_at=now()
+                           WHERE tenant_id=%s AND id=ANY(%s)""",
+                        (tenant_id, [r[0] for r in rows]))
     return rows
 
 
-def _touch(tid):
+def _pending_tenants(limit):
+    """Durably rotate the global operator over tenant queues; task claims stay tenant-local."""
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS task_dispatch_cursor (
+            singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK(singleton),
+            tenant_id TEXT NOT NULL DEFAULT '_platform',last_tenant_id TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        cur.execute("""INSERT INTO task_dispatch_cursor(singleton,tenant_id)
+                       VALUES (true,'_platform') ON CONFLICT (singleton) DO NOTHING""")
+        cur.execute("SELECT last_tenant_id FROM task_dispatch_cursor WHERE singleton FOR UPDATE")
+        last = cur.fetchone()[0]
+        cur.execute("""SELECT tenant_id FROM (
+                         SELECT tenant_id,min(created_at) AS oldest FROM tasks
+                          WHERE status='pending' AND (not_before IS NULL OR not_before<=now())
+                          GROUP BY tenant_id
+                       ) pending WHERE tenant_id>%s ORDER BY tenant_id LIMIT %s""", (last, int(limit)))
+        tenants = [r[0] for r in cur.fetchall()]
+        if len(tenants) < int(limit):
+            cur.execute("""SELECT tenant_id FROM (
+                             SELECT tenant_id,min(created_at) AS oldest FROM tasks
+                              WHERE status='pending' AND (not_before IS NULL OR not_before<=now())
+                              GROUP BY tenant_id
+                           ) pending WHERE tenant_id<=%s ORDER BY tenant_id LIMIT %s""",
+                        (last, int(limit) - len(tenants)))
+            tenants.extend(r[0] for r in cur.fetchall() if r[0] not in tenants)
+        if tenants:
+            cur.execute("""UPDATE task_dispatch_cursor SET last_tenant_id=%s,updated_at=now()
+                           WHERE singleton""", (tenants[-1],))
+        return tenants
+
+
+def _touch(tid, tenant_id="_platform"):
     """Refresh the lease on a still-running claimed task: re-stamp locked_at=now() so tasksweep does not
     reclaim a LIVE worker. Scoped to status='active' so we never resurrect a row that some other path has
     already moved to done/dead/pending (avoids a heartbeat racing a concurrent completion)."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("UPDATE tasks SET locked_at=now() WHERE id=%s AND status='active'", (tid,))
-        c.commit()
+    with _conn(tenant_id) as c, c.cursor() as cur:
+        cur.execute("""UPDATE tasks SET locked_at=now()
+                       WHERE tenant_id=%s AND id=%s AND status='active'""", (tenant_id, tid))
+        if cur.rowcount != 1:
+            raise PermissionError("active task does not belong to tenant")
 
 
 class _Heartbeat:
@@ -81,8 +146,9 @@ class _Heartbeat:
     lease, double-running them. While we hold the task we beat every HEARTBEAT_S to keep the lease fresh, so
     tasksweep only reclaims genuinely dead/stalled workers. Use as a context manager around factory.agent()."""
 
-    def __init__(self, tid):
+    def __init__(self, tid, tenant_id):
         self.tid = tid
+        self.tenant_id = tenant_id
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, name=f"lease-{tid}", daemon=True)
 
@@ -90,7 +156,7 @@ class _Heartbeat:
         # wait-then-touch: sleep one interval, refresh, repeat — until __exit__ sets the stop event.
         while not self._stop.wait(HEARTBEAT_S):
             try:
-                _touch(self.tid)
+                _touch(self.tid, self.tenant_id)
             except Exception:
                 # A transient DB hiccup must not kill the worker; the next beat (or, worst case, tasksweep's
                 # full lease window) covers a single missed refresh, so swallow and keep beating.
@@ -106,33 +172,42 @@ class _Heartbeat:
         return False
 
 
-def _done(tid):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("UPDATE tasks SET status='done', locked_at=NULL WHERE id=%s", (tid,))
-        c.commit()
+def _done(tid, tenant_id="_platform"):
+    with _conn(tenant_id) as c, c.cursor() as cur:
+        cur.execute("""UPDATE tasks SET status='done',locked_at=NULL
+                       WHERE tenant_id=%s AND id=%s""", (tenant_id, tid))
+        if cur.rowcount != 1:
+            raise PermissionError("task does not belong to tenant")
 
 
-def _retry_or_dead(tid, attempts, max_retry, err):
+def _retry_or_dead(tid, attempts, max_retry, err, tenant_id=None):
     """A failed task is NOT dropped: requeue with linear backoff until max_retry, then dead-letter it
     (visible in the 'dead' state + paged) so a human can act. Returns 'retry' or 'dead'."""
     attempts += 1
     err = (err or "")[:500]
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    if not tenant_id:
+        raise ValueError("tenant_id is required for task retry")
+    with _conn(tenant_id) as c, c.cursor() as cur:
         if attempts >= max_retry:
-            cur.execute("UPDATE tasks SET status='dead', attempts=%s, last_error=%s, locked_at=NULL WHERE id=%s",
-                        (attempts, err, tid))
-            c.commit()
+            cur.execute("""UPDATE tasks SET status='dead',attempts=%s,last_error=%s,locked_at=NULL
+                           WHERE tenant_id=%s AND id=%s""", (attempts, err, tenant_id, tid))
+            if cur.rowcount != 1:
+                raise PermissionError("task does not belong to tenant")
             audit.append(actor="dispatcher", action="TaskDeadLettered", resource=str(tid),
-                         decision="dead", payload={"attempts": attempts, "error": err[:160]})
+                         decision="dead", payload={"attempts": attempts, "error": err[:160]},
+                         tenant_id=tenant_id)
             notify.send(f"Task #{tid} dead-lettered after {attempts} attempts: {err[:120]}",
                         title="agent-os queue", priority="high", tags="warning")
             return "dead"
         cur.execute("""UPDATE tasks SET status='pending', attempts=%s, last_error=%s, locked_at=NULL,
-                       not_before=now() + (%s || ' seconds')::interval WHERE id=%s""",
-                    (attempts, err, BACKOFF_S * attempts, tid))
-        c.commit()
+                       not_before=now() + (%s || ' seconds')::interval
+                       WHERE tenant_id=%s AND id=%s""",
+                    (attempts, err, BACKOFF_S * attempts, tenant_id, tid))
+        if cur.rowcount != 1:
+            raise PermissionError("task does not belong to tenant")
         audit.append(actor="dispatcher", action="TaskRetry", resource=str(tid), decision="requeued",
-                     payload={"attempts": attempts, "backoff_s": BACKOFF_S * attempts, "error": err[:160]})
+                     payload={"attempts": attempts, "backoff_s": BACKOFF_S * attempts, "error": err[:160]},
+                     tenant_id=tenant_id)
         return "retry"
 
 
@@ -156,51 +231,70 @@ def _paused_apps():
         return set()
 
 
-def _defer_paused(tid, app):
+def _defer_paused(tid, app, tenant_id=None):
     """Release a claimed task for a PAUSED app back to 'pending' with a re-check delay instead of running
     it — waking its agent would spend the very money the circuit-breaker is halting. attempts/max_retry are
     left UNTOUCHED so a long pause never dead-letters legitimate work; it simply waits for the human resume."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    if not tenant_id:
+        raise ValueError("tenant_id is required for task deferral")
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("""UPDATE tasks SET status='pending', locked_at=NULL,
                        not_before=now() + (%s || ' seconds')::interval
-                       WHERE id=%s AND status='active'""", (PAUSE_DEFER_S, tid))
-        c.commit()
+                       WHERE tenant_id=%s AND id=%s AND status='active'""",
+                    (PAUSE_DEFER_S, tenant_id, tid))
+        if cur.rowcount != 1:
+            raise PermissionError("active task does not belong to tenant")
     audit.append(actor="dispatcher", action="SkipPausedApp", resource=app, decision="deferred",
-                 payload={"task_id": tid, "recheck_s": PAUSE_DEFER_S})
+                 payload={"task_id": tid, "recheck_s": PAUSE_DEFER_S}, tenant_id=tenant_id)
 
 
 def process(task, paused=None):
-    tid, assignee, requester, title, priority, attempts, max_retry = task
+    tid, assignee, requester, title, priority, attempts, max_retry, tenant_id = task
     app = _app_of(assignee)
     if paused is None:                                # standalone call (not via tick): resolve pauses now
         paused = _paused_apps()
     if app and app in paused:                         # circuit-breaker open for this app -> do NOT spend
-        _defer_paused(tid, app)
+        _defer_paused(tid, app, tenant_id=tenant_id)
         return {"task_id": tid, "assignee": assignee, "ok": False, "disposition": "paused-skip", "app": app}
     role = assignee.split("@", 1)[0]                  # agent_id 'legal-...@inst' -> role
     workspace = INBOX_WORKSPACE / assignee.replace("@", "_at_").replace("/", "_")
     workspace.mkdir(parents=True, exist_ok=True)
     audit.append(actor="dispatcher", action="WakeAgent", resource=assignee, decision="invoked",
-                 payload={"task_id": tid, "priority": priority, "attempt": attempts + 1})
+                 payload={"task_id": tid, "priority": priority, "attempt": attempts + 1}, tenant_id=tenant_id)
     try:
-        with _Heartbeat(tid):                            # keep the lease fresh while this live worker runs
+        with _Heartbeat(tid, tenant_id):                 # keep the lease fresh while this live worker runs
             r = factory.agent(role, str(workspace), title)   # INVOKE the idle agent to actually do the task
     except Exception as e:                               # a crash is a failure, not a silent drop
         r = {"rc": 1, "out": "", "blocker": f"agent raised: {e}"}
     if r.get("rc") == 0:
-        _done(tid)
+        _done(tid, tenant_id)
         if requester:                                 # close the loop: reply to whoever asked
-            directory.contact(assignee, requester, "reply", (r.get("out") or "")[:800])
+            directory.contact(assignee, requester, "reply", (r.get("out") or "")[:800],
+                              tenant_id=tenant_id)
         return {"task_id": tid, "assignee": assignee, "ok": True, "disposition": "done"}
-    disp = _retry_or_dead(tid, attempts, max_retry, r.get("blocker") or (r.get("out") or "")[:200])
+    disp = _retry_or_dead(tid, attempts, max_retry, r.get("blocker") or (r.get("out") or "")[:200],
+                          tenant_id=tenant_id)
     if requester and disp == "dead":
-        directory.contact(assignee, requester, "reply", f"FAILED (dead-lettered): {title[:200]}")
+        directory.contact(assignee, requester, "reply", f"FAILED (dead-lettered): {title[:200]}",
+                          tenant_id=tenant_id)
     return {"task_id": tid, "assignee": assignee, "ok": False, "disposition": disp}
 
 
 def tick():
     INBOX_WORKSPACE.mkdir(parents=True, exist_ok=True)
-    rows = _pull(MAX_PER_TICK)
+    tenants = _pending_tenants(MAX_PER_TICK)
+    rows = []
+    while tenants and len(rows) < MAX_PER_TICK:
+        progress = False
+        for tenant_id in tenants:
+            claimed = _pull(1, tenant_id=tenant_id)
+            if claimed:
+                rows.extend(claimed)
+                progress = True
+            if len(rows) >= MAX_PER_TICK:
+                break
+        if not progress:
+            break
     paused = _paused_apps()                           # one lookup per tick; gates every claimed task below
     results = [process(t, paused) for t in rows]
     return {"processed": len(results), "tasks": results}
@@ -225,7 +319,15 @@ def fleet(n=None):
     scale. Additive + safe — the durable queue's SKIP-LOCKED claim already guarantees exactly-once dispatch no
     matter how many workers run. Returns the launched pids."""
     import subprocess
-    n = max(1, int(n or os.environ.get("AOS_WORKER_FLEET", "3")))
+    requested = os.environ.get("AOS_WORKER_FLEET", "3") if n is None else n
+    try:
+        db_max = int(os.environ.get("AOS_DB_POOL_MAX", "16"))
+        hard_max = int(os.environ.get("AOS_WORKER_FLEET_MAX", "8"))
+    except ValueError:
+        db_max, hard_max = 16, 8
+    n = resourcepressure.runtime_worker_limit(
+        requested, cpu_count=os.cpu_count() or 1, db_pool_max=db_max,
+        hard_ceiling=hard_max)
     me = os.path.abspath(__file__)
     log = open("/tmp/worker-fleet.log", "a")
     pids = []
@@ -233,7 +335,7 @@ def fleet(n=None):
         p = subprocess.Popen([sys.executable, me, "run"], stdout=log, stderr=log,
                              stdin=subprocess.DEVNULL, start_new_session=True)
         pids.append(p.pid)
-    return {"launched": n, "pids": pids}
+    return {"requested": requested, "launched": n, "pids": pids}
 
 
 def _main(a):
@@ -251,38 +353,39 @@ def _main(a):
         ag = f"technical-writer@disp-{suf}"
         # self-heal: purge any orphaned selftest rows left by a PRIOR interrupted run (they would
         # otherwise age past the lease and get run as bogus real work). Unmistakable test-only pattern.
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("DELETE FROM tasks WHERE assignee LIKE 'technical-writer@disp-%%' "
-                        "AND title LIKE 'selftest task %%'"); c.commit()
+                        "AND title LIKE 'selftest task %%'")
         try:
-            orchestrate.enqueue(ag, f"selftest task {suf}", priority=5, requester=f"controller@{suf}")
+            orchestrate.enqueue(ag, f"selftest task {suf}", priority=5,
+                                requester=f"controller@{suf}", tenant_id="_platform")
             # scope the claim to our throwaway assignee: exercises the real _pull SELECT FOR UPDATE
             # SKIP LOCKED + UPDATE->active path, but CANNOT claim (and strand) real production tasks,
             # and is deterministic no matter how many real pending rows sort ahead under priority,id.
-            claimed = _pull(5, ag)
+            claimed = _pull(5, ag, tenant_id="_platform")
             got = [r for r in claimed if r[1] == ag]
             ok = len(got) == 1 and got[0][3].startswith("selftest task")
         finally:                                          # ALWAYS release our own row, even on error
-            with psycopg.connect(DB) as c, c.cursor() as cur:
-                cur.execute("DELETE FROM tasks WHERE assignee=%s", (ag,)); c.commit()
+            with _conn() as c, c.cursor() as cur:
+                cur.execute("DELETE FROM tasks WHERE assignee=%s", (ag,))
         print(f"claimed pending task for idle agent: {ok} (assignee={ag})")
         # #25: prove the lease heartbeat refreshes a LIVE worker's locked_at so tasksweep won't reap it.
         # Insert an 'active' row with a stale (long-expired) lease, run one _touch, confirm it moved forward
         # past the tasksweep lease horizon. Done WITHOUT spending on an agent call.
         hb_ag = f"hbtest@disp-{suf}"
         try:
-            with psycopg.connect(DB) as c, c.cursor() as cur:
-                cur.execute("""INSERT INTO tasks (assignee,title,status,locked_at)
-                               VALUES (%s,%s,'active', now() - interval '999 hours') RETURNING id""",
+            with _conn() as c, c.cursor() as cur:
+                cur.execute("""INSERT INTO tasks (tenant_id,assignee,title,status,locked_at)
+                               VALUES ('_platform',%s,%s,'active',now()-interval '999 hours') RETURNING id""",
                             (hb_ag, f"selftest heartbeat {suf}"))
-                hb_id = cur.fetchone()[0]; c.commit()
+                hb_id = cur.fetchone()[0]
             _touch(hb_id)                                 # the heartbeat's core lease-refresh step
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with _conn() as c, c.cursor() as cur:
                 cur.execute("SELECT now() - locked_at < interval '1 minute' FROM tasks WHERE id=%s", (hb_id,))
                 hb_ok = bool(cur.fetchone()[0])
         finally:
-            with psycopg.connect(DB) as c, c.cursor() as cur:
-                cur.execute("DELETE FROM tasks WHERE assignee=%s", (hb_ag,)); c.commit()
+            with _conn() as c, c.cursor() as cur:
+                cur.execute("DELETE FROM tasks WHERE assignee=%s", (hb_ag,))
         print(f"heartbeat refreshed live lease: {hb_ok}")
         ok = ok and hb_ok
         # C2 FLEET-SAFETY: the horizontal-scale guarantee — N concurrent workers draining the SAME queue must
@@ -292,11 +395,12 @@ def _main(a):
         fag = f"technical-writer@fleet-{suf}"
         try:
             for i in range(6):
-                orchestrate.enqueue(fag, f"selftest task {suf} {i}", priority=5, requester=f"controller@{suf}")
+                orchestrate.enqueue(fag, f"selftest task {suf} {i}", priority=5,
+                                    requester=f"controller@{suf}", tenant_id="_platform")
             results = {}
 
             def _w(k):
-                results[k] = [r[0] for r in _pull(6, fag)]
+                results[k] = [r[0] for r in _pull(6, fag, tenant_id="_platform")]
 
             threads = [threading.Thread(target=_w, args=(k,)) for k in (0, 1, 2)]
             for t in threads:
@@ -306,35 +410,48 @@ def _main(a):
             claimed = [i for v in results.values() for i in v]
             fleet_ok = len(claimed) == len(set(claimed)) == 6      # exactly-once: no double-claim, no loss
         finally:
-            with psycopg.connect(DB) as c, c.cursor() as cur:
-                cur.execute("DELETE FROM tasks WHERE assignee=%s", (fag,)); c.commit()
+            with _conn() as c, c.cursor() as cur:
+                cur.execute("DELETE FROM tasks WHERE assignee=%s", (fag,))
         print(f"fleet-safe: 3 concurrent workers claim 6 tasks exactly-once (no double-claim): {fleet_ok}")
         ok = ok and fleet_ok
         # circuit-breaker gate: a claimed task whose app appguard PAUSED must be skipped (agent NOT invoked,
         # so $0 spent) and released back to 'pending' for later — NOT failed/dead-lettered. Proven offline.
         papp = f"paused-app-{suf}"
         pag = f"technical-writer@{papp}"
+        ptid = f"tenant-dispatcher-{suf}"
         try:
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with _conn() as c, c.cursor() as cur:
+                cur.execute("""INSERT INTO tenants (tenant_id, name, api_token)
+                               VALUES (%s,%s,%s) ON CONFLICT (tenant_id) DO NOTHING""",
+                            (ptid, ptid, f"tok-{suf}"))
+                cur.execute("""INSERT INTO tenant_products (product, tenant_id)
+                               VALUES (%s,%s) ON CONFLICT DO NOTHING""", (papp, ptid))
                 cur.execute("""INSERT INTO app_policies (app,status,reason) VALUES (%s,'paused','selftest')
                                ON CONFLICT (app) DO UPDATE SET status='paused', reason='selftest'""", (papp,))
-                c.commit()
-            orchestrate.enqueue(pag, f"selftest paused {suf}", priority=5)
-            with psycopg.connect(DB) as c, c.cursor() as cur:
-                cur.execute("""UPDATE tasks SET status='active', locked_at=now() WHERE assignee=%s
+            orchestrate.enqueue(pag, f"selftest paused {suf}", priority=5, tenant_id=ptid)
+            with _conn() as c, c.cursor() as cur:
+                cur.execute("""UPDATE tasks SET status='active', locked_at=now()
+                               WHERE tenant_id=%s AND assignee=%s
                                RETURNING id, assignee, requester, title, priority,
-                                         COALESCE(attempts,0), COALESCE(max_retry,3)""", (pag,))
-                prow = cur.fetchone(); c.commit()
+                                         COALESCE(attempts,0), COALESCE(max_retry,3),tenant_id""",
+                            (ptid, pag))
+                prow = cur.fetchone()
             disp = process(prow, _paused_apps()) if prow else {}     # gate; does NOT call factory.agent
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with _conn() as c, c.cursor() as cur:
                 cur.execute("SELECT status FROM tasks WHERE assignee=%s", (pag,))
                 st = cur.fetchone()
-            pause_ok = bool(prow) and disp.get("disposition") == "paused-skip" and bool(st) and st[0] == "pending"
+                cur.execute("""SELECT count(*) FROM audit_log
+                               WHERE action='SkipPausedApp' AND resource=%s AND tenant_id=%s""", (papp, ptid))
+                paused_audit_tenant = cur.fetchone()[0] >= 1
+            pause_ok = bool(prow) and disp.get("disposition") == "paused-skip" and bool(st) \
+                and st[0] == "pending" and paused_audit_tenant
         finally:                                          # ALWAYS clean up our fixture rows
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with _conn() as c, c.cursor() as cur:
                 cur.execute("DELETE FROM tasks WHERE assignee=%s", (pag,))
-                cur.execute("DELETE FROM app_policies WHERE app=%s", (papp,)); c.commit()
-        print(f"paused-app task skipped (no spend) + requeued, not failed: {pause_ok}")
+                cur.execute("DELETE FROM app_policies WHERE app=%s", (papp,))
+                cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (ptid,))
+                cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (ptid,))
+        print(f"paused-app task skipped (no spend) + requeued, tenant-audited, not failed: {pause_ok}")
         ok = ok and pause_ok
         print("PASS: dispatcher claims + would invoke idle agents + heartbeats live leases + skips paused apps ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)

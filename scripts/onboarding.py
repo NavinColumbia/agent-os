@@ -20,15 +20,12 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit            # noqa: E402
 import consent          # noqa: E402
 import tenantproviders  # noqa: E402
-
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 FRAMING = (
     "Welcome, CEO — you're now running a small company of AI agents, and they're ready to build for you. "
@@ -50,22 +47,21 @@ _ORDER = [s["key"] for s in STEPS] + ["done"]
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS onboarding_state (
             tenant_id TEXT PRIMARY KEY, step TEXT DEFAULT 'welcome',
             completed BOOLEAN DEFAULT false, updated_at TIMESTAMPTZ DEFAULT now())""")
-        c.commit()
 
 
 def _row(tid):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT step, completed FROM onboarding_state WHERE tenant_id=%s", (tid,))
         return cur.fetchone()
 
 
 def _has_product(tid):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM tenant_products WHERE tenant_id=%s LIMIT 1", (tid,))
         return cur.fetchone() is not None
 
@@ -104,25 +100,23 @@ def advance(tid, step):
     row = _row(tid)
     cur_idx = _ORDER.index(row[0]) if (row and row[0] in _ORDER) else 0
     furthest = step if _ORDER.index(step) >= cur_idx else row[0]
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO onboarding_state (tenant_id, step, updated_at) VALUES (%s,%s, now())
                        ON CONFLICT (tenant_id) DO UPDATE SET step=EXCLUDED.step, updated_at=now()""",
                     (tid, furthest))
-        c.commit()
     audit.append(actor="onboarding", action="OnboardingAdvanced", resource=tid, decision="advanced",
-                 payload={"step": furthest})
+                 payload={"step": furthest}, tenant_id=tid)
     return state(tid)
 
 
 def _set_completed(tid, action):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO onboarding_state (tenant_id, step, completed, updated_at)
                        VALUES (%s,'done', true, now())
                        ON CONFLICT (tenant_id) DO UPDATE SET completed=true, step='done', updated_at=now()""",
                     (tid,))
-        c.commit()
-    audit.append(actor="onboarding", action=action, resource=tid, decision="completed", payload={})
+    audit.append(actor="onboarding", action=action, resource=tid, decision="completed", payload={}, tenant_id=tid)
     return state(tid)
 
 
@@ -141,30 +135,34 @@ def _selftest():
     tid = billing.signup("onboarding-selftest", "free")["tenant_id"]
     try:
         s0 = state(tid)
-        fresh_step_ok = s0["step"] in ("provider", "welcome")
+        # A self-hosted install may deliberately expose its already-authenticated host CLI as the
+        # platform default.  In that case a brand-new tenant has a usable provider and correctly lands
+        # on consent; on a host without one it lands on provider.  Keep this check aligned with the real
+        # onboarding contract instead of assuming the machine running the test is logged out.
+        host_default = tenantproviders.default_provider().get("ok") is True
+        fresh_step_ok = s0["step"] == ("consent" if host_default else "provider")
         not_completed = s0["completed"] is False
         four_steps = len(s0["steps"]) == 4
         by = {s["key"]: s for s in s0["steps"]}
-        provider_undone = by["provider"]["done"] is False
+        provider_correct = by["provider"]["done"] is host_default
         consent_undone = by["consent"]["done"] is False
 
         consent.record(tid)                         # give real consent
         s1 = state(tid)
         consent_now = {s["key"]: s for s in s1["steps"]}["consent"]["done"] is True
 
-        ok = (fresh_step_ok and not_completed and four_steps and provider_undone
+        ok = (fresh_step_ok and not_completed and four_steps and provider_correct
               and consent_undone and consent_now)
         print(f"fresh-step={s0['step']} completed={s0['completed']} steps={len(s0['steps'])} "
               f"provider-done={by['provider']['done']} consent-done(pre)={consent_undone is False} "
               f"consent-done(post)={consent_now}")
-        print("PASS: onboarding computes step status from real state (fresh blocks at provider, "
+        print("PASS: onboarding computes step status from real state (host default respected, "
               "consent flips done after record) ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM onboarding_state WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

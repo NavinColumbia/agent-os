@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -35,7 +36,7 @@ from agent_os.infrastructure.mission_programs import (
 )
 
 
-MISSION_BOOTSTRAP_WORKFLOW_ID = "agent-os-mission-bootstrap"
+MISSION_BOOTSTRAP_WORKFLOW_ID = "agent-os-mission-bootstrap-v6"
 MISSION_PLAN_ARTIFACT_LABEL = "mission-workflow"
 _MISSION_PLAN_MAX_NODES = 64
 _MISSION_PLAN_MAX_EDGES = 256
@@ -44,9 +45,25 @@ _MISSION_PLAN_MAX_TOTAL_ITERATIONS = 128
 _MISSION_MAX_DEPTH = 8
 _MISSION_INTERNAL_TOOLS = frozenset({"workflow.revise"})
 _MISSION_TOOL_ALLOWLIST = frozenset({
-    "connector.invoke", "deploy.preview", "deploy.service", "deploy.static",
+    "connector.invoke", "deploy.preview", "deploy.service", "deploy.static", "preview.fetch",
     "sandbox.run", "workflow.revise",
 })
+_MISSION_PROGRAM_PATCH_FORMAT = "agent-os.mission-program-merge-patch.v1"
+_ARTIFACT_ID = re.compile(r"^artifact-[0-9a-f]{64}$")
+
+
+def _json_merge_patch(target: Any, patch: Any) -> Any:
+    """Apply RFC 7396 merge semantics to JSON-compatible values."""
+
+    if not isinstance(patch, Mapping):
+        return copy.deepcopy(patch)
+    merged = copy.deepcopy(dict(target)) if isinstance(target, Mapping) else {}
+    for key, value in patch.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = _json_merge_patch(merged.get(key), value)
+    return merged
 
 
 def _mission_tools(configured: Collection[str] | None) -> frozenset[str]:
@@ -140,6 +157,44 @@ def mission_bootstrap_definition(
         ),
         "plan_schema": MissionProgramPlan.model_json_schema(),
         "available_tools": sorted(tools),
+        "workflow_node_configuration_contract": {
+            "agent_or_decision": {
+                "allowed_keys_only": ["max_iterations", "agent_context"],
+                "notes": (
+                    "agent_context must be an object. Put bounded task-specific instructions and "
+                    "expected artifact labels inside it. Conditions belong on workflow edges, "
+                    "never in this configuration."
+                ),
+            },
+            "human": {
+                "allowed_keys_only": [
+                    "max_iterations", "recipient_ids", "response_condition",
+                    "rejection_condition", "correlation_id",
+                ],
+                "notes": (
+                    "recipient_ids must contain 1..32 nonempty recipients. response_condition and "
+                    "optional rejection_condition must name distinct outgoing edge conditions."
+                ),
+            },
+            "terminal": {"allowed_keys_only": ["max_iterations"]},
+            "subworkflow": {
+                "allowed_keys_only": [
+                    "source", "success_condition", "failure_condition",
+                    "budget_limit_cents", "max_iterations",
+                ],
+                "notes": "source must resolve a complete child mission-program artifact from an earlier node.",
+            },
+            "tool": {
+                "base_allowed_keys_only": [
+                    "tool", "source", "success_condition", "max_iterations",
+                ],
+                "notes": (
+                    "Use only the additional keys shown in the matching tool configuration below. "
+                    "Do not copy tool keys such as success_condition, failure_condition, or "
+                    "required_tool_ids onto agent, decision, human, or terminal nodes."
+                ),
+            },
+        },
         **({"sandbox_tool_configuration": {
             "tool": "sandbox.run",
             "source": {
@@ -154,10 +209,50 @@ def mission_bootstrap_definition(
             "tool": "deploy.preview",
             "source": {
                 "node_id": "successful earlier agent node",
-                "output_path": ["artifact_ids", "html-preview-artifact-label"],
+                "output_path": ["artifact_ids", "html-or-source-bundle-label"],
             },
             "success_condition": "outgoing condition after publication",
+            "notes": (
+                "The source may be text/html or a canonical source bundle containing index.html. "
+                "Prefer the already tested source bundle: deploy.preview deterministically extracts "
+                "and persists exact index.html bytes. Never add an agent node merely to copy HTML."
+            ),
         }} if "deploy.preview" in tools else {}),
+        **({"preview_fetch_configuration": {
+            "tool": "preview.fetch",
+            "source": {
+                "node_id": "successful earlier deploy.preview tool node",
+                "output_path": ["public_url"],
+            },
+            "success_condition": "outgoing condition after verified HTTP fetch",
+            "failure_condition": "outgoing repair or replan condition after failed fetch",
+            "notes": (
+                "Use this tenant-scoped controller fetch for preview URLs. Generic sandboxes have "
+                "no network and must not be given broader connectivity merely to verify a preview."
+            ),
+        }} if "preview.fetch" in tools else {}),
+        **({"workflow_revision_configuration": {
+            "tool": "workflow.revise",
+            "source": {
+                "node_id": "preceding replan agent or decision node",
+                "output_path": ["artifact_ids", "replacement-mission-program-label"],
+            },
+            "success_condition": "outgoing condition after atomic revision",
+            "repair_condition": "outgoing condition back to the proposing node after validation rejection",
+            "bounded_correction_format": {
+                "format": _MISSION_PROGRAM_PATCH_FORMAT,
+                "base_artifact_id": "the rejected complete mission-program artifact ID",
+                "patch": {
+                    "one_or_more_changed_sections": "RFC 7396 JSON Merge Patch values",
+                },
+            },
+            "notes": (
+                "Initial revisions use a complete mission program. After deterministic validation rejects "
+                "one, prefer the bounded correction format instead of rewriting unchanged sections. The "
+                "authority verifies the base is prior evidence, materializes a complete immutable candidate, "
+                "and applies every normal schema, graph, budget, and authority check before admission."
+            ),
+        }} if "workflow.revise" in tools else {}),
         **({"http_connector_configuration": {
             "tool": "connector.invoke",
             "connector_id": "one ID from authoritative configured_connectors",
@@ -209,6 +304,47 @@ def mission_bootstrap_definition(
             "max_iterations_per_node": _MISSION_PLAN_MAX_ITERATIONS_PER_NODE,
             "total_node_iterations": _MISSION_PLAN_MAX_TOTAL_ITERATIONS,
         },
+        "semantic_constraints": [
+            (
+                "Every agent and subworkflow node requires owner_role. For every workflow node "
+                "listed in a workstream, any owner_role must exactly equal that workstream's "
+                "accountable_role_id."
+            ),
+            (
+                "replanning.replan_node_ids must contain only agent or decision nodes that each "
+                "have both declared continue_condition and replan_condition outgoing edges. "
+                "Every replan_condition edge must directly target a tool node whose tool is "
+                "workflow.revise; do not list that tool node itself in replan_node_ids. The "
+                "preceding agent or decision must propose a complete replacement mission-program, or after "
+                "a rejection a bounded merge patch against that rejected complete artifact, consumed by "
+                "workflow.revise. Every workflow.revise node must declare a "
+                "repair_condition and an edge on that condition back to the proposing node so a "
+                "rejected replacement is corrected within the same mission."
+            ),
+            (
+                "For every open clarification, human_node_id must reference a human node whose "
+                "configuration.recipient_ids contains every value in requested_from. Assumed "
+                "clarifications need no human node and must include default_assumption."
+            ),
+            (
+                "For every verified or available_unverified capability, required_tool_ids may "
+                "contain only runtime_available_tools and every required tool must be represented "
+                "by a tool node in that capability's expansion_node_ids. Do not attach a required "
+                "tool to a capability unless its own expansion path invokes that tool."
+            ),
+            (
+                "All referenced role, node, workstream, resource, capability, measure, and claim "
+                "IDs must exist and IDs must be unique within their section. Role, resource, and "
+                "workstream dependency graphs must be acyclic and contain no self-dependencies."
+            ),
+            (
+                "Every success measure must be covered by verification; verification nodes must "
+                "be agent, decision, or tool nodes and every failure route must reference a real "
+                "repair node. Human-governed acquisition and external capability expansion must "
+                "include a human node."
+            ),
+            "Every non-terminal workflow node must be covered by at least one governance section.",
+        ],
     }
     return WorkflowDefinition(
         workflow_id=MISSION_BOOTSTRAP_WORKFLOW_ID,
@@ -222,7 +358,7 @@ def mission_bootstrap_definition(
                 NodeKind.AGENT,
                 "Design a safe executable mission graph from the authoritative CEO directive.",
                 "mission-architect",
-                {"agent_context": requirements, "max_iterations": 1},
+                {"agent_context": requirements, "max_iterations": 3},
             ),
             WorkflowNode(
                 "launch",
@@ -235,7 +371,8 @@ def mission_bootstrap_definition(
                         "output_path": ["artifact_ids", MISSION_PLAN_ARTIFACT_LABEL],
                     },
                     "success_condition": "launched",
-                    "max_iterations": 1,
+                    "repair_condition": "repair",
+                    "max_iterations": 3,
                 },
             ),
             WorkflowNode(
@@ -248,6 +385,7 @@ def mission_bootstrap_definition(
         edges=(
             WorkflowEdge("plan", "launch", "planned"),
             WorkflowEdge("launch", "done", "launched"),
+            WorkflowEdge("launch", "plan", "repair"),
         ),
         created_by="system:mission-bootstrap",
     )
@@ -302,6 +440,12 @@ def materialize_mission_workflow(
                 raise FatalCommandError(
                     f"planned {kind.value} node has unsupported configuration: {sorted(unexpected)}"
                 )
+            # A string carries no authority and has an unambiguous safe form as
+            # task context. Normalize it so a harmless representation choice
+            # does not consume a full planner-repair iteration.
+            if isinstance(agent_context, str) and agent_context.strip():
+                agent_context = {"instructions": agent_context}
+                configuration["agent_context"] = agent_context
             if not isinstance(agent_context, Mapping):
                 raise FatalCommandError("planned agent_context must be an object")
         elif kind is NodeKind.HUMAN:
@@ -405,6 +549,10 @@ def materialize_mission_workflow(
             }
             if tool == "sandbox.run":
                 allowed_configuration.update({"command", "failure_condition"})
+            elif tool == "preview.fetch":
+                allowed_configuration.add("failure_condition")
+            elif tool == "workflow.revise":
+                allowed_configuration.add("repair_condition")
             elif tool == "connector.invoke":
                 allowed_configuration.update({
                     "connector_id", "method", "path", "query", "approval_node_id",
@@ -526,10 +674,27 @@ def materialize_mission_workflow(
             configured_conditions.append((
                 proposed.node_id, "success_condition", success_condition,
             ))
+            repair_condition = configuration.get("repair_condition")
+            if tool == "workflow.revise" and repair_condition is not None:
+                if not isinstance(repair_condition, str) or not repair_condition:
+                    raise FatalCommandError("planned revision repair_condition must be nonempty")
+                if repair_condition == success_condition:
+                    raise FatalCommandError(
+                        "planned revision success and repair conditions must differ"
+                    )
+                configured_conditions.append((
+                    proposed.node_id, "repair_condition", repair_condition,
+                ))
             failure_condition = configuration.get("failure_condition")
-            if tool == "sandbox.run" and failure_condition is not None:
+            if tool in {"sandbox.run", "preview.fetch"} and failure_condition is not None:
                 if not isinstance(failure_condition, str) or not failure_condition:
-                    raise FatalCommandError("planned sandbox failure_condition must be nonempty")
+                    raise FatalCommandError(
+                        f"planned {tool} failure_condition must be nonempty"
+                    )
+                if failure_condition == success_condition:
+                    raise FatalCommandError(
+                        f"planned {tool} success and failure conditions must differ"
+                    )
                 configured_conditions.append((
                     proposed.node_id, "failure_condition", failure_condition,
                 ))
@@ -757,6 +922,73 @@ class WorkflowLaunchToolNodeHandlers:
             raise FatalCommandError("mission program artifact must contain one object")
         return raw
 
+    def _revision_program(
+        self,
+        tenant_id: str,
+        state: WorkflowRunState,
+        action: WorkflowAction,
+        proposal_artifact_id: str,
+    ) -> tuple[Mapping[str, Any], str, tuple[str, ...]]:
+        """Materialize an optional bounded correction into a complete candidate."""
+
+        raw = self._program_artifact(tenant_id, proposal_artifact_id)
+        if raw.get("format") != _MISSION_PROGRAM_PATCH_FORMAT:
+            return raw, proposal_artifact_id, (proposal_artifact_id,)
+        if set(raw) != {"format", "base_artifact_id", "patch"}:
+            raise FatalCommandError(
+                "mission program correction must contain only format, base_artifact_id, and patch"
+            )
+        base_artifact_id = raw.get("base_artifact_id")
+        patch = raw.get("patch")
+        if (
+            not isinstance(base_artifact_id, str)
+            or not _ARTIFACT_ID.fullmatch(base_artifact_id)
+            or base_artifact_id == proposal_artifact_id
+            or not isinstance(patch, Mapping)
+            or not patch
+        ):
+            raise FatalCommandError("mission program correction contract is invalid")
+        authorized_evidence = {
+            evidence_id
+            for token in state.tokens
+            for evidence_id in token.evidence_ids
+        }
+        if base_artifact_id not in authorized_evidence:
+            raise FatalCommandError(
+                "mission program correction base is not prior evidence in this run"
+            )
+        base = self._program_artifact(tenant_id, base_artifact_id)
+        if base.get("format") == _MISSION_PROGRAM_PATCH_FORMAT:
+            raise FatalCommandError("mission program corrections cannot chain patch artifacts")
+        try:
+            candidate = _json_merge_patch(base, patch)
+            if not isinstance(candidate, Mapping):
+                raise TypeError("candidate is not an object")
+            content = json.dumps(
+                candidate,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+            candidate_artifact_id = self._artifacts.put(
+                organization_id=tenant_id,
+                content=content,
+                media_type="application/json",
+                idempotency_key=(
+                    f"mission-program-correction:v1:{action.action_id}:{proposal_artifact_id}"
+                ),
+            )
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise FatalCommandError(
+                "mission program correction could not be materialized"
+            ) from exc
+        return candidate, candidate_artifact_id, (
+            proposal_artifact_id,
+            base_artifact_id,
+            candidate_artifact_id,
+        )
+
     def execute(
         self,
         tenant_id: str,
@@ -788,14 +1020,29 @@ class WorkflowLaunchToolNodeHandlers:
         raw_budget = state.context.get("budget_limit_cents", 0)
         if isinstance(raw_budget, bool) or not isinstance(raw_budget, int):
             raise FatalCommandError("CEO-authorized mission budget is invalid")
-        program, child_definition = materialize_mission_program(
-            raw,
-            tenant_id=tenant_id,
-            planning_run_id=run_id,
-            artifact_id=artifact_id,
-            allowed_tools=self._available_tools,
-            authorized_budget_cents=raw_budget,
-        )
+        try:
+            program, child_definition = materialize_mission_program(
+                raw,
+                tenant_id=tenant_id,
+                planning_run_id=run_id,
+                artifact_id=artifact_id,
+                allowed_tools=self._available_tools,
+                authorized_budget_cents=raw_budget,
+            )
+        except FatalCommandError as exc:
+            repair_condition = node.configuration.get("repair_condition")
+            if not isinstance(repair_condition, str) or not repair_condition:
+                raise
+            return {
+                "disposition": "complete",
+                "satisfied_conditions": [repair_condition],
+                "evidence_ids": [artifact_id],
+                "output": {
+                    "rejected_artifact_id": artifact_id,
+                    "validation_error": str(exc),
+                    "repair_required": True,
+                },
+            }
         self._graph.register_workflow(child_definition)
         child_run_id = _child_run_id(run_id, child_definition.workflow_id)
         child_context = {
@@ -810,6 +1057,7 @@ class WorkflowLaunchToolNodeHandlers:
             "workflow_plan_artifact_id": artifact_id,
             "mission_program": program.model_dump(mode="json", exclude={"workflow"}),
             "mission_program_revision": program.revision,
+            "runtime_available_tools": sorted(self._available_tools),
         })
         self._graph.start_graph_run(
             tenant_id,
@@ -1000,12 +1248,14 @@ class WorkflowLaunchToolNodeHandlers:
             raise FatalCommandError("workflow revision handler received the wrong tool node")
         if state.context.get("mission_execution") is not True:
             raise FatalCommandError("only an admitted mission execution may revise its workflow")
-        artifact_id = resolve_prior_output(
+        proposal_artifact_id = resolve_prior_output(
             state, node.configuration.get("source"), subject="workflow revision",
         )
-        if not isinstance(artifact_id, str) or not artifact_id:
+        if not isinstance(proposal_artifact_id, str) or not proposal_artifact_id:
             raise FatalCommandError("workflow revision source is not an artifact ID")
-        raw = self._program_artifact(tenant_id, artifact_id)
+        raw, artifact_id, revision_evidence_ids = self._revision_program(
+            tenant_id, state, action, proposal_artifact_id,
+        )
         current_revision = state.context.get("mission_program_revision", 1)
         current_program = state.context.get("mission_program", {})
         if isinstance(current_revision, bool) or not isinstance(current_revision, int):
@@ -1019,23 +1269,50 @@ class WorkflowLaunchToolNodeHandlers:
         if current_revision >= max_revisions:
             raise FatalCommandError("mission program reached its admitted revision bound")
 
-        program, replacement = materialize_mission_program(
-            raw,
-            tenant_id=tenant_id,
-            planning_run_id=str(state.context.get("planning_run_id") or run_id),
-            artifact_id=artifact_id,
-            allowed_tools=self._available_tools,
-            workflow_id=state.workflow_id,
-            workflow_version=state.workflow_version + 1,
-            supersedes_version=state.workflow_version,
-            authorized_budget_cents=int(current_program.get("authorized_budget_cents", 0)),
-        )
-        if program.revision != current_revision + 1:
-            raise FatalCommandError("replacement mission program must advance exactly one revision")
-        if program.replanning.max_revisions > max_revisions:
-            raise FatalCommandError("replacement program cannot expand its admitted revision authority")
-        if program.authorized_budget_cents > int(current_program.get("authorized_budget_cents", 0)):
-            raise FatalCommandError("replacement program cannot expand its admitted budget authority")
+        try:
+            program, replacement = materialize_mission_program(
+                raw,
+                tenant_id=tenant_id,
+                planning_run_id=str(state.context.get("planning_run_id") or run_id),
+                artifact_id=artifact_id,
+                allowed_tools=self._available_tools,
+                workflow_id=state.workflow_id,
+                workflow_version=state.workflow_version + 1,
+                supersedes_version=state.workflow_version,
+                authorized_budget_cents=int(current_program.get("authorized_budget_cents", 0)),
+            )
+            if program.revision != current_revision + 1:
+                raise FatalCommandError(
+                    "replacement mission program must advance exactly one revision"
+                )
+            if program.replanning.max_revisions > max_revisions:
+                raise FatalCommandError(
+                    "replacement program cannot expand its admitted revision authority"
+                )
+            if program.authorized_budget_cents > int(
+                current_program.get("authorized_budget_cents", 0)
+            ):
+                raise FatalCommandError(
+                    "replacement program cannot expand its admitted budget authority"
+                )
+        except FatalCommandError as exc:
+            repair_condition = node.configuration.get("repair_condition")
+            if not isinstance(repair_condition, str) or not repair_condition:
+                raise
+            return {
+                "disposition": "complete",
+                "satisfied_conditions": [repair_condition],
+                "evidence_ids": list(dict.fromkeys(revision_evidence_ids)),
+                "output": {
+                    "rejected_artifact_id": artifact_id,
+                    **({
+                        "correction_artifact_id": proposal_artifact_id,
+                    } if proposal_artifact_id != artifact_id else {}),
+                    "validation_error": str(exc),
+                    "repair_required": True,
+                    "mission_program_revision": current_revision,
+                },
+            }
         self._graph.register_workflow(replacement)
         event_id = "mission-revision-" + hashlib.sha256(action.action_id.encode()).hexdigest()
         receipt = self._graph.submit_graph_event(
@@ -1048,7 +1325,7 @@ class WorkflowLaunchToolNodeHandlers:
                 {
                     "replacement_workflow": replacement.to_dict(),
                     "mission_program": program.model_dump(mode="json", exclude={"workflow"}),
-                    "evidence_ids": [artifact_id],
+                    "evidence_ids": list(dict.fromkeys(revision_evidence_ids)),
                     "reason": node.purpose,
                 },
             ),
@@ -1056,11 +1333,12 @@ class WorkflowLaunchToolNodeHandlers:
         return {
             "disposition": "complete",
             "satisfied_conditions": [str(node.configuration.get("success_condition") or "revised")],
-            "evidence_ids": [artifact_id],
+            "evidence_ids": list(dict.fromkeys(revision_evidence_ids)),
             "output": {
                 "mission_program_revision": program.revision,
                 "workflow_version": replacement.version,
                 "state_version": receipt.state.version,
+                "program_artifact_id": artifact_id,
             },
         }
 
@@ -1166,10 +1444,12 @@ class MissionGraphEffectHandlers:
         lifecycle_engine: WorkflowEngine,
         graph_engine: GraphWorkflowEngine,
         notification_handlers: Mapping[WorkflowActionKind, Any],
+        lifecycle_result_waiter: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> None:
         self._lifecycle = lifecycle_engine
         self._graph = graph_engine
         self._notifications = dict(notification_handlers)
+        self._lifecycle_result_waiter = lifecycle_result_waiter
 
     def graph_handlers(self):
         handlers = dict(self._notifications)
@@ -1223,6 +1503,16 @@ class MissionGraphEffectHandlers:
             raise FatalCommandError("mission lifecycle disappeared before terminal projection")
         if lifecycle.status is LifecycleStatus.CANCELLED:
             return {"projected": False, "reason": "lifecycle_cancelled"}
+        if lifecycle.status is LifecycleStatus.SUCCEEDED:
+            return {
+                "projected": False,
+                "reason": "lifecycle_already_succeeded",
+                "duplicate": True,
+            }
+        if lifecycle.status is not LifecycleStatus.ACTIVE:
+            raise FatalCommandError(
+                "mission terminal result cannot replace a waiting or failed CEO lifecycle"
+            )
         raw_expected = context.get("lifecycle_expected_version")
         if isinstance(raw_expected, bool):
             raise FatalCommandError("mission lifecycle projection version is invalid")
@@ -1230,6 +1520,12 @@ class MissionGraphEffectHandlers:
             expected_version = int(raw_expected)
         except (TypeError, ValueError) as exc:
             raise FatalCommandError("mission lifecycle projection version is missing") from exc
+        if lifecycle.version < expected_version:
+            raise FatalCommandError("mission lifecycle projection version moved backwards")
+        # The graph may survive an explicitly authorized lifecycle recovery.
+        # Fence against the current aggregate version instead of replaying the
+        # initial launch version forever.
+        expected_version = lifecycle.version
         event_id = "mission-result-" + hashlib.sha256(action.action_id.encode()).hexdigest()
         if succeeded:
             evidence_ids = list(dict.fromkeys(
@@ -1264,11 +1560,15 @@ class MissionGraphEffectHandlers:
                 },
             )
         receipt = self._lifecycle.submit_event(tenant_id, lifecycle_run_id, event)
+        result: Mapping[str, Any] | None = None
+        if self._lifecycle_result_waiter is not None:
+            result = self._lifecycle_result_waiter(receipt.workflow_id)
         return {
             "projected": True,
             "lifecycle_run_id": lifecycle_run_id,
             "workflow_id": receipt.workflow_id,
             "duplicate": receipt.duplicate,
+            **({"lifecycle_result": dict(result)} if result is not None else {}),
         }
 
     def _resume_parent(self, child: WorkflowRunState) -> Mapping[str, Any]:

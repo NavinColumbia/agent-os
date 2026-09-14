@@ -10,6 +10,7 @@ ntfy/lib/
 bridge/inbox/
 bridge/rejected/
 bridge/pending/
+bridge/processed/
 bridge/*.log
 
 # Voice test artifacts
@@ -18,6 +19,7 @@ samples/*.wav
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
 
 # Python venv
 .venv/
@@ -40,3 +42,12 @@ assets/voices/
 # Runtime-generated incident RCAs
 docs/incidents/
 logs/
+.runtime/
+
+# Tool-managed dependency state and local databases
+.terraform/
+*.sqlite3
+
+# Security-test sentinel and generated report source
+AOS_PWNED
+report-source.md

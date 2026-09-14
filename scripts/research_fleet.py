@@ -12,6 +12,7 @@ Run with the agent-os venv python. Agents already have WebSearch/WebFetch (facto
 """
 import json
 import os
+import re
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +24,13 @@ import audit     # noqa: E402
 import factory   # noqa: E402
 
 MAX_SUBQ = int(os.environ.get("AOS_RESEARCH_SUBQ", "8"))
+
+_REDIRECT_NOTE_RE = re.compile(
+    r"\b(?:wrote|write)\s+(?:the\s+)?(?:research\s+memo|findings?)\s+to\s+"
+    r"(?:\[[^\]]*(?:docs|tasks)/findings/\d{2}\.md[^\]]*\]\()?`?"
+    r"(?P<path>(?:docs|tasks)/findings/\d{2}\.md)?",
+    re.I,
+)
 
 
 def _slug(q):
@@ -135,15 +143,60 @@ def research_one(repo: Path, idx: int, subq: str, api_key=None):
     return {"idx": idx, "subq": subq, "ok": fp.exists(), "file": out}
 
 
+def _canonicalize_findings(repo: Path, results: list | None = None) -> int:
+    """Materialize governed findings paths into canonical findings/*.md before synthesis.
+
+    The research role is usually constrained to docs/** and tasks/**, while this fleet's public contract
+    historically tells workers to write findings/<idx>.md. Some agents correctly obey the stricter write
+    scope and leave only a pointer in findings/<idx>.md. Treat docs/findings and tasks/findings as accepted
+    write locations, copying their substantive contents into findings/ so the synthesizer does not silently
+    drop evidence.
+    """
+    canonical = repo / "findings"
+    canonical.mkdir(parents=True, exist_ok=True)
+    materialized = 0
+    for alt_dir in (repo / "docs" / "findings", repo / "tasks" / "findings"):
+        if not alt_dir.exists():
+            continue
+        for alt in sorted(alt_dir.glob("*.md")):
+            if not re.fullmatch(r"\d{2}\.md", alt.name):
+                continue
+            txt = alt.read_text(errors="replace")
+            if not txt.strip():
+                continue
+            dst = canonical / alt.name
+            old = dst.read_text(errors="replace") if dst.exists() else ""
+            if (not old.strip()) or _REDIRECT_NOTE_RE.search(old) or len(txt) > len(old) * 2:
+                dst.write_text(txt)
+                materialized += 1
+    if results:
+        for r in results:
+            try:
+                idx = int(r.get("idx"))
+            except Exception:
+                continue
+            if (canonical / f"{idx:02d}.md").exists():
+                r["ok"] = True
+                r["file"] = f"findings/{idx:02d}.md"
+    return materialized
+
+
 def synthesize(repo: Path, question: str, out_rel: str):
     """AGGREGATOR reads all findings and writes one coherent, cited report."""
+    _canonicalize_findings(repo)
     factory._ctx.product = repo.name; factory._ctx.run = f"research-{repo.name}"; factory._ctx.stage = "SYNTHESIZE"
     factory.agent("research-growth", str(repo),
                   f"You are the research SYNTHESIZER. Read every file under findings/ and write ONE coherent, "
                   f"well-structured report at {out_rel} answering:\n{question}\n\nRequirements: lead with the "
                   f"key findings, preserve source URLs, flag anything weakly-sourced or contradictory, and be "
                   f"honest about gaps. Do NOT invent facts not in the findings.")
-    return repo / out_rel
+    primary = repo / out_rel
+    if primary.exists() and primary.stat().st_size > 0:
+        return primary
+    governed = repo / "docs" / out_rel
+    if governed.exists() and governed.stat().st_size > 0:
+        return governed
+    return primary
 
 
 def research(question: str, out_rel: str = "REPORT.md", api_key=None, run_id=None) -> dict:
@@ -172,6 +225,9 @@ def research(question: str, out_rel: str = "REPORT.md", api_key=None, run_id=Non
                 results.append(f.result())
             except Exception as e:
                 results.append({"ok": False, "error": str(e)})
+    materialized = _canonicalize_findings(repo, results)
+    if materialized:
+        print(f"[research] materialized {materialized} governed findings into findings/", flush=True)
     report = synthesize(repo, question, out_rel)
     ok = sum(1 for r in results if r.get("ok"))
     audit.append(actor="research:lead", action="ResearchComplete", resource=repo.name, decision="executed",
@@ -197,6 +253,21 @@ def _selftest():
     if not parse_ok:
         print("FAIL: _parse_subqs"); sys.exit(1)
     workdir = Path(tempfile.mkdtemp())
+    # Governed-write compatibility: a worker may obey docs/** scope and leave only a pointer in findings/.
+    gov_repo = workdir / "governed-findings"
+    (gov_repo / "findings").mkdir(parents=True)
+    (gov_repo / "docs" / "findings").mkdir(parents=True)
+    (gov_repo / "findings" / "00.md").write_text(
+        "# q0\n\nDone. I wrote the research memo to [docs/findings/00.md]"
+        f"({gov_repo / 'docs' / 'findings' / '00.md'}).\n"
+    )
+    (gov_repo / "docs" / "findings" / "00.md").write_text(
+        "# Real governed finding\n\nVerified dog-walking evidence.\nSources: https://example.com\n"
+    )
+    materialized = _canonicalize_findings(gov_repo, [{"idx": 0, "ok": False, "file": "findings/00.md"}])
+    governed_ok = (materialized == 1 and "Verified dog-walking evidence" in
+                   (gov_repo / "findings" / "00.md").read_text())
+    print(f"governed findings materialized={materialized}")
     # fake the three agent phases via PLAN.json + findings + report files
     calls = {"research": 0, "synth": 0}
     real_agent = factory.agent
@@ -211,13 +282,22 @@ def _selftest():
             (repo / f).parent.mkdir(parents=True, exist_ok=True); (repo / f).write_text("finding\nSources: x")
             calls["research"] += 1
         elif "SYNTHESIZER" in task:
-            (repo / "REPORT.md").write_text("# report"); calls["synth"] += 1
+            calls["synth"] += 1
+            if "governed report" in task:
+                (repo / "docs").mkdir(exist_ok=True)
+                (repo / "docs" / "REPORT.md").write_text("# governed report")
+            else:
+                (repo / "REPORT.md").write_text("# report")
         return {"rc": 0, "out": "ok"}
     factory.agent = fake_agent
     try:
         r = research("how do solo founders distribute faceless")
-        ok = (calls["research"] == 3 and calls["synth"] == 1 and Path(r["report"]).exists() and r["answered"] == 3)
-        print(f"decompose->{r['subquestions']} subq, parallel research={calls['research']}, synth={calls['synth']}")
+        r2 = research("governed report path")
+        ok = (governed_ok and calls["research"] == 6 and calls["synth"] == 2 and Path(r["report"]).exists()
+              and Path(r2["report"]).name == "REPORT.md" and Path(r2["report"]).parent.name == "docs"
+              and Path(r2["report"]).exists() and r["answered"] == 3 and r2["answered"] == 3)
+        print(f"decompose->{r['subquestions']} subq, parallel research={calls['research']}, synth={calls['synth']} "
+              f"governed_report={Path(r2['report']).parent.name}/REPORT.md")
         print("PASS: research fleet (decompose -> parallel -> synthesize) ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
     finally:

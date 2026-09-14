@@ -16,15 +16,11 @@ import json
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
 
-DB = next((l.split("=", 1)[1].strip()
-           for l in __import__("aoscfg").ENV.read_text().splitlines()
-           if l.strip().startswith("DATABASE_URL=")), None)
+from dbpool import connection, tenant_connection  # noqa: E402
 
 STATUSES = ("draft", "review", "approved")
 _SURFACES = {
@@ -35,7 +31,7 @@ _SURFACES = {
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS design_artifacts (
             id BIGSERIAL PRIMARY KEY, org_id TEXT, product TEXT, kind TEXT DEFAULT 'screen',
             surface TEXT, title TEXT, html_path TEXT, status TEXT DEFAULT 'draft',
@@ -43,7 +39,6 @@ def _ensure():
         # Defense-in-depth: scope every artifact by tenant as well as org (IDOR hardening). Older
         # rows predate the column, so add it idempotently rather than only on first create.
         cur.execute("ALTER TABLE design_artifacts ADD COLUMN IF NOT EXISTS tenant_id TEXT")
-        c.commit()
 
 
 _PREVIEW_CHARS = 4000   # cap the inlined content so the gallery payload stays sane for many artifacts
@@ -106,7 +101,7 @@ def gallery(tenant_id: str, org_id: str) -> list:
     the surface, and a `reviewable` flag, by reading the self-contained HTML the design fleet wrote to
     disk. Scoped by tenant_id AND org_id so a tenant never reads another tenant's artifacts."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("""SELECT id, surface, title, html_path, status, product FROM design_artifacts
                        WHERE tenant_id=%s AND org_id=%s ORDER BY id DESC""", (tenant_id, org_id))
         rows = cur.fetchall()
@@ -125,16 +120,16 @@ def decide(tenant_id: str, org_id: str, artifact_id, status: str) -> dict:
     _ensure()
     if status not in STATUSES:
         return {"ok": False, "error": f"status must be one of {STATUSES}"}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("UPDATE design_artifacts SET status=%s WHERE id=%s AND tenant_id=%s AND org_id=%s",
                     (status, artifact_id, tenant_id, org_id))
         changed = cur.rowcount
-        c.commit()
     if not changed:
         return {"ok": False, "error": "not found or not your artifact"}
     audit.append(actor="designview", action="DesignDecide", resource=str(artifact_id),
                  decision=status, payload={"tenant": tenant_id, "org": org_id,
-                                           "artifact_id": artifact_id, "status": status})
+                                           "artifact_id": artifact_id, "status": status},
+                 tenant_id=tenant_id)
     return {"ok": True}
 
 
@@ -160,7 +155,7 @@ def _selftest():
         # one metadata-only row whose file is missing — to prove gallery() returns reviewable content
         # for real prototypes AND a full description (never a dead link) when no file exists.
         real = {}
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             for s in ("cockpit", "team"):
                 fp = workdir / f"{s}.html"
                 fp.write_text(f"<!doctype html><html><head><title>demo {s}</title></head>"
@@ -175,7 +170,6 @@ def _selftest():
                              title, html_path, status) VALUES (%s,%s,'demo',%s,%s,%s,'review')""",
                         (tenant_id, org_id, "external", "demo — external screen",
                          str(workdir / "missing.html")))
-            c.commit()
 
         g = gallery(tenant_id, org_id)
         target = g[0]["id"]
@@ -215,10 +209,9 @@ def _selftest():
         print("PASS: designview reviewable gallery + tenant/org-scoped decide + surfaces ✅"
               if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM design_artifacts WHERE tenant_id=%s AND org_id=%s",
                         (tenant_id, org_id))
-            c.commit()
         shutil.rmtree(workdir, ignore_errors=True)
     sys.exit(0 if ok else 1)
 

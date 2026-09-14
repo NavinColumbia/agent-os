@@ -1,0 +1,13 @@
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${AOS_V2_POSTGRES_HOST_PORT:-55432}:5432"
+
+  api:
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

@@ -39,42 +39,78 @@ import hmac
 import os
 import secrets
 import sys
+import threading
+import time
 from pathlib import Path
-
-import psycopg
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit    # noqa: E402
 import billing  # noqa: E402
 
-from aoscfg import ENV, DB
+from aoscfg import ENV, DB, get
+from dbpool import connection, tenant_connection
 
 MAX_CODE_ATTEMPTS = int(os.environ.get("AOS_MAX_CODE_ATTEMPTS", "6"))   # wrong-code tries before a code locks
+SESSION_TTL_DAYS = int(os.environ.get("AOS_AUTH_SESSION_TTL_DAYS", "30"))
+# Public endpoint limits are deliberately separate by IP and account. The DB-backed buckets work across
+# threads/process restarts and across multiple console workers; no attacker can reset them by reconnecting.
+PUBLIC_RATE_POLICIES = {
+    "signup": (3600, 8, 3),
+    "login": (900, 20, 10),
+    "verify-email": (900, 30, 8),
+    "resend-code": (3600, 12, 4),
+    "reset-request": (3600, 12, 4),
+    "reset-password": (900, 20, 8),
+    "assurance-intake": (3600, 8, 3),
+}
 _BAD_LOGIN = "that email or password is incorrect"   # non-enumerating: same for no-account and wrong-password
 _ROUNDS = 200_000
+_ensured = False
+_ensure_lock = threading.Lock()
+
+
+def _conn():
+    return connection()
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS accounts (
-            email TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT,
-            pw_salt TEXT NOT NULL, pw_hash TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())""")
-        # email verification: gate app access until the emailed code is confirmed (idempotent like the rest)
-        cur.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT false")
-        cur.execute("""CREATE TABLE IF NOT EXISTS email_codes (
-            email TEXT NOT NULL, code_hash TEXT NOT NULL,
-            purpose TEXT NOT NULL DEFAULT 'verify',
-            expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ DEFAULT now(),
-            PRIMARY KEY (email, purpose))""")
-        # migrate a pre-existing single-column (email) PK -> composite (email, purpose) so a live 'verify'
-        # code and a 'reset' code for the same person can coexist instead of clobbering each other.
-        cur.execute("ALTER TABLE email_codes ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'verify'")
-        cur.execute("ALTER TABLE email_codes DROP CONSTRAINT IF EXISTS email_codes_pkey")
-        cur.execute("ALTER TABLE email_codes ADD CONSTRAINT email_codes_pkey PRIMARY KEY (email, purpose)")
-        # brute-force guard: a 6-digit code (1M space) with no attempt cap is guessable in the 15-min window.
-        cur.execute("ALTER TABLE email_codes ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0")
-        c.commit()
+    global _ensured
+    if _ensured:
+        return
+    with _ensure_lock:
+        if _ensured:
+            return
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS accounts (
+                email TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT,
+                pw_salt TEXT NOT NULL, pw_hash TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())""")
+            # email verification: gate app access until the emailed code is confirmed (idempotent like the rest)
+            cur.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT false")
+            cur.execute("""CREATE TABLE IF NOT EXISTS email_codes (
+                email TEXT NOT NULL, code_hash TEXT NOT NULL,
+                purpose TEXT NOT NULL DEFAULT 'verify',
+                expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ DEFAULT now(),
+                PRIMARY KEY (email, purpose))""")
+            # migrate a pre-existing single-column (email) PK -> composite (email, purpose) so a live 'verify'
+            # code and a 'reset' code for the same person can coexist instead of clobbering each other.
+            cur.execute("ALTER TABLE email_codes ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'verify'")
+            cur.execute("ALTER TABLE email_codes DROP CONSTRAINT IF EXISTS email_codes_pkey")
+            cur.execute("ALTER TABLE email_codes ADD CONSTRAINT email_codes_pkey PRIMARY KEY (email, purpose)")
+            # brute-force guard: a 6-digit code (1M space) with no attempt cap is guessable in the 15-min window.
+            cur.execute("ALTER TABLE email_codes ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0")
+            cur.execute("""CREATE TABLE IF NOT EXISTS auth_sessions (
+                token_hash TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, email TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL)""")
+            cur.execute("CREATE INDEX IF NOT EXISTS auth_sessions_tenant_idx ON auth_sessions(tenant_id)")
+            cur.execute("""CREATE TABLE IF NOT EXISTS auth_rate_limits (
+                action TEXT NOT NULL, key_hash TEXT NOT NULL, bucket BIGINT NOT NULL,
+                attempts INT NOT NULL DEFAULT 1, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (action, key_hash, bucket))""")
+            c.commit()
+        _ensured = True
 
 
 def _hash(password, salt):
@@ -95,6 +131,116 @@ def _code_hash(code, purpose="verify"):
     return hashlib.sha256((f"aos-emailcode:{purpose}:" + (code or "")).encode()).hexdigest()
 
 
+def _opaque_hash(value):
+    return hashlib.sha256((value or "").encode()).hexdigest()
+
+
+def _rate_key(action, dimension, value):
+    # Never persist raw addresses or client IPs in the abuse-control ledger. Public preflight requires a
+    # strong AUDIT_HMAC_KEY; the fallback keeps local development functional without pretending it is secret.
+    secret = (get("AUDIT_HMAC_KEY") or "agent-os-development-rate-limit-key").encode()
+    payload = f"{action}:{dimension}:{value}".encode()
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+def public_rate_limit(action, email="", client_id=""):
+    """Atomically admit one unauthenticated auth request or return a retry delay.
+
+    Both the client and normalized account dimensions must remain under their own policy. This prevents one
+    IP spraying many accounts and a distributed set of IPs hammering one account. The result is deliberately
+    non-enumerating and contains no email/IP.
+    """
+    policy = PUBLIC_RATE_POLICIES.get(str(action))
+    if not policy:
+        raise ValueError(f"unknown public auth action: {action}")
+    window_s, client_limit, account_limit = policy
+    now = int(time.time())
+    bucket = now // window_s
+    dimensions = [("client", str(client_id or "unknown"), int(client_limit))]
+    norm_email = _norm(email)
+    if norm_email:
+        dimensions.append(("account", norm_email, int(account_limit)))
+    counts = []
+    _ensure()
+    with _conn() as c, c.cursor() as cur:
+        for dimension, value, limit in dimensions:
+            key_hash = _rate_key(action, dimension, value)
+            cur.execute("""INSERT INTO auth_rate_limits(action,key_hash,bucket,attempts)
+                           VALUES (%s,%s,%s,1)
+                           ON CONFLICT(action,key_hash,bucket) DO UPDATE
+                             SET attempts=auth_rate_limits.attempts+1, updated_at=now()
+                           RETURNING attempts""", (action, key_hash, bucket))
+            counts.append((int(cur.fetchone()[0]), limit))
+        # Bounded housekeeping; this table never becomes an unbounded history of authentication metadata.
+        cur.execute("DELETE FROM auth_rate_limits WHERE updated_at < now() - interval '2 days'")
+        c.commit()
+    allowed = all(count <= limit for count, limit in counts)
+    return {"allowed": allowed, "retry_after_s": max(1, ((bucket + 1) * window_s) - now)}
+
+
+def clear_public_rate_limit(action, email="", client_id=""):
+    """Clear the current successful login/code-completion buckets without exposing their raw keys."""
+    policy = PUBLIC_RATE_POLICIES.get(str(action))
+    if not policy:
+        return
+    window_s = policy[0]
+    values = [("client", str(client_id or "unknown"))]
+    if _norm(email):
+        values.append(("account", _norm(email)))
+    with _conn() as c, c.cursor() as cur:
+        for dimension, value in values:
+            cur.execute("DELETE FROM auth_rate_limits WHERE action=%s AND key_hash=%s AND bucket=%s",
+                        (action, _rate_key(action, dimension, value), int(time.time()) // window_s))
+        c.commit()
+
+
+def create_session(tenant_id, email):
+    """Mint a revocable opaque browser session. Only its SHA-256 digest reaches Postgres."""
+    _ensure()
+    token = secrets.token_urlsafe(32)
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM auth_sessions WHERE expires_at <= now()")
+        cur.execute("""INSERT INTO auth_sessions(token_hash,tenant_id,email,expires_at)
+                       VALUES (%s,%s,%s,now() + (%s * interval '1 day'))""",
+                    (_opaque_hash(token), tenant_id, _norm(email), max(1, SESSION_TTL_DAYS)))
+        c.commit()
+    return token
+
+
+def tenant_for_session(token):
+    """Resolve a live verified-account session, touching last_seen at most twice per day."""
+    if not token:
+        return None
+    _ensure()
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""SELECT s.tenant_id, s.last_seen < now() - interval '12 hours'
+                         FROM auth_sessions s JOIN accounts a
+                           ON a.tenant_id=s.tenant_id AND a.email=s.email
+                        WHERE s.token_hash=%s AND s.expires_at > now() AND a.verified=true
+                        LIMIT 1""", (_opaque_hash(token),))
+        row = cur.fetchone()
+        if row and row[1]:
+            cur.execute("UPDATE auth_sessions SET last_seen=now() WHERE token_hash=%s", (_opaque_hash(token),))
+            c.commit()
+    return row[0] if row else None
+
+
+def revoke_session(token):
+    if not token:
+        return
+    _ensure()
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM auth_sessions WHERE token_hash=%s", (_opaque_hash(token),))
+        c.commit()
+
+
+def revoke_tenant_sessions(tenant_id):
+    _ensure()
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM auth_sessions WHERE tenant_id=%s", (tenant_id,))
+        c.commit()
+
+
 def _ntfy_configured():
     """Is the self-hosted ntfy 'ping my phone' channel wired (a real topic, not the placeholder)?"""
     try:
@@ -107,7 +253,7 @@ def _ntfy_configured():
 
 def _email_configured():
     """Is a real email provider wired up? Gated like Stripe/OAuth — off by default on a self-host."""
-    return bool(os.environ.get("AOS_SMTP_URL") or os.environ.get("SENDGRID_API_KEY"))
+    return bool(get("AOS_SMTP_URL") or get("SENDGRID_API_KEY"))
 
 
 def _notify_configured():
@@ -119,9 +265,9 @@ def _notify_configured():
 def _channels():
     """Human-readable list of the delivery channels currently wired (for status/nudge copy)."""
     ch = []
-    if os.environ.get("AOS_SMTP_URL"):
+    if get("AOS_SMTP_URL"):
         ch.append("email (SMTP)")
-    if os.environ.get("SENDGRID_API_KEY"):
+    if get("SENDGRID_API_KEY"):
         ch.append("email (SendGrid)")
     if _ntfy_configured():
         ch.append("ntfy push")
@@ -146,10 +292,10 @@ def _send_over_channels(email, subject, body):
     """Best-effort REAL delivery over whatever is wired (email first, then ntfy push). Returns True if ANY
     channel accepted the message; False (the bare self-host default) tells the caller to surface dev_code
     instead. Never raises."""
-    frm = os.environ.get("AOS_SMTP_FROM", "no-reply@agent-os.local")
+    frm = get("AOS_SMTP_FROM", "no-reply@agent-os.local")
     sent = False
     try:
-        url = os.environ.get("AOS_SMTP_URL")
+        url = get("AOS_SMTP_URL")
         if url:
             import smtplib
             import ssl
@@ -173,7 +319,7 @@ def _send_over_channels(email, subject, body):
     except Exception:
         pass
     try:
-        key = os.environ.get("SENDGRID_API_KEY")
+        key = get("SENDGRID_API_KEY")
         if not sent and key:
             import requests
             r = requests.post(
@@ -224,7 +370,7 @@ def _issue_code(email, purpose="verify"):
     purpose), then try to deliver it. Returns dev_code (the plaintext code) when NO channel is configured,
     else None."""
     code = _gen_code()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""INSERT INTO email_codes (email, code_hash, purpose, expires_at)
                        VALUES (%s, %s, %s, now() + interval '15 minutes')
                        ON CONFLICT (email, purpose) DO UPDATE
@@ -250,21 +396,20 @@ def signup(email, password, name=None, plan="free"):
     if not password or len(password) < 8:
         return {"error": "password must be at least 8 characters"}
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM accounts WHERE email=%s", (email,))
         if cur.fetchone():
             return {"error": "an account with that email already exists — sign in instead"}
     reg = billing.signup(name or email.split("@")[0], plan)          # creates the tenant + token
     tid = reg["tenant_id"]
     salt = os.urandom(16).hex()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         # account is created UNVERIFIED — the tenant token is withheld until verify_email() succeeds
         cur.execute("""INSERT INTO accounts (email, tenant_id, name, pw_salt, pw_hash, verified)
                        VALUES (%s,%s,%s,%s,%s, false)""", (email, tid, name, salt, _hash(password, salt)))
-        c.commit()
     dev_code = _issue_code(email)
     audit.append(actor="auth", action="SignUp", resource=tid, decision="pending_verification",
-                 payload={"email": email})
+                 payload={"email": email}, tenant_id=tid)
     return {"pending_verification": True, "email": email, "dev_code": dev_code,
             "notify_configured": _notify_configured()}
 
@@ -273,7 +418,7 @@ def _tenant_token(tid):
     """Read a tenant's current api token + plan. Best-effort — a missing tenants row/col yields (None,'free')
     rather than raising, so verify/reset still return a usable dict."""
     token, plan = None, "free"
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         try:
             cur.execute("SELECT api_token, plan FROM tenants WHERE tenant_id=%s", (tid,))
             r = cur.fetchone()
@@ -289,7 +434,7 @@ def verify_email(email, code):
     (same shape signup used to return) so the UI can log them straight in. On a bad/expired code: error."""
     email = _norm(email)
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT code_hash, attempts FROM email_codes WHERE email=%s AND purpose='verify' AND expires_at > now()",
                     (email,))
         row = cur.fetchone()
@@ -312,7 +457,7 @@ def verify_email(email, code):
     tid = arow[0]
     token, plan = _tenant_token(tid)
     audit.append(actor="auth", action="VerifyEmail", resource=tid, decision="verified",
-                 payload={"email": email})
+                 payload={"email": email}, tenant_id=tid)
     return {"tenant_id": tid, "api_token": token, "email": email, "plan": plan}
 
 
@@ -321,7 +466,7 @@ def resend_code(email):
     so we don't leak which addresses have pending accounts."""
     email = _norm(email)
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT verified FROM accounts WHERE email=%s", (email,))
         row = cur.fetchone()
     if not row or row[0]:
@@ -336,7 +481,7 @@ def issue_reset(email):
     signup verification does; with a channel wired, dev_code is None and the code goes to email/ntfy."""
     email = _norm(email)
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM accounts WHERE email=%s", (email,))
         exists = cur.fetchone()
     if not exists:
@@ -354,7 +499,7 @@ def verify_reset(email, code, new_password):
     if not new_password or len(new_password) < 8:
         return {"error": "password must be at least 8 characters"}
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT code_hash, attempts FROM email_codes WHERE email=%s AND purpose='reset' AND expires_at > now()",
                     (email,))
         row = cur.fetchone()
@@ -373,20 +518,24 @@ def verify_reset(email, code, new_password):
         cur.execute("DELETE FROM email_codes WHERE email=%s AND purpose='reset'", (email,))   # single-use
         cur.execute("SELECT tenant_id FROM accounts WHERE email=%s", (email,))
         arow = cur.fetchone()
+        if arow:
+            # A password reset is also a credential-compromise boundary: revoke every existing browser
+            # session before issuing the caller a fresh one at the HTTP layer.
+            cur.execute("DELETE FROM auth_sessions WHERE tenant_id=%s", (arow[0],))
         c.commit()
     if not arow:
         return {"error": "that code is wrong or expired — resend a new one"}
     tid = arow[0]
     token, plan = _tenant_token(tid)
     audit.append(actor="auth", action="ResetPassword", resource=tid, decision="reset",
-                 payload={"email": email})
+                 payload={"email": email}, tenant_id=tid)
     return {"tenant_id": tid, "api_token": token, "email": email, "plan": plan}
 
 
 def login(email, password):
     email = _norm(email)
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT tenant_id, pw_salt, pw_hash, verified FROM accounts WHERE email=%s", (email,))
         row = cur.fetchone()
     if not row:
@@ -404,13 +553,13 @@ def login(email, password):
     except Exception:
         token = None
     if not token:                                                    # fall back to reading the token store
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with tenant_connection(tid) as c, c.cursor() as cur:
             try:
                 cur.execute("SELECT api_token FROM tenants WHERE tenant_id=%s", (tid,))
                 r = cur.fetchone(); token = r[0] if r else None
             except Exception:
                 token = None
-    audit.append(actor="auth", action="LogIn", resource=tid, decision="ok", payload={"email": email})
+    audit.append(actor="auth", action="LogIn", resource=tid, decision="ok", payload={"email": email}, tenant_id=tid)
     return {"tenant_id": tid, "api_token": token, "email": email}
 
 
@@ -433,8 +582,8 @@ def provider_resolved(tid):
     except Exception:
         return True                                                  # resolver infra error => fail OPEN
     if not r or not r.get("provider"):
-        return False                                                 # nothing connected => platform default
-    return r.get("auth_mode") == "subscription" or bool(r.get("key"))
+        return False
+    return r.get("auth_mode") in {"subscription", "default_cli"} or bool(r.get("key"))
 
 
 def _selftest():
@@ -455,10 +604,12 @@ def _selftest():
         wrong_code = "000000" if code != "000000" else "111111"
         badcode = verify_email(email, wrong_code)                    # wrong code rejected
         ver = verify_email(email, code)                              # right code -> normal token dict
+        browser_session = create_session(ver["tenant_id"], email)
+        session_live = tenant_for_session(browser_session) == ver["tenant_id"]
         good = login(email, "correct-horse-battery")                 # verified account can now log in + get a token
         wrong = login(email, "nope")                                 # wrong password rejected
         nouser = login("ghost@example.com", "whatever")
-        no_prov = provider_resolved(ver["tenant_id"])                # fresh account, nothing connected -> NOT resolved
+        provider_state = provider_resolved(ver["tenant_id"])         # may resolve to the configured host default
         no_tenant = provider_resolved("")                            # no tenant in context -> not gated (resolved)
         # --- password reset (Forgot password?) ---
         rst = issue_reset(email)                                     # existing account -> code issued
@@ -469,8 +620,19 @@ def _selftest():
         rshort = verify_reset(email, rcode, "short")                 # too-short new password rejected
         old_still = login(email, "correct-horse-battery")            # neither failed attempt changed the password
         rok = verify_reset(email, rcode, "brand-new-password")       # right code -> password changed + token
+        reset_revoked = tenant_for_session(browser_session) is None  # reset invalidates sessions stolen before reset
+        logout_session = create_session(ver["tenant_id"], email)
+        revoke_session(logout_session)
+        logout_revoked = tenant_for_session(logout_session) is None
         new_login = login(email, "brand-new-password")               # new password works
         old_login = login(email, "correct-horse-battery")            # old password no longer works
+        rate_client = "selftest-" + os.urandom(4).hex()
+        account_limit = PUBLIC_RATE_POLICIES["login"][2]
+        rate_results = [public_rate_limit("login", email, rate_client)
+                        for _ in range(account_limit + 1)]
+        rate_bounded = all(item["allowed"] for item in rate_results[:account_limit]) \
+            and not rate_results[-1]["allowed"] and rate_results[-1]["retry_after_s"] > 0
+        clear_public_rate_limit("login", email, rate_client)
         nstat = notify_status()                                      # onboarding nudge surface, honest + graceful
         passed = (bad.get("error")
                   and pend.get("pending_verification") is True and not pend.get("api_token")
@@ -479,9 +641,10 @@ def _selftest():
                   and "verify" in (blocked.get("error") or "") and not blocked.get("api_token")
                   and badcode.get("error") and not badcode.get("api_token")
                   and ver.get("api_token") and ver.get("tenant_id")
+                  and session_live and reset_revoked and logout_revoked and rate_bounded
                   and good.get("tenant_id") == ver["tenant_id"] and good.get("api_token")
                   and wrong.get("error") == _BAD_LOGIN and nouser.get("error")
-                  and no_prov is False and no_tenant is True
+                  and isinstance(provider_state, bool) and no_tenant is True
                   and rst.get("ok") and not ghost_rst.get("dev_code")
                   and rbad.get("error") and rshort.get("error")
                   and old_still.get("api_token")
@@ -493,17 +656,19 @@ def _selftest():
               f"dup-blocked={bool(dup.get('error'))} "
               f"unverified-login-blocked={'verify' in (blocked.get('error') or '')} "
               f"wrong-code-rejected={bool(badcode.get('error'))} verify-token={bool(ver.get('api_token'))} "
+              f"session-live={session_live} reset-revoked={reset_revoked} logout-revoked={logout_revoked} "
+              f"rate-bounded={rate_bounded} "
               f"verified-login-token={bool(good.get('api_token'))} wrong-pw={wrong.get('error')==_BAD_LOGIN} "
-              f"provider-gate(none={no_prov},no-tenant={no_tenant}) "
+              f"provider-gate(account={provider_state},no-tenant={no_tenant}) "
               f"reset-issued={bool(rst.get('ok'))} no-leak={not ghost_rst.get('dev_code')} "
               f"reset-badcode={bool(rbad.get('error'))} reset-shortpw={bool(rshort.get('error'))} "
               f"reset-token={bool(rok.get('api_token'))} newpw-works={bool(new_login.get('api_token'))} "
               f"oldpw-dead={old_login.get('error')==_BAD_LOGIN} notify-cfg={nstat.get('configured')}")
-        print("PASS: email-verified accounts + password reset (signup→verify→login→reset→relogin) ✅"
+        print("PASS: verified accounts + rate limits + opaque sessions (signup→verify→login→reset→relogin) ✅"
               if passed else "FAIL")
     finally:
         _send_code, _email_configured = _saved_send, _saved_cfg
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("SELECT tenant_id FROM accounts WHERE email=%s", (email,))
             r = cur.fetchone()
             cur.execute("DELETE FROM email_codes WHERE email=%s", (email,))

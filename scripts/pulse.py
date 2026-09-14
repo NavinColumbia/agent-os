@@ -28,11 +28,13 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
-import psycopg
+import aoscfg
+from dbpool import connection, tenant_connection
 
-from aoscfg import ENV, DB
+DB = aoscfg.DB
 
 # A pulse is "stalled" once it has been silent for cadence * STALL_MULT. The multiplier tolerates one or two
 # slow beats (a heavy model call) before crying stall — silence, not slowness, is the failure signal.
@@ -40,8 +42,19 @@ STALL_MULT = int(os.environ.get("AOS_PULSE_STALL_MULT", "3"))
 DEFAULT_CADENCE_S = 90
 
 
+@contextmanager
+def _connection(tenant_id=None):
+    """Tenant-scoped when the caller knows the tenant; otherwise a platform/operator connection."""
+    if tenant_id:
+        with tenant_connection(tenant_id) as c:
+            yield c
+    else:
+        with connection() as c:
+            yield c
+
+
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _connection() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS agent_pulse (
                          work_id            TEXT PRIMARY KEY,
                          kind               TEXT NOT NULL,
@@ -57,7 +70,6 @@ def _ensure():
                          finished_at        TIMESTAMPTZ,
                          result             JSONB)""")
         cur.execute("CREATE INDEX IF NOT EXISTS agent_pulse_status_idx ON agent_pulse (status, last_beat DESC)")
-        c.commit()
 
 
 def start(work_id, kind, label="", tenant_id=None, expected_cadence_s=DEFAULT_CADENCE_S, stage=None, meta=None):
@@ -67,7 +79,7 @@ def start(work_id, kind, label="", tenant_id=None, expected_cadence_s=DEFAULT_CA
         return work_id
     try:
         _ensure()
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _connection(tenant_id) as c, c.cursor() as cur:
             cur.execute("""INSERT INTO agent_pulse
                              (work_id, kind, label, tenant_id, expected_cadence_s, stage, meta,
                               status, started_at, last_beat)
@@ -78,7 +90,6 @@ def start(work_id, kind, label="", tenant_id=None, expected_cadence_s=DEFAULT_CA
                              expected_cadence_s=EXCLUDED.expected_cadence_s, stage=EXCLUDED.stage""",
                         (work_id, kind, label, tenant_id, int(expected_cadence_s), stage,
                          json.dumps(meta or {})))
-            c.commit()
     except Exception:
         pass
     return work_id
@@ -93,7 +104,7 @@ def beat(work_id, stage=None, progress=None, meta=None, status="active",
         return
     try:
         _ensure()
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _connection(tenant_id) as c, c.cursor() as cur:
             cur.execute("""UPDATE agent_pulse SET last_beat=now(), status=%s,
                              kind=COALESCE(%s,kind), label=COALESCE(%s,label), tenant_id=COALESCE(%s,tenant_id),
                              stage=COALESCE(%s,stage), progress=COALESCE(%s,progress),
@@ -108,7 +119,6 @@ def beat(work_id, stage=None, progress=None, meta=None, status="active",
                                  COALESCE(%s, %s)) ON CONFLICT (work_id) DO NOTHING""",
                             (work_id, kind, label, tenant_id, stage, progress,
                              expected_cadence_s, DEFAULT_CADENCE_S))
-            c.commit()
     except Exception:
         pass
 
@@ -119,18 +129,17 @@ def finish(work_id, status="done", result=None):
         return
     try:
         _ensure()
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _connection() as c, c.cursor() as cur:
             cur.execute("""UPDATE agent_pulse SET status=%s, last_beat=now(), finished_at=now(), result=%s
                            WHERE work_id=%s""",
                         (status, json.dumps(result) if result is not None else None, work_id))
-            c.commit()
     except Exception:
         pass
 
 
 def _rows(include_done_s=0):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _connection() as c, c.cursor() as cur:
         cur.execute("""SELECT work_id, kind, label, tenant_id, status, stage, progress, expected_cadence_s,
                          EXTRACT(EPOCH FROM now()-last_beat)::INT AS beat_age_s,
                          EXTRACT(EPOCH FROM now()-started_at)::INT AS age_s
@@ -150,7 +159,7 @@ def _fleet_rows():
     actor hot path (a synchronous write there perturbs the timing-sensitive supervisor/sibling race). Only
     working/blocked actors in still-running runs. Fail-open if the orchestra tables are absent."""
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _connection() as c, c.cursor() as cur:
             cur.execute("""SELECT a.actor_id, a.role, a.name, a.tenant_id, a.status, a.assignment,
                              EXTRACT(EPOCH FROM now()-a.last_active)::INT AS beat_age_s,
                              EXTRACT(EPOCH FROM now()-a.hired_at)::INT AS age_s
@@ -164,7 +173,9 @@ def _fleet_rows():
                             "label": f"{role} · {name}", "tenant_id": tid, "status": status,
                             "stage": status, "progress": assignment or "", "expected_cadence_s": cad,
                             "beat_age_s": bage or 0, "age_s": age or 0,
-                            "stalled": (bage or 0) > cad * STALL_MULT})
+                            # A blocked actor is durably waiting on an event/tool/capacity slot; it is not
+                            # expected to heartbeat. Only an actor that claims to be working can go silent.
+                            "stalled": status == "working" and (bage or 0) > cad * STALL_MULT})
             return out
     except Exception:
         return []
@@ -189,7 +200,10 @@ def stalled(mult=None):
     if not DB:
         return []
     try:
-        return [r for r in _rows() if r["status"] == "active" and r["beat_age_s"] > r["expected_cadence_s"] * m]
+        return [r for r in _rows()
+                if r["status"] == "active"
+                and str(r.get("stage") or "").lower() not in {"queued", "waiting_capacity", "admission_wait"}
+                and r["beat_age_s"] > r["expected_cadence_s"] * m]
     except Exception:
         return []
 
@@ -203,10 +217,9 @@ def sweep():
         return 0
     try:
         _ensure()
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _connection() as c, c.cursor() as cur:
             cur.execute("UPDATE agent_pulse SET status='stalled' WHERE work_id = ANY(%s) AND status='active'",
                         ([h["work_id"] for h in hits],))
-            c.commit()
     except Exception:
         pass
     return len(hits)
@@ -224,24 +237,45 @@ REAP_MIN_S = int(os.environ.get("AOS_PULSE_REAP_MIN_S", "900"))     # 15 min flo
 
 
 def reap_orphans():
-    """Finalize non-terminal pulses gone silent past max(cadence*REAP_MULT, REAP_MIN_S) → status='reaped'.
-    Their process is provably gone (dead heartbeat). Returns the count reaped. Fail-open."""
+    """Finalize non-terminal pulses whose durable owner is gone.
+
+    Silence remains the conservative fallback for generic work. Tool-job pulse IDs,
+    however, carry ``run_id:actor_id:tool:attempt``.  A missing/terminal run or
+    actor is stronger evidence than a timer and lets recovery retire queued and
+    stalled ghosts immediately.  The orchestra run-status fence already prevents
+    a late worker from committing after that terminal transition.
+    """
     if not DB:
         return 0
     try:
         _ensure()
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""UPDATE agent_pulse
+        with _connection() as c, c.cursor() as cur:
+            cur.execute("""UPDATE agent_pulse p
                              SET status='reaped', finished_at=now(),
                                  result=COALESCE(result,'{}'::jsonb)
-                                        || jsonb_build_object('reaped_reason','heartbeat dead (process gone) — reconciled',
+                                        || jsonb_build_object('reaped_reason',CASE
+                                               WHEN p.kind='tool-job'
+                                                AND p.work_id ~ '^[0-9]+:[0-9]+:'
+                                               THEN 'durable tool owner is terminal or absent — reconciled'
+                                               ELSE 'heartbeat dead (process gone) — reconciled' END,
                                                               'last_beat_age_s', EXTRACT(EPOCH FROM now()-last_beat)::INT)
-                           WHERE status IN ('active','stalled')
-                             AND EXTRACT(EPOCH FROM now()-last_beat)
-                                 > GREATEST(expected_cadence_s * %s, %s)
+                           WHERE p.status IN ('active','stalled')
+                             AND (EXTRACT(EPOCH FROM now()-p.last_beat)
+                                    > GREATEST(p.expected_cadence_s * %s, %s)
+                                  OR (p.kind='tool-job'
+                                      AND p.work_id ~ '^[0-9]+:[0-9]+:'
+                                      AND NOT EXISTS (
+                                        SELECT 1
+                                          FROM orchestra_runs r
+                                          JOIN orchestra_actors a
+                                            ON a.run_id=r.run_id AND a.tenant_id=r.tenant_id
+                                         WHERE r.run_id=split_part(p.work_id,':',1)::BIGINT
+                                           AND a.actor_id=split_part(p.work_id,':',2)::BIGINT
+                                           AND r.tenant_id=p.tenant_id
+                                           AND r.status='running'
+                                           AND a.status NOT IN ('done','dead'))))
                            RETURNING work_id""", (REAP_MULT, REAP_MIN_S))
             n = len(cur.fetchall())
-            c.commit()
         return n
     except Exception:
         return 0
@@ -284,7 +318,7 @@ def _selftest():
     finish(wid, status="done", result={"ok": True})
     assert not any(r["work_id"] == wid for r in live()), "a finished pulse must leave the live view"
     # cleanup
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _connection() as c, c.cursor() as cur:
         cur.execute("DELETE FROM agent_pulse WHERE work_id=%s", (wid,))
         c.commit()
     print("pulse selftest: PASS (start->beat->live->stall-on-silence->beat-clears->finish->gone)")

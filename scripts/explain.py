@@ -15,10 +15,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import psycopg  # noqa: E402
-import trace as _trace  # noqa: E402
-
-DB = _trace.DB
+from dbpool import connection, tenant_connection  # noqa: E402
 
 
 def _gist(text, n=160):
@@ -26,23 +23,30 @@ def _gist(text, n=160):
     return (t[:n] + "…") if len(t) > n else t
 
 
-def trail(product, limit=20):
+def trail(product, limit=20, tenant_id=None):
     """The real decision steps for a product, oldest first: who (role), what stage, a gist of the output,
     and the cost — straight from traces (the ground truth of what the fleet actually did)."""
     if not product:
         return []
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""SELECT role, stage, output, coalesce(cost_usd,0), ts
-                       FROM traces WHERE product=%s AND kind='agent'
-                       ORDER BY ts ASC LIMIT %s""", (product, limit))
+    cm = tenant_connection(tenant_id) if tenant_id else connection()
+    with cm as c, c.cursor() as cur:
+        if tenant_id:
+            cur.execute("""SELECT t.role, t.stage, t.output, coalesce(t.cost_usd,0), t.ts
+                           FROM traces t JOIN tenant_products tp ON tp.product=t.product
+                           WHERE tp.tenant_id=%s AND t.product=%s AND t.kind='agent'
+                           ORDER BY t.ts ASC, t.id ASC LIMIT %s""", (tenant_id, product, limit))
+        else:
+            cur.execute("""SELECT role, stage, output, coalesce(cost_usd,0), ts
+                           FROM traces WHERE product=%s AND kind='agent'
+                           ORDER BY ts ASC, id ASC LIMIT %s""", (product, limit))
         return [{"role": r, "stage": s, "did": _gist(o), "cost_usd": round(float(cost), 4),
                  "at": ts.isoformat() if ts else None} for r, s, o, cost, ts in cur.fetchall()]
 
 
-def explain(product, api_key=None):
+def explain(product, api_key=None, tenant_id=None):
     """Grounded plain-language 'why' over the trail. Model composes it FROM the steps only; a deterministic
     fallback (still grounded) is used if the model call fails — never blank, never invented."""
-    steps = trail(product)
+    steps = trail(product, tenant_id=tenant_id)
     if not steps:
         return {"product": product, "steps": [], "summary": "No fleet activity is recorded for this product yet."}
     total = round(sum(s["cost_usd"] for s in steps), 4)
@@ -70,6 +74,11 @@ def explain(product, api_key=None):
                        f"{', '.join(stages[:6])} — total AI cost ${total}. Each step's action is listed below."}
 
 
+def explain_for_tenant(tenant_id, product, api_key=None):
+    """Tenant-facing explainability surface: refuses cross-tenant product names by returning no activity."""
+    return explain(product, api_key=api_key, tenant_id=tenant_id)
+
+
 def _selftest():
     import uuid
     import factory
@@ -83,13 +92,12 @@ def _selftest():
         ok = ok and bool(cond)
 
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             for role, stage, out, cost in [("staff-engineer", "PLAN", "Decomposed into 3 modules", 0.04),
                                            ("backend-engineer", "BUILD", "Implemented the money engine with Decimal", 0.21),
                                            ("qa-security", "TESTQA", "Ran 40 tests, all passed", 0.07)]:
                 cur.execute("""INSERT INTO traces (product,stage,role,kind,rc,output,prompt,run_id,cost_usd,ts)
                                VALUES (%s,%s,%s,'agent',0,%s,'p',555001,%s,now())""", (prod, stage, role, out, cost))
-            c.commit()
 
         t = trail(prod)
         chk(len(t) == 3 and t[0]["role"] == "staff-engineer" and "Decomposed" in t[0]["did"]
@@ -113,9 +121,8 @@ def _selftest():
         print("PASS: explain — grounded 'why did the AI do X' from the real trace trail ✅" if ok else "FAIL")
     finally:
         factory.agent = real
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM traces WHERE product=%s", (prod,))
-            c.commit()
     return ok
 
 

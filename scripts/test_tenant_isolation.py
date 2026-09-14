@@ -40,8 +40,10 @@ def _seed(tag):
     prod = f"iso-{tag}-{uuid.uuid4().hex[:6]}"
     with psycopg.connect(DB) as c, c.cursor() as cur:
         cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s)", (prod, tid))
-        cur.execute("""INSERT INTO tasks (assignee, requester, role, title, status, attempts, max_retry)
-                       VALUES (%s,'iso','builder','dead one','dead',3,3) RETURNING id""", (f"builder@{prod}",))
+        cur.execute("""INSERT INTO tasks
+                         (tenant_id,assignee,requester,role,title,status,attempts,max_retry)
+                       VALUES (%s,%s,'iso','builder','dead one','dead',3,3) RETURNING id""",
+                    (tid, f"builder@{prod}"))
         dead_id = cur.fetchone()[0]
         cur.execute("""INSERT INTO traces (product, stage, role, kind, rc, output, prompt, run_id, cost_usd, ts)
                        VALUES (%s,'BUILD','builder','agent',0,'built','p',900900,0.1,now())""", (prod,))

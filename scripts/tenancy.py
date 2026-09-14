@@ -12,17 +12,14 @@ import secrets
 import sys
 from pathlib import Path
 
-import psycopg
-
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection
 
 
 def create_tenant(name):
     tid = "t-" + secrets.token_hex(4)
     tok = "aos_" + secrets.token_hex(20)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("INSERT INTO tenants (tenant_id, name, api_token) VALUES (%s,%s,%s)", (tid, name, tok))
-        c.commit()
     return {"tenant_id": tid, "name": name, "api_token": tok}
 
 
@@ -36,19 +33,18 @@ def tenant_for_token(token):
 
 
 def register_product(product, tenant_id):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (product, tenant_id))
-        c.commit()
 
 
 def owns(tenant_id, product):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("SELECT 1 FROM tenant_products WHERE product=%s AND tenant_id=%s", (product, tenant_id))
         return cur.fetchone() is not None
 
 
 def products_of(tenant_id):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s ORDER BY product", (tenant_id,))
         return [r[0] for r in cur.fetchall()]
 
@@ -61,9 +57,9 @@ def _test():
     iso = products_of(a["tenant_id"]) == ["acme-app"] and products_of(b["tenant_id"]) == ["globex-app"]
     cross_denied = (not owns(a["tenant_id"], "globex-app")) and owns(b["tenant_id"], "globex-app")
     bad_token = tenant_for_token("aos_wrong") is None
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("DELETE FROM tenant_products WHERE tenant_id IN (%s,%s)", (a["tenant_id"], b["tenant_id"]))
-        cur.execute("DELETE FROM tenants WHERE tenant_id IN (%s,%s)", (a["tenant_id"], b["tenant_id"])); c.commit()
+        cur.execute("DELETE FROM tenants WHERE tenant_id IN (%s,%s)", (a["tenant_id"], b["tenant_id"]))
     ok = ta and iso and cross_denied and bad_token
     print(f"token→tenant={ta}, isolation={iso}, cross-access-denied={cross_denied}, bad-token-rejected={bad_token}")
     print("PASS: multi-tenant isolation — each tenant sees only their own ✅" if ok else "FAIL")

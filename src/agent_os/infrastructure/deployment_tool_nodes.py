@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Mapping
 
 from agent_os.application.command_worker import FatalCommandError
-from agent_os.application.ports import ApplicationDeployer, Deployer, StaticSiteDeployer
+from agent_os.application.ports import (
+    ApplicationDeployer,
+    Deployer,
+    PreviewDeploymentStore,
+    StaticSiteDeployer,
+)
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowNode
 from agent_os.domain.workflow_runtime import WorkflowAction, WorkflowRunState
 from agent_os.infrastructure.graph_output_refs import resolve_prior_output
@@ -24,6 +29,8 @@ class DeploymentToolNodeHandlers:
 
     def named_handlers(self):
         handlers = {"deploy.preview": self.execute}
+        if isinstance(self._deployer, PreviewDeploymentStore):
+            handlers["preview.fetch"] = self.verify_preview_fetch
         if self._static_deployer is not None:
             handlers["deploy.static"] = self.execute_static
         if self._service_deployer is not None:
@@ -82,10 +89,67 @@ class DeploymentToolNodeHandlers:
         configured = self._success_condition(
             definition, node, subject="preview deployment",
         )
+        evidence = [artifact_id]
+        deployed_artifact_id = result.get("artifact_id")
+        if (
+            isinstance(deployed_artifact_id, str)
+            and deployed_artifact_id
+            and deployed_artifact_id not in evidence
+        ):
+            evidence.append(deployed_artifact_id)
+        evidence.append(receipt_artifact_id)
         return {
             "disposition": "complete",
             "satisfied_conditions": [configured],
-            "evidence_ids": [artifact_id, receipt_artifact_id],
+            "evidence_ids": evidence,
+            "output": result,
+        }
+
+    def verify_preview_fetch(
+        self,
+        tenant_id: str,
+        run_id: str,
+        definition: WorkflowDefinition,
+        state: WorkflowRunState,
+        action: WorkflowAction,
+        node: WorkflowNode,
+    ) -> Mapping[str, object]:
+        del run_id
+        if (
+            node.kind is not NodeKind.TOOL
+            or node.configuration.get("tool") != "preview.fetch"
+            or not isinstance(self._deployer, PreviewDeploymentStore)
+        ):
+            raise FatalCommandError("preview fetch handler received the wrong tool node")
+        public_url = resolve_prior_output(
+            state, node.configuration.get("source"), subject="preview fetch",
+        )
+        if not isinstance(public_url, str) or not public_url:
+            raise FatalCommandError("preview fetch source is not a public URL")
+        result = dict(self._deployer.verify_fetch(
+            organization_id=tenant_id,
+            public_url=public_url,
+            idempotency_key=action.action_id,
+        ))
+        evidence_id = result.get("verification_artifact_id")
+        artifact_id = result.get("artifact_id")
+        if not isinstance(evidence_id, str) or not evidence_id:
+            raise FatalCommandError("preview fetch returned no durable verification evidence")
+        condition_key = "success_condition" if result.get("verified") is True else "failure_condition"
+        available = {
+            edge.condition for edge in definition.outgoing(node.node_id)
+            if edge.condition != "always"
+        }
+        condition = node.configuration.get(condition_key)
+        if not isinstance(condition, str) or condition not in available:
+            raise FatalCommandError(f"preview fetch {condition_key} is not declared")
+        evidence = [evidence_id]
+        if isinstance(artifact_id, str) and artifact_id:
+            evidence.insert(0, artifact_id)
+        return {
+            "disposition": "complete",
+            "satisfied_conditions": [condition],
+            "evidence_ids": evidence,
             "output": result,
         }
 

@@ -19,6 +19,8 @@ What it observes (each returns watchdog-shaped issues {sig, level, msg}):
      still-running run but whose heartbeat (store.heartbeat -> last_active) went silent: the actor
      runtime beats every live actor on a cadence while it works, so silence = a silently-dead employee
      holding an assignment. This is heartbeat liveness on *agentic work in progress* (NORTH-STAR).
+  3c. STUCK ORCHESTRA STEP LEASE — an actor-level single-flight claim older than the lease window, meaning a
+     runtime worker likely died mid-step and another process is waiting for reclaim.
   4. (side-effect) PROACTIVE PROGRESS PING — while agent work is ACTIVE and healthy for a long time,
      periodically tell the owner "fleet still working: N agents, oldest Xm" so long work never looks dead.
   5. (side-effect) BOOT NOTICE — after an OS/WSL restart, announce "system restarted, stack recovered"
@@ -39,8 +41,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "orchestra"))
-import psycopg  # noqa: E402
 
+from dbpool import connection  # noqa: E402
 import trace as _trace  # noqa: E402  — same .env.local-sourced DATABASE_URL every other module uses
 import store as _store  # noqa: E402  — the durable org (orchestra actors + heartbeats)
 DB = _trace.DB
@@ -55,24 +57,29 @@ DB_LOCK_PILEUP = int(os.environ.get("AOS_SENTINEL_DB_LOCK_PILEUP", "8"))     # t
 SESSION_BURN_WARN = int(os.environ.get("AOS_SENTINEL_BURN_WARN", "4000000")) # output tokens/hr that says "approaching the session cap"
 PROGRESS_EVERY_S = int(os.environ.get("AOS_SENTINEL_PROGRESS_S", "3600"))  # "still working" ping cadence
 _TRANSIENT_SQL = "(output ~* 'overloaded|rate.?limit|too many requests|529|429' OR rc <> 0)"
+_LIVE_TRACE_SQL = "NOT COALESCE(test_run, FALSE)"
 CLAUDE_DIR = Path(os.environ.get("AOS_CLAUDE_DIR", str(Path.home() / ".claude" / "projects")))
 
 
+def _conn(autocommit=False):
+    return connection(autocommit=autocommit)
+
+
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("CREATE TABLE IF NOT EXISTS sentinel_state (key TEXT PRIMARY KEY, val TEXT, ts TIMESTAMPTZ DEFAULT now())")
         c.commit()
 
 
 def _state_get(key):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("SELECT val, EXTRACT(EPOCH FROM now()-ts) FROM sentinel_state WHERE key=%s", (key,))
         r = cur.fetchone()
         return (r[0], float(r[1])) if r else (None, None)
 
 
 def _state_set(key, val):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""INSERT INTO sentinel_state (key, val, ts) VALUES (%s,%s,now())
                        ON CONFLICT (key) DO UPDATE SET val=EXCLUDED.val, ts=now()""", (key, str(val)))
         c.commit()
@@ -84,13 +91,21 @@ def _agent_procs():
         p = subprocess.run(["ps", "-eo", "pid,etimes,args"], capture_output=True, text=True, timeout=15)
     except Exception:
         return []
+    ancestors = set()
+    parent = os.getpid()
+    while parent > 1 and parent not in ancestors:
+        ancestors.add(parent)
+        try:
+            parent = int((Path("/proc") / str(parent) / "stat").read_text().split()[3])
+        except Exception:
+            break
     out = []
     for line in (p.stdout or "").splitlines()[1:]:
         parts = line.strip().split(None, 2)
         if len(parts) < 3:
             continue
         pid, etimes, args = parts
-        if ("claude -p" in args or "codex exec" in args) and "--continue" not in args:
+        if int(pid) not in ancestors and ("claude -p" in args or "codex exec" in args) and "--continue" not in args:
             try:
                 out.append((int(pid), int(etimes) / 60.0, args[:90]))
             except ValueError:
@@ -143,8 +158,9 @@ def observe(wf_root=None, notify_fn=None, now=None):
     # "usage limit" / "resets") = HARD STOP, heavy work fails until reset — pause new workflows; (b) a high
     # BURN RATE (output tokens/hr) = approaching the wall, a heads-up to pace before we hit it.
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("""SELECT count(*) FROM traces WHERE ts > now()-interval '20 minutes'
+        with _conn() as c, c.cursor() as cur:
+            cur.execute(f"""SELECT count(*) FROM traces WHERE ts > now()-interval '20 minutes'
+                           AND {_LIVE_TRACE_SQL}
                            AND output ~* 'session limit|usage limit|hit your .* limit|limit .* resets'""")
             capped = cur.fetchone()[0]
             if capped:
@@ -152,7 +168,8 @@ def observe(wf_root=None, notify_fn=None, now=None):
                                "msg": f"⛔ SESSION USAGE CAP reached ({capped} cap-hit(s) in 20m) — heavy work "
                                       f"(builds/workflows) will FAIL until the account's 5h window resets. "
                                       f"Pause new fleets; resume after reset (workflows resume from their runId)."})
-            cur.execute("SELECT coalesce(sum(tokens_out),0) FROM traces WHERE ts > now()-interval '60 minutes'")
+            cur.execute(f"SELECT coalesce(sum(tokens_out),0) FROM traces WHERE ts > now()-interval '60 minutes' "
+                        f"AND {_LIVE_TRACE_SQL}")
             burn = int(cur.fetchone()[0])
             if burn >= SESSION_BURN_WARN:
                 issues.append({"sig": "sentinel:session-burn", "level": "warn",
@@ -163,8 +180,9 @@ def observe(wf_root=None, notify_fn=None, now=None):
 
     # 3) provider degraded — burst of transient failures in recent traces
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute(f"SELECT count(*) FROM traces WHERE ts > now()-interval '15 minutes' AND {_TRANSIENT_SQL}")
+        with _conn() as c, c.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM traces WHERE ts > now()-interval '15 minutes' "
+                        f"AND {_LIVE_TRACE_SQL} AND {_TRANSIENT_SQL}")
             n = cur.fetchone()[0]
             if n >= PROVIDER_BURST:
                 issues.append({"sig": "sentinel:provider-degraded", "level": "warn",
@@ -183,18 +201,24 @@ def observe(wf_root=None, notify_fn=None, now=None):
                            "msg": f"orchestra actor {a['name']} ({a['role']}, run {a['run_id']}) says "
                                   f"'working' but has been silent {a['stale_min']}m — possible dead "
                                   f"agent holding an assignment (tenant {a['tenant_id']})"})
+        for a in _store.stale_step_claims(ACTOR_STALE_MIN):
+            issues.append({"sig": f"sentinel:actor-step-lease:{a['actor_id']}", "level": "warn",
+                           "msg": f"orchestra actor {a['name']} ({a['role']}, run {a['run_id']}) has held "
+                                  f"a step lease for {a['stale_min']}m by {a['claimed_by']} — another runtime "
+                                  f"process may be waiting for crash reclaim (tenant {a['tenant_id']})"})
     except Exception:
         pass
 
-    # 3b-ii) STUCK / LOOPING BUILD — a product still spawning agents (traces in the last 20m) but that has
+    # 3d) STUCK / LOOPING BUILD — a product still spawning agents (traces in the last 20m) but that has
     # been "building" for BUILD_STUCK_H+ hours and NEVER reached a terminal ProductComplete (LAUNCHED/BLOCKED/
     # FAILED). A real build finishes in well under an hour; hours of continuous agents with no verdict is a
     # poison-phase retry loop that makes no noise while it burns agents/tokens. WARN (observe, don't kill).
     try:
-        with psycopg.connect(DB, autocommit=True) as c, c.cursor() as cur:
+        with _conn(autocommit=True) as c, c.cursor() as cur:
             cur.execute("""SELECT t.product, count(*), round(extract(epoch from now()-min(t.ts))/3600, 1)
                            FROM traces t
-                           WHERE t.kind='agent'
+                           WHERE t.kind='agent' AND NOT COALESCE(t.test_run, FALSE)
+                             AND (t.run_id LIKE 'build-%' OR t.run_id LIKE 'proj-%')
                            GROUP BY t.product
                            HAVING max(t.ts) > now() - interval '20 minutes'
                               AND min(t.ts) < now() - make_interval(hours => %s)
@@ -214,16 +238,16 @@ def observe(wf_root=None, notify_fn=None, now=None):
     # idle-in-transaction older than the threshold, and flag a lock-wait pileup. Safe + idempotent — a healthy
     # app connection commits in milliseconds, so anything idle-in-txn for minutes is a leak, never live work.
     try:
-        with psycopg.connect(DB, autocommit=True) as c, c.cursor() as cur:
+        with _conn(autocommit=True) as c, c.cursor() as cur:
             cur.execute("""SELECT count(*) FROM pg_stat_activity
                            WHERE state='idle in transaction'
-                             AND query_start < now() - make_interval(mins => %s)
+                             AND state_change < now() - make_interval(mins => %s)
                              AND pid <> pg_backend_pid()""", (DB_TXN_STALE_MIN,))
             stale = cur.fetchone()[0]
             if stale:
                 cur.execute("""SELECT pg_terminate_backend(pid) FROM pg_stat_activity
                                WHERE state='idle in transaction'
-                                 AND query_start < now() - make_interval(mins => %s)
+                                 AND state_change < now() - make_interval(mins => %s)
                                  AND pid <> pg_backend_pid()""", (DB_TXN_STALE_MIN,))
                 killed = cur.rowcount
                 issues.append({"sig": "sentinel:db-hang-healed", "level": "warn", "_healed": True,
@@ -311,8 +335,9 @@ def _selftest():
     after = len([s for s in sent if "still working" in s])
     assert after == before, "progress ping ignored its cooldown"
     # (d) provider-degraded query is well-formed (runs without error)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute(f"SELECT count(*) FROM traces WHERE ts > now()-interval '15 minutes' AND {_TRANSIENT_SQL}")
+    with _conn() as c, c.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM traces WHERE ts > now()-interval '15 minutes' "
+                    f"AND {_LIVE_TRACE_SQL} AND {_TRANSIENT_SQL}")
         cur.fetchone()
     # (e) a stuck orchestra actor is flagged: seed a REAL durable-org run with a 'working' actor
     # whose heartbeat we backdate (a silently-dead employee), assert observe() raises the issue,
@@ -323,7 +348,7 @@ def _selftest():
     a = _store.spawn_actor(orc, stid, "researcher-x", "research-growth", kind="worker")
     _store.update_actor(a["actor_id"], stid, status="working")
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:   # simulate silence: backdate the beat
+        with _conn() as c, c.cursor() as cur:   # simulate silence: backdate the beat
             cur.execute("UPDATE orchestra_actors SET last_active=now()-interval '30 minutes' "
                         "WHERE actor_id=%s", (a["actor_id"],))
             c.commit()
@@ -335,13 +360,24 @@ def _selftest():
         _store.heartbeat(a["actor_id"], stid)               # the actor beats -> it is alive, not stuck
         iss3 = observe(wf_root="/nonexistent", notify_fn=fake_notify)
         assert not [i for i in iss3 if i["sig"] == sig], "heartbeat did not clear the stuck-actor issue"
+        assert _store.claim_actor_step(a["actor_id"], stid, claimed_by="sentinel-selftest", lease_s=60)
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("UPDATE orchestra_actors SET step_claimed_at=now()-interval '30 minutes' "
+                        "WHERE actor_id=%s", (a["actor_id"],))
+            c.commit()
+        iss4 = observe(wf_root="/nonexistent", notify_fn=fake_notify)
+        lease_sig = f"sentinel:actor-step-lease:{a['actor_id']}"
+        lease_hit = [i for i in iss4 if i["sig"] == lease_sig]
+        assert lease_hit and "step lease" in lease_hit[0]["msg"], \
+            f"stale actor step lease not flagged: {iss4}"
+        _store.release_actor_step(a["actor_id"], stid, claimed_by="sentinel-selftest")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("DELETE FROM orchestra_actors WHERE tenant_id=%s", (stid,))
             cur.execute("DELETE FROM orchestra_runs WHERE tenant_id=%s", (stid,))
             c.commit()
     print("PASS: sentinel — silent-failure observer (stale-workflow, hung-agent, provider-burst, "
-          "stuck-orchestra-actor heartbeat, deduped progress ping, boot notice) ✅")
+          "stuck-orchestra-actor heartbeat, stale actor-step lease, deduped progress ping, boot notice) ✅")
 
 
 def report():
@@ -354,14 +390,16 @@ def report():
     print(f"  ({len(procs)} running)")
     print("── real agent runs + spend (traces, last 6h — factory work the workflow meter misses) ──")
     try:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("""SELECT count(*), coalesce(sum(cost_usd),0), coalesce(sum(tokens_in),0),
                                   coalesce(sum(tokens_out),0), count(*) FILTER (WHERE rc<>0)
-                           FROM traces WHERE kind='agent' AND ts > now()-interval '6 hours'""")
+                           FROM traces WHERE kind='agent' AND ts > now()-interval '6 hours'
+                             AND NOT COALESCE(test_run, FALSE)""")
             n, usd, tin, tout, bad = cur.fetchone()
             print(f"  {n} agent runs · ${float(usd):.2f} · {int(tin):,} in / {int(tout):,} out · {bad} failed")
             cur.execute("""SELECT product, stage, ts::time(0), rc FROM traces
-                           WHERE kind='agent' ORDER BY ts DESC LIMIT 5""")
+                           WHERE kind='agent' AND NOT COALESCE(test_run, FALSE)
+                           ORDER BY ts DESC LIMIT 5""")
             for prod, stage, ts, rc in cur.fetchall():
                 print(f"  {ts} {prod or '-'}:{stage or '-'} rc={rc}")
     except Exception as e:
@@ -377,7 +415,7 @@ def report():
         print(f"  (pool stats unavailable: {e})")
     # idle-in-transaction is the hang canary ([[hang-resilience]]) — surface it in the one-look report too
     try:
-        with psycopg.connect(DB, autocommit=True) as c, c.cursor() as cur:
+        with _conn(autocommit=True) as c, c.cursor() as cur:
             cur.execute("SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction'")
             it = cur.fetchone()[0]
             cur.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock'")

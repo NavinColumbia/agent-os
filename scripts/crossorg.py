@@ -24,18 +24,19 @@ import json
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit  # noqa: E402
 import orgs   # noqa: E402
+from dbpool import connection, tenant_connection  # noqa: E402
 
-from aoscfg import ENV, DB
+
+def _conn(tenant_id=None):
+    return tenant_connection(tenant_id) if tenant_id else connection()
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS xorg_ops (
             id BIGSERIAL PRIMARY KEY, tenant_id TEXT, kind TEXT, source_org BIGINT, target_org BIGINT,
             feature TEXT, status TEXT DEFAULT 'proposed', plan JSONB, result JSONB,
@@ -43,11 +44,11 @@ def _ensure():
         cur.execute("""CREATE TABLE IF NOT EXISTS org_lineage (
             id BIGSERIAL PRIMARY KEY, org_id BIGINT, derived_from BIGINT, note TEXT,
             at TIMESTAMPTZ DEFAULT now())""")
-        c.commit()
+        cur.execute("ALTER TABLE org_lineage ADD COLUMN IF NOT EXISTS tenant_id TEXT")
 
 
 def _row(op_id):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""SELECT id, tenant_id, kind, source_org, target_org, feature, status, plan, result,
                               created_at FROM xorg_ops WHERE id=%s""", (op_id,))
         r = cur.fetchone()
@@ -67,14 +68,14 @@ def propose(tenant_id, kind, source_org, target_org=None, feature=None):
         return {"error": "source_org not your org"}
     if target_org is not None and orgs.get(tenant_id, target_org).get("error"):
         return {"error": "target_org not your org"}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO xorg_ops (tenant_id, kind, source_org, target_org, feature, status)
                        VALUES (%s,%s,%s,%s,%s,'proposed') RETURNING id""",
                     (tenant_id, kind, source_org, target_org, feature))
-        op_id = cur.fetchone()[0]; c.commit()
+        op_id = cur.fetchone()[0]
     audit.append(actor="crossorg", action="XOrgProposed", resource=str(op_id), decision="proposed",
                  payload={"tenant": tenant_id, "kind": kind, "source": source_org,
-                          "target": target_org, "feature": feature})
+                          "target": target_org, "feature": feature}, tenant_id=tenant_id)
     return {"op_id": op_id, "status": "proposed"}
 
 
@@ -85,12 +86,12 @@ def scope(op_id):
     op = _row(op_id)
     if not op:
         return {"error": "no such op"}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("UPDATE xorg_ops SET status='scoping' WHERE id=%s", (op_id,)); c.commit()
     tid, src, tgt, feat = op["tenant_id"], op["source_org"], op["target_org"], op["feature"]
+    with _conn(tid) as c, c.cursor() as cur:
+        cur.execute("UPDATE xorg_ops SET status='scoping' WHERE id=%s", (op_id,))
     src_brief = orgs.context_brief(tid, src)
     # enumerate the source org's products + artifacts (the "components" available to port).
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tid) as c, c.cursor() as cur:
         cur.execute("SELECT product FROM tenant_products WHERE org_id=%s", (src,))
         src_products = [r[0] for r in cur.fetchall()]
         arts = []
@@ -119,7 +120,7 @@ def scope(op_id):
             ],
         }
     else:  # merge
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn(tid) as c, c.cursor() as cur:
             cur.execute("SELECT product FROM tenant_products WHERE org_id=%s", (tgt,))
             tgt_products = [r[0] for r in cur.fetchall()]
         plan = {
@@ -136,11 +137,11 @@ def scope(op_id):
             ],
         }
 
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tid) as c, c.cursor() as cur:
         cur.execute("UPDATE xorg_ops SET plan=%s, status='planned' WHERE id=%s",
-                    (json.dumps(plan), op_id)); c.commit()
+                    (json.dumps(plan), op_id))
     audit.append(actor="crossorg", action="XOrgScoped", resource=str(op_id), decision="planned",
-                 payload={"kind": op["kind"], "components": len(plan.get("components", []))})
+                 payload={"kind": op["kind"], "components": len(plan.get("components", []))}, tenant_id=tid)
     return {"op_id": op_id, "plan": plan}
 
 
@@ -153,10 +154,11 @@ def request_approval(tenant_id, op_id):
         return {"error": "no such op"}
     if op["tenant_id"] != tenant_id:
         return {"error": "not your op"}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("UPDATE xorg_ops SET status='await_approval' WHERE id=%s", (op_id,)); c.commit()
+    with _conn(tenant_id) as c, c.cursor() as cur:
+        cur.execute("UPDATE xorg_ops SET status='await_approval' WHERE id=%s", (op_id,))
     audit.append(actor="crossorg", action="XOrgAwaitApproval", resource=str(op_id),
-                 decision="await_approval", payload={"tenant": tenant_id, "kind": op["kind"]})
+                 decision="await_approval", payload={"tenant": tenant_id, "kind": op["kind"]},
+                 tenant_id=tenant_id)
     return {"op_id": op_id, "status": "await_approval"}
 
 
@@ -172,34 +174,36 @@ def execute(op_id, confirmed=False):
     if not confirmed:
         return {"requires_confirm": True, "plan": op["plan"], "op_id": op_id}
 
+    tenant_id = op["tenant_id"]
     src, tgt, feat, kind = op["source_org"], op["target_org"], op["feature"], op["kind"]
     derived = tgt if tgt is not None else src
     note = (f"ported '{feat}' from org {src}" if kind == "steal_feature"
             else f"merged from org {src}")
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("UPDATE xorg_ops SET status='executing' WHERE id=%s", (op_id,))
-        cur.execute("""INSERT INTO org_lineage (org_id, derived_from, note) VALUES (%s,%s,%s) RETURNING id""",
-                    (derived, src, note))
+        cur.execute("""INSERT INTO org_lineage (org_id, derived_from, note, tenant_id)
+                       VALUES (%s,%s,%s,%s) RETURNING id""",
+                    (derived, src, note, tenant_id))
         lineage_id = cur.fetchone()[0]
-        c.commit()
     # record the ported intent as a context artifact on the target org (bookkeeping, not code).
     summary = (f"ported {feat} from org {src}" if kind == "steal_feature"
                else f"merged org {src} into this org")
-    art = orgs.record_artifact(derived, "spec", summary, ref=f"xorg:{op_id}")
+    art = orgs.record_artifact(derived, "spec", summary, ref=f"xorg:{op_id}", tenant_id=tenant_id)
     result = {"lineage_id": lineage_id, "artifact_id": art.get("artifact_id"),
               "derived_org": derived, "note": note,
               "boundary": "lineage + spec recorded; actual code port/merge left to a human-approved build step"}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("UPDATE xorg_ops SET status='done', result=%s WHERE id=%s",
-                    (json.dumps(result), op_id)); c.commit()
+                    (json.dumps(result), op_id))
     audit.append(actor="crossorg", action="XOrgExecuted", resource=str(op_id), decision="done",
-                 payload={"kind": kind, "derived_org": derived, "source": src, "lineage_id": lineage_id})
+                 payload={"kind": kind, "derived_org": derived, "source": src, "lineage_id": lineage_id},
+                 tenant_id=tenant_id)
     return {"op_id": op_id, "status": "done", "result": result}
 
 
 def list_ops(tenant_id):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("""SELECT id, kind, source_org, target_org, feature, status, created_at
                        FROM xorg_ops WHERE tenant_id=%s ORDER BY created_at DESC""", (tenant_id,))
         return [{"op_id": i, "kind": k, "source_org": s, "target_org": t, "feature": f,
@@ -278,9 +282,12 @@ def _selftest():
 
         done = execute(op_id, confirmed=True)
         is_done = done.get("status") == "done"
-        with psycopg.connect(DB) as c, c.cursor() as cur:
-            cur.execute("SELECT count(*) FROM org_lineage WHERE org_id=%s AND derived_from=%s", (b, a))
+        with _conn(tid) as c, c.cursor() as cur:
+            cur.execute("""SELECT count(*) FROM org_lineage
+                           WHERE org_id=%s AND derived_from=%s AND tenant_id=%s""", (b, a, tid))
             lineage_ok = cur.fetchone()[0] >= 1
+            cur.execute("SELECT tenant_id FROM xorg_ops WHERE id=%s", (op_id,))
+            op_tenant_ok = cur.fetchone()[0] == tid
 
         # ownership guard: a foreign org may not be source or target.
         guard = propose(tid, "steal_feature", foreign, b, "x").get("error") == "source_org not your org" \
@@ -294,15 +301,15 @@ def _selftest():
         brief_ok = ("PORTFOLIO" in (pb.get("text") or "") and isinstance(pb.get("orgs"), list)
                     and isinstance(pb.get("open_ops"), list))
 
-        ok = (proposed and planned and awaiting and requires and is_done and lineage_ok and guard
+        ok = (proposed and planned and awaiting and requires and is_done and lineage_ok and op_tenant_ok and guard
               and actions_ok and brief_ok)
         print(f"proposed={proposed} scoped/planned={planned} await_approval={awaiting} "
               f"requires_confirm={requires} done={is_done} lineage_row={lineage_ok} "
-              f"ownership_guard={guard} actions={actions_ok} portfolio_brief={brief_ok}")
+              f"op_tenant={op_tenant_ok} ownership_guard={guard} actions={actions_ok} portfolio_brief={brief_ok}")
         print("PASS: cross-org ops are owner-scoped, scoped to a plan, human-gated, "
               "and executed as governed lineage bookkeeping ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn() as c, c.cursor() as cur:
             cur.execute("DELETE FROM xorg_ops WHERE tenant_id IN (%s,%s)", (tid, foreign_tid))
             cur.execute("""DELETE FROM org_lineage WHERE org_id IN
                            (SELECT id FROM orgs WHERE tenant_id IN (%s,%s))""", (tid, foreign_tid))
@@ -310,7 +317,6 @@ def _selftest():
                            (SELECT id FROM orgs WHERE tenant_id IN (%s,%s))""", (tid, foreign_tid))
             cur.execute("DELETE FROM orgs WHERE tenant_id IN (%s,%s)", (tid, foreign_tid))
             cur.execute("DELETE FROM tenants WHERE tenant_id IN (%s,%s)", (tid, foreign_tid))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

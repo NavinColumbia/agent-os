@@ -113,7 +113,7 @@ def static_security(repo: Path, rigor=2):
     return (len(blocking) == 0), blocking + warnings
 
 
-def adversarial(repo: Path, n: int, api_key=None, engine=None, codex_key=None):
+def adversarial(repo: Path, n: int, api_key=None, engine=None, codex_key=None, stack=None):
     """Spawn n agents that try to BREAK the product: each writes failing edge-case tests under
     tests/adversarial/, then defects are fixed (bounded). Returns (ok, summary).
     api_key/engine/codex_key are the TENANT's BYO routing — they must reach every attack worker."""
@@ -121,7 +121,11 @@ def adversarial(repo: Path, n: int, api_key=None, engine=None, codex_key=None):
     factory._ctx.api_key = api_key
     factory._ctx.engine = engine
     factory._ctx.codex_key = codex_key
+    st = (stack or "").strip().lower()
+    node_stack = st in ("web", "node", "js", "ts", "javascript", "typescript")
     (repo / "tests" / "adversarial").mkdir(parents=True, exist_ok=True)
+    test_glob = ("tests/adversarial/adv_{i}.test.js" if node_stack else "tests/adversarial/adv_{i}.py")
+    runner_hint = ("node --test tests/adversarial/*.test.js" if node_stack else "python -m pytest -q tests/adversarial")
 
     def attack(i):
         # Each ThreadPoolExecutor worker is a FRESH thread and factory._ctx is threading.local(), so it
@@ -136,9 +140,10 @@ def adversarial(repo: Path, n: int, api_key=None, engine=None, codex_key=None):
         factory.agent("qa-security", str(repo),
                       f"You are adversary #{i}. Read the product under src/ and its docs. Try HARD to BREAK it: "
                       f"find edge cases, boundary conditions, invalid inputs, and contract violations the "
-                      f"existing tests MISS. Write NEW tests under tests/adversarial/adv_{i}.py that exercise "
-                      f"these — real, meaningful assertions (NOT trivially-passing filler). It's fine (expected) "
-                      f"if some FAIL — that means you found a real defect.")
+                      f"existing tests MISS. Write NEW tests under {test_glob.format(i=i)} that exercise "
+                      f"these — real, meaningful assertions (NOT trivially-passing filler). The tests must run "
+                      f"with `{runner_hint}`. It's fine (expected) if some FAIL — that means you found a real "
+                      f"defect.")
         return i
     with ThreadPoolExecutor(max_workers=min(n, int(os.environ.get("AOS_FLEET_WORKERS", "5")))) as ex:
         list(as_completed([ex.submit(attack, i) for i in range(n)]))
@@ -151,23 +156,24 @@ def adversarial(repo: Path, n: int, api_key=None, engine=None, codex_key=None):
     # "no adversary actually ran" from "adversaries ran and exposed unfixable defects". Only the latter is
     # a real DEFECTS-REMAIN. If nothing was authored, do NOT brick legitimate liveness — pass the tier and
     # SURFACE that adversarial coverage was unavailable so the gap is visible rather than silently failing.
-    authored = [p for p in (repo / "tests" / "adversarial").glob("*.py")
+    pattern = "*.test.js" if node_stack else "*.py"
+    authored = [p for p in (repo / "tests" / "adversarial").glob(pattern)
                 if p.name != "__init__.py" and p.read_text().strip()]
     if not authored:
         return True, (f"{n} adversaries, 0 tests authored — adversarial coverage UNAVAILABLE on this engine "
                       f"(attack workers could not write tests/adversarial); NOT a product defect, build not blocked")
-    ok, out = factory.run_tests(str(repo), target="tests/adversarial")
+    ok, out = factory.run_tests(str(repo), target="tests/adversarial", stack=("web" if node_stack else ""))
     fixes = 0
     while not ok and fixes < MAX_FIX:                 # real defects the adversaries exposed -> fix them
         fixes += 1
         factory.agent("builder", str(repo),
                       f"Adversarial tests exposed real defects:\n\n{out[-1600:]}\n\nFix the product under src/ "
-                      f"so `python -m pytest -q tests/adversarial` passes WITHOUT weakening those tests.")
-        ok, out = factory.run_tests(str(repo), target="tests/adversarial")
+                      f"so `{runner_hint}` passes WITHOUT weakening those tests.")
+        ok, out = factory.run_tests(str(repo), target="tests/adversarial", stack=("web" if node_stack else ""))
     return ok, f"{n} adversaries, {fixes} fix loops, {'ROBUST' if ok else 'DEFECTS REMAIN'}"
 
 
-def verify(product, rigor=1, api_key=None, engine=None, codex_key=None):
+def verify(product, rigor=1, api_key=None, engine=None, codex_key=None, stack=None):
     """Run scalable verification at the given rigor. Returns a structured result; each tier must pass.
     engine/codex_key thread the tenant's BYO provider routing down to the adversarial attack workers."""
     repo = factory.PRODUCTS / product
@@ -175,7 +181,7 @@ def verify(product, rigor=1, api_key=None, engine=None, codex_key=None):
         return {"product": product, "error": "no such product"}
     result = {"product": product, "rigor": rigor, "passes": []}
 
-    ok, _ = factory.run_tests(str(repo))             # tier 1: baseline suite
+    ok, _ = factory.run_tests(str(repo), stack=stack)  # tier 1: baseline suite
     result["passes"].append({"check": "test-suite", "ok": ok})
     if ok and rigor >= 2:                             # tier 2: static security + service runtime/load
         sec_ok, findings = static_security(repo, rigor)
@@ -186,7 +192,7 @@ def verify(product, rigor=1, api_key=None, engine=None, codex_key=None):
             result["passes"].append({"check": "runtime+load", "ok": rt_ok, "detail": rt[-200:]})
     if all(p["ok"] for p in result["passes"]) and rigor >= 3:   # tier 3+: adversarial (scales with rigor)
         n = min(MAX_ADVERSARIES, rigor)
-        adv_ok, adv = adversarial(repo, n, api_key, engine, codex_key)
+        adv_ok, adv = adversarial(repo, n, api_key, engine, codex_key, stack=stack)
         result["passes"].append({"check": "adversarial", "ok": adv_ok, "agents": n, "detail": adv})
 
     result["passed"] = all(p["ok"] for p in result["passes"])

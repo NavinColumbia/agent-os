@@ -20,8 +20,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit     # noqa: E402
@@ -32,7 +30,7 @@ import notifications  # noqa: E402
 import tenancy   # noqa: E402
 import vault     # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection
 PRODUCTS = factory.PRODUCTS
 
 
@@ -47,17 +45,27 @@ def _tenant(token):
 
 
 def _own(product, tid):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (product, tid))
-        c.commit()
 
 
-def _status(product):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("SELECT DISTINCT stage FROM traces WHERE product=%s", (product,))
+def _status(product, tid=None):
+    cm = tenant_connection(tid) if tid else connection()
+    with cm as c, c.cursor() as cur:
+        if tid:
+            cur.execute("""SELECT DISTINCT t.stage FROM traces t
+                           JOIN tenant_products tp ON tp.product=t.product
+                           WHERE tp.tenant_id=%s AND t.product=%s""", (tid, product))
+        else:
+            cur.execute("SELECT DISTINCT stage FROM traces WHERE product=%s", (product,))
         stages = [r[0] for r in cur.fetchall() if r[0]]
-        cur.execute("""SELECT decision, payload FROM audit_log WHERE resource=%s AND action='ProductComplete'
-                       ORDER BY id DESC LIMIT 1""", (product,))
+        if tid:
+            cur.execute("""SELECT decision, payload FROM audit_log
+                           WHERE resource=%s AND action='ProductComplete' AND tenant_id=%s
+                           ORDER BY id DESC LIMIT 1""", (product, tid))
+        else:
+            cur.execute("""SELECT decision, payload FROM audit_log WHERE resource=%s AND action='ProductComplete'
+                           ORDER BY id DESC LIMIT 1""", (product,))
         r = cur.fetchone()
     result = r[0] if r else ("building" if stages else "queued")
     failed = result not in ("LAUNCHED", "building", "queued")   # FAILED / BLOCKED_AT_* / crashed
@@ -83,15 +91,15 @@ def _run_build(tid, product, charter, kind):
         except Exception:
             pass
     try:
-        factory.build_product(product, charter, kind, **bk)
+        factory.build_product(product, charter, kind, tenant_id=tid, **bk)
     except Exception as e:
         # DON'T swallow: record a terminal FAILED status so the user sees a real failure (+ retry CTA),
         # not an eternal "building" spinner. _status reads this ProductComplete row.
         audit.append(actor="frontdoor", action="ProductComplete", resource=product, decision="FAILED",
-                     payload={"error": str(e)[:300], "tenant": tid})
+                     payload={"error": str(e)[:300], "tenant": tid}, tenant_id=tid)
     # emit a tenant-facing notification reflecting the REAL outcome (build category)
     try:
-        st = _status(product)
+        st = _status(product, tid)
         if st["ready"]:
             notifications.send(tid, "build", f"Build ready: {product}",
                                "Your product passed QA and is ready to download.", level="standard",
@@ -245,10 +253,10 @@ class H(BaseHTTPRequestHandler):
             tid = _tenant(self.headers.get("X-Tenant-Token"))
             if not tid:
                 return self._json(401, {"error": "sign up first"})
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with tenant_connection(tid) as c, c.cursor() as cur:
                 cur.execute("SELECT product FROM tenant_products WHERE tenant_id=%s ORDER BY created_at DESC", (tid,))
                 prods = [r[0] for r in cur.fetchall()]
-            self._json(200, {"builds": [_status(p) for p in prods]})
+            self._json(200, {"builds": [_status(p, tid) for p in prods]})
         elif p.startswith("/download/"):
             product = p[len("/download/"):]
             tid = _tenant(self.headers.get("X-Tenant-Token"))
@@ -260,7 +268,7 @@ class H(BaseHTTPRequestHandler):
             if not (PRODUCTS / product).resolve().is_relative_to(PRODUCTS.resolve()):
                 return self._json(404, {"error": "not found"})
             # OWNERSHIP: a tenant may only download a product it owns
-            with psycopg.connect(DB) as c, c.cursor() as cur:
+            with tenant_connection(tid) as c, c.cursor() as cur:
                 cur.execute("SELECT 1 FROM tenant_products WHERE tenant_id=%s AND product=%s", (tid, product))
                 owned = cur.fetchone() is not None
             if not owned:
@@ -299,6 +307,13 @@ class H(BaseHTTPRequestHandler):
             if not consent.require_consent(tid):       # MANDATORY AI-consent gate (Apple/Play/EU AI Act)
                 return self._json(403, {"error": "consent_required",
                                         "consent": consent.state(tid)})
+            try:
+                import auth
+                if not auth.provider_resolved(tid):
+                    return self._json(403, {"error": "provider_required",
+                                            "message": "connect OpenAI/Codex or Anthropic before building"})
+            except Exception:
+                pass
             q = billing.quota(tid)
             if not q["within_quota"]:
                 return self._json(402, {"error": f"quota reached ({q['builds']}) — upgrade your plan"})

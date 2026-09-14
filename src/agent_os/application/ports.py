@@ -815,6 +815,14 @@ class PreviewDeploymentStore(Deployer, Protocol):
         self, tenant_slug: str, public_id: str,
     ) -> Mapping[str, Any] | None: ...
 
+    def verify_fetch(
+        self,
+        *,
+        organization_id: str,
+        public_url: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
     def list_previews(
         self, organization_id: str, *, limit: int = 100,
     ) -> tuple[Mapping[str, Any], ...]: ...

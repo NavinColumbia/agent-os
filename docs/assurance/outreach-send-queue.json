@@ -1,0 +1,32 @@
+{
+  "schema": "agent-os.assurance-outreach/1",
+  "prepared_at": "2026-08-25",
+  "public_offer": "https://agent-os-release-assurance.artmusicasia.chatgpt.site/",
+  "public_sample": "https://agent-os-release-assurance.artmusicasia.chatgpt.site/sample",
+  "messages": [
+    {
+      "id": "a-cubic-aymen",
+      "recipient": "aymenkrifa@gmail.com",
+      "subject": "A one-day release evidence layer for A Cubic builds",
+      "body": "Hi Aymen — I saw that A Cubic is shipping commissioned AI products end to end. The awkward last-mile question for that work is usually not ‘did the code build?’ but ‘what browser evidence can we hand the client before release?’ I run a fixed-scope Release Assurance audit: three agreed user journeys, reproducible evidence, defect triage, and a ship/no-ship decision in one business day. The founding audit is $500, and it can sit behind your client delivery rather than compete with it. Here is the redacted sample: {sample_url}. Would it be useful to scope one current A Cubic delivery?\n\n— Swami\nAgent OS Release Assurance"
+    },
+    {
+      "id": "yasmine",
+      "recipient": "hello@yasmine.works",
+      "subject": "Three release journeys for Yasmine's Slack trust boundary",
+      "body": "Hi Yasmine team — your Slack coworker promise depends on boundaries users can actually see: one tenant's state stays isolated, risky work pauses for approval, and the action record never leaks a credential. I run a narrow Release Assurance audit for AI web products. We agree on three browser-visible journeys and I return reproducible evidence plus an honest ship/no-ship decision in one business day. For Yasmine I would scope workspace install/isolation, a staged action through approval, and the resulting audit/redaction view using synthetic data. The founding audit is $500. Sample: {sample_url}. Is there a current release where that evidence would help?\n\n— Swami\nAgent OS Release Assurance"
+    },
+    {
+      "id": "leaping-ai",
+      "recipient": "contact@leapingai.com",
+      "subject": "Release evidence for Leaping's cross-channel stop state",
+      "body": "Hi Leaping team — the trust-critical part of a multi-channel call/text campaign is what happens after the lead responds: every remaining scheduled contact should stop, the campaign state should stay consistent, and the operator should be able to prove why. I run a fixed-scope Release Assurance audit covering three agreed browser journeys with screenshots, reproduction steps, and a ship/no-ship decision in one business day. I would scope synthetic campaign creation, a response/stop transition, and operator evidence across the two channels. The founding audit is $500. Redacted sample: {sample_url}. Useful for an upcoming release?\n\n— Swami\nAgent OS Release Assurance"
+    },
+    {
+      "id": "n71",
+      "recipient": "discover@n71.ai",
+      "subject": "Three evidence journeys for N71's source-linked company brain",
+      "body": "Hi N71 team — your source-linked company brain makes the hard promise unusually clear: facts remain tied to evidence even when company realities conflict and change. I run a fixed-scope Release Assurance audit for AI products. We choose three critical browser journeys and I return reproducible evidence, defect triage, and a ship/no-ship decision in one business day. For N71 I would scope source connection, role-scoped retrieval, and a synthetic stale or conflicting-fact update. The founding audit is $500. Sample: {sample_url}. Worth scoping for a current release?\n\n— Swami\nAgent OS Release Assurance"
+    }
+  ]
+}

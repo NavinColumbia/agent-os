@@ -25,15 +25,13 @@ Run with the agent-os venv python.
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit     # noqa: E402
 import verify    # noqa: E402
 import improve   # noqa: E402
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection
 
 # Score weights: tests are the floor (does it even work?), security and independent verification split the
 # rest. The score is a continuous quality signal for the learning store; the BAR is the hard ship gate.
@@ -51,8 +49,33 @@ def _rigor_for(bar: str) -> int:
     return _BAR_RIGOR.get(bar, 3)
 
 
+def _conn(tenant_id=None):
+    return tenant_connection(tenant_id) if tenant_id else connection()
+
+
+def _tenant_for_product(product):
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM tenant_products WHERE product=%s ORDER BY created_at DESC LIMIT 1",
+                        (product,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _tenant_for_run(run_id):
+    try:
+        with _conn() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM quality_runs WHERE id=%s", (run_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS quality_runs (
             id BIGSERIAL PRIMARY KEY, product TEXT, org_id TEXT, bar TEXT, rounds INT DEFAULT 0,
             status TEXT DEFAULT 'running', result TEXT,
@@ -64,7 +87,9 @@ def _ensure():
         cur.execute("""CREATE TABLE IF NOT EXISTS build_outcomes (
             id BIGSERIAL PRIMARY KEY, product TEXT, kind TEXT, rounds INT, final_score NUMERIC,
             shipped BOOLEAN, cost_usd NUMERIC, at TIMESTAMPTZ DEFAULT now())""")
-        c.commit()
+        cur.execute("ALTER TABLE quality_runs ADD COLUMN IF NOT EXISTS tenant_id TEXT")
+        cur.execute("ALTER TABLE quality_measurements ADD COLUMN IF NOT EXISTS tenant_id TEXT")
+        cur.execute("ALTER TABLE build_outcomes ADD COLUMN IF NOT EXISTS tenant_id TEXT")
 
 
 def _check(passes, name):
@@ -107,13 +132,13 @@ def _bar_met(m: dict, bar: str) -> bool:
 
 
 def _record_measurement(run_id, rnd, m):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    tenant_id = _tenant_for_run(run_id)
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO quality_measurements
-                       (run_id, round, tests_pass, security_clean, verified, score, note)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                       (run_id, round, tests_pass, security_clean, verified, score, note, tenant_id)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (run_id, rnd, m["tests_pass"], m["security_clean"], m["verified"], m["score"],
-                     m.get("error") or f"score={m['score']}"))
-        c.commit()
+                     m.get("error") or f"score={m['score']}", tenant_id))
 
 
 def _finish(run_id, status, result, rounds, product, m, shipped, kind="lib"):
@@ -125,16 +150,17 @@ def _finish(run_id, status, result, rounds, product, m, shipped, kind="lib"):
         cost = factory.spent_usd()
     except Exception:
         pass
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    tenant_id = _tenant_for_product(product) or _tenant_for_run(run_id)
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("""UPDATE quality_runs SET status=%s, result=%s, rounds=%s, finished_at=now()
                        WHERE id=%s""", (status, result, rounds, run_id))
-        cur.execute("""INSERT INTO build_outcomes (product, kind, rounds, final_score, shipped, cost_usd)
-                       VALUES (%s,%s,%s,%s,%s,%s)""",
-                    (product, kind, rounds, (m or {}).get("score", 0.0), shipped, cost))
-        c.commit()
+        cur.execute("""INSERT INTO build_outcomes (product, kind, rounds, final_score, shipped, cost_usd, tenant_id)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (product, kind, rounds, (m or {}).get("score", 0.0), shipped, cost, tenant_id))
     audit.append(actor="qualityloop", action="QualityLoop", resource=product,
                  decision=status, payload={"run_id": run_id, "rounds": rounds,
-                                           "score": (m or {}).get("score"), "shipped": shipped})
+                                           "score": (m or {}).get("score"), "shipped": shipped},
+                 tenant_id=tenant_id)
 
 
 def _loop(run_id, product, bar, max_rounds, start_round=0, api_key=None) -> dict:
@@ -147,8 +173,18 @@ def _loop(run_id, product, bar, max_rounds, start_round=0, api_key=None) -> dict
     result = "did not reach the bar within the round budget"
     for rnd in range(start_round + 1, max_rounds + 1):
         rounds = rnd
+        try:
+            import factory
+            factory._emit_progress("QUALITY", f"round-{rnd}-started", {"bar": bar})
+        except Exception:
+            pass
         m = _measure(product, bar=bar, api_key=api_key)
         _record_measurement(run_id, rnd, m)
+        try:
+            factory._emit_progress("QUALITY", f"round-{rnd}-measured",
+                                   {"bar": bar, "score": m.get("score")})
+        except Exception:
+            pass
         if m.get("error"):                                   # no such product / verifier couldn't run
             status, result = "error", m["error"]
             break
@@ -170,13 +206,13 @@ def run(product, bar="standard", max_rounds=3, api_key=None, org_id=None) -> dic
     measures (verify), ships if the bar is met, else improves and re-measures. Records the run, a
     measurement per round, and a terminal build_outcome. Returns {run_id, status, rounds, final_score, shipped}."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""INSERT INTO quality_runs (product, org_id, bar, status)
-                       VALUES (%s,%s,%s,'running') RETURNING id""", (product, org_id, bar))
+    tenant_id = _tenant_for_product(product)
+    with _conn(tenant_id) as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO quality_runs (product, org_id, bar, status, tenant_id)
+                       VALUES (%s,%s,%s,'running',%s) RETURNING id""", (product, org_id, bar, tenant_id))
         run_id = cur.fetchone()[0]
-        c.commit()
     audit.append(actor="qualityloop", action="QualityLoop", resource=product, decision="started",
-                 payload={"run_id": run_id, "bar": bar, "max_rounds": max_rounds})
+                 payload={"run_id": run_id, "bar": bar, "max_rounds": max_rounds}, tenant_id=tenant_id)
     return _loop(run_id, product, bar, max_rounds, start_round=0, api_key=api_key)
 
 
@@ -184,7 +220,8 @@ def resume(run_id, api_key=None) -> dict:
     """Continue a run left 'running' (e.g. the process died mid-climb). Picks up after the last recorded
     round so prior measurements aren't redone, and finishes the climb against the same bar."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    tenant_id = _tenant_for_run(run_id)
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute("SELECT product, bar, status FROM quality_runs WHERE id=%s", (run_id,))
         row = cur.fetchone()
         if not row:
@@ -202,7 +239,7 @@ def outcomes(limit=50):
     """Recent build_outcomes — the learning store that feeds the build recommender (which bar / how many
     rounds a kind of product tends to need, and what it cost)."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with _conn() as c, c.cursor() as cur:
         cur.execute("""SELECT product, kind, rounds, final_score, shipped, cost_usd, at
                        FROM build_outcomes ORDER BY at DESC LIMIT %s""", (limit,))
         cols = [d[0] for d in cur.description]
@@ -262,7 +299,7 @@ def _selftest():
                           and improve_calls[0] == 0)
 
         # rows were written: the run, exactly one measurement, one outcome
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with _conn(_tenant_for_product(product)) as c, c.cursor() as cur:
             cur.execute("SELECT status, result FROM quality_runs WHERE id=%s", (run_id,))
             qr = cur.fetchone()
             cur.execute("SELECT count(*) FROM quality_measurements WHERE run_id=%s", (run_id,))
@@ -282,11 +319,10 @@ def _selftest():
         verify.verify, improve.improve_once = real_verify, real_improve
         if run_id is not None:
             try:
-                with psycopg.connect(DB) as c, c.cursor() as cur:
+                with _conn(_tenant_for_product(product)) as c, c.cursor() as cur:
                     cur.execute("DELETE FROM quality_measurements WHERE run_id=%s", (run_id,))
                     cur.execute("DELETE FROM quality_runs WHERE id=%s", (run_id,))
                     cur.execute("DELETE FROM build_outcomes WHERE product=%s", (product,))
-                    c.commit()
             except Exception:
                 pass
 

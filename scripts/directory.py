@@ -18,53 +18,119 @@ Run with the agent-os venv python.
 """
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
-import psycopg
+from dbpool import connection, tenant_connection  # noqa: E402
 
-from aoscfg import ENV, DB
 ACTIVE_WINDOW = "15 minutes"
+_ensured = False
+_ensure_lock = threading.Lock()
+
+
+def _column_exists(cur, table, column):
+    cur.execute("""SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = current_schema()
+                     AND table_name = %s AND column_name = %s""", (table, column))
+    return cur.fetchone() is not None
 
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS directory (agent_id TEXT PRIMARY KEY, role TEXT NOT NULL,
-                       status TEXT NOT NULL DEFAULT 'active', product TEXT, task TEXT,
-                       resources TEXT[] NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
-        c.commit()
+    global _ensured
+    if _ensured:
+        return
+    with _ensure_lock:
+        if _ensured:
+            return
+        with connection() as c, c.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout = '2s'")
+            cur.execute("""CREATE TABLE IF NOT EXISTS directory (agent_id TEXT PRIMARY KEY, role TEXT NOT NULL,
+                           status TEXT NOT NULL DEFAULT 'active', product TEXT, task TEXT,
+                           resources TEXT[] NOT NULL DEFAULT '{}', updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+            if not _column_exists(cur, "directory", "tenant_id"):
+                cur.execute("ALTER TABLE directory ADD COLUMN tenant_id TEXT")
+            cur.execute("CREATE INDEX IF NOT EXISTS directory_tenant_id_rls_idx ON directory (tenant_id)")
+            if not _column_exists(cur, "conversations", "tenant_id"):
+                cur.execute("ALTER TABLE conversations ADD COLUMN tenant_id TEXT")
+            cur.execute("CREATE INDEX IF NOT EXISTS conversations_tenant_id_rls_idx ON conversations (tenant_id)")
+            if not _column_exists(cur, "inbox", "tenant_id"):
+                cur.execute("ALTER TABLE inbox ADD COLUMN tenant_id TEXT")
+            cur.execute("CREATE INDEX IF NOT EXISTS inbox_tenant_id_rls_idx ON inbox (tenant_id)")
+        _ensured = True
 
 
-def register(agent_id, role, product=None, task=None, resources=None):
+def _tenant_for_product(product):
+    if not product:
+        return None
+    try:
+        with connection() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM tenant_products WHERE product=%s LIMIT 1", (product,))
+            row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _tenant_for_agent(agent_id):
+    if not agent_id:
+        return None
+    try:
+        with connection() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM directory WHERE agent_id=%s", (agent_id,))
+            row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _conn(tenant_id=None):
+    return tenant_connection(tenant_id) if tenant_id else connection()
+
+
+def register(agent_id, role, product=None, task=None, resources=None, tenant_id=None):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""INSERT INTO directory (agent_id, role, status, product, task, resources, updated_at)
-                       VALUES (%s,%s,'active',%s,%s,%s, now())
+    tenant_id = tenant_id or _tenant_for_product(product)
+    with _conn(tenant_id) as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO directory (agent_id, role, status, product, task, resources, tenant_id, updated_at)
+                       VALUES (%s,%s,'active',%s,%s,%s,%s, now())
                        ON CONFLICT (agent_id) DO UPDATE SET role=EXCLUDED.role, status='active',
-                         product=EXCLUDED.product, task=EXCLUDED.task, resources=EXCLUDED.resources, updated_at=now()""",
-                    (agent_id, role, product, task, resources or []))
-        c.commit()
+                         product=EXCLUDED.product, task=EXCLUDED.task, resources=EXCLUDED.resources,
+                         tenant_id=EXCLUDED.tenant_id, updated_at=now()""",
+                    (agent_id, role, product, task, resources or [], tenant_id))
 
 
-def release(agent_id):
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("UPDATE directory SET status='idle', resources='{}', updated_at=now() WHERE agent_id=%s", (agent_id,))
-        c.commit()
+def release(agent_id, tenant_id=None):
+    tenant_id = tenant_id or _tenant_for_agent(agent_id)
+    with _conn(tenant_id) as c, c.cursor() as cur:
+        if tenant_id:
+            cur.execute("""UPDATE directory SET status='idle', resources='{}', updated_at=now()
+                           WHERE agent_id=%s AND tenant_id=%s""", (agent_id, tenant_id))
+        else:
+            cur.execute("UPDATE directory SET status='idle', resources='{}', updated_at=now() WHERE agent_id=%s", (agent_id,))
 
 
-def roster(active_only=True):
+def roster(active_only=True, tenant_id=None):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    where, args = [], []
+    if tenant_id:
+        where.append("tenant_id=%s")
+        args.append(tenant_id)
+    if active_only:
+        where.append("status='active'")
+        where.append(f"updated_at > now() - interval '{ACTIVE_WINDOW}'")
+    clause = "WHERE " + " AND ".join(where) if where else ""
+    with _conn(tenant_id) as c, c.cursor() as cur:
         cur.execute(f"""SELECT agent_id, role, status, product, task, resources,
                           round(EXTRACT(EPOCH FROM now()-updated_at)) FROM directory
-                        {"WHERE status='active' AND updated_at > now() - interval '" + ACTIVE_WINDOW + "'" if active_only else ""}
-                        ORDER BY updated_at DESC""")
+                        {clause}
+                        ORDER BY updated_at DESC""", tuple(args))
         return [{"agent_id": a, "role": r, "status": s, "product": p, "task": t, "resources": res, "age_s": int(age)}
                 for a, r, s, p, t, res, age in cur.fetchall()]
 
 
-def find(role=None, product=None):
-    rows = roster(active_only=True)
+def find(role=None, product=None, tenant_id=None):
+    rows = roster(active_only=True, tenant_id=tenant_id)
     return [x for x in rows if (role is None or x["role"] == role) and (product is None or x["product"] == product)]
 
 
@@ -84,9 +150,9 @@ def _overlap(a_res, b_res):
     return hits
 
 
-def conflicts():
+def conflicts(tenant_id=None):
     """Active agents on the SAME product whose resource claims overlap -> they may step on each other."""
-    rows = roster(active_only=True)
+    rows = roster(active_only=True, tenant_id=tenant_id)
     out, seen = [], set()
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
@@ -102,17 +168,19 @@ def conflicts():
     return out
 
 
-def contact(frm, to, intent, content):
+def contact(frm, to, intent, content, tenant_id=None):
     """Direct, brokered, durable message (no socket). Goes into the conversation log + the recipient's
     inbox (exactly-once). The recipient need not be online — it processes it when it next runs."""
     _ensure()
     mid = f"dm-{int(time.time()*1000)}"
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""INSERT INTO conversations (conversation_id, message_id, intent, sender, recipient, content)
-                       VALUES (%s,%s,%s,%s,%s,%s)""",
-                    (f"dm-{frm}-{to}", mid, intent, frm, to, json.dumps({"text": content})))
-        cur.execute("INSERT INTO inbox (subscriber, message_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (to, mid))
-        c.commit()
+    tenant_id = tenant_id or _tenant_for_agent(to) or _tenant_for_agent(frm)
+    with _conn(tenant_id) as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO conversations
+                         (conversation_id, message_id, intent, sender, recipient, content, tenant_id)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (f"dm-{frm}-{to}", mid, intent, frm, to, json.dumps({"text": content}), tenant_id))
+        cur.execute("""INSERT INTO inbox (subscriber, message_id, tenant_id)
+                       VALUES (%s,%s,%s) ON CONFLICT DO NOTHING""", (to, mid, tenant_id))
     return {"message_id": mid, "from": frm, "to": to, "intent": intent}
 
 
@@ -136,18 +204,43 @@ def _main(a):
     elif a[0] == "selftest":
         _ensure()
         import os
+        import billing
+        t = billing.signup("directory-selftest")
+        tid = t["tenant_id"]
         p = f"dt-{os.urandom(3).hex()}"
-        register(f"builder@{p}", "builder", p, "BUILD", ["src/**", "tests/**"])
-        register(f"refactorer@{p}", "staff-engineer", p, "REFACTOR", ["src/**"])
-        register(f"docs@{p}", "technical-writer", p, "DOCS", ["docs/**"])
-        cs = conflicts()
-        conflict_found = any(c["product"] == p for c in cs)
-        msg = contact(f"builder@{p}", f"refactorer@{p}", "conflict", "we both edit src/** — split files?")
-        # no false conflict between builder and docs (disjoint paths)
-        no_false = not any(set(c["agents"]) == {f"builder@{p}", f"docs@{p}"} for c in cs)
-        release(f"builder@{p}"); release(f"refactorer@{p}"); release(f"docs@{p}")
-        ok = conflict_found and no_false and msg["message_id"].startswith("dm-")
-        print(f"conflict detected on src/**: {conflict_found}; no false (docs disjoint): {no_false}; direct contact: {msg['message_id']}")
+        msg = None
+        try:
+            with tenant_connection(tid) as c, c.cursor() as cur:
+                cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s)", (p, tid))
+            register(f"builder@{p}", "builder", p, "BUILD", ["src/**", "tests/**"])
+            register(f"refactorer@{p}", "staff-engineer", p, "REFACTOR", ["src/**"])
+            register(f"docs@{p}", "technical-writer", p, "DOCS", ["docs/**"])
+            cs = conflicts(tenant_id=tid)
+            conflict_found = any(c["product"] == p for c in cs)
+            msg = contact(f"builder@{p}", f"refactorer@{p}", "conflict",
+                          "we both edit src/** — split files?")
+            scoped = roster(tenant_id=tid)
+            tenant_scoped = scoped and all(x["product"] == p for x in scoped if x["agent_id"].endswith(f"@{p}"))
+            with tenant_connection(tid) as c, c.cursor() as cur:
+                cur.execute("SELECT tenant_id FROM conversations WHERE message_id=%s", (msg["message_id"],))
+                conv_tid = cur.fetchone()
+                cur.execute("SELECT tenant_id FROM inbox WHERE message_id=%s", (msg["message_id"],))
+                inbox_tid = cur.fetchone()
+            contact_tagged = conv_tid and conv_tid[0] == tid and inbox_tid and inbox_tid[0] == tid
+            # no false conflict between builder and docs (disjoint paths)
+            no_false = not any(set(c["agents"]) == {f"builder@{p}", f"docs@{p}"} for c in cs)
+            ok = conflict_found and no_false and msg["message_id"].startswith("dm-") and tenant_scoped and contact_tagged
+            print(f"conflict detected on src/**: {conflict_found}; no false (docs disjoint): {no_false}; "
+                  f"tenant_scoped={tenant_scoped}; contact_tagged={contact_tagged}; direct contact: {msg['message_id']}")
+        finally:
+            with tenant_connection(tid) as c, c.cursor() as cur:
+                if msg:
+                    cur.execute("DELETE FROM inbox WHERE message_id=%s", (msg["message_id"],))
+                    cur.execute("DELETE FROM conversations WHERE message_id=%s", (msg["message_id"],))
+                cur.execute("DELETE FROM directory WHERE product=%s", (p,))
+                cur.execute("DELETE FROM tenant_products WHERE product=%s", (p,))
+            with connection() as c, c.cursor() as cur:
+                cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
         print("PASS: directory presence + conflict detection + direct contact ✅" if ok else "FAIL")
         sys.exit(0 if ok else 1)
 

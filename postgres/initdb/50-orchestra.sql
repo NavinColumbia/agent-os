@@ -35,12 +35,22 @@ CREATE TABLE IF NOT EXISTS orchestra_actors (
     assignment    TEXT,
     memory        JSONB NOT NULL DEFAULT '{}',
     result        JSONB,
+    hire_key      TEXT,                             -- stable replay key for crash-safe hiring
     hired_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_active   TIMESTAMPTZ NOT NULL DEFAULT now()
+    last_active   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    step_claimed_at TIMESTAMPTZ,
+    step_claimed_by TEXT
 );
+ALTER TABLE orchestra_actors ADD COLUMN IF NOT EXISTS step_claimed_at TIMESTAMPTZ;
+ALTER TABLE orchestra_actors ADD COLUMN IF NOT EXISTS step_claimed_by TEXT;
+ALTER TABLE orchestra_actors ADD COLUMN IF NOT EXISTS hire_key TEXT;
 CREATE INDEX IF NOT EXISTS orchestra_actors_run_idx    ON orchestra_actors (run_id);
 CREATE INDEX IF NOT EXISTS orchestra_actors_tenant_idx ON orchestra_actors (tenant_id, status);
 CREATE INDEX IF NOT EXISTS orchestra_actors_sup_idx    ON orchestra_actors (supervisor_id);
+CREATE INDEX IF NOT EXISTS orchestra_actors_step_claim_idx
+    ON orchestra_actors (step_claimed_at) WHERE step_claimed_at IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS orchestra_actors_hire_key_idx
+    ON orchestra_actors (run_id, hire_key) WHERE hire_key IS NOT NULL;
 
 -- The PERSISTED bus: every inter-actor event is a claimable row. A consumer claims its pending events
 -- with FOR UPDATE SKIP LOCKED (concurrent-claimer-safe, same pattern as the tasks queue), stamps
@@ -53,7 +63,8 @@ CREATE TABLE IF NOT EXISTS orchestra_events (
     frm          BIGINT,                           -- sending actor_id (NULL = system/human injection)
     to_actor     BIGINT NOT NULL,                  -- recipient actor_id (the inbox this row sits in)
     kind         TEXT NOT NULL,                    -- task|done|next|blocked|finding|question|need_agent|
-                                                   -- need_context|escalate|resolve|context_update|broadcast
+                                                   -- resource_request|process_change|need_context|escalate|
+                                                   -- resolve|context_update|broadcast
     payload      JSONB NOT NULL DEFAULT '{}',
     corr_id      TEXT,                             -- conversation/escalation-chain correlation
     ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -66,3 +77,24 @@ CREATE INDEX IF NOT EXISTS orchestra_events_inbox_idx
     ON orchestra_events (to_actor, id) WHERE processed_at IS NULL;
 CREATE INDEX IF NOT EXISTS orchestra_events_run_idx  ON orchestra_events (run_id);
 CREATE INDEX IF NOT EXISTS orchestra_events_corr_idx ON orchestra_events (corr_id);
+
+-- Durable fencing for long-running tool workers.  Session advisory locks disappear when their
+-- PostgreSQL connection is reset even though Chromium/a fixer may still be alive.  A lease row
+-- survives that reset; every takeover increments fence_token, so a superseded worker can prove it
+-- no longer owns the side-effect boundary and stop before its next action.
+CREATE TABLE IF NOT EXISTS orchestra_tool_leases (
+    lease_key      TEXT PRIMARY KEY,
+    tenant_id      TEXT NOT NULL,
+    run_id         BIGINT NOT NULL,
+    actor_id       BIGINT NOT NULL,
+    tool           TEXT NOT NULL,
+    owner_id       TEXT NOT NULL,
+    fence_token    BIGINT NOT NULL DEFAULT 1,
+    lease_until    TIMESTAMPTZ NOT NULL,
+    heartbeat_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS orchestra_tool_leases_expiry_idx
+    ON orchestra_tool_leases (lease_until);
+CREATE INDEX IF NOT EXISTS orchestra_tool_leases_run_idx
+    ON orchestra_tool_leases (tenant_id, run_id);

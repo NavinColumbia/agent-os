@@ -16,34 +16,49 @@ an optional org_id (added idempotently) so existing single-org data keeps workin
 Run with the agent-os venv python.
 """
 import sys
+import threading
 from pathlib import Path
 
-import psycopg
-import dbpool   # noqa: E402  — pooled read path (C2)
+from dbpool import connection, tenant_connection  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit   # noqa: E402
 
-from aoscfg import ENV, DB
-
+_ensured = False
+_ensure_lock = threading.Lock()
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS orgs (
-            id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL,
-            vision TEXT DEFAULT '', stage TEXT NOT NULL DEFAULT 'new',   -- new|researching|designing|building|live|archived
-            status TEXT NOT NULL DEFAULT 'active',                        -- active|archived
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
-        cur.execute("CREATE INDEX IF NOT EXISTS orgs_tenant_idx ON orgs (tenant_id, status)")
-        # give existing org-scoped tables an optional org_id (NULL = the tenant's default/legacy org),
-        # idempotently — so single-org data keeps working while new data is org-scoped.
-        for tbl in ("tenant_products", "chat_threads", "findings", "custom_agents"):
-            try:
+    global _ensured
+    if _ensured:
+        return
+    with _ensure_lock:
+        if _ensured:
+            return
+        with connection() as c, c.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout='2s'")
+            cur.execute("SET LOCAL statement_timeout='10s'")
+            cur.execute("""CREATE TABLE IF NOT EXISTS orgs (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL,
+                vision TEXT DEFAULT '', stage TEXT NOT NULL DEFAULT 'new',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+            cur.execute("CREATE INDEX IF NOT EXISTS orgs_tenant_idx ON orgs (tenant_id, status)")
+            # org_artifacts is canonicalized by migration 79. Keep the owner-side
+            # bootstrap for rolling upgrades, but never issue schema DDL through a
+            # tenant/app-role transaction at the write callsite.
+            cur.execute("""CREATE TABLE IF NOT EXISTS org_artifacts (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT, org_id BIGINT NOT NULL,
+                kind TEXT NOT NULL, product TEXT, path TEXT, ref TEXT, summary TEXT,
+                created_at TIMESTAMPTZ DEFAULT now())""")
+            cur.execute("ALTER TABLE org_artifacts ADD COLUMN IF NOT EXISTS tenant_id TEXT")
+            cur.execute("CREATE INDEX IF NOT EXISTS org_artifacts_tenant_id_rls_idx ON org_artifacts (tenant_id)")
+            # Give existing org-scoped tables an optional org_id (NULL = the
+            # tenant's default/legacy org), idempotently.
+            for tbl in ("tenant_products", "chat_threads", "findings", "custom_agents"):
                 cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS org_id BIGINT")
-            except Exception:
-                pass
-        c.commit()
+        _ensured = True
 
 
 def create(tenant_id, name, vision=""):
@@ -51,12 +66,12 @@ def create(tenant_id, name, vision=""):
     name = (name or "").strip()
     if not name:
         return {"error": "org name required"}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("INSERT INTO orgs (tenant_id, name, vision) VALUES (%s,%s,%s) RETURNING id",
                     (tenant_id, name[:120], vision))
-        oid = cur.fetchone()[0]; c.commit()
+        oid = cur.fetchone()[0]
     audit.append(actor="orgs", action="OrgCreated", resource=str(oid), decision="created",
-                 payload={"tenant": tenant_id, "name": name[:80]})
+                 payload={"tenant": tenant_id, "name": name[:80]}, tenant_id=tenant_id)
     return {"org_id": oid, "name": name, "stage": "new"}
 
 
@@ -66,7 +81,7 @@ def list_orgs(tenant_id, include_archived=False):
                   (SELECT count(*) FROM tenant_products tp WHERE tp.org_id = o.id) AS products
            FROM orgs o WHERE tenant_id=%s {} ORDER BY created_at DESC"""
     q = q.format("" if include_archived else "AND status='active'")
-    with dbpool.connection(autocommit=True) as c, c.cursor() as cur:   # C2: pooled read
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute(q, (tenant_id,))
         return [{"org_id": i, "name": n, "vision": v, "stage": st, "status": stat,
                  "created_at": str(ca), "products": p} for i, n, v, st, stat, ca, p in cur.fetchall()]
@@ -110,7 +125,7 @@ def resolve(tenant_id, org_id):
 
 def get(tenant_id, org_id):
     _ensure()
-    with dbpool.connection(autocommit=True) as c, c.cursor() as cur:   # C2: pooled read
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         cur.execute("SELECT id, name, vision, stage, status, created_at FROM orgs WHERE tenant_id=%s AND id=%s",
                     (tenant_id, org_id))
         r = cur.fetchone()
@@ -124,12 +139,22 @@ def _owned(cur, tenant_id, org_id):
     return cur.fetchone() is not None
 
 
+def _tenant_for_org(org_id):
+    try:
+        with connection() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM orgs WHERE id=%s", (org_id,))
+            row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
 def set_vision(tenant_id, org_id, vision):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         if not _owned(cur, tenant_id, org_id):
             return {"error": "not your org"}
-        cur.execute("UPDATE orgs SET vision=%s, updated_at=now() WHERE id=%s", (vision, org_id)); c.commit()
+        cur.execute("UPDATE orgs SET vision=%s, updated_at=now() WHERE id=%s", (vision, org_id))
     try:                                  # mirror into the requirements keeper (org scope) so this company's
         import visionkeeper               # vague idea becomes build-ready requirements without the CEO restating
         visionkeeper.set_vision(tenant_id, vision, scope=f"org:{org_id}")   # it. Best-effort; no spend here.
@@ -141,34 +166,33 @@ def set_vision(tenant_id, org_id, vision):
 def set_stage(tenant_id, org_id, stage):
     """Advance the org through its lifecycle (new->researching->designing->building->live)."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         if not _owned(cur, tenant_id, org_id):
             return {"error": "not your org"}
-        cur.execute("UPDATE orgs SET stage=%s, updated_at=now() WHERE id=%s", (stage, org_id)); c.commit()
-    audit.append(actor="orgs", action="OrgStage", resource=str(org_id), decision=stage)
+        cur.execute("UPDATE orgs SET stage=%s, updated_at=now() WHERE id=%s", (stage, org_id))
+    audit.append(actor="orgs", action="OrgStage", resource=str(org_id), decision=stage, tenant_id=tenant_id)
     return {"org_id": org_id, "stage": stage}
 
 
 def archive(tenant_id, org_id):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         if not _owned(cur, tenant_id, org_id):
             return {"error": "not your org"}
-        cur.execute("UPDATE orgs SET status='archived', updated_at=now() WHERE id=%s", (org_id,)); c.commit()
+        cur.execute("UPDATE orgs SET status='archived', updated_at=now() WHERE id=%s", (org_id,))
     return {"org_id": org_id, "status": "archived"}
 
 
-def record_artifact(org_id, kind, summary, product=None, path=None, ref=None):
+def record_artifact(org_id, kind, summary, product=None, path=None, ref=None, tenant_id=None):
     """Record a context artifact (research_report|plan|design|product_repo|spec|qa_report) for an org —
     the ONE place an org's full context is enumerable (enables context_brief + cross-org ops)."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS org_artifacts (
-            id BIGSERIAL PRIMARY KEY, org_id BIGINT NOT NULL, kind TEXT NOT NULL, product TEXT,
-            path TEXT, ref TEXT, summary TEXT, created_at TIMESTAMPTZ DEFAULT now())""")
-        cur.execute("""INSERT INTO org_artifacts (org_id, kind, product, path, ref, summary)
-                       VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""", (org_id, kind, product, path, ref, summary))
-        aid = cur.fetchone()[0]; c.commit()
+    tenant_id = tenant_id or _tenant_for_org(org_id)
+    with (tenant_connection(tenant_id) if tenant_id else connection()) as c, c.cursor() as cur:
+        cur.execute("""INSERT INTO org_artifacts (tenant_id, org_id, kind, product, path, ref, summary)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (tenant_id, org_id, kind, product, path, ref, summary))
+        aid = cur.fetchone()[0]
     return {"artifact_id": aid}
 
 
@@ -179,7 +203,7 @@ def context_brief(tenant_id, org_id):
     if g.get("error"):
         return g["error"]
     arts = {}
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tenant_id) as c, c.cursor() as cur:
         try:
             cur.execute("""SELECT DISTINCT ON (kind) kind, summary FROM org_artifacts
                            WHERE org_id=%s ORDER BY kind, created_at DESC""", (org_id,))
@@ -211,15 +235,22 @@ def _selftest():
         rz_ok = (resolve(tid, 0)["home"] is True
                  and resolve(tid, a["org_id"]).get("name") == "YouTube competitor"
                  and resolve("t-someone-else", a["org_id"]).get("error") == "not your org")
-        ok = a["org_id"] and two and updated and guard and after and sw_ok and rz_ok
+        art = record_artifact(a["org_id"], "research_report", "creators want rev-share", tenant_id=tid)
+        brief = context_brief(tid, a["org_id"])
+        with connection() as c, c.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM org_artifacts WHERE id=%s", (art["artifact_id"],))
+            art_tid = cur.fetchone()[0]
+        art_ok = art_tid == tid and "creators want rev-share" in brief
+        ok = a["org_id"] and two and updated and guard and after and sw_ok and rz_ok and art_ok
         print(f"created=2 listed={len(listed)} vision/stage-updated={updated} ownership-guard={guard} "
-              f"archive-hides={after} switcher={sw_ok} resolve={rz_ok}")
+              f"archive-hides={after} switcher={sw_ok} resolve={rz_ok} artifact_tenant={art_ok}")
         print("PASS: orgs are first-class per-tenant (create/list/vision/stage/archive, owner-scoped) ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
+            cur.execute("""DELETE FROM org_artifacts WHERE org_id IN
+                           (SELECT id FROM orgs WHERE tenant_id=%s)""", (tid,))
             cur.execute("DELETE FROM orgs WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

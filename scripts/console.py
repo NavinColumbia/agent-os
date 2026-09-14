@@ -18,6 +18,7 @@ Run with the agent-os venv python.
 import json
 import sys
 import threading
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -26,7 +27,9 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import account           # noqa: E402
 import approvals          # noqa: E402
+import assurance          # noqa: E402
 import audit              # noqa: E402
+import auth               # noqa: E402
 import billing           # noqa: E402
 import billingview       # noqa: E402
 import cockpit           # noqa: E402
@@ -52,29 +55,35 @@ import orgs as orgsmod   # noqa: E402
 import orgview           # noqa: E402
 import projbudget        # noqa: E402
 import projectsview      # noqa: E402
+import qatiming          # noqa: E402
 import qualityview       # noqa: E402
 import visionkeeper       # noqa: E402  — the CEO's self-refining requirements (incl. up-front prerequisites)
 import settingsview      # noqa: E402
 import statuspage        # noqa: E402
+import stripebilling     # noqa: E402
 import templatesview     # noqa: E402
 import tenancy           # noqa: E402
 import tenantproviders   # noqa: E402
 import traceview         # noqa: E402
 import vault             # noqa: E402
 import versions          # noqa: E402
+import workstreamview    # noqa: E402
+from aoscfg import get as cfg_get  # noqa: E402
+from dbpool import connection  # noqa: E402
 
 
 # Sentinel for an infrastructure/transient failure (e.g. Postgres briefly unreachable during WSL
 # boot) — distinct from a genuine "unknown token". A real no-match returns None -> 401; this sentinel
 # -> 503 so a momentary backend blip never force-logs-out a valid user nor wipes their saved token.
 _TENANT_ERROR = object()
+MAX_REQUEST_BODY = 1_048_576
 
 
-def _tenant(token):
-    if not token:
+def _tenant(token=None, session_token=None):
+    if not token and not session_token:
         return None
     try:
-        t = tenancy.tenant_for_token(token)
+        t = tenancy.tenant_for_token(token) if token else auth.tenant_for_session(session_token)
         return t["tenant_id"] if isinstance(t, dict) else t   # None when no match -> genuine 401
     except Exception:
         return _TENANT_ERROR                                  # transient/infra failure -> 503, not 401
@@ -95,9 +104,9 @@ def _owns(tid, org_id):
 # Routes that carry a client-supplied org id — gated through _owns() before they ever touch a module.
 ORG_SCOPED_GET = {"/api/controller/state", "/api/controller/research", "/api/design", "/api/brief", "/api/workstreams",
                   "/api/cockpit", "/api/projects", "/api/fleet",
-                  "/api/health", "/api/company", "/api/comms_graph"}
-ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/controller/cancel", "/api/workstreams/new",
-                   "/api/design/decide"}
+                  "/api/health", "/api/company", "/api/comms_graph", "/api/observability"}
+ORG_SCOPED_POST = {"/api/controller/say", "/api/controller/choose", "/api/controller/cancel",
+                   "/api/workstreams/new", "/api/workstreams/cancel", "/api/design/decide"}
 
 
 def _fleet(tid, org_id=0):
@@ -151,7 +160,7 @@ def _controller_state(tid, org_id):
     # and an ETA so it can render a live, working bubble instead of a static "give me a little time".
     if st.get("awaiting") == "fleet":
         try:
-            out["progress"] = _controller_progress(thread, st)
+            out["progress"] = _controller_progress(tid, thread, st)
         except Exception:
             pass
     return out
@@ -165,7 +174,7 @@ _PHASE_LABEL = {"DISCOVER": "Scoping", "RESEARCH": "Researching", "OPTIONS": "Op
                 "PROTOTYPE": "Designing screens", "IMPLEMENT": "Building", "TESTQA": "Testing",
                 "DELIVER": "Finishing up"}
 _PHASE_ETA_MIN = {"RESEARCH": 10, "DEEP_DESIGN": 4, "PROTOTYPE": 6,
-                  "IMPLEMENT": 14, "TESTQA": 5, "DELIVER": 1}
+                  "IMPLEMENT": 14, "TESTQA": qatiming.slice_eta_min(), "DELIVER": 1}
 
 
 def _phase_label(phase):
@@ -186,20 +195,21 @@ def _job_eta_min(phase, kind):
     return _PHASE_ETA_MIN.get(p, 8)
 
 
-def _active_job(thread_id):
+def _active_job(tid, thread_id):
     """The newest in-flight (running/pending) controller job for this thread, with elapsed seconds.
     Reads through loopcontroller's own DB handle so console stays a thin shell over it."""
-    with loopcontroller.psycopg.connect(loopcontroller.DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("""SELECT id, kind, phase, EXTRACT(EPOCH FROM (now()-started_at))::int
-                       FROM controller_jobs WHERE thread_id=%s AND status IN ('running','pending')
-                       ORDER BY id DESC LIMIT 1""", (thread_id,))
+                       FROM controller_jobs WHERE tenant_id=%s AND thread_id=%s
+                         AND status IN ('running','pending')
+                       ORDER BY id DESC LIMIT 1""", (tid, thread_id))
         r = cur.fetchone()
     if not r:
         return None
     return {"job_id": r[0], "kind": r[1], "job_phase": r[2], "elapsed_s": int(r[3] or 0)}
 
 
-def _controller_progress(thread_id, st):
+def _controller_progress(tid, thread_id, st):
     """Live-progress payload for an in-flight job: phase label, elapsed seconds, ETA minutes + a
     plain-language note. Prefers loopcontroller's own live snapshot (live_status/progress/live); only
     falls back to a local controller_jobs read + estimate.py so the bubble works regardless."""
@@ -207,7 +217,7 @@ def _controller_progress(thread_id, st):
         f = getattr(loopcontroller, fn, None)
         if callable(f):
             try:
-                p = f(thread_id)
+                p = f(thread_id, tid)
             except Exception:
                 p = None
             if isinstance(p, dict) and p and not p.get("error"):
@@ -219,9 +229,11 @@ def _controller_progress(thread_id, st):
                 mins_in = elapsed_s // 60
                 note = "" if not eta else (f"about {max(1, int(eta) - mins_in)} min left" if mins_in < eta
                                            else "taking a little longer than usual — still working")
+                pct = p.get("subprogress_pct") if p.get("subprogress_pct") is not None else p.get("progress_pct")
                 return {"phase_label": label, "elapsed_s": elapsed_s, "eta_min": eta,
-                        "eta_note": note, "kind": p.get("job_kind") or p.get("kind")}
-    job = _active_job(thread_id) or {}
+                        "eta_note": note, "kind": p.get("job_kind") or p.get("kind"),
+                        "progress_detail": p.get("progress_detail"), "progress_pct": pct}
+    job = _active_job(tid, thread_id) or {}
     phase = job.get("job_phase") or st.get("phase")
     eta = _job_eta_min(phase, job.get("kind"))
     elapsed_s = int(job.get("elapsed_s") or 0)
@@ -263,6 +275,11 @@ def _ctl_cancel(tid, org_id):
         return {"error": str(e)[:160]}
 
 
+def _workstream_cancel(tid, org_id, thread_id):
+    return workstreamview.cancel_workstream(tid, org_id, thread_id,
+                                            reason="stopped by user from cockpit/projects")
+
+
 def _ctl_say(tid, org_id, msg):
     """Route a message: org=0 home -> assistant.py (account router) when present; org=N -> the company's
     loopcontroller (which applies the consent + provider gate before any model call). org=0 is never sent
@@ -275,6 +292,21 @@ def _ctl_say(tid, org_id, msg):
         if not org_id:
             return {"error": "Create a company first — open My companies to start one."}
     return loopcontroller.say(tid, loopcontroller.thread_for_org(tid, org_id), msg)
+
+
+def _ctl_say_thread(tid, thread_id, msg):
+    st = loopcontroller._st(thread_id)
+    if not st or st.get("tenant_id") != tid:
+        return {"error": "no such controller thread"}
+    out = loopcontroller.say(tid, thread_id, msg)
+    try:
+        for it in notifications.feed(tid, unread_only=True):
+            body = it.get("body") or ""
+            if it.get("category") in ("approvals", "build") and f"ceo-{thread_id}" in body:
+                notifications.mark_read(tid, it["id"])
+    except Exception:
+        pass
+    return out
 
 
 def _ctl_choose(tid, org_id, option_id):
@@ -385,7 +417,7 @@ GETS = {
     "/api/projects": lambda tid, q: {"projects": projectsview.list_projects(tid, int(q.get("org", ["0"])[0] or 0))},
     "/api/project": lambda tid, q: projectsview.project_detail(tid, q.get("product", [""])[0]),
     "/api/fleet": lambda tid, q: _fleet(tid, int(q.get("org", ["0"])[0] or 0)),
-    "/api/observability": lambda tid, q: traceview.overview(tid),
+    "/api/observability": lambda tid, q: traceview.overview(tid, int(q.get("org", ["0"])[0] or 0)),
     "/api/runs": lambda tid, q: {"runs": traceview.runs(tid)},
     # per-tenant audit chain: a CEO cryptographically verifies their OWN complete, unbroken audit trail (C2)
     "/api/audit/verify": lambda tid, q: (lambda r: {"intact": r[0], "reason": r[1]})(audit.verify_tenant(tid)),
@@ -411,7 +443,7 @@ GETS = {
     "/api/versions": lambda tid, q: {"versions": versions.versions(tid, q.get("product", [""])[0])},
     "/api/help/topics": lambda tid, q: {"topics": helpagent.topics()},
     "/api/agents": lambda tid, q: {"agents": customagents.list_agents(tid), "roles": list(customagents.ALLOWED_ROLES), "system": _system_agents()},
-    "/api/explain": lambda tid, q: explain.explain((q.get("product", [""])[0])),   # C4 explainability: why the AI did X
+    "/api/explain": lambda tid, q: explain.explain_for_tenant(tid, (q.get("product", [""])[0])),   # C4 explainability: why the AI did X
     "/api/orgs": lambda tid, q: {"orgs": orgsmod.list_orgs(tid)},
     "/api/brief": lambda tid, q: chiefofstaff.brief(tid, int((q.get("org", ["0"])[0]) or 0)),   # B1 chief-of-staff
     "/api/portfolio": lambda tid, q: crossorgview.portfolio(tid),
@@ -453,7 +485,11 @@ POSTS = {
     "/api/org/message": lambda tid, q, b: orgview.message_agent(tid, b.get("actor_id"), b.get("text", "")),   # B2: CEO -> a specific agent
     "/api/orgs/new": lambda tid, q, b: orgsmod.create(tid, b.get("name", ""), b.get("vision", "")),
     "/api/workstreams/new": lambda tid, q, b: loopcontroller.new_workstream(tid, int(b.get("org") or 0)),   # A2: start a parallel workstream
+    "/api/workstreams/cancel": lambda tid, q, b: _workstream_cancel(tid, int(b.get("org") or 0),
+                                                                     int(b.get("thread_id") or 0)),
     "/api/controller/say": lambda tid, q, b: _ctl_say(tid, int(b.get("org") or 0), b.get("message", "")),
+    "/api/controller/say_thread": lambda tid, q, b: _ctl_say_thread(tid, int(b.get("thread_id") or 0),
+                                                                     b.get("message", "")),
     "/api/controller/choose": lambda tid, q, b: _ctl_choose(tid, int(b.get("org") or 0), int(b.get("option_id") or 0)),
     "/api/controller/cancel": lambda tid, q, b: _ctl_cancel(tid, int(b.get("org") or 0)),
     "/api/design/decide": lambda tid, q, b: designview.decide(tid, str(int(b.get("org") or 0)), int(b.get("id") or 0), b.get("status", "approved")),
@@ -468,6 +504,7 @@ POSTS = {
     "/api/integrations/connect": lambda tid, q, b: integrationsview.connect(tid, b.get("slug", ""), b.get("secret")),
     "/api/integrations/disconnect": lambda tid, q, b: integrationsview.disconnect(tid, b.get("slug", "")),
     "/api/billing/plan": lambda tid, q, b: billingview.change_plan(tid, b.get("plan", "")),
+    "/api/billing/checkout": lambda tid, q, b: billingview.change_plan(tid, b.get("plan", "")),
     "/api/settings/pref": lambda tid, q, b: settingsview.set_pref(tid, b.get("category"), b.get("in_app", True), b.get("email", True), b.get("push", False)),
     "/api/settings/consent": lambda tid, q, b: settingsview.set_consent(tid, b.get("accept", True)),
     "/api/notifications/read": lambda tid, q, b: {"read": notifications.mark_read(tid, b.get("id"))},
@@ -717,13 +754,13 @@ const NAV=[
  ['Account',[['billing','Billing','▣'],['providers','Providers','🔌'],['integrations','Integrations','⌁']]],
 ];
 const LABEL={controller:'Assistant',assistant:'Assistant',chat:'Quick build',build:'New build',agents:'Agents',templates:'Templates',cockpit:'Cockpit',requirements:'Requirements',projects:'Projects',design:'Design',agentic:'Agentic features',approvals:'Approvals',activity:'Activity',orgs:'My companies',portfolio:'Portfolio',billing:'Billing',providers:'Providers',integrations:'Integrations',notifications:'Notifications',help:'Help',team:'Org',settings:'Settings',status:'Status'};
-const $=s=>document.querySelector(s);let TOK=localStorage.getItem('aos_tenant')||'';let CUR='cockpit';let BADGES={};
+const $=s=>document.querySelector(s);let STORED_TOKEN=localStorage.getItem('aos_tenant')||'';let TOK=STORED_TOKEN||'cookie';let CUR='cockpit';let BADGES={};
 let ORG=parseInt(localStorage.getItem('aos_org')||'0')||0;let ORGS=[];let PROVIDER_OK=true;let PEND_EMAIL='';
 async function loadOrgs(){try{const d=await get('/api/orgs');ORGS=d.orgs||[];
   if(ORG && !ORGS.some(o=>o.org_id==ORG)){ORG=0;localStorage.removeItem('aos_org');}   // stale/deleted org -> home (org=0)
   setOrgName();}catch(e){}}
 function setOrgName(){const cur=ORGS.find(o=>o.org_id==ORG);if($('#orgname'))$('#orgname').textContent=ORG?(cur?cur.name:'company'):'All companies (home)';}
-async function loadProviders(){try{const d=await get('/api/providers');PROVIDER_OK=(d.providers||[]).some(p=>p.connected);}catch(e){}}   // subscription login OR api key both count as connected
+async function loadProviders(){try{const d=await get('/api/providers');PROVIDER_OK=(d.providers||[]).some(p=>p.connected);}catch(e){}}   // tenant provider OR signed-in host default counts as model-ready
 function toggleOrgSw(force){const m=$('#orgmenu');if(!m)return;const open=force!==undefined?force:(m.style.display==='none');m.style.display=open?'block':'none';const chip=$('#orgchip');if(chip)chip.setAttribute('aria-expanded',open?'true':'false');if(open){renderOrgSw();const s=$('#orgsearch');if(s){s.value='';setTimeout(()=>{try{s.focus()}catch(_){}} ,0)}}}
 function renderOrgSw(){const list=$('#orglist');if(!list)return;const q=(($('#orgsearch')||{}).value||'').toLowerCase();
   const opts=[{org_id:0,name:'All companies (home)',vision:'Ask across every company · start a new one'}].concat(ORGS);
@@ -739,7 +776,7 @@ function gateNote(e){
  if(e==='provider_required')return 'Connect an AI model to start — <button class=linkbtn onclick="go(\'providers\')">connect a model</button>. It takes one click.';
  if(e==='consent_required')return 'One-time setup: approve AI use before your agents run — <button class=linkbtn onclick="go(\'settings\')">approve AI use</button>.';
  return esc(''+e);}
-function H(){return {'Content-Type':'application/json','X-Tenant-Token':TOK}}
+function H(){const h={'Content-Type':'application/json'};if(TOK&&TOK!=='cookie')h['X-Tenant-Token']=TOK;return h}
 function showApp(on){$('#signin').style.display=on?'none':'block';$('#app').style.display=on?'flex':'none';if(!on){const up=($('#su_signup')||{}).style&&$('#su_signup').style.display!=='none';const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}}
 function resetSession(){localStorage.removeItem('aos_org');localStorage.removeItem('aos_email');ORG=0;ORGS=[];THREAD=null;PROVIDER_OK=true;CUR='controller'}
 function suTab(t){const up=t==='up';$('#su_signup').style.display=up?'block':'none';$('#su_signin').style.display=up?'none':'block';['su_verify','su_reset_req','su_reset'].forEach(id=>{const v=$('#'+id);if(v)v.style.display='none'});setNote(up?'su':'si','');const f=$(up?'#su_name':'#si_email');if(f)setTimeout(()=>{try{f.focus()}catch(_){}},0)}
@@ -791,7 +828,7 @@ async function resetPassword(){
  catch(e){restore();setNote('rp','Couldn\'t reach the server — is the console running?','err');return}
  if(r.error){restore();aInv('rp_code',true);setNote('rp',r.error,'err');$('#rp_code').focus();return}
  restore();setNote('rp','');
- TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||PEND_EMAIL);
+ TOK=r.api_token||'cookie';if(r.api_token)localStorage.setItem('aos_tenant',r.api_token);else localStorage.removeItem('aos_tenant');localStorage.setItem('aos_email',r.email||PEND_EMAIL);
  showApp(true);boot();
 }
 async function resetResend(){
@@ -828,7 +865,7 @@ async function signUp(){
  if(r.error){restore();if(/already/.test(r.error)){aInv('su_email',true);$('#su_email').focus()}setNote('su',humanError(r.error,'signup'),'err');return}
  if(r.pending_verification){restore();setNote('su','');showVerify(r.email||email,r.dev_code);return}   // email-verification gate: collect the 6-digit code before entering the app
  restore();setNote('su','');  // re-enable the button & clear the note so a later sign-out→sign-in isn't stuck disabled
- TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||email);
+ TOK=r.api_token||'cookie';if(r.api_token)localStorage.setItem('aos_tenant',r.api_token);else localStorage.removeItem('aos_tenant');localStorage.setItem('aos_email',r.email||email);
  showApp(true);boot();
 }
 function showVerify(email,devCode){
@@ -850,7 +887,7 @@ async function verifyEmail(){
  catch(e){restore();setNote('ve','Couldn\'t reach the server — is the console running?','err');return}
  if(r.error){restore();aInv('ve_code',true);setNote('ve',r.error,'err');$('#ve_code').focus();return}
  restore();setNote('ve','');
- TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||PEND_EMAIL);
+ TOK=r.api_token||'cookie';if(r.api_token)localStorage.setItem('aos_tenant',r.api_token);else localStorage.removeItem('aos_tenant');localStorage.setItem('aos_email',r.email||PEND_EMAIL);
  showApp(true);boot();
 }
 async function resendCode(){
@@ -872,10 +909,10 @@ async function signIn(){
  catch(e){restore();setNote('si','Couldn\'t reach the server — is the console running?','err');return}
  if(r.error){restore();setNote('si',humanError(r.error,'signin'),'err');return}
  restore();setNote('si','');  // re-enable the button & clear the note so a later sign-out→sign-in isn't stuck disabled
- TOK=r.api_token;localStorage.setItem('aos_tenant',TOK);localStorage.setItem('aos_email',r.email||email);
+ TOK=r.api_token||'cookie';if(r.api_token)localStorage.setItem('aos_tenant',r.api_token);else localStorage.removeItem('aos_tenant');localStorage.setItem('aos_email',r.email||email);
  showApp(true);boot();
 }
-function signOut(msg){localStorage.removeItem('aos_tenant');TOK='';clearTimers();resetSession();suTab('in');showApp(false);const n=$('#si_note');if(n)n.textContent=msg||''}
+function signOut(msg){fetch('/api/logout',{method:'POST',headers:{'Content-Type':'application/json'}}).catch(()=>{});localStorage.removeItem('aos_tenant');TOK='';clearTimers();resetSession();suTab('in');showApp(false);const n=$('#si_note');if(n)n.textContent=msg||''}
 function toggleAcct(){const m=$('#acctmenu');m.style.display=m.style.display==='none'?'block':'none'}
 function toggleNav(force){const a=$('#app');if(!a)return;const open=force!==undefined?force:!a.classList.contains('navopen');a.classList.toggle('navopen',open)}   // mobile: slide the sidebar in/out as a drawer
 async function get(p){
@@ -985,7 +1022,10 @@ function stoppedBubble(p){const el=(p&&p.elapsed_s)?(' after '+esc(fmtElapsed(p.
   +'</span></div></div>';}
 function fmtElapsed(s){s=Math.max(0,Math.floor(s));const m=Math.floor(s/60),ss=s%60;return m+'m '+(ss<10?'0':'')+ss+'s elapsed';}
 function progressBubble(p){const lab=esc(p.phase_label||'Working');const eta=p.eta_note?(' · '+esc(p.eta_note)):'';
- return '<div class="msg ai" id=ctlprog style="margin:8px 0"><div><span class=bubble><span class=spin></span> <b>'+lab+'…</b> <span id=progelapsed class=muted>'+fmtElapsed(p.elapsed_s||0)+'</span>'+eta+'<div style="margin-top:8px"><button onclick=ctlStop()>Stop</button></div></span></div></div>';}
+ const pct=Math.max(0,Math.min(99,parseInt(p.progress_pct||0,10)||0));
+ const detail=p.progress_detail?('<div class=muted style="margin-top:6px">'+esc(p.progress_detail)+'</div>'):'';
+ const bar=pct?('<div aria-label="Progress '+pct+'%" title="Progress '+pct+'%" style="height:6px;background:var(--line);border-radius:999px;margin-top:8px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:var(--accent)"></div></div>'):'';
+ return '<div class="msg ai" id=ctlprog style="margin:8px 0"><div><span class=bubble><span class=spin></span> <b>'+lab+'…</b> <span id=progelapsed class=muted>'+fmtElapsed(p.elapsed_s||0)+'</span>'+eta+detail+bar+'<div style="margin-top:8px"><button onclick=ctlStop()>Stop</button></div></span></div></div>';}
 function startTick(){if(window.CTLTICK)return;window.CTLTICK=setInterval(()=>{
   if(!TOK||CUR!=='controller'||!PROG){clearInterval(window.CTLTICK);window.CTLTICK=null;return}
   const el=$('#progelapsed');if(el)el.textContent=fmtElapsed((Date.now()-PROG._anchor)/1000);},1000);}
@@ -1139,7 +1179,9 @@ const VIEWS={
     if((hl.dead_letter||0))hi+=`<div class=item>${pill('stuck','bad')} ${hl.dead_letter} task(s) need a human decision — see Approvals</div>`;
     if(hi)h+='<div class=card><h2>Needs attention · org health</h2>'+hi+'</div>';}
   else if(hl&&hl.ok){h+='<div class=card><h2>Org health</h2><div class=row>'+pill('all clear','ok')+' <span class=muted>no blocked or stuck agents</span></div></div>';}
-  h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${ql[p.product]?pill('✓ '+ql[p.product].overall,(ql[p.product].overall=='verified'||ql[p.product].overall=='passed')?'ok':(ql[p.product].overall=='failed'?'bad':'')):''} ${ls[p.product]&&ls[p.product].url?'<a href="'+ls[p.product].url+'" target=_blank>'+(ls[p.product].reachable?'● live':'open ↗')+'</a>':''} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):'<div class=muted>none yet — start one in the Assistant</div>')+'</div>';
+  const cws=(d.workstreams||[]).filter(w=>!w.product||!d.products.find(p=>p.product===w.product));
+  if(cws.length){h+='<div class=card><h2>Active workstreams</h2>'+cws.map(w=>`<div class=item><div class="row spread"><span><b>${esc(w.product||('workstream '+w.thread_id))}</b> ${pill(w.running?'running':(w.awaiting||'working'),w.running?'accent':'warn')}</span><span class=row style="gap:8px;align-items:center"><span class=muted>${esc(w.phase||'')}${w.status?' · '+esc(w.status):''}</span>${w.can_cancel?`<button onclick="ctlWsStop(${Number(w.thread_id)||0})">Stop</button>`:''}</span></div></div>`).join('')+'</div>';}
+  h+='<div class=card><h2>Projects</h2>'+(d.products.length?d.products.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${ql[p.product]?pill('✓ '+ql[p.product].overall,(ql[p.product].overall=='verified'||ql[p.product].overall=='passed')?'ok':(ql[p.product].overall=='failed'?'bad':'')):''} ${ls[p.product]&&ls[p.product].url?'<a href="'+ls[p.product].url+'" target=_blank>'+(ls[p.product].reachable?'● live':'open ↗')+'</a>':''} ${p.halted?pill('paused','bad'):''}</span><span>${p.halted?`<button onclick="ctl('${p.product}','resume')">resume</button>`:`<button onclick="ctl('${p.product}','pause')">pause</button>`}</span></div>${stages(p.stages)}<div class=muted>$${p.cost_usd} · ${p.tokens} tok · ${p.workers.length} workers</div></div>`).join(''):(cws.length?'<div class=muted>no materialized products yet — controller work is running above</div>':'<div class=muted>none yet — start one in the Assistant</div>'))+'</div>';
   h+='<div class=grid><div class=card><h2>Communications</h2><table>'+(d.communications.length?d.communications.map(m=>`<tr><td>${m.ts}</td><td>${esc(m.from)}</td><td>→ ${esc(m.to)}</td><td>${esc(m.intent)}</td></tr>`).join(''):'<tr><td class=muted>no recent agent messages</td></tr>')+'</table></div>';
   h+=`<div class=card><h2>Work queue</h2>${kpis([['pending',d.queue.pending],['active',d.queue.active],['dead',d.queue.dead]])}</div></div>`;
   if(CUR==='cockpit')$('#view').innerHTML=h;},   // guard: cockpit does ~8 awaits; if the user navigated away mid-load (e.g. clicked 'Continue in Assistant'), this late render must NOT clobber #view (the 'title Assistant / body Cockpit' race a QA hit under build load)
@@ -1157,24 +1199,24 @@ const VIEWS={
   h+='<div class=card><h2>Agentic features</h2><div class="row spread"><span class=muted>Embed agents INTO your product — buttons and endpoints your own users trigger. A curated catalog your fleet builds into your app.</span><button onclick="go(\'agentic\')">Browse features</button></div></div>';
   $('#view').innerHTML=h;},
  templates:async()=>{const d=await get('/api/templates');$('#view').innerHTML=`<h1>Templates</h1><p class=sub>Start from a curated, factory-ready blueprint.</p><div class=grid>`+(d.templates||[]).map(t=>`<div class=tile><div class="row spread"><b>${esc(t.name)}</b>${pill(t.kind)}</div><div class=muted style=margin:6px_0>${esc(t.blurb)}</div><button class=pri onclick="buildTpl('${t.slug}')">Build this</button></div>`).join('')+'</div>';},
- projects:async()=>{const d=await get('/api/projects?org='+ORG);d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))}</span><span class=muted>$${p.cost_usd||0} · ${p.stages_done||0} stages <button onclick="explainProduct('${esc(p.product)}')" title="Why did the AI do what it did?">Why?</button></span></div><div id="why_${esc(p.product)}" class=muted style="margin-top:6px"></div></div>`).join(''):emptyB('▤','No projects yet','Describe your first product and the factory builds, tests and ships it.','<button class=pri onclick="go(\'controller\')">Start your first build</button>'))+'</div>';},
- activity:async()=>{const o=await get('/api/observability');let fl={workers:[]};try{fl=await get('/api/fleet?org='+ORG)}catch(e){}fl.workers=fl.workers||[];
+ projects:async()=>{const d=await get('/api/projects?org='+ORG);d.projects=d.projects||[];$('#view').innerHTML='<h1>Projects</h1><p class=sub>Everything you have built.</p><div class=card>'+(d.projects.length?d.projects.map(p=>`<div class=item><div class="row spread"><span><b>${esc(p.product)}</b> ${pill(p.result,p.ready?'ok':(p.failed?'bad':''))} ${p.provisional?pill('workstream','accent'):''}</span><span class="row muted" style="gap:8px;align-items:center">${p.phase?esc(p.phase)+' · ':''}$${p.cost_usd||0} · ${p.stages_done||0} stages ${p.provisional&&p.can_cancel?`<button onclick="ctlWsStop(${Number(p.thread_id)||0})">Stop</button>`:(p.provisional?'':`<button onclick="explainProduct('${esc(p.product)}')" title="Why did the AI do what it did?">Why?</button>`)}</span></div><div id="why_${esc(p.product)}" class=muted style="margin-top:6px"></div></div>`).join(''):emptyB('▤','No projects yet','Describe your first product and the factory builds, tests and ships it.','<button class=pri onclick="go(\'controller\')">Start your first build</button>'))+'</div>';},
+ activity:async()=>{const o=await get('/api/observability?org='+ORG);let fl={workers:[]};try{fl=await get('/api/fleet?org='+ORG)}catch(e){}fl.workers=fl.workers||[];const ws=(o.workstreams||[]).filter(w=>w.running||w.awaiting);
   let h='<h1>Activity</h1><p class=sub>Runs, errors, spend, and the live workers across your fleet.</p>';
-  h+=kpis([['Runs',o.runs||0],['Steps',o.steps||0],['Errors',o.errors||0],['Cost $',o.cost_usd||0],['Workers',fl.workers.length]]);
-  h+='<div class=card><h2>Live workers</h2><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th></tr>'+(fl.workers.length?fl.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td></tr>`).join(''):'<tr><td class=muted colspan=4>no live workers right now</td></tr>')+'</table></div>';
-  h+='<div class=card><h2>Recent activity</h2><p class=muted style="margin:0 0 8px">Watch your AI team work — the latest thing each agent did.</p>'+((o.recent_activity||[]).length?o.recent_activity.map(a=>`<div class=item><div class="row spread"><span>${pill(a.role||'agent',a.ok?'ok':'bad')} <b>${esc(a.stage||'')}</b> <span class=muted>on ${esc(a.product||'')}</span></span><span class=muted>${a.ts?esc(String(a.ts).replace('T',' ').slice(0,16)):''}</span></div></div>`).join(''):emptyB('📡','No live activity right now','Agents show up here as they work. If you just directed a build, they\'ll appear as they spin up — give it a moment. Otherwise, start a build to watch your team work in real time.'))+'</div>';
+  h+=kpis([['Runs',o.runs||0],['Steps',o.steps||0],['Errors',o.errors||0],['Cost $',o.cost_usd||0],['Workers',fl.workers.length+ws.length],['Workstreams',o.in_flight_workstreams||0]]);
+  h+='<div class=card><h2>Live workers</h2><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th></th></tr>'+(fl.workers.length||ws.length?[...ws.map(w=>`<tr><td>controller</td><td>workstream</td><td>${pill(w.running?'running':(w.awaiting||'waiting'),w.running?'accent':'warn')}</td><td>${esc(w.product||w.label||('workstream '+w.thread_id))}</td><td>${w.can_cancel?`<button onclick="ctlWsStop(${Number(w.thread_id)||0})">Stop</button>`:''}</td></tr>`),...fl.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td></td></tr>`)].join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';
+  h+='<div class=card><h2>Recent activity</h2><p class=muted style="margin:0 0 8px">Watch your AI team work — the latest thing each agent did.</p>'+((o.recent_activity||[]).length?o.recent_activity.map(a=>`<div class=item><div class="row spread"><span>${pill(a.role||'agent',a.workstream?'accent':(a.ok?'ok':'bad'))} <b>${esc(a.stage||'')}</b> <span class=muted>on ${esc(a.product||'')}</span></span><span class="row muted" style="gap:8px;align-items:center">${a.status?esc(a.status):(a.ts?esc(String(a.ts).replace('T',' ').slice(0,16)):'')}${a.workstream&&a.can_cancel?`<button onclick="ctlWsStop(${Number(a.thread_id)||0})">Stop</button>`:''}</span></div></div>`).join(''):emptyB('📡','No live activity right now','Agents show up here as they work. If you just directed a build, they\'ll appear as they spin up — give it a moment. Otherwise, start a build to watch your team work in real time.'))+'</div>';
   h+='<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(o.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div>';
   h+='<div class=card><h2>Recent errors</h2>'+((o.recent_errors||[]).length?o.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean ✓</div>')+'</div>';
   $('#view').innerHTML=h;},
  fleet:async()=>{const d=await get('/api/fleet?org='+ORG);d.workers=d.workers||[];$('#view').innerHTML='<h1>Agent fleet</h1><p class=sub>Live workers across your products.</p>'+kpis([['Live workers',d.count||0],['Active products',d.products_active||0]])+'<div class=card><table><tr><th>agent</th><th>role</th><th>status</th><th>product</th><th>task</th></tr>'+(d.workers.length?d.workers.map(w=>`<tr><td>${esc(w.agent)}</td><td>${esc(w.role)}</td><td>${pill(w.status,w.status=='active'?'ok':'')}</td><td>${esc(w.product)}</td><td>${esc(w.task)}</td></tr>`).join(''):'<tr><td class=muted colspan=5>no live workers right now</td></tr>')+'</table></div>';},
- observability:async()=>{const d=await get('/api/observability');$('#view').innerHTML='<h1>Observability</h1><p class=sub>Runs, errors, spend across your fleet.</p>'+kpis([['Runs',d.runs],['Steps',d.steps],['Errors',d.errors],['Cost $',d.cost_usd],['Tokens',d.tokens]])+'<div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(d.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div><div class=card><h2>Recent errors</h2>'+((d.recent_errors||[]).length?d.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean</div>')+'</div>';},
- approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>i.kind=='consent'?`<div class=item><div class="row spread"><span>${pill('setup','accent')} <b>Approve AI processing</b></span><span><button class=pri onclick="decide('consent','${esc(i.ref)}','approve')">Approve AI processing</button></span></div><div class=muted>Nothing's broken — this is a one-time, revocable OK to let your AI provider process your prompts so your agents can build. Approving it unlocks your first build.</div></div>`:i.kind=='question'?`<div class=item><div class="row spread"><span>${pill('question','accent')} <b>${esc(i.title)}</b></span></div><div class=row style="gap:6px;margin-top:6px"><input id="ans_${i.ref}" aria-label="Your answer" placeholder="Type your answer — your fleet resumes on it" style="flex:1" onkeydown="if(event.key==='Enter')answerQuestion('${i.ref}')"><button class=pri onclick="answerQuestion('${i.ref}')">Answer</button></div><div class=muted style=margin-top:4px>${esc(i.detail||'')}</div></div>`:`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'||i.kind=='blocked_build'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">${i.kind=='blocked_build'?'abandon':'deny'}</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):emptyB('✓','All clear','Nothing needs your decision right now. We\'ll bring anything important here.'))+'</div>';},
+ observability:async()=>{const d=await get('/api/observability?org='+ORG);$('#view').innerHTML='<h1>Observability</h1><p class=sub>Runs, errors, spend across your fleet.</p>'+kpis([['Runs',d.runs],['Steps',d.steps],['Errors',d.errors],['Cost $',d.cost_usd],['Tokens',d.tokens],['Workstreams',d.in_flight_workstreams||0]])+'<div class=card><h2>Recent activity</h2>'+((d.recent_activity||[]).length?d.recent_activity.map(a=>`<div class=item><div class="row spread"><span>${pill(a.role||'agent',a.workstream?'accent':(a.ok?'ok':'bad'))} <b>${esc(a.stage||'')}</b> <span class=muted>on ${esc(a.product||'')}</span></span><span class="row muted" style="gap:8px;align-items:center">${a.status?esc(a.status):(a.ts?esc(String(a.ts).replace('T',' ').slice(0,16)):'')}${a.workstream&&a.can_cancel?`<button onclick="ctlWsStop(${Number(a.thread_id)||0})">Stop</button>`:''}</span></div></div>`).join(''):'<div class=muted>no recent activity</div>')+'</div><div class=card><h2>By stage</h2><table><tr><th>stage</th><th>steps</th><th>errors</th><th>cost</th><th>avg s</th></tr>'+(d.by_stage||[]).map(s=>`<tr><td>${esc(s.stage)}</td><td>${s.steps}</td><td>${s.errors}</td><td>$${s.cost_usd}</td><td>${s.avg_elapsed_s}</td></tr>`).join('')+'</table></div><div class=card><h2>Recent errors</h2>'+((d.recent_errors||[]).length?d.recent_errors.map(e=>`<div class=item><b>${esc(e.product)}</b> · ${esc(e.stage)} <span class=muted>${e.ts}</span><div><code>${esc(e.snippet)}</code></div></div>`).join(''):'<div class=muted>no errors — clean</div>')+'</div>';},
+ approvals:async()=>{const d=await get('/api/approvals');$('#view').innerHTML='<h1>Approvals</h1><p class=sub>Decisions awaiting you. Governed: nothing risky happens without this.</p><div class=card>'+(d.count?d.items.map(i=>i.kind=='consent'?`<div class=item><div class="row spread"><span>${pill('setup','accent')} <b>Approve AI processing</b></span><span><button class=pri onclick="decide('consent','${esc(i.ref)}','approve')">Approve AI processing</button></span></div><div class=muted>Nothing's broken — this is a one-time, revocable OK to let your AI provider process your prompts so your agents can build. Approving it unlocks your first build.</div></div>`:i.kind=='question'?`<div class=item><div class="row spread"><span>${pill('question','accent')} <b>${esc(i.title)}</b></span></div><div class=row style="gap:6px;margin-top:6px"><input id="ans_${i.ref}" aria-label="Your answer" placeholder="Type your answer — your fleet resumes on it" style="flex:1" onkeydown="if(event.key==='Enter')answerQuestion('${i.ref}')"><button class=pri onclick="answerQuestion('${i.ref}')">Answer</button></div><div class=muted style=margin-top:4px>${esc(i.detail||'')}</div></div>`:i.kind=='ceo_decision'?`<div class=item><div class="row spread"><span>${pill('needs you','bad')} <b>${esc(i.title)}</b></span><span><button onclick="go('controller')">Open Assistant</button></span></div><div class=muted>${esc(i.detail||'')}</div><div class=row style="gap:6px;margin-top:6px"><input id="gate_${i.ref}" aria-label="Your response" placeholder="Type your response — e.g. approve the plan" style="flex:1" onkeydown="if(event.key==='Enter')answerGate('${i.ref}')"><button class=pri onclick="answerGate('${i.ref}')">Respond</button></div></div>`:`<div class=item><div class="row spread"><span>${pill(i.kind,i.severity=='high'?'bad':(i.severity=='med'?'warn':''))} <b>${esc(i.title)}</b></span><span><button class=pri onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'retry':'approve'}')">${esc(i.action_label||'approve')}</button> ${i.kind=='hire_request'||i.kind=='dead_letter'||i.kind=='blocked_build'?`<button onclick="decide('${i.kind}','${esc(i.ref)}','${i.kind=='dead_letter'?'drop':'deny'}')">${i.kind=='blocked_build'?'abandon':'deny'}</button>`:''}</span></div><div class=muted>${esc(i.detail||'')}</div></div>`).join(''):emptyB('✓','All clear','Nothing needs your decision right now. We\'ll bring anything important here.'))+'</div>';},
  integrations:async()=>{const d=await get('/api/integrations');$('#view').innerHTML='<h1>Integrations</h1><p class=sub>Connect the services your products need.</p><div class=grid>'+(d.integrations||[]).map(i=>`<div class=tile><div class=row style=margin-bottom:6px><span class=int-ic>${esc((i.name||'?')[0])}</span><b>${esc(i.name)}</b><span style=flex:1></span>${pill(i.status=='connected'?'connected':'disconnected',i.status=='connected'?'ok':'off')}</div><div class=muted style=margin:0_0_8px>${esc(i.blurb)} · ${esc(i.category)}</div>${i.status=='connected'?`<button onclick="integ('disconnect','${i.slug}')">disconnect</button>`:`<button class=pri onclick="integ('connect','${i.slug}')">connect</button>`}</div>`).join('')+'</div>';},
- billing:async()=>{const d=await get('/api/billing');$('#view').innerHTML=`<h1>Billing & plans</h1><p class=sub>Usage, quota and plan. Real payment is gated (BYO Stripe).</p>`+kpis([['Plan',d.plan],['Builds',(d.usage&&d.usage.builds)||0],['Tokens',(d.usage&&d.usage.tokens)||0]])+'<div class=card><h2>Plans</h2><table><tr><th>plan</th><th>price</th><th>builds</th><th>tokens</th><th></th></tr>'+(d.plans||[]).map(p=>`<tr><td>${esc(p.slug)} ${p.current?pill('current','ok'):''}</td><td>$${p.price}</td><td>${p.builds}</td><td>${p.tokens}</td><td>${p.current?'':`<button onclick="plan('${p.slug}')">switch</button>`}</td></tr>`).join('')+'</table></div>'+(d.invoice?`<div class=card><h2>This month’s bill</h2><div class=item><div class="row spread"><span>Base plan (${esc(d.invoice.plan)})</span><span>$${d.invoice.base}</span></div></div>${(d.invoice.overage&&d.invoice.overage.cost>0)?`<div class=item><div class="row spread"><span>Overage · ${d.invoice.overage.builds} extra build(s) · ${d.invoice.overage.tokens} extra tokens</span><span>$${d.invoice.overage.cost}</span></div></div>`:''}<div class=item><div class="row spread"><b>Total due this period</b><b>$${d.invoice.total}</b></div></div><div class=muted style="margin-top:6px">Real payment is gated until you connect Stripe (bring-your-own). This is your live usage-based bill.</div></div>`:'')+'';},
+ billing:async()=>{const d=await get('/api/billing');const pay=d.payments||{};$('#view').innerHTML=`<h1>Billing & plans</h1><p class=sub>Usage, quota and payment-backed plan state.</p>`+kpis([['Plan',d.plan],['Builds',(d.usage&&d.usage.builds)||0],['Tokens',(d.usage&&d.usage.tokens)||0],['Payment',pay.status||'none']])+(pay.configured?'':`<div class=card style="border-color:var(--y)"><b>Stripe is not configured.</b><div class=muted style=margin-top:6px>Paid upgrades are blocked until the operator sets ${esc((pay.missing||[]).join(', ')||'Stripe config')}.</div></div>`)+'<div class=card><h2>Plans</h2><table><tr><th>plan</th><th>price</th><th>builds</th><th>tokens</th><th></th></tr>'+(d.plans||[]).map(p=>`<tr><td>${esc(p.slug)} ${p.current?pill('current','ok'):''}</td><td>$${p.price}</td><td>${p.builds}</td><td>${p.tokens}</td><td>${p.current?'':`<button onclick="plan('${p.slug}')">${p.slug==='free'?'downgrade':'checkout'}</button>`}</td></tr>`).join('')+'</table><div id=plannote class=muted style=margin-top:8px></div></div>'+(d.invoice?`<div class=card><h2>This month’s bill</h2><div class=item><div class="row spread"><span>Base plan (${esc(d.invoice.plan)})</span><span>$${d.invoice.base}</span></div></div>${(d.invoice.overage&&d.invoice.overage.cost>0)?`<div class=item><div class="row spread"><span>Overage · ${d.invoice.overage.builds} extra build(s) · ${d.invoice.overage.tokens} extra tokens</span><span>$${d.invoice.overage.cost}</span></div></div>`:''}<div class=item><div class="row spread"><b>Total due this period</b><b>$${d.invoice.total}</b></div></div><div class=muted style="margin-top:6px">Usage is metered here; paid entitlement changes only after Stripe confirms checkout or subscription state by webhook.</div></div>`:'')+'';},
  notifications:async()=>{const d=await get('/api/notifications');d.feed=d.feed||[];const unread=d.unread||0;
   let h=`<h1>Notifications</h1><p class=sub>${unread} unread.</p><div class=card>`;
   if(unread>0)h+=`<div class="row spread" style=margin-bottom:10px><span class=muted>${unread} unread</span><button onclick=markAllRead()>Mark all read</button></div>`;
-  h+=(d.feed.length?d.feed.map(n=>`<div class=item><div class="row spread"><span>${pill(n.level,n.level=='urgent'?'bad':(n.level=='standard'?'':'warn'))} <b>${esc(n.title)}</b></span><span class=row style=gap:8px><span class=muted>${esc(n.category)} · ${n.created_at}</span>${n.read?'':`<button onclick="markRead(${n.id})">Mark read</button>`}</span></div><div class=muted>${esc(n.body||'')}</div></div>`).join(''):emptyB('◔','You\'re all caught up','Build updates, billing alerts and agent reports will appear here.'));
+  h+=(d.feed.length?d.feed.map(n=>{const ds=(n.deliveries||[]);const dl=ds.length?'<div class=muted style="margin-top:4px">Delivery: '+ds.map(x=>esc(x.channel)+' '+(x.status==='accepted'?pill('accepted','ok'):pill(x.status,x.status==='failed'?'bad':'warn'))+(x.attempts>1?' · '+x.attempts+' attempts':'')).join(' · ')+'</div>':'';return `<div class=item><div class="row spread"><span>${pill(n.level,n.level=='urgent'?'bad':(n.level=='standard'?'':'warn'))} <b>${esc(n.title)}</b> ${n.resolved?pill('resolved','ok'):''}</span><span class=row style=gap:8px><span class=muted>${esc(n.category)} · ${n.created_at}</span>${n.read?'':`<button onclick="markRead(${n.id})">Mark read</button>`}</span></div><div class=muted>${esc(n.body||'')}</div>${dl}</div>`}).join(''):emptyB('◔','You\'re all caught up','Build updates, billing alerts and agent reports will appear here.'));
   $('#view').innerHTML=h+'</div>';},
  team:async()=>{let o=null,t=null;try{o=await get('/api/org')}catch(e){}try{t=await get('/api/team')}catch(e){}
   let h='<h1>Org chart</h1><p class=sub>Your fleet of AI agents — who does what, and who\'s working right now.</p>';
@@ -1207,7 +1249,7 @@ const VIEWS={
   $('#view').innerHTML='<h1>Connect an AI model</h1>'
    +'<p class=sub>Your agents need an AI model to do their work — Claude, ChatGPT/Codex, or both. You only need one to get started.</p>'
    +banner
-   +'<div id=provnote class=muted style="margin:0 0 10px"></div><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill('connected','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)}</div>${p.connected?`<button onclick="provRemove('${p.slug}')">Disconnect</button>`:`<div class=row><button class=pri onclick="provSub('${p.slug}')">Connect</button><button onclick="provKeyForm('${p.slug}')">Use an API key</button></div><div id=pk_${p.slug} class=pkform style="display:none;margin-top:10px"><label for=pkin_${p.slug}>API key</label><div class=pwwrap><input id=pkin_${p.slug} type=password autocomplete=off spellcheck=false placeholder="${esc(p.key_hint||'paste your key')}" aria-label="${esc(p.name)} API key" onkeydown="if(event.key===\'Enter\')provKeySave('${p.slug}')"><button type=button class=pwtoggle aria-label="Show key" aria-pressed=false onclick="pwToggle('pkin_${p.slug}',this)">Show</button></div><div class=row style="margin-top:8px;justify-content:space-between"><button class=pri id=pkbtn_${p.slug} onclick="provKeySave('${p.slug}')">Connect with key</button>${keyUrl(p)?`<a href="${esc(keyUrl(p))}" target=_blank rel="noopener noreferrer" class=linkbtn>Get your key ↗</a>`:''}</div><div id=pkerr_${p.slug} class=note style="margin-top:6px"></div></div>`}</div>`).join('')+'</div>'
+   +'<div id=provnote class=muted style="margin:0 0 10px"></div><div class=grid>'+(d.providers||[]).map(p=>`<div class=tile><div class="row spread"><b>${esc(p.name)}</b>${p.connected?pill(p.default_connected?'host default':'connected','ok'):pill('not connected')}</div><div class=muted style=margin:6px_0>${esc(p.blurb)}</div>${p.connected?(p.default_connected?`<div class=muted>This host is already signed in, so first-run builds can start with ${esc(p.name)}. Add a tenant key or subscription later if you want separate billing.</div>`:`<button onclick="provRemove('${p.slug}')">Disconnect</button>`):`<div class=row><button class=pri onclick="provSub('${p.slug}')">Connect</button><button onclick="provKeyForm('${p.slug}')">Use an API key</button></div><div id=pk_${p.slug} class=pkform style="display:none;margin-top:10px"><label for=pkin_${p.slug}>API key</label><div class=pwwrap><input id=pkin_${p.slug} type=password autocomplete=off spellcheck=false placeholder="${esc(p.key_hint||'paste your key')}" aria-label="${esc(p.name)} API key" onkeydown="if(event.key===\'Enter\')provKeySave('${p.slug}')"><button type=button class=pwtoggle aria-label="Show key" aria-pressed=false onclick="pwToggle('pkin_${p.slug}',this)">Show</button></div><div class=row style="margin-top:8px;justify-content:space-between"><button class=pri id=pkbtn_${p.slug} onclick="provKeySave('${p.slug}')">Connect with key</button>${keyUrl(p)?`<a href="${esc(keyUrl(p))}" target=_blank rel="noopener noreferrer" class=linkbtn>Get your key ↗</a>`:''}</div><div id=pkerr_${p.slug} class=note style="margin-top:6px"></div></div>`}</div>`).join('')+'</div>'
    +'<details style="margin-top:14px"><summary style="cursor:pointer;color:var(--mut)">Technical details</summary>'
    +'<p class=muted style="margin-top:10px"><b>Connect</b> signs this machine into your Claude or ChatGPT account using the provider\'s own secure login (it opens a browser on this host and connects only once you\'re genuinely signed in, via <code>claude auth login</code> / <code>codex login</code>). Because it uses the machine\'s own sign-in, it connects the whole machine to one account — ideal for a self-hosted, single-operator setup. <b>Use an API key</b> connects with a key instead. Builds use your highest-priority connected model; with none connected, the platform default is used.</p></details>';},
  help:async()=>{const d=await get('/api/help/topics');$('#view').innerHTML=`<h1>Help</h1><p class=sub>Ask me anything about using agent-os.</p>
@@ -1410,6 +1452,7 @@ async function chatConfirm(){
 async function showEst(){const k=($('#bk')||{}).value||'lib';let e;try{e=await get('/api/estimate?kind='+k)}catch(_){return}if($('#est'))$('#est').textContent='Estimate: '+(e.note||('~$'+e.cost_usd_estimate+', ~'+e.minutes_estimate+' min'));}
 async function doBuild(){$('#bnote').textContent='submitting…';const r=await post('/api/build',{name:$('#bn').value,kind:$('#bk').value,charter:$('#bc').value});if(r&&r.error&&gateError(r.error)){$('#bnote').innerHTML=gateNote(r.error);return;}$('#bnote').textContent=r.error?('✗ '+r.error):('building '+r.product+' — see Cockpit');}
 async function explainProduct(prod){const el=$('#why_'+prod);if(!el)return;if(el.dataset.open==='1'){el.dataset.open='0';el.innerHTML='';return}el.dataset.open='1';el.innerHTML='<span class=spin></span> <span class=muted>reconstructing…</span>';try{const e=await get('/api/explain?product='+encodeURIComponent(prod));el.innerHTML='<div style="margin-top:4px"><b>'+esc(e.summary||'No activity recorded.')+'</b></div>'+(e.steps||[]).slice(0,10).map(s=>'<div class=muted style="margin-top:2px">· '+esc(s.role||'')+' — '+esc(s.stage||'')+': '+esc(s.did||'')+'</div>').join('')}catch(_e){el.innerHTML='<span class=muted>Could not load the explanation.</span>'}}
+async function ctlWsStop(thread){await post('/api/workstreams/cancel',{org:ORG||0,thread_id:thread});refreshView();}
 function msgAgent(aid){const el=$('#msg_'+aid);if(!el)return;if(el.dataset.open==='1'){el.dataset.open='0';el.innerHTML='';return}el.dataset.open='1';el.innerHTML=`<div class=row style="gap:6px;margin-top:6px"><input id="mi_${aid}" aria-label="Message to agent" placeholder="Message this agent — e.g. prioritize the login bug" style="flex:1"><button class=pri onclick="msgSend(${aid})">Send</button></div><div id="ms_${aid}" class=muted style="margin-top:4px"></div>`;const inp=$('#mi_'+aid);if(inp){inp.focus();inp.onkeydown=e=>{if(e.key==='Enter')msgSend(aid)}}}
 async function msgSend(aid){const inp=$('#mi_'+aid),note=$('#ms_'+aid);if(!inp)return;const text=(inp.value||'').trim();if(!text){if(note)note.textContent='Type a message first.';return}inp.disabled=true;if(note)note.textContent='Delivering…';try{await post('/api/org/message',{actor_id:aid,text});const el=$('#msg_'+aid);if(el){el.dataset.open='0';el.innerHTML='<div class=ok style="margin-top:6px">✓ Delivered to your agent — it will pick this up on its next check-in.</div>'}}catch(e){inp.disabled=false;if(note)note.textContent='Could not deliver. Try again.'}}
 async function buildTpl(slug){
@@ -1422,8 +1465,9 @@ async function buildTpl(slug){
 async function ctl(p,a){await post('/api/control',{product:p,action:a});go('cockpit');}
 async function decide(kind,ref,verdict){await post('/api/approvals/decide',{kind,ref,verdict});go('approvals');}
 async function answerQuestion(ref){const inp=$('#ans_'+ref);if(!inp)return;const t=(inp.value||'').trim();if(!t){inp.focus();return}inp.disabled=true;try{await post('/api/requests/answer',{ref:ref,text:t});go('approvals')}catch(e){inp.disabled=false}}
+async function answerGate(ref){const inp=$('#gate_'+ref);if(!inp)return;const t=(inp.value||'').trim();if(!t){inp.focus();return}inp.disabled=true;try{await post('/api/controller/say_thread',{thread_id:ref,message:t});markCtlNotifs();go('approvals')}catch(e){inp.disabled=false}}
 async function integ(act,slug){let secret=null;if(act=='connect')secret=prompt('API key / secret for '+slug+' (leave blank if OAuth):')||null;await post('/api/integrations/'+act,{slug,secret});go('integrations');}
-async function plan(p){await post('/api/billing/plan',{plan:p});go('billing');}
+async function plan(p){const r=await post('/api/billing/checkout',{plan:p});if(r.checkout_url){location.href=r.checkout_url;return}const n=$('#plannote');if(r.error&&n){n.textContent=r.error+(r.missing?': '+r.missing.join(', '):'');return}go('billing');}
 function provNote(msg,bad){const n=$('#provnote');if(!n){if(bad)alert(msg);return}n.style.color=bad?'var(--accent)':'';n.textContent=msg;}
 const KEY_URL={anthropic:'https://console.anthropic.com/settings/keys',openai:'https://platform.openai.com/api-keys'};
 function keyUrl(p){return (p&&p.key_url)||KEY_URL[p&&p.slug]||'';}
@@ -1497,7 +1541,7 @@ async function start(){                                   // validate the saved 
  try{await get('/api/onboarding');}                       // lightweight authed probe
  catch(e){if(e.kind==='auth')authFailed=true;}            // 5xx/net errors fall through: token still valid, reveal + reconnect
  if(sp)sp.style.display='none';
- if(authFailed||!TOK){showApp(false);return}              // stale/invalid token -> sign-in; app shell never shown
+ if(authFailed||!TOK){if(!STORED_TOKEN)suTab('up');showApp(false);return} // fresh visitor -> create account; stale token -> sign in
  showApp(true);boot();                                    // valid (or transient backend blip) -> reveal; boot()/go() surface reconnecting state
 }
 start();
@@ -1508,10 +1552,38 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _json(self, code, obj):
+    def _json(self, code, obj, headers=None):
         b = json.dumps(obj, default=str).encode()
         self.send_response(code); self.send_header("Content-Type", "application/json")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
+    def _session_token(self):
+        try:
+            jar = SimpleCookie(self.headers.get("Cookie", ""))
+            morsel = jar.get("aos_session")
+            return morsel.value if morsel else None
+        except Exception:
+            return None
+
+    def _request_tenant(self):
+        return _tenant(self.headers.get("X-Tenant-Token"), self._session_token())
+
+    def _session_cookie(self, token="", *, clear=False):
+        # Caddy supplies X-Forwarded-Proto. Local HTTP development deliberately omits Secure so browser QA
+        # can exercise the same opaque-session path; public preflight requires HTTPS and therefore Secure.
+        public_https = str(cfg_get("AOS_PUBLIC_URL") or "").lower().startswith("https://")
+        secure = public_https or self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+        value = f"aos_session={token if not clear else ''}; Path=/; HttpOnly; SameSite=Lax"
+        if secure:
+            value += "; Secure"
+        value += "; Max-Age=0" if clear else f"; Max-Age={max(1, auth.SESSION_TTL_DAYS) * 86400}"
+        return value
+
+    def _client_identity(self):
+        forwarded = (self.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+        return forwarded or str((self.client_address or ("unknown",))[0])
 
     def _body(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
@@ -1519,6 +1591,10 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             return {}
+
+    def _raw_body(self):
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        return self.rfile.read(n) if n else b""
 
     def _ctl_stream(self, tid, body):
         """SSE: stream the controller's CONVERSATIONAL clarifying reply token-by-token so the chat bubble
@@ -1589,6 +1665,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
             return
+        if p in ("/assurance", "/assurance/"):
+            b = assurance.page().encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
+        if p in ("/assurance/sample", "/assurance/sample/"):
+            b = assurance.sample_page().encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
+        if p.startswith("/assurance/sample/assets/"):
+            b = assurance.sample_asset(p.rsplit("/", 1)[-1])
+            if b is None:
+                return self._json(404, {"error": "not found"})
+            self.send_response(200); self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+            return
         if p == "/health":
             return self._json(200, {"service": "agent-os-console", "ok": True})
         if p.startswith("/download/"):
@@ -1596,7 +1690,7 @@ class Handler(BaseHTTPRequestHandler):
             # below, so it must do its own auth + ownership + path-traversal defense (mirrors the hardened
             # frontdoor.py:252). Every failure returns 404 so a stranger can't even probe which products exist.
             product = p[len("/download/"):]
-            tid = _tenant(self.headers.get("X-Tenant-Token"))
+            tid = self._request_tenant()
             if tid is _TENANT_ERROR:                              # transient backend blip — keep the session
                 return self._json(503, {"error": "backend temporarily unavailable — reconnecting"})
             slug_ok = bool(product) and set(product) <= set("abcdefghijklmnopqrstuvwxyz0123456789-")
@@ -1612,7 +1706,7 @@ class Handler(BaseHTTPRequestHandler):
         fn = GETS.get(p)
         if not fn:
             return self._json(404, {"error": "not found"})
-        tid = _tenant(self.headers.get("X-Tenant-Token"))
+        tid = self._request_tenant()
         if tid is _TENANT_ERROR:                              # transient backend blip — keep the session
             return self._json(503, {"error": "backend temporarily unavailable — reconnecting"})
         if not tid:
@@ -1627,14 +1721,62 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path); p = u.path
+        try:
+            if int(self.headers.get("Content-Length", 0) or 0) > MAX_REQUEST_BODY:
+                return self._json(413, {"error": "request body too large"})
+        except ValueError:
+            return self._json(400, {"error": "invalid content length"})
+        if p == "/api/logout":
+            token = self._session_token()
+            try:
+                auth.revoke_session(token)
+            except Exception:
+                pass
+            return self._json(200, {"ok": True},
+                              {"Set-Cookie": self._session_cookie(clear=True)})
+        if p == "/api/stripe/webhook":
+            raw = self._raw_body()
+            try:
+                r = stripebilling.handle_webhook(raw, self.headers.get("Stripe-Signature", ""))
+                return self._json(200 if r.get("ok") else 400, r)
+            except Exception as e:
+                return self._json(400, {"error": str(e)[:200]})
+        if p == "/api/assurance/intake":
+            b = self._body()
+            try:
+                limited = auth.public_rate_limit(
+                    "assurance-intake", b.get("email", ""), self._client_identity())
+            except Exception:
+                return self._json(503, {"error": "intake temporarily unavailable — try again"})
+            if not limited["allowed"]:
+                return self._json(429, {"error": "too many requests — try again later",
+                                        "retry_after_s": limited["retry_after_s"]},
+                                  {"Retry-After": str(limited["retry_after_s"])})
+            try:
+                result = assurance.submit(b)
+                return self._json(200 if result.get("ok") else 400, result)
+            except Exception:
+                return self._json(503, {"error": "intake temporarily unavailable — try again"})
         if p in ("/api/signup", "/api/login", "/api/verify-email", "/api/resend-code",
                  "/api/reset-request", "/api/reset-password"):   # UNAUTHENTICATED: account + email-verification + password reset
-            import auth
             b = self._body()
+            try:
+                action = p.removeprefix("/api/")
+                limited = auth.public_rate_limit(
+                    action, b.get("email", ""), self._client_identity())
+            except Exception:
+                # The public abuse gate is fail-closed. A Postgres outage cannot become an unlimited
+                # password/email endpoint; report a retryable service failure without leaking internals.
+                return self._json(503, {"error": "authentication temporarily unavailable — try again"})
+            if not limited["allowed"]:
+                return self._json(429, {"error": "too many attempts — try again later",
+                                        "retry_after_s": limited["retry_after_s"]},
+                                  {"Retry-After": str(limited["retry_after_s"])})
             try:
                 if p == "/api/signup":
                     r = auth.signup(b.get("email", ""), b.get("password", ""),
-                                    (b.get("name") or "").strip()[:60] or None, b.get("plan", "free"))
+                                    (b.get("name") or "").strip()[:60] or None,
+                                    "free")  # plan is server-owned; never trust an unauthenticated JSON value
                 elif p == "/api/verify-email":
                     r = auth.verify_email(b.get("email", ""), b.get("code", ""))
                 elif p == "/api/resend-code":
@@ -1647,11 +1789,19 @@ class Handler(BaseHTTPRequestHandler):
                     r = fn(b.get("email", ""), b.get("code", ""), b.get("password", "")) if fn else {"error": "password reset is not available"}
                 else:
                     r = auth.login(b.get("email", ""), b.get("password", ""))
+                if not r.get("error") and r.get("api_token") and r.get("tenant_id"):
+                    session = auth.create_session(r["tenant_id"], r.get("email") or b.get("email", ""))
+                    public = dict(r)
+                    public.pop("api_token", None)       # raw tenant API credentials never enter browser JS/storage
+                    if action in {"login", "verify-email", "reset-password"}:
+                        auth.clear_public_rate_limit(action, b.get("email", ""), self._client_identity())
+                    return self._json(200, public,
+                                      {"Set-Cookie": self._session_cookie(session)})
                 return self._json(200 if not r.get("error") else 400, r)
-            except Exception as e:
-                return self._json(400, {"error": str(e)[:200]})
+            except Exception:
+                return self._json(503, {"error": "authentication temporarily unavailable — try again"})
         if p == "/api/controller/stream":                     # SSE: stream the controller's clarifying reply
-            tid = _tenant(self.headers.get("X-Tenant-Token"))
+            tid = self._request_tenant()
             if tid is _TENANT_ERROR:
                 return self._json(503, {"error": "backend temporarily unavailable — reconnecting"})
             if not tid:
@@ -1663,7 +1813,7 @@ class Handler(BaseHTTPRequestHandler):
         fn = POSTS.get(p)
         if not fn:
             return self._json(404, {"error": "not found"})
-        tid = _tenant(self.headers.get("X-Tenant-Token"))
+        tid = self._request_tenant()
         if tid is _TENANT_ERROR:                              # transient backend blip — keep the session
             return self._json(503, {"error": "backend temporarily unavailable — reconnecting"})
         if not tid:
@@ -1684,16 +1834,13 @@ class Handler(BaseHTTPRequestHandler):
 def _selftest():
     """Prove every GET route resolves + renders for a REAL tenant with one product, end to end."""
     import billing as _b
-    import psycopg
     reg = _b.signup("console-selftest", "free")
     tid = reg["tenant_id"]
     prod = tid.replace("t-", "")[:6] + "-demo"
-    DB = frontdoor.DB
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (prod, tid))
         cur.execute("""INSERT INTO traces (run_id, product, stage, role, kind, rc, cost_usd, tokens_in, tokens_out, elapsed_s, prompt, output, model)
                        VALUES (%s,%s,'SPEC','builder','agent',0,0.16,500,800,20,'p','o','m')""", (f"run-{prod}", prod))
-        c.commit()
     try:
         results = {}
         for path, fn in GETS.items():
@@ -1711,11 +1858,10 @@ def _selftest():
             print("FAILING ROUTES:", bad)
         print("PASS: console mounts all area views for a real tenant ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM traces WHERE product=%s", (prod,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

@@ -20,8 +20,6 @@ import sys
 import threading
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 import audit       # noqa: E402
@@ -32,7 +30,7 @@ import factory     # noqa: E402
 import frontdoor   # noqa: E402
 import governance  # noqa: E402  (read side of the role manifest: enforce()/may())
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection
 
 SYS = (
     "You are the ORCHESTRATOR for a non-technical CEO who directs a company of AI agents that build and "
@@ -51,29 +49,40 @@ SYS = (
     "looks right. Only emit a build block when you can write a good plan + charter. Never emit more than one."
 )
 
+_ENSURED = False
+_ENSURE_LOCK = threading.Lock()
+
 
 def _ensure():
-    with psycopg.connect(DB) as c, c.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS chat_threads (
-            id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS chat_messages (
-            id BIGSERIAL PRIMARY KEY, thread_id BIGINT NOT NULL, tenant_id TEXT NOT NULL,
-            role TEXT NOT NULL, content TEXT NOT NULL, meta JSONB DEFAULT '{}',
-            ts TIMESTAMPTZ DEFAULT now())""")
-        c.commit()
+    global _ENSURED
+    if _ENSURED:
+        return
+    with _ENSURE_LOCK:
+        if _ENSURED:
+            return
+        with connection() as c, c.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout='1s'")
+            cur.execute("SET LOCAL statement_timeout='3s'")
+            cur.execute("""CREATE TABLE IF NOT EXISTS chat_threads (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS chat_messages (
+                id BIGSERIAL PRIMARY KEY, thread_id BIGINT NOT NULL, tenant_id TEXT NOT NULL,
+                role TEXT NOT NULL, content TEXT NOT NULL, meta JSONB DEFAULT '{}',
+                ts TIMESTAMPTZ DEFAULT now())""")
+        _ENSURED = True
 
 
 def start_thread(tid):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("INSERT INTO chat_threads (tenant_id) VALUES (%s) RETURNING id", (tid,))
-        thread = cur.fetchone()[0]; c.commit()
+        thread = cur.fetchone()[0]
     return thread
 
 
 def history(tid, thread_id):
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""SELECT role, content, meta, ts FROM chat_messages
                        WHERE tenant_id=%s AND thread_id=%s ORDER BY id""", (tid, thread_id))
         return [{"role": r, "content": ct, "meta": m, "ts": str(t)} for r, ct, m, t in cur.fetchall()]
@@ -144,14 +153,14 @@ def _gate(tid, thread_id):
                "you'd like to build.")
         post(tid, thread_id, msg, {"kind": "consent_required"})
         audit.append(actor="orchestrator", action="ConsentRequired", resource=str(thread_id),
-                     decision="say", payload={"tenant": tid})
+                     decision="say", payload={"tenant": tid}, tenant_id=tid)
         return {"reply": msg, "proposal": None, "blocked": "consent_required"}
     if not _resolved_provider(tid):
         msg = ("I need a model provider connected first — add Anthropic or OpenAI/Codex in Settings → "
                "Providers (or sign in with your subscription), then tell me again what to build.")
         post(tid, thread_id, msg, {"kind": "provider_required"})
         audit.append(actor="orchestrator", action="ProviderRequired", resource=str(thread_id),
-                     decision="say", payload={"tenant": tid})
+                     decision="say", payload={"tenant": tid}, tenant_id=tid)
         return {"reply": msg, "proposal": None, "blocked": "provider_required"}
     return None
 
@@ -159,10 +168,9 @@ def _gate(tid, thread_id):
 def say(tid, thread_id, message, api_key=None):
     """One chat turn: persist the CEO msg, ask the orchestrator agent, persist + return its reply/proposal."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("INSERT INTO chat_messages (thread_id, tenant_id, role, content) VALUES (%s,%s,'user',%s)",
                     (thread_id, tid, message))
-        c.commit()
     # CONSENT + PROVIDER GATE: this turn sends the CEO's text to the model. Refuse BEFORE any spend if
     # AI-processing consent isn't on file, or no provider is connected — so we never leak pre-consent text
     # and spend always lands on the tenant's own account (the quick-build front door used to skip this).
@@ -178,11 +186,10 @@ def say(tid, thread_id, message, api_key=None):
     r = factory.agent("orchestrator", str(frontdoor.PRODUCTS), task, tools=[])
     reply_raw = (r.get("out") or "").strip() or "Tell me a bit more about what you'd like to build."
     proposal, reply = _parse_build(reply_raw)
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         cur.execute("""INSERT INTO chat_messages (thread_id, tenant_id, role, content, meta)
                        VALUES (%s,%s,'assistant',%s,%s)""",
                     (thread_id, tid, reply, json.dumps({"proposal": proposal} if proposal else {})))
-        c.commit()
     return {"reply": reply, "proposal": proposal}
 
 
@@ -190,10 +197,27 @@ def post(tid, thread_id, content, meta=None):
     """Post an assistant turn back into the thread (controller -> CEO). This is how the controller REPORTS
     progress/results/next-steps so the chat is an ongoing dialogue, not a write-once intake form."""
     _ensure()
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    metadata = dict(meta or {})
+    context_key = str(metadata.get("context_key") or "").strip()
+    with tenant_connection(tid) as c, c.cursor() as cur:
+        cur.execute("SET LOCAL lock_timeout='1s'")
+        cur.execute("SET LOCAL statement_timeout='3s'")
+        if context_key:
+            # A controller retry after notification/DB acknowledgement loss must not duplicate the same chat
+            # turn. The transaction advisory lock serializes producers; the durable meta key is the outbox ID.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+                        (f"chat:{tid}:{thread_id}:{context_key}",))
+            cur.execute("""SELECT id FROM chat_messages
+                            WHERE tenant_id=%s AND thread_id=%s
+                              AND meta->>'context_key'=%s
+                            ORDER BY id LIMIT 1""", (tid, thread_id, context_key))
+            prior = cur.fetchone()
+            if prior:
+                return prior[0]
         cur.execute("""INSERT INTO chat_messages (thread_id, tenant_id, role, content, meta)
-                       VALUES (%s,%s,'assistant',%s,%s)""", (thread_id, tid, content, json.dumps(meta or {})))
-        c.commit()
+                       VALUES (%s,%s,'assistant',%s,%s) RETURNING id""",
+                    (thread_id, tid, content, json.dumps(metadata)))
+        return cur.fetchone()[0]
 
 
 def _run_and_report(tid, thread_id, product, charter, kind):
@@ -208,7 +232,7 @@ def _run_and_report(tid, thread_id, product, charter, kind):
     except Exception as e:
         post(tid, thread_id, f"⚠️ I hit an error launching **{product}**: {str(e)[:200]}. Want me to retry?")
         return
-    st = frontdoor._status(product)
+    st = frontdoor._status(product, tid)
     if st.get("ready"):
         post(tid, thread_id,
              f"✅ **{product}** is built, tested and ready — download it from Projects. "
@@ -275,15 +299,14 @@ def confirm(tid, thread_id, api_key=None):
     # every surface until the first agent trace lands seconds-to-minutes later (a QA feature-completeness gap:
     # "directed build has zero visibility, uncancellable everywhere"). Fail-open: never block the build on this.
     try:
-        with psycopg.connect(DB) as _c, _c.cursor() as _cur:
+        with tenant_connection(tid) as _c, _c.cursor() as _cur:
             _cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
                          (product, tid))
-            _c.commit()
     except Exception:
         pass
     threading.Thread(target=_run_and_report, args=(tid, thread_id, product, p["charter"], p["kind"]), daemon=True).start()
     audit.append(actor="orchestrator", action="BuildFromChat", resource=product, decision="started",
-                 payload={"thread": thread_id, "kind": p["kind"]})
+                 payload={"thread": thread_id, "kind": p["kind"]}, tenant_id=tid)
     return {"product": product, "status": "building", "charter": p["charter"]}
 
 
@@ -307,6 +330,8 @@ def _selftest():
                                 "Includes input validation and tests.\n[[/BUILD]]"}
     factory.agent = fake_agent
     import tenantproviders
+    real_cli = tenantproviders._cli_logged_in
+    tenantproviders._cli_logged_in = lambda provider: {"ok": True}
     try:
         th = start_thread(tid)
         # CONSENT GATE: pre-consent, say() must REFUSE before touching the agent (no proposal, no spend).
@@ -317,6 +342,7 @@ def _selftest():
         pre_prov = say(tid, th, "I want to track my expenses")
         provider_gate = pre_prov.get("blocked") == "provider_required" and turns["n"] == 0
         tenantproviders.connect(tid, "anthropic", "subscription")   # subscription login = resolved (no key)
+        consent.record(tid)                                        # named-provider consent for Anthropic
         t1 = say(tid, th, "I want to track my expenses")
         clarified = t1["proposal"] is None and "?" in t1["reply"]    # asked a question, no build yet
         t2 = say(tid, th, "just me, a simple API")
@@ -334,14 +360,14 @@ def _selftest():
         factory.agent = real
         frontdoor._run_build = real_build
         globals()["_run_and_report"] = real_rar
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        tenantproviders._cli_logged_in = real_cli
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM chat_messages WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM chat_threads WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM ai_consent WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenant_providers WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

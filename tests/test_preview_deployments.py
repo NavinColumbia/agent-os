@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 from pathlib import Path
+from threading import Thread
 from urllib.parse import urlparse
 
 import pytest
@@ -137,6 +141,85 @@ def test_static_preview_rejects_non_html_and_weak_capability_secret(tmp_path: Pa
         artifacts.close()
 
 
+def test_preview_fetch_verifier_is_origin_scoped_and_persists_digest_evidence(
+    tmp_path: Path,
+):
+    expected = b"<!doctype html><title>Verified preview</title><h1>TrailPaws</h1>"
+
+    class Handler(BaseHTTPRequestHandler):
+        payload = expected
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(self.payload)
+
+        def log_message(self, format, *args):
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'fetch-artifacts.sqlite3'}", create_schema=True,
+    )
+    deployments = SQLStaticPreviewDeployer(
+        f"sqlite:///{tmp_path / 'fetch-previews.sqlite3'}",
+        artifacts,
+        public_base_url=f"http://127.0.0.1:{server.server_port}",
+        capability_secret="test-capability-secret-with-32-bytes",
+        create_schema=True,
+    )
+    try:
+        artifact_id = artifacts.put(
+            organization_id="tenant-a",
+            content=expected,
+            media_type="text/html",
+            idempotency_key="fetch-source",
+        )
+        deployed = deployments.deploy(
+            organization_id="tenant-a",
+            artifact_id=artifact_id,
+            idempotency_key="fetch-deploy",
+        )
+        verified = deployments.verify_fetch(
+            organization_id="tenant-a",
+            public_url=str(deployed["public_url"]),
+            idempotency_key="fetch-verify",
+        )
+
+        assert verified["verified"] is True
+        assert verified["digest_matches"] is True
+        assert verified["status_code"] == 200
+        assert verified["content_sha256"] == verified["expected_sha256"]
+        assert artifacts.describe(
+            "tenant-a", verified["verification_artifact_id"],
+        )["media_type"] == "application/json"
+
+        Handler.payload = b"<!doctype html><h1>Tampered</h1>"
+        mismatch = deployments.verify_fetch(
+            organization_id="tenant-a",
+            public_url=str(deployed["public_url"]),
+            idempotency_key="fetch-mismatch",
+        )
+        assert mismatch["verified"] is False
+        assert mismatch["digest_matches"] is False
+
+        with pytest.raises(FatalCommandError, match="configured preview origin"):
+            deployments.verify_fetch(
+                organization_id="tenant-a",
+                public_url="https://example.test/v2/public/previews/a/b",
+                idempotency_key="fetch-external",
+            )
+    finally:
+        deployments.close()
+        artifacts.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_preview_tool_selects_upstream_artifact_and_emits_deployment_evidence():
     definition = WorkflowDefinition(
         "preview", "tenant-a", "Preview", 1, "build",
@@ -194,6 +277,140 @@ def test_preview_tool_selects_upstream_artifact_and_emits_deployment_evidence():
         "artifact-html", "artifact-deployment-receipt",
     ]
     assert result["output"]["public_url"] == "https://preview.example.test/app"
+
+
+def test_preview_deployer_extracts_exact_index_from_source_bundle(tmp_path):
+    artifacts = SQLArtifactStore(
+        f"sqlite:///{tmp_path / 'preview-source-artifacts.sqlite3'}", create_schema=True,
+    )
+    deployments = SQLStaticPreviewDeployer(
+        f"sqlite:///{tmp_path / 'preview-source.sqlite3'}",
+        artifacts,
+        public_base_url="https://preview.example.test",
+        capability_secret="p" * 32,
+        create_schema=True,
+    )
+    try:
+        html = b"<!doctype html><title>Exact</title><main>source bundle</main>"
+        source_id = artifacts.put(
+            organization_id="tenant-a",
+            content=json.dumps({
+                "format": "agent-os.source-bundle.v1",
+                "files": {
+                    "index.html": {
+                        "encoding": "base64",
+                        "content": base64.b64encode(html).decode(),
+                    },
+                    "verify.py": {"encoding": "utf-8", "content": "print('ok')"},
+                },
+            }, separators=(",", ":")).encode(),
+            media_type="application/vnd.agent-os.source-bundle+json",
+            idempotency_key="preview-source",
+        )
+
+        result = deployments.deploy(
+            organization_id="tenant-a",
+            artifact_id=source_id,
+            idempotency_key="publish-source",
+        )
+
+        assert result["source_artifact_id"] == source_id
+        assert result["artifact_id"] != source_id
+        assert artifacts.get("tenant-a", result["artifact_id"]) == html
+        assert artifacts.describe("tenant-a", result["artifact_id"])["media_type"] == (
+            "text/html; charset=utf-8"
+        )
+        repeated = deployments.deploy(
+            organization_id="tenant-a",
+            artifact_id=source_id,
+            idempotency_key="publish-source",
+        )
+        assert repeated == result
+    finally:
+        deployments.close()
+        artifacts.close()
+
+
+def test_preview_fetch_tool_routes_verified_and_failed_results():
+    definition = WorkflowDefinition(
+        "preview-fetch", "tenant-a", "Preview fetch", 1, "publish",
+        (
+            WorkflowNode("publish", NodeKind.AGENT, "Publish", "release"),
+            WorkflowNode("fetch", NodeKind.TOOL, "Verify preview", configuration={
+                "tool": "preview.fetch",
+                "source": {"node_id": "publish", "output_path": ["public_url"]},
+                "success_condition": "verified",
+                "failure_condition": "failed",
+            }),
+            WorkflowNode("done", NodeKind.TERMINAL, "Done"),
+            WorkflowNode("blocked", NodeKind.TERMINAL, "Blocked"),
+        ),
+        (
+            WorkflowEdge("publish", "fetch", "published"),
+            WorkflowEdge("fetch", "done", "verified"),
+            WorkflowEdge("fetch", "blocked", "failed"),
+        ),
+        "architect",
+    )
+    started = start_workflow(definition, run_id="run-preview-fetch")
+    publish_action = started.actions[0]
+    running = begin_node(
+        started.state, publish_action.token_id, expected_version=0,
+    ).state
+    published = complete_node(
+        definition, running, publish_action.token_id, expected_version=1,
+        satisfied_conditions=frozenset({"published"}), evidence_ids=("artifact-html",),
+        output={"public_url": "https://preview.example.test/app"},
+    )
+    fetch_action = published.actions[0]
+    fetch_running = begin_node(
+        published.state, fetch_action.token_id, expected_version=2,
+    ).state
+    fetch_node = next(node for node in definition.nodes if node.node_id == "fetch")
+
+    class StubPreviewStore:
+        verified = True
+
+        def deploy(self, **kwargs):
+            del kwargs
+            raise AssertionError("not called")
+
+        def verify_fetch(self, **kwargs):
+            assert kwargs["organization_id"] == "tenant-a"
+            assert kwargs["public_url"] == "https://preview.example.test/app"
+            return {
+                "verified": self.verified,
+                "artifact_id": "artifact-html",
+                "verification_artifact_id": "artifact-fetch-evidence",
+            }
+
+        def resolve_public(self, tenant_slug, public_id):
+            del tenant_slug, public_id
+            return None
+
+        def list_previews(self, organization_id, *, limit=100):
+            del organization_id, limit
+            return ()
+
+        def revoke(self, **kwargs):
+            del kwargs
+            return None
+
+    store = StubPreviewStore()
+    handler = DeploymentToolNodeHandlers(store).named_handlers()["preview.fetch"]
+    result = handler(
+        "tenant-a", "run-preview-fetch", definition, fetch_running,
+        fetch_action, fetch_node,
+    )
+    assert result["satisfied_conditions"] == ["verified"]
+    assert result["evidence_ids"] == ["artifact-html", "artifact-fetch-evidence"]
+
+    store.verified = False
+    failed = handler(
+        "tenant-a", "run-preview-fetch", definition, fetch_running,
+        fetch_action, fetch_node,
+    )
+    assert failed["satisfied_conditions"] == ["failed"]
 
 
 def test_public_preview_serves_only_the_opaque_capability_with_a_browser_sandbox(

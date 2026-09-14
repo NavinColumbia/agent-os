@@ -23,15 +23,13 @@ import json
 import sys
 from pathlib import Path
 
-import psycopg
-
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "orchestra"))
 import audit  # noqa: E402  (audit-trail the org reads, same convention as the other surfaces)
 import store  # noqa: E402  (the durable org: real hired agents with identity/tenure/heartbeats)
 
-from aoscfg import ENV, DB
+from dbpool import connection, tenant_connection
 ACTIVE_WINDOW = "15 minutes"
 
 # The static org chart of the AI-agent company: a controller at top, functional leads/specialists
@@ -110,7 +108,7 @@ def orgchart(tid):
     """Every node of the static hierarchy, marked live + with the count of that role's active
     instances on the tenant's products and the most recent task. Root reports_to=null.
     PLUS org_runs: the durable store's real spawned-agent trees (see org_runs above)."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         products = _products(cur, tid)
         by_role = _live_by_role(cur, products)
     tree = []
@@ -130,7 +128,7 @@ def orgchart(tid):
 
 def roster(tid):
     """Flat list of the tenant's currently-live agents on their products."""
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with tenant_connection(tid) as c, c.cursor() as cur:
         products = _products(cur, tid)
         if not products:
             return []
@@ -148,13 +146,12 @@ def _selftest():
     reg = billing.signup("orgview-selftest", "free")     # a REAL tenant (tenant_products FK -> tenants)
     tid = reg["tenant_id"]
     prod = tid.replace("t-", "")[:6] + "-org"
-    with psycopg.connect(DB) as c, c.cursor() as cur:
+    with connection() as c, c.cursor() as cur:
         cur.execute("INSERT INTO tenant_products (product, tenant_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (prod, tid))
         cur.execute("""INSERT INTO directory (agent_id, role, status, product, task, updated_at)
                        VALUES (%s,'builder','active',%s,'shipping the API', now())
                        ON CONFLICT (agent_id) DO UPDATE SET role=EXCLUDED.role, status='active',
                          product=EXCLUDED.product, task=EXCLUDED.task, updated_at=now()""", (f"builder@{prod}", prod))
-        c.commit()
     # Seed a REAL orchestra run for this tenant (durable store rows: hired controller -> supervisor
     # -> worker) so the chart's org_runs section renders actual spawn data, not the static list.
     orc = store.start_run(tid, "grow the creator platform")["run_id"]
@@ -192,13 +189,12 @@ def _selftest():
         print("PASS: org chart — static hierarchy overlaid with live directory agents + REAL "
               "orchestra org trees (names/roles/status/tenure from spawn rows) ✅" if ok else "FAIL")
     finally:
-        with psycopg.connect(DB) as c, c.cursor() as cur:
+        with connection() as c, c.cursor() as cur:
             cur.execute("DELETE FROM directory WHERE product=%s", (prod,))
             cur.execute("DELETE FROM tenant_products WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM orchestra_actors WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM orchestra_runs WHERE tenant_id=%s", (tid,))
             cur.execute("DELETE FROM tenants WHERE tenant_id=%s", (tid,))
-            c.commit()
     sys.exit(0 if ok else 1)
 
 

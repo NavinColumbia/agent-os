@@ -310,7 +310,11 @@ def test_same_management_generation_files_one_hire(monkeypatch, migration_69_req
 def test_migration_declares_tenant_rls_and_idempotency_contracts():
     sql = (ROOT / "postgres" / "initdb" / "69-management-task-tenancy.sql").read_text()
     assert "UPDATE tasks SET tenant_id='_platform'" in sql
+    assert "UPDATE hire_requests SET tenant_id='_platform'" in sql
     assert "tasks_tenant_idempotency_uidx" in sql
+    assert "hire_requests_tenant_idempotency_uidx" in sql
     assert "ON tasks(tenant_id" in sql
+    assert "'tasks','hire_requests','management_dispatches'" in sql
+    assert "GRANT USAGE, SELECT ON SEQUENCE hire_requests_id_seq" in sql
     assert "ALTER TABLE %I FORCE ROW LEVEL SECURITY" in sql
     assert "management_dispatches" in sql and "management_duty_cursors" in sql

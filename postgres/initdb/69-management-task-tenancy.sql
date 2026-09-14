@@ -27,6 +27,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS tasks_tenant_idempotency_uidx
 -- Hiring and its eventual task/message hand-off share the management dispatch
 -- key. This lets a process retry after any crash boundary without manufacturing
 -- another hire, task, or mailbox delivery.
+ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+UPDATE hire_requests SET tenant_id='_platform'
+ WHERE tenant_id IS NULL OR tenant_id='' OR tenant_id='unknown';
+ALTER TABLE hire_requests ALTER COLUMN tenant_id SET DEFAULT '_platform';
+ALTER TABLE hire_requests ALTER COLUMN tenant_id SET NOT NULL;
+ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 5;
 ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
 ALTER TABLE hire_requests ADD COLUMN IF NOT EXISTS fulfilled_agent_id TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS hire_requests_tenant_idempotency_uidx
@@ -108,7 +115,7 @@ DO $$
 DECLARE tbl TEXT;
 BEGIN
   FOREACH tbl IN ARRAY ARRAY[
-    'tasks','management_dispatches','management_duty_cursors','task_dispatch_cursor'
+    'tasks','hire_requests','management_dispatches','management_duty_cursors','task_dispatch_cursor'
   ] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', tbl);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', tbl);
@@ -122,5 +129,8 @@ BEGIN
   END LOOP;
   IF to_regclass('tasks_id_seq') IS NOT NULL THEN
     GRANT USAGE, SELECT ON SEQUENCE tasks_id_seq TO agentos_app;
+  END IF;
+  IF to_regclass('hire_requests_id_seq') IS NOT NULL THEN
+    GRANT USAGE, SELECT ON SEQUENCE hire_requests_id_seq TO agentos_app;
   END IF;
 END $$;

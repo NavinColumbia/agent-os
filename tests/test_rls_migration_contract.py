@@ -20,6 +20,35 @@ def test_rls_rollout_series_is_contiguous_and_ordered():
     assert [int(path.name.split("-", 1)[0]) for path in readiness._migration_paths()] == list(range(53, 85))
 
 
+def test_task_board_schema_precedes_rls_prep_that_indexes_it():
+    schema = _migration(33)
+    prep = _migration(53)
+
+    assert "CREATE TABLE IF NOT EXISTS task_board" in schema
+    assert "ON task_board (tenant)" in prep
+
+
+def test_organization_schema_precedes_cross_org_lineage_and_tenant_backfill():
+    schema = _migration(40)
+    lineage = _migration(49)
+    spine = _migration(54)
+
+    assert "CREATE TABLE IF NOT EXISTS orgs" in schema
+    assert "CREATE TABLE IF NOT EXISTS org_lineage" in lineage
+    assert "FROM orgs o" in spine
+
+
+def test_controller_schema_precedes_recovery_and_execution_scope_migrations():
+    schema = _migration(39)
+    recovery = _migration(66)
+    scope = _migration(73)
+
+    assert "CREATE TABLE IF NOT EXISTS controller_state" in schema
+    assert "CREATE TABLE IF NOT EXISTS controller_jobs" in schema
+    assert "worker_start_ticks" in recovery
+    assert "ALTER TABLE controller_state" in scope
+
+
 def test_answered_agentic_decision_requires_durable_application_ack():
     migration = _migration(78)
     assert "applied_at" in migration

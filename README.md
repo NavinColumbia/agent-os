@@ -50,5 +50,7 @@ bash scripts/recover.sh                              # bring all services up
 After any reboot it self-recovers (WSL `[boot]` hook). See [QUICKSTART](QUICKSTART.md).
 
 ## Status
-Reference architecture **v1 complete** and integrated into a running, autonomous, self-proving system.
-Roadmap and deferred items in [BUILD_STATUS.md](BUILD_STATUS.md).
+The V2 first-customer release is CI-green, containerized, and locally rehearsable through the CEO workspace.
+Public activation still requires the external account, identity, billing, database, DNS, model, and monitoring
+inputs listed in [Production activation](docs/PRODUCTION-ACTIVATION.md). Historical roadmap and deferred research
+items remain in [BUILD_STATUS.md](BUILD_STATUS.md).

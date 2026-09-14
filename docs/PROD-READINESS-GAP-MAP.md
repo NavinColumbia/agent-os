@@ -1,6 +1,39 @@
 # Production Readiness Gap Map
 
-Last updated: 2026-08-25
+Last updated: 2026-09-14
+
+## 2026-09-14 V2 Production-Readiness Closure
+
+This section supersedes every older readiness statement below. Historical sections remain for audit context,
+not as the current launch verdict.
+
+- A fresh one-prompt TrailPaws mission completed through the durable V2 graph: graph run
+  `mission-run-a955d9cac6b4e9bea4669fc183234a22`, lifecycle
+  `run-1ce373b8546200c7ce89557c1322bab8`, and workflow
+  `mission-202d6c8f9cece7428c74096166caf5ef` all reached `succeeded`. The final accepted workflow was revision
+  3 at state version 102.
+- The released preview was fetched independently over HTTP with status 200. Its exact 7,068-byte HTML payload
+  has SHA-256 `7b0b85a1766ae095ad59fef9df58ba613fd8725afcf7d094154e03f13c10aacf`; the acceptance graph retained the
+  fetch evidence, publication receipt, and released artifact.
+- Workflow revision corruption, lost-model-result recovery, evidence hydration, oversized QA context,
+  screenshot/evidence overhead, failed-node recovery, stale lifecycle projection, and scheduler alert
+  truncation now have bounded implementations and regressions. Preview publishing consumes canonical source
+  bundles directly, while rejected graph revisions may use a bounded merge patch that is materialized and
+  fully revalidated by the authority layer.
+- A clean empty PostgreSQL replay exposed legacy tables that had depended on Python import order. The task
+  board, controller state/jobs, organizations, tenant runtime tables, and hire-request tenant/RLS contract are
+  now explicit ordered migrations. The same clean-state environment passes 1,361 tests with one intentional
+  skip, the zero-finding security scan, production OpenTofu validation, and runtime/migration/sandbox container
+  build and entrypoint smoke tests.
+- Verified GitHub evidence for the pre-documentation release is CI run `34836881970` at commit `e2bac1e`; the
+  current revision must retain the same green gates before release. The local founder rehearsal is healthy at
+  `http://127.0.0.1:8088/app` with PostgreSQL and the subscription-backed worker running.
+- Repository-owned production work is closed for the first-customer V2 cell. Public activation is not yet
+  performed: the remaining boundary is external GCP projects/deploy identity, managed PostgreSQL principals,
+  DNS names, OIDC application, Stripe live configuration, a model-provider credential, and a tested monitoring
+  destination. See `docs/PRODUCTION-ACTIVATION.md` and `deploy/gcp/launch.env.example`.
+- Commercial outcomes remain separate from software readiness: revenue is still $0, no customer adoption or
+  investment return is guaranteed, and no investment capital has been traded.
 
 ## 2026-08-25 Completion-Audit Supersession
 

@@ -119,6 +119,15 @@ def test_checked_in_launch_template_fails_closed_until_every_placeholder_is_repl
     required = report["checks"][0]
     assert "GCP_PROJECT_ID" in required["detail"]
     assert "AOS_V2_MODEL_PROVIDER_KEY" in str(report)
+    projects = next(
+        check for check in report["checks"]
+        if check["check"] == "three isolated GCP projects"
+    )
+    assert projects == {
+        "check": "three isolated GCP projects",
+        "ok": False,
+        "detail": "IDs must be valid and distinct",
+    }
 
 
 def test_launch_preflight_accepts_github_workflow_terraform_aliases():

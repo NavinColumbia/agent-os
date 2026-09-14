@@ -178,10 +178,14 @@ def evaluate(values: Mapping[str, str], *, require_bootstrap_secrets: bool) -> d
     projects = [str(values.get(key, "")) for key in (
         "GCP_PROJECT_ID", "GCP_SANDBOX_PROJECT_ID", "GCP_APP_PROJECT_ID",
     )]
+    projects_ok = (
+        all(PROJECT_ID.fullmatch(item) for item in projects)
+        and len(set(projects)) == 3
+    )
     add(
         "three isolated GCP projects",
-        all(PROJECT_ID.fullmatch(item) for item in projects) and len(set(projects)) == 3,
-        "three valid distinct IDs" if len(set(projects)) == 3 else "IDs must be valid and distinct",
+        projects_ok,
+        "three valid distinct IDs" if projects_ok else "IDs must be valid and distinct",
     )
     region = str(values.get("GCP_REGION") or "us-central1")
     add("GCP region", bool(REGION.fullmatch(region)), "valid region" if REGION.fullmatch(region) else "invalid")

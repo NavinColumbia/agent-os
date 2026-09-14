@@ -1,9 +1,31 @@
+import json
 from pathlib import Path
 import sys
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+
+
+@pytest.fixture(autouse=True)
+def hermetic_role_manifests(monkeypatch, tmp_path):
+    """Exercise role policy without depending on a sibling control-plane checkout."""
+    import governance
+
+    roles = tmp_path / "roles"
+    roles.mkdir()
+    manifests = {
+        "reviewer": {},
+        "qa-security": {"tools": ["Read", "Write"]},
+        "product-manager": {"tools": ["Read", "Write"]},
+        "builder": {"can_modify_code": True},
+        "resource-allocator": {"tools": ["Read", "Write"]},
+    }
+    for role, manifest in manifests.items():
+        (roles / f"{role}.yaml").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(governance, "ROLES", roles)
 
 
 def test_read_only_roles_receive_an_os_enforced_codex_sandbox():

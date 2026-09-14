@@ -1872,6 +1872,13 @@ def test_repair_planner_uses_balanced_stage_tier_without_weakening_final_judge(m
 
 
 def test_repair_specialty_is_mapped_to_a_manifest_authorized_writer(monkeypatch, tmp_path):
+    roles = tmp_path / "roles"
+    roles.mkdir()
+    for role in ("security-redteam", "frontend-engineer", "staff-engineer"):
+        (roles / f"{role}.yaml").write_text(
+            json.dumps({"can_modify_code": True}), encoding="utf-8")
+    monkeypatch.setattr(dev_loop.governance, "ROLES", roles)
+
     assert dev_loop._authorized_fix_writer_role("security-governance") == "security-redteam"
     assert dev_loop._authorized_fix_writer_role("frontend") == "frontend-engineer"
     assert dev_loop._authorized_fix_writer_role("invented-specialist") == "staff-engineer"

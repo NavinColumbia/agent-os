@@ -473,7 +473,9 @@ def test_owned_codex_tree_is_reaped_leaf_first_without_touching_same_group_peer(
 
 def test_dead_browser_parent_reaps_exact_registered_tree_and_preserves_peers(
         monkeypatch, tmp_path):
-    owner_id = pa.ProcessIdentity(410, 5, "boot-a")
+    # Use a PID outside the kernel's supported range so the real CI host can
+    # never make the synthetic "dead" owner look alive by coincidence.
+    owner_id = pa.ProcessIdentity(987654321, 5, "boot-a")
     root_id = pa.ProcessIdentity(411, 10, "boot-a")
     child_id = pa.ProcessIdentity(412, 11, "boot-a")
     peer_id = pa.ProcessIdentity(499, 12, "boot-a")

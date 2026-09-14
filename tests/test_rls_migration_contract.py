@@ -28,6 +28,18 @@ def test_task_board_schema_precedes_rls_prep_that_indexes_it():
     assert "ON task_board (tenant)" in prep
 
 
+def test_lazy_tenant_relations_are_canonical_before_rls_rollout():
+    schema = _migration(35)
+    expected = {
+        "accounts", "ceo_vision", "proactive_sent", "brief_cache",
+        "tenant_providers", "product_registry", "findings",
+        "finding_verifications", "qa_runs", "story_corpus",
+    }
+
+    for table in expected:
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in schema
+
+
 def test_organization_schema_precedes_cross_org_lineage_and_tenant_backfill():
     schema = _migration(40)
     lineage = _migration(49)

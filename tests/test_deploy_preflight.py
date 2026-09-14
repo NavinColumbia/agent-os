@@ -79,7 +79,11 @@ def test_public_installer_selects_validated_host_or_container_edge():
     assert "AOS_PUBLIC_HOST: ${AOS_PUBLIC_HOST:?" in compose
 
 
-def test_public_preflight_fails_closed_on_placeholders(tmp_path):
+def test_public_preflight_fails_closed_on_placeholders(tmp_path, monkeypatch):
+    # CI exports valid bootstrap credentials.  This case specifically exercises
+    # an all-placeholder configuration, so isolate it from the parent process.
+    for key in ("DATABASE_URL", "AUDIT_HMAC_KEY", "VAULT_KEY", "AOS_API_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
     checks = preflight.validate_config({
         "DATABASE_URL": "postgresql://agentos:CHANGE-ME@127.0.0.1/agentos",
         "VAULT_KEY": "CHANGE-ME",

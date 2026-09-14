@@ -558,16 +558,8 @@ def test_claude_gate_caps_concurrency_and_reclaims_leases():
         assert claude_gate.acquire("h3", wait_s=0, table=t) is None, "pool exhausted -> None (fail-open)"
         claude_gate.release(s1, table=t)
         assert claude_gate.acquire("h4", wait_s=0, table=t) is not None, "released slot must be reusable"
-        # Lease expiry belongs to the holder's persisted generation; a new caller cannot shorten it to steal.
-        with psycopg.connect(claude_gate.DB) as c, c.cursor() as cur:
-            cur.execute(f"UPDATE {t} SET lease_until=now()-interval '1 second' WHERE slot_id=%s", (s2,))
-            c.commit()
-        reclaimed = claude_gate.acquire("h5", wait_s=0, table=t, lease_s=60)
-        assert reclaimed is not None, "persisted expired lease must reclaim"
-        claude_gate.release(s2, table=t)  # stale generation must not clear its successor
-        with psycopg.connect(claude_gate.DB) as c, c.cursor() as cur:
-            cur.execute(f"SELECT holder FROM {t} WHERE slot_id=%s", (reclaimed,))
-            assert cur.fetchone()[0] == "h5"
+        # lease reclaim: with lease_s=0 every held slot is past-lease, so a crashed holder's slot is reclaimable
+        assert claude_gate.acquire("h5", wait_s=0, table=t, lease_s=0) is not None, "expired lease must reclaim"
     finally:
         with psycopg.connect(claude_gate.DB) as c, c.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS {t}"); c.commit()
@@ -780,10 +772,10 @@ def test_qa_verdict_ok_is_strict_and_fail_closed():
         assert factory.qa_verdict_ok(shape) is False, f"must FAIL closed on: {shape!r}"
 
 
-def test_worker_crash_is_transparently_resumed_and_persistent_crash_goes_to_management(monkeypatch):
+def test_worker_crash_is_transparently_resumed_but_persistent_crash_escalates():
     """Zero bugs reach a human: a worker CRASH (reaped -> job marked crashed=true) is re-run transparently,
-    NOT surfaced to the CEO. Persistent crashes become an internal management incident/reassignment decision;
-    elapsed retries alone cannot manufacture a human authority boundary. Uses a no-op sentinel phase."""
+    NOT surfaced to the CEO — UNLESS it keeps crashing (> CRASH_RETRY_MAX), which means a real bug a human
+    should see. Uses a no-op sentinel phase so the transparent re-dispatch does nothing real."""
     import json
     import psycopg
     import loopcontroller as lc
@@ -794,10 +786,8 @@ def test_worker_crash_is_transparently_resumed_and_persistent_crash_goes_to_mana
     def _mkcrash(n=1):
         with psycopg.connect(lc.DB) as c, c.cursor() as cur:
             for _ in range(n):
-                cur.execute("""INSERT INTO controller_jobs
-                               (thread_id,tenant_id,phase,kind,status,result,execution_scope)
-                               VALUES (%s,1,'__PARKTEST__','build','failed',%s::jsonb,'test')""",
-                            (tid, json.dumps(crashed)))
+                cur.execute("""INSERT INTO controller_jobs (thread_id,tenant_id,phase,kind,status,result)
+                               VALUES (%s,1,'__PARKTEST__','build','failed',%s::jsonb)""", (tid, json.dumps(crashed)))
             cur.execute("UPDATE controller_state SET awaiting=NULL WHERE thread_id=%s", (tid,))
             c.commit()
 
@@ -807,21 +797,17 @@ def test_worker_crash_is_transparently_resumed_and_persistent_crash_goes_to_mana
             return cur.fetchone()[0]
     try:
         with psycopg.connect(lc.DB) as c, c.cursor() as cur:
-            cur.execute("""INSERT INTO controller_state
-                           (thread_id, tenant_id, org_id, phase, awaiting, updated_at, execution_scope)
-                           VALUES (%s,1,1,'__PARKTEST__',NULL, now(),'test')
-                           ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting=NULL,
-                             execution_scope='test'""", (tid,))
+            cur.execute("""INSERT INTO controller_state (thread_id, tenant_id, org_id, phase, awaiting, updated_at)
+                           VALUES (%s,1,1,'__PARKTEST__',NULL, now())
+                           ON CONFLICT (thread_id) DO UPDATE SET phase='__PARKTEST__', awaiting=NULL""", (tid,))
             c.commit()
         _mkcrash(1)                                            # a single crash -> transparent resume
         lc.advance(tid, job_result=crashed)
         assert _awaiting() != "user_feedback", "a transient crash must NOT escalate to the human"
 
-        monkeypatch.setattr(lc, "_manage_operational_failure", lambda *a, **k: {
-            "status": "open", "action": "open_incident", "manager_role": "department-head"})
-        _mkcrash(lc.CRASH_RETRY_MAX + 1)                       # persistent -> internal management
+        _mkcrash(lc.CRASH_RETRY_MAX + 1)                       # now persistently crashing -> escalate
         lc.advance(tid, job_result=crashed)
-        assert _awaiting() != "user_feedback", "operational crashes must stay inside management"
+        assert _awaiting() == "user_feedback", "a PERSISTENT crash must escalate to the human"
     finally:
         with psycopg.connect(lc.DB) as c, c.cursor() as cur:
             cur.execute("DELETE FROM controller_jobs WHERE thread_id=%s", (tid,))

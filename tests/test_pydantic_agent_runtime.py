@@ -88,6 +88,7 @@ def test_agent_turn_can_delegate_hire_message_decide_and_raise_risk_without_netw
     assert result["idempotency_key"] == "turn-1"
     assert meter.reservations[0]["maximum_cost_cents"] == 1
     assert meter.reservations[0]["source_id"] == "turn-1"
+    assert meter.reservations[0]["category"] == "lifecycle_agent"
     assert meter.settlements[0]["usage"]["total_tokens"] == result["usage"]["total_tokens"]
     assert "provider_cost_usd_micros" in result["usage"]
 
@@ -119,3 +120,23 @@ def test_agent_runtime_selects_and_meters_the_model_for_each_tenant():
 
     assert selected_tenants == ["tenant-special"]
     assert meter.reservations[0]["model"] == "test:tenant-model"
+
+
+def test_agent_runtime_records_an_explicit_management_usage_category():
+    meter = FakeUsageMeter()
+    runtime = PydanticAgentRuntime(
+        TestModel(custom_output_args={
+            "summary": "Review complete.", "disposition": "continue",
+            "progress_percent": 50, "evidence_ids": [],
+        }),
+        usage_meter=meter,
+        model_name="test:manager",
+    )
+
+    runtime.run_agent(
+        organization_id="tenant-1", run_id="run-1", role="mission-manager",
+        prompt="Review health", idempotency_key="management-review-1",
+        budget_cents=1, usage_category="management_review",
+    )
+
+    assert meter.reservations[0]["category"] == "management_review"

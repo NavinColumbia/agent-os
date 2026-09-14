@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import time
 
 from agent_os.application.management_monitor import DurableManagementMonitor
 from agent_os.application.ports import ManagementWatchLease
@@ -32,6 +33,7 @@ class Watches:
         self.notified_level = 0
         self.last_result = None
         self.retired = False
+        self.heartbeats = 0
 
     def claim_management_watch(self, tenant_id, *, worker_id, lease_seconds=60):
         if tenant_id != "tenant-a" or not self.available or self.retired:
@@ -56,6 +58,14 @@ class Watches:
 
     def retry_management_watch(self, *args, **kwargs):
         raise AssertionError("healthy monitor test must not retry")
+
+    def heartbeat_management_watch(
+        self, tenant_id, run_id, *, worker_id, lease_seconds=60,
+    ):
+        assert tenant_id == "tenant-a" and run_id == "graph-run"
+        assert worker_id == "manager" and lease_seconds >= 3
+        self.heartbeats += 1
+        return True
 
     def make_due(self):
         self.available = True
@@ -164,3 +174,103 @@ def test_monitor_retires_terminal_run_without_manufacturing_recovery_notice():
     assert result.status.value == "succeeded"
     assert watches.retired is True
     assert notifications.items == []
+
+
+class ManagerRuntime:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def run_agent(self, **values):
+        self.calls.append(values)
+        time.sleep(1.1)
+        return {"output": {
+            "summary": "The lease is healthy; inspect the slow provider call before intervening.",
+            "disposition": "continue",
+            "progress_percent": 45,
+            "observations": ["The action still has a renewable owner."],
+            "risks": ["A provider response may be delayed."],
+            "next_actions": ["Inspect provider-call timing and retain the current worker."],
+            "messages": [],
+            "proposed_work": [],
+            "hiring_requests": [],
+            "decisions": [{
+                "intent": "Choose whether to restart",
+                "considered_options": ["wait", "restart"],
+                "chosen_option": "wait",
+                "rationale": "The current renewable lease proves ownership.",
+                "evidence_ids": [],
+                "confidence": 0.9,
+                "reversible": True,
+                "needs_human_approval": False,
+            }],
+        }}
+
+
+def test_monitor_runs_one_metered_lease_renewed_manager_diagnosis_per_signal():
+    watches = Watches()
+    graph = Graph()
+    notifications = Notifications()
+    runtime = ManagerRuntime()
+    monitor = DurableManagementMonitor(
+        watches=watches, graph=graph, inspector=graph, notifications=notifications,
+        worker_id="manager", lease_seconds=3, check_interval_seconds=30,
+        slow_after_seconds=300, escalation_checks=2, manager_runtime=runtime,
+        manager_turn_budget_cents=7, clock=lambda: NOW,
+    )
+
+    first = monitor.run_one("tenant-a")
+
+    assert first.status.value == "succeeded"
+    assert watches.heartbeats >= 1
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0]["role"] == "mission-manager"
+    assert runtime.calls[0]["usage_category"] == "management_review"
+    assert runtime.calls[0]["budget_cents"] == 7
+    assert runtime.calls[0]["context"]["management_signals"][0]["signal"] == "slow_but_owned"
+    assert len(notifications.items) == 2
+    diagnosis = notifications.items[1]
+    assert diagnosis.subject == "Mission manager diagnosis"
+    assert diagnosis.payload["manager_review"]["decisions"][0]["chosen_option"] == "wait"
+    assert watches.last_result["manager_review"]["summary"].startswith("The lease is healthy")
+
+    watches.make_due()
+    second = monitor.run_one("tenant-a")
+
+    assert second.status.value == "succeeded"
+    assert len(runtime.calls) == 1
+    assert len(notifications.items) == 3
+    assert notifications.items[-1].recipient_ids == ("agent:mission-manager", "human:ceo")
+    assert notifications.items[-1].payload["manager_review"]["decisions"][0]["chosen_option"] == "wait"
+
+
+def test_manager_provider_failure_never_blocks_health_escalation():
+    watches = Watches()
+    graph = Graph()
+    notifications = Notifications()
+
+    class UnavailableRuntime:
+        def __init__(self):
+            self.calls = 0
+
+        def run_agent(self, **_values):
+            self.calls += 1
+            raise ConnectionError("provider unavailable")
+
+    runtime = UnavailableRuntime()
+    monitor = DurableManagementMonitor(
+        watches=watches, graph=graph, inspector=graph, notifications=notifications,
+        worker_id="manager", check_interval_seconds=30, slow_after_seconds=300,
+        escalation_checks=2, manager_runtime=runtime, clock=lambda: NOW,
+    )
+
+    first = monitor.run_one("tenant-a")
+    assert first.status.value == "succeeded"
+    assert watches.last_result["manager_review_error"]["type"] == "ConnectionError"
+    assert notifications.items[0].recipient_ids == ("agent:mission-manager",)
+
+    watches.make_due()
+    second = monitor.run_one("tenant-a")
+    assert second.status.value == "succeeded"
+    assert runtime.calls == 2
+    assert notifications.items[-1].recipient_ids == ("agent:mission-manager", "human:ceo")
+    assert watches.consecutive == 2

@@ -443,6 +443,15 @@ class ManagementWatchStore(Protocol):
         lease_seconds: int = 60,
     ) -> ManagementWatchLease | None: ...
 
+    def heartbeat_management_watch(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> bool: ...
+
     def complete_management_watch(
         self,
         tenant_id: str,
@@ -686,6 +695,7 @@ class AgentRuntime(Protocol):
         idempotency_key: str,
         budget_cents: int = 100,
         context: Mapping[str, Any] | None = None,
+        usage_category: str = "lifecycle_agent",
     ) -> Mapping[str, Any]: ...
 
 

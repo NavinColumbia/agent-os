@@ -83,11 +83,15 @@ Every graph run also creates a durable management watch. The fair tenant worker 
 owner-fenced lease, runs the same authority-derived diagnosis, and schedules the next check without keeping a
 tenant permanently hot. Sustained `slow_but_owned`, expired/recovering lease, delayed dispatch, or contradictory
 state produces one idempotent manager notification; critical infrastructure symptoms also reach the operator.
-Only a condition that survives the configured number of consecutive checks escalates to the CEO, and a later
-healthy check publishes recovery to the same audience. Rechecking or crashing between notification publication
-and watch acknowledgement cannot duplicate the inbox item. The monitor never cancels work. A future manager-agent
-turn may add contextual repair/reassignment proposals, but deterministic health classification and delivery do
-not depend on a model being available.
+The first observation of a new actionable signal also runs a metered, lease-renewed mission-manager turn over a
+bounded operational snapshot. Its structured root-cause analysis, risks, decisions, repair/reassignment ideas,
+resource needs, and escalation recommendations are retained as proposals in the notification and reused if the
+same condition later reaches the CEO. Provider failure never suppresses the deterministic alert or freezes the
+escalation counter; the review failure is recorded and retried on exponentially spaced checks. Only a condition
+that survives the configured number of consecutive checks escalates to the CEO, and a later healthy check
+publishes recovery to the same audience. Rechecking or crashing between notification publication and watch
+acknowledgement cannot duplicate the inbox item. The monitor never cancels healthy work, and model proposals do
+not bypass workflow revision or human-approval authority.
 
 The first standing organization write model is also live. `aos_v2_companies` and its append-only tenant event
 stream survive individual directives. `GET /v2/company/organization` projects the bootstrap teams plus approved
@@ -276,6 +280,7 @@ Important controls:
 - `AOS_V2_MANAGEMENT_CHECK_SECONDS` (default `30`; durable review cadence)
 - `AOS_V2_SLOW_WORK_SECONDS` (default `300`; diagnostic threshold, never a kill timeout)
 - `AOS_V2_MANAGEMENT_ESCALATION_CHECKS` (default `3`; consecutive checks before CEO escalation)
+- `AOS_V2_MANAGER_TURN_COST_CENTS` (default `25`; must not exceed the general per-turn ceiling)
 - `AOS_V2_CONNECTOR_SECRET_BACKEND` (`file` locally, `gcp` in hosted production)
 - `AOS_V2_CONNECTOR_SECRET_DIR` (local/BYOC read-only credential root)
 - `AOS_V2_CONNECTOR_SECRET_PROJECT_ID` (Secret Manager project when the backend is `gcp`)

@@ -219,11 +219,14 @@ class PydanticAgentRuntime(AgentRuntime):
         idempotency_key: str,
         budget_cents: int = 100,
         context: Mapping[str, Any] | None = None,
+        usage_category: str = "lifecycle_agent",
     ) -> Mapping[str, Any]:
         if not organization_id or not run_id or not role or not prompt or not idempotency_key:
             raise ValueError("organization, run, role, prompt, and idempotency key are required")
         if budget_cents < 0:
             raise ValueError("budget_cents cannot be negative")
+        if not usage_category.strip() or len(usage_category) > 64:
+            raise ValueError("usage_category must contain 1 to 64 characters")
         context_text = "" if not context else f"\nAuthoritative work context:\n{dict(context)}"
         instructions = f"{_BASE_INSTRUCTIONS}\n\nYour assigned role is: {role}.{context_text}"
         selection = self._selection(organization_id)
@@ -240,7 +243,7 @@ class PydanticAgentRuntime(AgentRuntime):
                 tenant_id=organization_id,
                 source_id=idempotency_key,
                 run_id=run_id,
-                category="lifecycle_agent",
+                category=usage_category,
                 model=selection.name,
                 maximum_cost_cents=max(1, budget_cents),
             )

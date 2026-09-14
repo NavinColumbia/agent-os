@@ -660,6 +660,25 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox, ManagementW
             ))
             return changed.rowcount == 1
 
+    def heartbeat_management_watch(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> bool:
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(management_watches).where(and_(
+                management_watches.c.tenant_id == tenant_id,
+                management_watches.c.run_id == run_id,
+                management_watches.c.status == "executing",
+                management_watches.c.lease_owner == worker_id,
+            )).values(lease_expires_at=_now() + timedelta(seconds=lease_seconds)))
+            return changed.rowcount == 1
+
     def retry_management_watch(
         self,
         tenant_id: str,

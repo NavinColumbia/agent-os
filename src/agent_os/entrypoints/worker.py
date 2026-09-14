@@ -128,6 +128,7 @@ class WorkerSettings:
     management_check_seconds: int
     slow_work_seconds: int
     management_escalation_checks: int
+    manager_turn_budget_cents: int
     connector_secret_directory: str
     connector_secret_backend: str
     connector_secret_project_id: str
@@ -243,12 +244,20 @@ class WorkerSettings:
         management_check_seconds = _positive_int("AOS_V2_MANAGEMENT_CHECK_SECONDS", 30)
         slow_work_seconds = _positive_int("AOS_V2_SLOW_WORK_SECONDS", 300)
         management_escalation_checks = _positive_int("AOS_V2_MANAGEMENT_ESCALATION_CHECKS", 3)
+        max_turn_budget_cents = _positive_int("AOS_V2_MAX_TURN_COST_CENTS", 100)
+        manager_turn_budget_cents = _positive_int(
+            "AOS_V2_MANAGER_TURN_COST_CENTS", min(25, max_turn_budget_cents),
+        )
         if management_check_seconds > 3_600:
             raise ValueError("AOS_V2_MANAGEMENT_CHECK_SECONDS cannot exceed 3600")
         if slow_work_seconds > 7 * 24 * 60 * 60:
             raise ValueError("AOS_V2_SLOW_WORK_SECONDS cannot exceed 604800")
         if management_escalation_checks > 100:
             raise ValueError("AOS_V2_MANAGEMENT_ESCALATION_CHECKS cannot exceed 100")
+        if manager_turn_budget_cents > max_turn_budget_cents:
+            raise ValueError(
+                "AOS_V2_MANAGER_TURN_COST_CENTS cannot exceed AOS_V2_MAX_TURN_COST_CENTS"
+            )
         connector_secret_directory = os.getenv(
             "AOS_V2_CONNECTOR_SECRET_DIR", "/run/secrets/agent-os-connectors",
         ).strip()
@@ -281,7 +290,7 @@ class WorkerSettings:
             request_limit=_positive_int("AOS_V2_MODEL_REQUEST_LIMIT", 12),
             output_tokens_limit=_positive_int("AOS_V2_MODEL_OUTPUT_TOKENS_LIMIT", 8_000),
             request_timeout_seconds=_positive_float("AOS_V2_MODEL_REQUEST_TIMEOUT_SECONDS", 120),
-            max_turn_budget_cents=_positive_int("AOS_V2_MAX_TURN_COST_CENTS", 100),
+            max_turn_budget_cents=max_turn_budget_cents,
             retry_max_attempts=retry_max_attempts,
             sandbox_backend=sandbox_backend,
             sandbox_image=os.getenv("AOS_V2_SANDBOX_IMAGE", DEFAULT_PYTHON_IMAGE).strip(),
@@ -307,6 +316,7 @@ class WorkerSettings:
             management_check_seconds=management_check_seconds,
             slow_work_seconds=slow_work_seconds,
             management_escalation_checks=management_escalation_checks,
+            manager_turn_budget_cents=manager_turn_budget_cents,
             connector_secret_directory=connector_secret_directory,
             connector_secret_backend=connector_secret_backend,
             connector_secret_project_id=connector_secret_project_id,
@@ -558,6 +568,8 @@ def run_worker(
             slow_after_seconds=settings.slow_work_seconds,
             escalation_checks=settings.management_escalation_checks,
             retry_delay_seconds=max(1, int(settings.error_backoff_seconds)),
+            manager_runtime=runtime,
+            manager_turn_budget_cents=settings.manager_turn_budget_cents,
         )
         notification_worker = DurableNotificationDeliveryWorker(
             store=notification_store,

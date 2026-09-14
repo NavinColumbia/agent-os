@@ -27,6 +27,9 @@ def test_runtime_image_installs_locked_dependencies_before_local_package():
     assert "pip install --no-cache-dir -r pylock.toml" in dockerfile
     assert "pip install --no-cache-dir --no-deps ." in dockerfile
     assert "python:3.12-slim-trixie@sha256:" in dockerfile
+    assert "COPY src ./src" in dockerfile
+    assert "COPY scripts" not in dockerfile
+    assert "COPY platform" not in dockerfile
 
 
 def test_migration_image_orders_numeric_revisions_and_compatibility_suffixes():

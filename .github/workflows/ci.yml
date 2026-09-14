@@ -1,6 +1,9 @@
 name: ci
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -78,7 +81,27 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: build locked non-root runtime image
         run: docker build -f deploy/Dockerfile.v2 -t agent-os-v2:ci .
+      - name: build the exact migration and hosted-sandbox images
+        run: |
+          docker build -f deploy/Dockerfile.migrations-v2 -t agent-os-migrations-v2:ci .
+          docker build -f deploy/Dockerfile.sandbox-v2 -t agent-os-sandbox-v2:ci .
       - name: smoke packaged API and worker entrypoints
         run: |
           docker run --rm agent-os-v2:ci agentos-v2 --help
           docker run --rm agent-os-v2:ci agentos-v2 worker --help
+          test "$(docker image inspect agent-os-migrations-v2:ci --format '{{.Config.User}}')" = "999:999"
+          test "$(docker image inspect agent-os-sandbox-v2:ci --format '{{json .Config.Entrypoint}}')" = '["python","-I","/opt/agent-os/sandbox_job.py"]'
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.12.6
+          tofu_wrapper: false
+      - name: validate reproducible production infrastructure
+        run: |
+          tofu -chdir=deploy/gcp fmt -check -recursive
+          tofu -chdir=deploy/gcp init -backend=false -input=false
+          tofu -chdir=deploy/gcp validate

@@ -1,6 +1,6 @@
 "use strict";
 
-const SHELL_CACHE = "agent-os-shell-v2";
+const SHELL_CACHE = "agent-os-shell-v3";
 const SHELL_ASSETS = [
   "/app", "/assets/ceo.css", "/assets/ceo.js", "/assets/app-icon.svg", "/app.webmanifest",
 ];

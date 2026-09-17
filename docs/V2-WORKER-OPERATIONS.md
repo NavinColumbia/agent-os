@@ -134,7 +134,9 @@ Per-person background alerts use standards-based Web Push rather than tenant-wid
 in from the PWA, which enrolls one browser device at `POST /v2/me/push-subscriptions`; the endpoint capability and
 browser encryption keys are encrypted before persistence and are never returned. Eligible notification commits
 create deterministic durable deliveries, and the worker leases/retries them alongside other tenant work. Only a
-generic “open Agent OS” payload leaves the system; all mission content is fetched again after authentication.
+generic “open Agent OS” payload plus an opaque delivery ID leaves the system; all mission content is fetched again
+after authentication. A click resolves through `GET /v2/me/push-deliveries/{delivery_id}`, rechecks current
+authorization through `GET /v2/notifications/{notification_id}`, and focuses that exact inbox item.
 `GET /v2/me/push-deliveries` exposes only the signed-in person's delivery receipts. A 404/410 from a push service
 deactivates that device. Normal alerts respect quiet hours; explicit critical/irreversible attention can bypass
 them. Configure all three values or none:

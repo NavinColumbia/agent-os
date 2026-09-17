@@ -340,6 +340,9 @@ def test_notification_enqueues_and_delivers_only_a_generic_durable_push(tmp_path
         assert "Secret acquisition" not in str(lease.payload)
         assert "Private deal" not in str(lease.payload)
         assert "do-not-push" not in str(lease.payload)
+        assert lease.payload["url"] == f"/app#view=inbox&push={lease.delivery_id}"
+        assert lease.payload["tag"] == lease.delivery_id
+        assert "notification-push-one" not in str(lease.payload)
 
         sent = {}
 
@@ -381,10 +384,34 @@ def test_notification_enqueues_and_delivers_only_a_generic_durable_push(tmp_path
             )
             assert response.status_code == 200
             assert response.json()["items"][0]["delivery_id"] == lease.delivery_id
+            direct_receipt = api.get(
+                f"/v2/me/push-deliveries/{lease.delivery_id}",
+                headers={"Authorization": "Bearer person-a"},
+            )
+            assert direct_receipt.status_code == 200
+            assert direct_receipt.json()["notification_id"] == "notification-push-one"
+            direct_notification = api.get(
+                "/v2/notifications/notification-push-one",
+                headers={"Authorization": "Bearer person-a"},
+            )
+            assert direct_notification.status_code == 200
+            assert direct_notification.json()["presentation"]["level"] == "time_sensitive"
             assert api.get(
                 "/v2/me/push-deliveries",
                 headers={"Authorization": "Bearer person-b"},
             ).json()["items"] == []
+            assert api.get(
+                f"/v2/me/push-deliveries/{lease.delivery_id}",
+                headers={"Authorization": "Bearer person-b"},
+            ).status_code == 404
+            assert api.get(
+                "/v2/me/push-deliveries/not-a-capability",
+                headers={"Authorization": "Bearer person-a"},
+            ).status_code == 404
+            assert api.get(
+                "/v2/notifications/notification-push-one",
+                headers={"Authorization": "Bearer person-b"},
+            ).status_code == 404
         engine = create_engine(database_url)
         try:
             with engine.begin() as connection:

@@ -60,6 +60,8 @@ GET /v2/events/stream?cursor=...          # authenticated SSE
 GET /v2/...                               # authoritative snapshots
 POST/DELETE /v2/me/push-subscriptions/... # explicit device enrollment
 GET /v2/me/push-deliveries                # person-scoped delivery receipts
+GET /v2/me/push-deliveries/{opaque_id}    # exact signed-in person's receipt
+GET /v2/notifications/{notification_id}   # currently authorized item projection
 ```
 
 The event log carries enough information to refetch or safely update a projection, not a duplicate unbounded
@@ -111,10 +113,13 @@ capability endpoints and P-256/auth material are accepted only from an explicit 
 rest with tenant/person/subscription-bound AEAD, and never returned through the API. Notification publication
 transactionally creates a durable delivery only for an eligible personal subscription. The renewable-lease worker
 retries transient provider failures, deactivates expired subscriptions, and records person-scoped receipts.
-Background payloads are deliberately generic: they disclose no mission title, question, body, or customer data and
-deep-link only to the authenticated inbox, which refetches authoritative state. Quiet hours delay ordinary pushes;
-explicit safety-critical/irreversible attention may bypass them. Enrollment is a user gesture, opt-out revokes
-future queued delivery, and foreground SSE/polling remain independent fallbacks.
+Background payloads are deliberately generic: they disclose no mission title, question, body, notification ID, or
+customer data. They carry only an opaque delivery ID. After sign-in, the application resolves that ID through a
+tenant/person-fenced receipt, rechecks the person's current notification visibility, fetches the authoritative item,
+and focuses it even when it is older than the first inbox page. A stale, cross-person, cross-tenant, malformed, or
+newly unauthorized link fails closed. Quiet hours delay ordinary pushes; explicit safety-critical/irreversible
+attention may bypass them. Enrollment is a user gesture, opt-out revokes future queued delivery, and foreground
+SSE/polling remain independent fallbacks.
 
 Code readiness does not imply live delivery on every deployment. Operators must provision one matching VAPID
 public/private pair plus a contact subject. In hosted GCP, all three are stable Secret Manager inputs so a later CI

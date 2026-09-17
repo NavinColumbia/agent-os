@@ -2188,6 +2188,25 @@ def create_app(
                 limit=limit,
             ))}
 
+        @app.get("/v2/me/push-deliveries/{delivery_id}")
+        def get_push_delivery(
+            delivery_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if re.fullmatch(r"push-delivery-[0-9a-f]{64}", delivery_id) is None:
+                raise HTTPException(status_code=404, detail="Web Push delivery not found")
+            reader = getattr(notification_store, "get_web_push_delivery", None)
+            if reader is None:
+                raise HTTPException(status_code=503, detail="Web Push delivery receipts are unavailable")
+            result = reader(
+                principal.organization_id,
+                subject_id=principal.subject_id,
+                delivery_id=delivery_id,
+            )
+            if result is None:
+                raise HTTPException(status_code=404, detail="Web Push delivery not found")
+            return result
+
         @app.post("/v2/me/push-subscriptions", status_code=201)
         def register_push_subscription(
             body: PushSubscriptionRegistrationRequest,
@@ -2417,51 +2436,22 @@ def create_app(
                     "duplicate": result["duplicate"],
                 }
 
-        @app.get("/v2/notifications")
-        def list_notifications(
-            principal: Annotated[Principal, Depends(current_principal)],
-            run_id: Annotated[str | None, Query(max_length=256)] = None,
-            limit: Annotated[int, Query(ge=1, le=500)] = 100,
-            cursor: Annotated[str | None, Query(max_length=1_024)] = None,
-        ) -> Mapping[str, Any]:
-            privileged = bool(principal.roles & {"owner", "operator", "system"})
-            try:
-                before = None if cursor is None else _decode_notification_cursor(cursor)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            list_args = {
-                "run_id": run_id,
-                "recipient_id": None if privileged else principal.subject_id,
-                "limit": limit + 1,
-            }
-            if before is not None:
-                list_args["before"] = before
-            raw_items = notification_store.list_notifications(
-                principal.organization_id, **list_args,
-            )
-            has_more = len(raw_items) > limit
-            page_items = raw_items[:limit]
-            next_cursor = None
-            if has_more and page_items:
-                try:
-                    next_cursor = _encode_notification_cursor(page_items[-1])
-                except ValueError as exc:
-                    raise HTTPException(
-                        status_code=503, detail="notification pagination is unavailable",
-                    ) from exc
-            items = tuple(
-                item for item in page_items if notification_visible_to(item, principal)
+        def project_notifications(
+            items: tuple[Mapping[str, Any], ...], principal: Principal,
+        ) -> tuple[list[Mapping[str, Any]], Mapping[str, Any]]:
+            notification_ids = tuple(
+                str(item.get("notification_id") or "") for item in items
             )
             state_reader = getattr(notification_store, "list_notification_states", None)
             states = {} if state_reader is None else state_reader(
                 principal.organization_id,
                 subject_id=principal.subject_id,
-                notification_ids=tuple(str(item.get("notification_id") or "") for item in items),
+                notification_ids=notification_ids,
             )
             decision_reader = getattr(notification_store, "list_decision_responses", None)
             decisions = {} if decision_reader is None else decision_reader(
                 principal.organization_id,
-                notification_ids=tuple(str(item.get("notification_id") or "") for item in items),
+                notification_ids=notification_ids,
             )
             preference_reader = getattr(notification_store, "get_notification_preferences", None)
             preferences = (
@@ -2478,7 +2468,7 @@ def create_app(
                 "management_attention",
             }
             graph_states: dict[str, Any] = {}
-            rendered = []
+            rendered: list[Mapping[str, Any]] = []
             for raw in items:
                 item = dict(raw)
                 if item.get("category") == "human_action_required":
@@ -2515,7 +2505,9 @@ def create_app(
                         "last_error": decision["last_error"],
                         "completed_at": decision["completed_at"],
                     }
-                    if decision["status"] in {"pending", "executing", "applied", "superseded", "failed"}:
+                    if decision["status"] in {
+                        "pending", "executing", "applied", "superseded", "failed",
+                    }:
                         item["actionable"] = False
                 item_state = dict(states.get(str(item.get("notification_id") or ""), {
                     "status": "unread", "snoozed_until": None, "version": 0,
@@ -2523,12 +2515,16 @@ def create_app(
                 snoozed_until = item_state.get("snoozed_until")
                 if item_state.get("status") == "snoozed" and snoozed_until:
                     try:
-                        if datetime.fromisoformat(str(snoozed_until).replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+                        if datetime.fromisoformat(
+                            str(snoozed_until).replace("Z", "+00:00")
+                        ) <= datetime.now(timezone.utc):
                             item_state["status"] = "unread"
                     except ValueError:
                         item_state["status"] = "unread"
                 category = str(item.get("category") or "")
-                payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else {}
+                payload = item.get("payload") if isinstance(
+                    item.get("payload"), Mapping,
+                ) else {}
                 attention = _notification_attention(category, payload)
                 promoted = (
                     attention["level"] == "time_sensitive"
@@ -2548,11 +2544,63 @@ def create_app(
                     "preference_mode": preference_mode,
                 }
                 rendered.append(item)
+            return rendered, preferences
+
+        @app.get("/v2/notifications")
+        def list_notifications(
+            principal: Annotated[Principal, Depends(current_principal)],
+            run_id: Annotated[str | None, Query(max_length=256)] = None,
+            limit: Annotated[int, Query(ge=1, le=500)] = 100,
+            cursor: Annotated[str | None, Query(max_length=1_024)] = None,
+        ) -> Mapping[str, Any]:
+            privileged = bool(principal.roles & {"owner", "operator", "system"})
+            try:
+                before = None if cursor is None else _decode_notification_cursor(cursor)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            list_args = {
+                "run_id": run_id,
+                "recipient_id": None if privileged else principal.subject_id,
+                "limit": limit + 1,
+            }
+            if before is not None:
+                list_args["before"] = before
+            raw_items = notification_store.list_notifications(
+                principal.organization_id, **list_args,
+            )
+            has_more = len(raw_items) > limit
+            page_items = raw_items[:limit]
+            next_cursor = None
+            if has_more and page_items:
+                try:
+                    next_cursor = _encode_notification_cursor(page_items[-1])
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=503, detail="notification pagination is unavailable",
+                    ) from exc
+            items = tuple(
+                item for item in page_items if notification_visible_to(item, principal)
+            )
+            rendered, preferences = project_notifications(items, principal)
             return {
                 "items": rendered,
                 "preferences": preferences,
                 "next_cursor": next_cursor,
             }
+
+        @app.get("/v2/notifications/{notification_id}")
+        def get_notification(
+            notification_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            reader = getattr(notification_store, "get_notification", None)
+            if reader is None:
+                raise HTTPException(status_code=503, detail="notifications are unavailable")
+            raw = reader(principal.organization_id, notification_id)
+            if raw is None or not notification_visible_to(raw, principal):
+                raise HTTPException(status_code=404, detail="notification not found")
+            rendered, _ = project_notifications((raw,), principal)
+            return rendered[0]
 
         @app.get("/v2/notification-routes")
         def list_notification_routes(

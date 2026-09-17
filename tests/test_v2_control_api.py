@@ -240,12 +240,17 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert "decisionDrafts" in script.text
     assert "/v2/events/stream" in script.text
     assert "/v2/me/push-subscriptions" in script.text
+    assert "/v2/me/push-deliveries/" in script.text
+    assert "routeFromHash" in script.text
+    assert "focusInboxItem" in script.text
+    assert "pushDeliveryId" in script.text
     assert "PushManager" in script.text
     assert "AbortController" in script.text
     assert "EventSource" not in script.text
     service_worker = api.get("/service-worker.js").text
     assert 'addEventListener("push"' in service_worker
     assert 'addEventListener("notificationclick"' in service_worker
+    assert "agent-os-shell-v3" in service_worker
     assert '"Authorization": `Bearer ${state.token}`' in script.text
     assert "#view=" in script.text
     assert 'querySelectorAll(".nav-item[data-view]")' in script.text

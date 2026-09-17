@@ -6,6 +6,7 @@ const state = {
   inboxCursor: null, decisionDrafts: {}, browserAlertBaseline: null, drawerReturnFocus: null,
   eventCursor: null, eventAbort: null, eventRefreshTimer: null,
   pushSubscriptionId: null,
+  focusedNotificationId: null, focusInboxItemPending: false,
 };
 const byId = (id) => document.getElementById(id);
 const el = (tag, className, text) => {
@@ -16,6 +17,15 @@ const el = (tag, className, text) => {
 };
 const shortId = (value) => value ? `${value.slice(0, 11)}…${value.slice(-5)}` : "—";
 const label = (value) => String(value || "unknown").replaceAll("_", " ");
+
+function routeFromHash() {
+  const raw = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : "";
+  const parameters = new URLSearchParams(raw);
+  return {
+    view: parameters.get("view") || "",
+    pushDeliveryId: parameters.get("push") || "",
+  };
+}
 
 function setFlash(message, kind = "") {
   const node = byId("flash");
@@ -203,10 +213,10 @@ async function connect(token) {
     await api("/v2/company/organization");
     byId("auth-gate").classList.add("hidden");
     byId("workspace").classList.remove("hidden");
-    const requestedView = window.location.hash.startsWith("#view=")
-      ? window.location.hash.slice(6) : "";
+    const requestedRoute = routeFromHash();
     const roleDefault = state.session?.persona === "operator" ? "inbox" : "missions";
-    await selectView(requestedView || roleDefault);
+    await selectView(requestedRoute.view || roleDefault);
+    if (requestedRoute.pushDeliveryId) await openPushDelivery(requestedRoute.pushDeliveryId);
     const billingNotice = sessionStorage.getItem("aos.billing.notice");
     if (billingNotice) {
       sessionStorage.removeItem("aos.billing.notice");
@@ -238,6 +248,8 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   state.inboxCursor = null;
   state.decisionDrafts = {};
   state.notificationPreferences = null;
+  state.focusedNotificationId = null;
+  state.focusInboxItemPending = false;
   state.browserAlertBaseline = null;
   state.eventCursor = null;
   state.pushSubscriptionId = null;
@@ -592,6 +604,7 @@ async function refreshInboxBadge() {
 }
 
 function inboxItemVisible(item) {
+  if (item.notification_id === state.focusedNotificationId) return true;
   const itemState = item.user_state?.status || "unread";
   if (state.inboxFilter === "all") return true;
   if (["dismissed", "snoozed", "resolved"].includes(itemState)) return false;
@@ -610,6 +623,11 @@ function renderInbox() {
     const itemState = item.user_state?.status || "unread";
     const attention = item.presentation?.level || "active";
     const node = el("article", `notice ${itemState} ${attention}`);
+    node.dataset.notificationId = item.notification_id;
+    if (item.notification_id === state.focusedNotificationId) {
+      node.classList.add("focused");
+      node.tabIndex = -1;
+    }
     const heading = el("div", "notice-heading");
     const copy = el("div");
     copy.append(
@@ -694,6 +712,48 @@ function renderInbox() {
       catch (error) { older.disabled = false; setFlash(error.message, "error"); }
     });
     content.append(older);
+  }
+  if (state.focusInboxItemPending) {
+    const target = [...content.querySelectorAll(".notice")].find(
+      (node) => node.dataset.notificationId === state.focusedNotificationId,
+    );
+    if (target) {
+      state.focusInboxItemPending = false;
+      window.requestAnimationFrame(() => {
+        target.scrollIntoView({behavior: "smooth", block: "center"});
+        target.focus({preventScroll: true});
+      });
+    }
+  }
+}
+
+function focusInboxItem(item) {
+  state.inboxItems = [
+    item,
+    ...state.inboxItems.filter((entry) => entry.notification_id !== item.notification_id),
+  ];
+  state.focusedNotificationId = item.notification_id;
+  state.focusInboxItemPending = true;
+  updateInboxBadge(state.inboxItems);
+  renderInbox();
+}
+
+async function openPushDelivery(deliveryId) {
+  history.replaceState({}, document.title, "#view=inbox");
+  if (!/^push-delivery-[0-9a-f]{64}$/.test(deliveryId)) {
+    setFlash("This attention link is invalid.", "error");
+    if (state.view !== "inbox") await selectView("inbox");
+    return;
+  }
+  try {
+    const receipt = await api(`/v2/me/push-deliveries/${encodeURIComponent(deliveryId)}`);
+    const item = await api(`/v2/notifications/${encodeURIComponent(receipt.notification_id)}`);
+    if (state.view !== "inbox") await selectView("inbox");
+    focusInboxItem(item);
+    setFlash("Opened the attention item from this device notification.");
+  } catch (_) {
+    if (state.view !== "inbox") await selectView("inbox");
+    setFlash("This attention item is unavailable or no longer authorized.", "error");
   }
 }
 
@@ -789,7 +849,12 @@ function deliverBrowserAlerts(items) {
       tag: item.notification_id,
       icon: "/assets/app-icon.svg",
     });
-    notice.onclick = () => { window.focus(); selectView("inbox"); notice.close(); };
+    notice.onclick = async () => {
+      window.focus();
+      await selectView("inbox");
+      focusInboxItem(item);
+      notice.close();
+    };
   }
 }
 
@@ -1548,6 +1613,10 @@ function selectView(name) {
     setFlash("Billing is not available in this deployment.", "error"); name = "missions";
   }
   state.view = name;
+  if (name !== "inbox") {
+    state.focusedNotificationId = null;
+    state.focusInboxItemPending = false;
+  }
   byId("mobile-more-menu").classList.add("hidden");
   byId("mobile-more-toggle").setAttribute("aria-expanded", "false");
   document.querySelectorAll(".nav-item").forEach((node) => node.classList.toggle("active", node.dataset.view === name));
@@ -1687,15 +1756,20 @@ byId("save-inbox-preferences").addEventListener("click", async (event) => {
 });
 document.querySelectorAll("[data-inbox-filter]").forEach((node) => node.addEventListener("click", () => {
   state.inboxFilter = node.dataset.inboxFilter;
+  state.focusedNotificationId = null;
+  state.focusInboxItemPending = false;
   document.querySelectorAll("[data-inbox-filter]").forEach((item) => item.classList.toggle("active", item === node));
   renderInbox();
 }));
 document.querySelectorAll(".nav-item[data-view]").forEach((node) => node.addEventListener("click", () => selectView(node.dataset.view)));
 window.addEventListener("hashchange", () => {
   if (!state.token) return;
-  if (!window.location.hash.startsWith("#view=")) return;
-  const requested = window.location.hash.slice(6);
-  if (requested && requested !== state.view) selectView(requested);
+  const requested = routeFromHash();
+  if (requested.pushDeliveryId) {
+    openPushDelivery(requested.pushDeliveryId);
+    return;
+  }
+  if (requested.view && requested.view !== state.view) selectView(requested.view);
 });
 document.addEventListener("visibilitychange", () => {
   if (!state.token) return;

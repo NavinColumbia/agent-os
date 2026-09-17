@@ -220,7 +220,9 @@ offset. The workspace can page backward without duplicates, keeps decision draft
 and applies every cursor inside the authenticated tenant and recipient projection. The live SSE/cursor event plane
 and the privacy-reduced Web Push adapter are now implemented. Live push still requires deployment-specific VAPID
 provisioning and a real-device smoke; the durable inbox remains authoritative when a browser or provider cannot
-deliver in the background.
+deliver in the background. Push clicks now resolve an opaque, person-scoped delivery only after authentication,
+recheck current item authorization, and focus the exact item even beyond the inbox's first page without putting
+mission or notification content into the background payload.
 
 First use now has a server-derived, resumable readiness projection covering identity, durable admission,
 standing organization, hard spend guard, model policy, human-decision routing, optional connectors, and the

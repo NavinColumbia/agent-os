@@ -137,6 +137,8 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .person, .notice, .release { padding: .9rem; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.022); }
 .notice.unread { border-color: rgba(198,255,69,.24); }
 .notice.time_sensitive { border-left: 3px solid var(--amber); }
+.notice.focused { border-color: var(--lime); box-shadow: 0 0 0 3px rgba(198,255,69,.14); }
+.notice.focused:focus { outline: 2px solid var(--lime); outline-offset: 3px; }
 .person strong, .notice strong, .release strong { display: block; font-size: .82rem; }
 .person small, .notice small, .release small { display: block; margin-top: .3rem; color: var(--muted); font-size: .68rem; line-height: 1.5; }
 .notice-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }

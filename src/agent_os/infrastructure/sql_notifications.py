@@ -2007,12 +2007,6 @@ class SQLNotificationStore(NotificationStore):
             )).rowcount
             if changed != 1:
                 return None
-            notification = connection.execute(select(
-                notifications.c.notification_id,
-            ).where(and_(
-                notifications.c.tenant_id == tenant_id,
-                notifications.c.notification_id == row["notification_id"],
-            ))).mappings().one()
         material = protector.open(
             bytes(subscription["sealed_subscription"]),
             tenant_id=tenant_id,
@@ -2027,8 +2021,8 @@ class SQLNotificationStore(NotificationStore):
             payload={
                 "title": "Agent OS needs your attention",
                 "body": "Open Agent OS to review the update securely.",
-                "url": "/app#view=inbox",
-                "tag": str(notification["notification_id"]),
+                "url": f"/app#view=inbox&push={row['delivery_id']}",
+                "tag": str(row["delivery_id"]),
             },
             worker_id=worker_id,
             attempt=int(row["attempts"]) + 1,
@@ -2203,7 +2197,11 @@ class SQLNotificationStore(NotificationStore):
                 web_push_deliveries.c.created_at.desc(),
                 web_push_deliveries.c.delivery_id.desc(),
             ).limit(limit)).mappings().all()
-        return tuple({
+        return tuple(self._web_push_delivery_record(row) for row in rows)
+
+    @staticmethod
+    def _web_push_delivery_record(row: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
             "delivery_id": str(row["delivery_id"]),
             "notification_id": str(row["notification_id"]),
             "subscription_id": str(row["subscription_id"]),
@@ -2219,7 +2217,39 @@ class SQLNotificationStore(NotificationStore):
             "delivered_at": (
                 None if row["delivered_at"] is None else row["delivered_at"].isoformat()
             ),
-        } for row in rows)
+        }
+
+    def get_web_push_delivery(
+        self,
+        tenant_id: str,
+        *,
+        subject_id: str,
+        delivery_id: str,
+    ) -> Mapping[str, Any] | None:
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(
+                web_push_deliveries.c.delivery_id,
+                web_push_deliveries.c.notification_id,
+                web_push_deliveries.c.subscription_id,
+                web_push_deliveries.c.status,
+                web_push_deliveries.c.attempts,
+                web_push_deliveries.c.available_at,
+                web_push_deliveries.c.last_error,
+                web_push_deliveries.c.result,
+                web_push_deliveries.c.created_at,
+                web_push_deliveries.c.delivered_at,
+            ).select_from(web_push_deliveries.join(
+                push_subscriptions,
+                and_(
+                    push_subscriptions.c.tenant_id == web_push_deliveries.c.tenant_id,
+                    push_subscriptions.c.subscription_id == web_push_deliveries.c.subscription_id,
+                ),
+            )).where(and_(
+                web_push_deliveries.c.tenant_id == tenant_id,
+                web_push_deliveries.c.delivery_id == delivery_id,
+                push_subscriptions.c.subject_id == subject_id,
+            ))).mappings().one_or_none()
+        return None if row is None else self._web_push_delivery_record(row)
 
     @staticmethod
     def _eligible_delivery(now: datetime):

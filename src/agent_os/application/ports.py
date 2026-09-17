@@ -757,6 +757,14 @@ class NotificationStore(Protocol):
         limit: int = 100,
     ) -> tuple[Mapping[str, Any], ...]: ...
 
+    def get_web_push_delivery(
+        self,
+        tenant_id: str,
+        *,
+        subject_id: str,
+        delivery_id: str,
+    ) -> Mapping[str, Any] | None: ...
+
     def admit_decision_response(
         self,
         *,

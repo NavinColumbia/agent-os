@@ -93,6 +93,8 @@ decision-response truth defined here.
 - Administrative controls consume the same capability projection: non-managers get read-only policy/access
   views, staffing actions require mission-steering authority, and operations authority does not imply billing
   authority. Audit reasons identify the shared workspace rather than claiming every actor is the CEO.
+- Human persona authorization now follows the centralized capability policy in
+  [ADR-005](ADR-005-capability-policy-and-human-roles.md); persona names remain presentation presets.
 
 ## Acceptance
 

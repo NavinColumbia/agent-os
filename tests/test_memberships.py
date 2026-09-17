@@ -151,7 +151,9 @@ def test_membership_authority_validates_roles_and_prevents_self_revocation(tmp_p
         memberships.close()
 
 
-@pytest.mark.parametrize("role", ["builder", "reviewer"])
+@pytest.mark.parametrize(
+    "role", ["admin", "manager", "builder", "reviewer", "billing", "client"],
+)
 def test_membership_supports_least_privilege_delivery_roles(tmp_path: Path, role: str):
     memberships = store(tmp_path)
     try:

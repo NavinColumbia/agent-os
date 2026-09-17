@@ -40,7 +40,7 @@
       </a>
       <nav aria-label="Workspace">
         <button class="nav-item active" data-view="missions" type="button"><span>◫</span>Missions</button>
-        <button class="nav-item" data-view="company" type="button"><span>⌘</span>Company</button>
+        <button class="nav-item requires-company-read" data-view="company" type="button"><span>⌘</span>Company</button>
         <button class="nav-item" data-view="inbox" type="button"><span>◇</span>Inbox <b id="inbox-count" class="count hidden">0</b></button>
         <button class="nav-item requires-integration-manage" data-view="integrations" type="button"><span>⌁</span>Integrations</button>
         <button class="nav-item" data-view="previews" type="button"><span>↗</span>Releases</button>
@@ -48,7 +48,7 @@
         <button id="mobile-more-toggle" class="nav-item mobile-only" type="button" aria-expanded="false" aria-controls="mobile-more-menu"><span>•••</span>More</button>
       </nav>
       <div id="mobile-more-menu" class="mobile-more-menu hidden" role="menu" aria-label="More workspace destinations">
-        <button type="button" data-mobile-view="company">Company</button>
+        <button class="requires-company-read" type="button" data-mobile-view="company">Company</button>
         <button class="requires-integration-manage" type="button" data-mobile-view="integrations">Integrations</button>
         <button class="requires-billing-manage" type="button" data-mobile-view="billing">Billing</button>
         <button id="mobile-disconnect" type="button">Disconnect</button>

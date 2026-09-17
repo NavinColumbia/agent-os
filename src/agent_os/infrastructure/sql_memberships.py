@@ -30,6 +30,7 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 
 from agent_os.application.ports import MembershipStore
+from agent_os.domain.access import HUMAN_MEMBERSHIP_ROLES
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
 from agent_os.infrastructure.sql_experience_events import (
     SQLExperienceEventLog,
@@ -38,7 +39,7 @@ from agent_os.infrastructure.sql_experience_events import (
 
 
 membership_metadata = MetaData()
-_MEMBER_ROLES = frozenset({"owner", "operator", "builder", "reviewer", "viewer"})
+_MEMBER_ROLES = HUMAN_MEMBERSHIP_ROLES
 
 
 memberships = Table(
@@ -135,7 +136,7 @@ class SQLMembershipStore(MembershipStore):
         roles = tuple(sorted(set(str(item).strip() for item in raw if str(item).strip())))
         if not roles or set(roles) - _MEMBER_ROLES:
             raise ValueError(
-                "membership roles must be owner, operator, builder, reviewer, or viewer"
+                "membership roles must be one of: " + ", ".join(sorted(_MEMBER_ROLES))
             )
         return roles
 

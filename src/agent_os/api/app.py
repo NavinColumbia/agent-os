@@ -54,6 +54,11 @@ from agent_os.application.ports import (
     WorkflowEngine,
     WorkflowReceipt,
 )
+from agent_os.domain.access import (
+    capabilities_for_roles,
+    persona_for_roles,
+    roles_have_capability,
+)
 from agent_os.domain.lifecycle import Event, EventKind, LifecycleState, TransitionRejected
 from agent_os.domain.mission_model import (
     AuthorityGrant,
@@ -687,50 +692,18 @@ def _response(receipt: WorkflowReceipt, run_id: str) -> MutationResponse:
 def _principal_experience(principal: Principal) -> Mapping[str, Any]:
     """Project authorization into honest navigation hints for any client."""
 
-    roles = set(principal.roles)
-    owner = bool(roles & {"owner", "system"})
-    operator = bool(roles & {"operator"})
-    builder = bool(roles & {"builder", "agent"})
-    reviewer = bool(roles & {"reviewer"})
-    if owner:
-        persona = "executive"
-    elif operator:
-        persona = "operator"
-    elif builder:
-        persona = "builder"
-    elif reviewer:
-        persona = "reviewer"
-    else:
-        persona = "viewer"
-    capabilities = {
-        "mission.read",
-        "notification.read",
-        "release.read",
-    }
-    if owner or operator:
-        capabilities.update({
-            "mission.create", "mission.cancel", "mission.steer",
-            "notification.respond", "decision.redrive", "company.read",
-            "integration.manage",
-        })
-    if owner:
-        capabilities.update({
-            "membership.manage", "model.manage", "billing.manage",
-            "authority.manage", "policy.manage",
-        })
-    if builder:
-        capabilities.update({
-            "work.read", "work.execute", "artifact.publish", "notification.respond",
-        })
-    if reviewer:
-        capabilities.update({"work.read", "review.read", "notification.respond"})
+    capabilities = capabilities_for_roles(principal.roles)
     return {
         "subject_id": principal.subject_id,
         "organization_id": principal.organization_id,
         "roles": sorted(principal.roles),
-        "persona": persona,
+        "persona": persona_for_roles(principal.roles),
         "capabilities": sorted(capabilities),
     }
+
+
+def _principal_can(principal: Principal, capability: str) -> bool:
+    return roles_have_capability(principal.roles, capability)
 
 
 def _notification_attention(category: str, payload: Mapping[str, Any]) -> Mapping[str, str]:
@@ -1046,8 +1019,16 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "system"}):
-                raise HTTPException(status_code=403, detail="invitations require owner authority")
+            if not _principal_can(principal, "membership.manage"):
+                raise HTTPException(status_code=403, detail="invitations require access-management authority")
+            if (
+                set(body.roles) & {"owner", "admin"}
+                and not _principal_can(principal, "ownership.manage")
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="only an owner can grant owner or administrator authority",
+                )
             try:
                 return membership_store.create_invitation(
                     tenant_id=principal.organization_id,
@@ -1078,7 +1059,7 @@ def create_app(
         def list_memberships(
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
+            if not _principal_can(principal, "membership.read"):
                 raise HTTPException(status_code=403, detail="membership inventory requires operator authority")
             return {"items": list(membership_store.list_members(principal.organization_id))}
 
@@ -1091,8 +1072,21 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "system"}):
-                raise HTTPException(status_code=403, detail="membership revocation requires owner authority")
+            if not _principal_can(principal, "membership.manage"):
+                raise HTTPException(status_code=403, detail="membership revocation requires access-management authority")
+            target = next((
+                item for item in membership_store.list_members(principal.organization_id)
+                if item.get("subject_id") == subject_id and item.get("active")
+            ), None)
+            if (
+                target is not None
+                and set(target.get("roles") or ()) & {"owner", "admin"}
+                and not _principal_can(principal, "ownership.manage")
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="only an owner can revoke owner or administrator authority",
+                )
             try:
                 result = membership_store.revoke_member(
                     tenant_id=principal.organization_id,
@@ -1112,6 +1106,8 @@ def create_app(
         def get_tenant_model_setting(
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "model.read"):
+                raise HTTPException(status_code=403, detail="model settings require policy authority")
             configured = tenant_model_store.get_model_setting(principal.organization_id)
             return {
                 "configured": configured is not None,
@@ -1126,8 +1122,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "system"}):
-                raise HTTPException(status_code=403, detail="model settings require owner authority")
+            if not _principal_can(principal, "model.manage"):
+                raise HTTPException(status_code=403, detail="model settings require policy authority")
             try:
                 return tenant_model_store.set_model_setting(
                     tenant_id=principal.organization_id,
@@ -1165,6 +1161,8 @@ def create_app(
         def get_billing_account(
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "billing.read"):
+                raise HTTPException(status_code=403, detail="billing account requires billing authority")
             return billing_service.account(principal.organization_id)
 
         @app.post("/v2/billing/checkout", status_code=201)
@@ -1175,8 +1173,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, str]:
-            if not (principal.roles & {"owner", "system"}):
-                raise HTTPException(status_code=403, detail="billing changes require owner authority")
+            if not _principal_can(principal, "billing.manage"):
+                raise HTTPException(status_code=403, detail="billing changes require billing authority")
             try:
                 return billing_service.checkout(
                     principal.organization_id, body.plan_id, idempotency_key,
@@ -1193,8 +1191,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, str]:
-            if not (principal.roles & {"owner", "system"}):
-                raise HTTPException(status_code=403, detail="billing changes require owner authority")
+            if not _principal_can(principal, "billing.manage"):
+                raise HTTPException(status_code=403, detail="billing changes require billing authority")
             try:
                 return billing_service.portal(principal.organization_id, idempotency_key)
             except ValueError as exc:
@@ -1207,6 +1205,8 @@ def create_app(
         def get_company_organization(
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "company.read"):
+                raise HTTPException(status_code=403, detail="company directory requires company authority")
             return _organization_view(
                 company_directory.get_organization(principal.organization_id)
             )
@@ -1217,6 +1217,8 @@ def create_app(
             after_version: Annotated[int, Query(ge=0)] = 0,
             limit: Annotated[int, Query(ge=1, le=500)] = 200,
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "company.read"):
+                raise HTTPException(status_code=403, detail="company activity requires company authority")
             events = company_directory.list_company_events(
                 principal.organization_id,
                 after_version=after_version,
@@ -1229,10 +1231,10 @@ def create_app(
         def get_external_onboarding(
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
+            if not _principal_can(principal, "workforce.manage"):
                 raise HTTPException(
                     status_code=403,
-                    detail="external onboarding inventory requires owner authority",
+                    detail="external onboarding inventory requires workforce authority",
                 )
             return {
                 "items": list(company_directory.list_external_onboarding(
@@ -1249,10 +1251,10 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
+            if not _principal_can(principal, "workforce.manage"):
                 raise HTTPException(
                     status_code=403,
-                    detail="external onboarding confirmation requires owner authority",
+                    detail="external onboarding confirmation requires workforce authority",
                 )
             try:
                 return company_directory.confirm_external_onboarding(
@@ -1279,8 +1281,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="standing agent creation requires owner authority")
+            if not _principal_can(principal, "workforce.manage"):
+                raise HTTPException(status_code=403, detail="standing agent creation requires workforce authority")
             try:
                 event = company_directory.hire_agent(
                     tenant_id=principal.organization_id,
@@ -1308,8 +1310,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="standing agent retirement requires owner authority")
+            if not _principal_can(principal, "workforce.manage"):
+                raise HTTPException(status_code=403, detail="standing agent retirement requires workforce authority")
             try:
                 return company_directory.retire_agent(
                     tenant_id=principal.organization_id,
@@ -1328,6 +1330,8 @@ def create_app(
         def list_connectors(
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "integration.manage"):
+                raise HTTPException(status_code=403, detail="connector inventory requires integration authority")
             return {"items": list(connector_registry.list_connectors(
                 principal.organization_id,
             ))}
@@ -1340,8 +1344,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="connector creation requires owner authority")
+            if not _principal_can(principal, "integration.manage"):
+                raise HTTPException(status_code=403, detail="connector creation requires integration authority")
             try:
                 return connector_registry.register_connector(
                     tenant_id=principal.organization_id,
@@ -1361,8 +1365,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="connector removal requires owner authority")
+            if not _principal_can(principal, "integration.manage"):
+                raise HTTPException(status_code=403, detail="connector removal requires integration authority")
             try:
                 result = connector_registry.disable_connector(
                     tenant_id=principal.organization_id,
@@ -1382,6 +1386,8 @@ def create_app(
         def get_usage_summary(
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "usage.read"):
+                raise HTTPException(status_code=403, detail="usage summary requires cost authority")
             return usage_meter.usage_summary(principal.organization_id)
 
         @app.get("/v2/usage/events")
@@ -1389,8 +1395,8 @@ def create_app(
             principal: Annotated[Principal, Depends(current_principal)],
             limit: Annotated[int, Query(ge=1, le=500)] = 100,
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="usage event detail requires owner authority")
+            if not _principal_can(principal, "usage.read"):
+                raise HTTPException(status_code=403, detail="usage event detail requires cost authority")
             return {"items": list(usage_meter.list_usage_events(
                 principal.organization_id, limit=limit,
             ))}
@@ -1404,9 +1410,9 @@ def create_app(
             principal: Annotated[Principal, Depends(current_principal)],
             limit: Annotated[int, Query(ge=1, le=500)] = 100,
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
+            if not _principal_can(principal, "release.manage"):
                 raise HTTPException(
-                    status_code=403, detail="preview inventory requires owner/operator authority",
+                    status_code=403, detail="preview inventory requires release authority",
                 )
             return {
                 "items": list(preview_deployments.list_previews(
@@ -1422,9 +1428,9 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
+            if not _principal_can(principal, "release.manage"):
                 raise HTTPException(
-                    status_code=403, detail="preview revocation requires owner/operator authority",
+                    status_code=403, detail="preview revocation requires release authority",
                 )
             try:
                 record = preview_deployments.revoke(
@@ -1472,8 +1478,8 @@ def create_app(
             body: MissionCreateRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not principal.roles & {"owner", "operator", "system"}:
-                raise HTTPException(status_code=403, detail="mission creation requires owner authority")
+            if not _principal_can(principal, "mission.create"):
+                raise HTTPException(status_code=403, detail="mission creation requires mission authority")
             try:
                 return mission_control.create_mission(MissionSpec(
                     mission_id=body.mission_id,
@@ -1508,8 +1514,8 @@ def create_app(
             body: MissionRevisionRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not principal.roles & {"owner", "operator", "system"}:
-                raise HTTPException(status_code=403, detail="mission revision requires owner authority")
+            if not _principal_can(principal, "mission.steer"):
+                raise HTTPException(status_code=403, detail="mission revision requires steering authority")
             current = mission_control.get_mission(principal.organization_id, mission_id)
             if current is None:
                 raise HTTPException(status_code=404, detail="mission not found")
@@ -1560,6 +1566,8 @@ def create_app(
             body: MissionEvidenceRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "artifact.publish"):
+                raise HTTPException(status_code=403, detail="evidence publication requires artifact authority")
             try:
                 created = mission_control.add_evidence(
                     principal.organization_id,
@@ -1584,6 +1592,8 @@ def create_app(
             body: MissionClaimRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "artifact.publish"):
+                raise HTTPException(status_code=403, detail="claim publication requires artifact authority")
             try:
                 created = mission_control.add_claim(
                     principal.organization_id,
@@ -1611,8 +1621,8 @@ def create_app(
             body: EvidenceErasureRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not principal.roles & {"owner", "operator", "system"}:
-                raise HTTPException(status_code=403, detail="evidence erasure requires owner authority")
+            if not _principal_can(principal, "evidence.erase"):
+                raise HTTPException(status_code=403, detail="evidence erasure requires evidence authority")
             try:
                 return mission_control.tombstone_evidence(
                     tenant_id=principal.organization_id, mission_id=mission_id,
@@ -1630,7 +1640,7 @@ def create_app(
             body: MissionHazardRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not principal.roles & {"owner", "operator", "system", "agent"}:
+            if not _principal_can(principal, "hazard.report"):
                 raise HTTPException(status_code=403, detail="hazard registration requires mission authority")
             try:
                 created = mission_control.add_hazard(
@@ -1657,8 +1667,8 @@ def create_app(
             body: AuthorityGrantRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not principal.roles & {"owner", "operator", "system"}:
-                raise HTTPException(status_code=403, detail="authority delegation requires owner authority")
+            if not _principal_can(principal, "authority.manage"):
+                raise HTTPException(status_code=403, detail="authority delegation requires mission authority")
             mission = mission_control.get_mission(principal.organization_id, mission_id)
             if mission is None:
                 raise HTTPException(status_code=404, detail="mission not found")
@@ -1689,9 +1699,11 @@ def create_app(
             body: MissionEffectRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if body.actor_id != principal.subject_id and not principal.roles & {
-                "owner", "operator", "system",
-            }:
+            if not _principal_can(principal, "effect.request"):
+                raise HTTPException(status_code=403, detail="effect requests require execution authority")
+            if body.actor_id != principal.subject_id and not _principal_can(
+                principal, "authority.manage",
+            ):
                 raise HTTPException(status_code=403, detail="agents may propose only their own effects")
             try:
                 return mission_control.admit_effect(EffectRequest(
@@ -1718,8 +1730,8 @@ def create_app(
             body: AuthorityRevocationRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not principal.roles & {"owner", "operator", "system"}:
-                raise HTTPException(status_code=403, detail="authority revocation requires owner authority")
+            if not _principal_can(principal, "authority.manage"):
+                raise HTTPException(status_code=403, detail="authority revocation requires mission authority")
             try:
                 return mission_control.revoke_authority(
                     tenant_id=principal.organization_id, mission_id=mission_id,
@@ -1737,8 +1749,8 @@ def create_app(
             body: MissionEffectSettlementRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not principal.roles & {"owner", "operator", "system"}:
-                raise HTTPException(status_code=403, detail="effect settlement requires operator authority")
+            if not _principal_can(principal, "effect.settle"):
+                raise HTTPException(status_code=403, detail="effect settlement requires mission authority")
             try:
                 return mission_control.settle_effect(
                     tenant_id=principal.organization_id, mission_id=mission_id,
@@ -1756,8 +1768,8 @@ def create_app(
         principal: Annotated[Principal, Depends(current_principal)],
         idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
     ) -> MutationResponse:
-        if not (principal.roles & {"owner", "operator", "system"}):
-            raise HTTPException(status_code=403, detail="mission creation requires owner/operator authority")
+        if not _principal_can(principal, "mission.create"):
+            raise HTTPException(status_code=403, detail="mission creation requires mission authority")
         run_id = _run_id(principal.organization_id, idempotency_key)
         if mission_control is not None:
             try:
@@ -1863,10 +1875,8 @@ def create_app(
         body: EventRequest,
         principal: Annotated[Principal, Depends(current_principal)],
     ) -> MutationResponse:
-        if body.kind in _HUMAN_EVENTS and not (
-            principal.roles & {"owner", "operator", "system"}
-        ):
-            raise HTTPException(status_code=403, detail="human lifecycle events require owner authority")
+        if body.kind in _HUMAN_EVENTS and not _principal_can(principal, "mission.steer"):
+            raise HTTPException(status_code=403, detail="human lifecycle events require steering authority")
         if body.kind not in _HUMAN_EVENTS and not (principal.roles & _INTERNAL_ROLES):
             raise HTTPException(status_code=403, detail="this event is restricted to the internal agent runtime")
         try:
@@ -1885,8 +1895,8 @@ def create_app(
         body: CancellationRequest,
         principal: Annotated[Principal, Depends(current_principal)],
     ) -> MutationResponse:
-        if not (principal.roles & {"owner", "operator", "system"}):
-            raise HTTPException(status_code=403, detail="mission cancellation requires owner authority")
+        if not _principal_can(principal, "mission.cancel"):
+            raise HTTPException(status_code=403, detail="mission cancellation requires mission authority")
         try:
             receipt = engine.cancel_run(
                 principal.organization_id,
@@ -2016,7 +2026,7 @@ def create_app(
             def experience_audience_ids(
                 principal: Principal,
             ) -> tuple[str, ...] | None:
-                if principal.roles & {"owner", "operator", "system"}:
+                if _principal_can(principal, "notification.read.all"):
                     return None
                 admitted = {
                     principal.subject_id,
@@ -2545,10 +2555,10 @@ def create_app(
                     str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
                 ],
             ) -> Mapping[str, Any]:
-                if not principal.roles & {"owner", "operator", "system"}:
+                if not _principal_can(principal, "decision.redrive"):
                     raise HTTPException(
                         status_code=403,
-                        detail="decision recovery requires owner or operator authority",
+                        detail="decision recovery requires recovery authority",
                     )
                 redriver = getattr(notification_store, "redrive_decision_response", None)
                 if redriver is None:
@@ -2703,7 +2713,7 @@ def create_app(
             limit: Annotated[int, Query(ge=1, le=500)] = 100,
             cursor: Annotated[str | None, Query(max_length=1_024)] = None,
         ) -> Mapping[str, Any]:
-            privileged = bool(principal.roles & {"owner", "operator", "system"})
+            privileged = _principal_can(principal, "notification.read.all")
             try:
                 before = None if cursor is None else _decode_notification_cursor(cursor)
             except ValueError as exc:
@@ -2763,8 +2773,8 @@ def create_app(
         def list_notification_routes(
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="notification routes require owner authority")
+            if not _principal_can(principal, "integration.manage"):
+                raise HTTPException(status_code=403, detail="notification routes require integration authority")
             return {"items": list(notification_store.list_notification_routes(
                 principal.organization_id,
             ))}
@@ -2777,8 +2787,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="notification route creation requires owner authority")
+            if not _principal_can(principal, "integration.manage"):
+                raise HTTPException(status_code=403, detail="notification route creation requires integration authority")
             if connector_registry is None:
                 raise HTTPException(status_code=503, detail="connector registry is unavailable")
             connector = connector_registry.get_connector(
@@ -2819,8 +2829,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="notification route removal requires owner authority")
+            if not _principal_can(principal, "integration.manage"):
+                raise HTTPException(status_code=403, detail="notification route removal requires integration authority")
             try:
                 result = notification_store.disable_notification_route(
                     tenant_id=principal.organization_id,
@@ -2840,8 +2850,8 @@ def create_app(
             principal: Annotated[Principal, Depends(current_principal)],
             limit: Annotated[int, Query(ge=1, le=500)] = 100,
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="notification delivery audit requires owner authority")
+            if not _principal_can(principal, "operations.read"):
+                raise HTTPException(status_code=403, detail="notification delivery audit requires operations authority")
             return {"items": list(notification_store.list_notification_deliveries(
                 principal.organization_id, limit=limit,
             ))}
@@ -2854,8 +2864,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="notification redrive requires owner authority")
+            if not _principal_can(principal, "operations.recover"):
+                raise HTTPException(status_code=403, detail="notification redrive requires recovery authority")
             try:
                 result = notification_store.redrive_notification_delivery(
                     tenant_id=principal.organization_id,
@@ -2925,7 +2935,7 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "builder", "agent", "system"}):
+            if not _principal_can(principal, "artifact.publish"):
                 raise HTTPException(status_code=403, detail="artifact publication requires write authority")
             try:
                 content = base64.b64decode(body.content_base64, validate=True)
@@ -3035,7 +3045,7 @@ def create_app(
                 company_events=company_events,
                 slow_after_seconds=slow_after_seconds,
             ))
-            if observation is not None and principal.roles & {"owner", "operator", "system"}:
+            if observation is not None and _principal_can(principal, "operations.read"):
                 action_rows = observation.get("actions", ())
                 action_rows = action_rows if isinstance(action_rows, list) else []
                 bounded_actions = action_rows[:200]
@@ -3086,9 +3096,9 @@ def create_app(
                 body: HiringProposalDecisionRequest,
                 principal: Annotated[Principal, Depends(current_principal)],
             ) -> Mapping[str, Any]:
-                if not (principal.roles & {"owner", "operator", "system"}):
+                if not _principal_can(principal, "workforce.manage"):
                     raise HTTPException(
-                        status_code=403, detail="staffing proposal decisions require owner authority",
+                        status_code=403, detail="staffing proposal decisions require workforce authority",
                     )
                 projection = get_mission_management(run_id, principal, 300)
                 proposal = next((
@@ -3225,8 +3235,8 @@ def create_app(
             body: WorkflowDefinitionRequest,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "system"}):
-                raise HTTPException(status_code=403, detail="workflow design requires owner/operator authority")
+            if not _principal_can(principal, "workflow.manage"):
+                raise HTTPException(status_code=403, detail="workflow design requires workflow authority")
             try:
                 definition = WorkflowDefinition(
                     workflow_id=body.workflow_id,
@@ -3257,6 +3267,8 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "workflow.manage"):
+                raise HTTPException(status_code=403, detail="workflow execution requires workflow authority")
             graph_run_id = "graph-" + hashlib.sha256(
                 f"agent-os:graph-run:v1:{principal.organization_id}:{workflow_id}:{idempotency_key}".encode()
             ).hexdigest()[:32]
@@ -3299,7 +3311,7 @@ def create_app(
             state_value = graph_engine.get_graph_run(principal.organization_id, run_id)
             if state_value is None:
                 raise HTTPException(status_code=404, detail="graph run not found")
-            owner_authority = bool(principal.roles & {"owner", "operator", "system"})
+            owner_authority = _principal_can(principal, "workflow.manage")
             if body.kind in {
                 WorkflowEventKind.RUN_REVISED,
                 WorkflowEventKind.CHILD_WAITED,

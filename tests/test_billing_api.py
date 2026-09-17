@@ -16,6 +16,8 @@ class Identity:
             return {"sub": "viewer-a", "org": "tenant-a", "roles": ["viewer"]}
         if authorization == "Bearer operator":
             return {"sub": "operator-a", "org": "tenant-a", "roles": ["operator"]}
+        if authorization == "Bearer billing":
+            return {"sub": "billing-a", "org": "tenant-a", "roles": ["billing"]}
         raise ValueError("authentication required")
 
 
@@ -65,6 +67,12 @@ def test_billing_api_is_tenant_authenticated_owner_governed_and_webhook_signed()
     )
     assert checkout.status_code == 201
     assert checkout.json()["url"].startswith("https://")
+    delegated_checkout = api.post(
+        "/v2/billing/checkout",
+        headers={"Authorization": "Bearer billing", "Idempotency-Key": "checkout-billing"},
+        json={"plan_id": "starter"},
+    )
+    assert delegated_checkout.status_code == 201
     assert api.post(
         "/v2/billing/portal",
         headers={"Authorization": "Bearer owner", "Idempotency-Key": "portal-owner"},

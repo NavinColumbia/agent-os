@@ -42,6 +42,14 @@ class FakeIdentity:
             return {"sub": "builder-a", "org": "org-a", "roles": ["builder"]}
         if authorization == "Bearer reviewer-a":
             return {"sub": "reviewer-a", "org": "org-a", "roles": ["reviewer"]}
+        if authorization == "Bearer admin-a":
+            return {"sub": "admin-a", "org": "org-a", "roles": ["admin"]}
+        if authorization == "Bearer manager-a":
+            return {"sub": "manager-a", "org": "org-a", "roles": ["manager"]}
+        if authorization == "Bearer billing-a":
+            return {"sub": "billing-a", "org": "org-a", "roles": ["billing"]}
+        if authorization == "Bearer client-a":
+            return {"sub": "client-a", "org": "org-a", "roles": ["client"]}
         if authorization == "Bearer viewer-a":
             return {"sub": "viewer-a", "org": "org-a", "roles": ["viewer"]}
         if authorization == "Bearer guest-b":
@@ -145,6 +153,73 @@ def test_invitation_capability_cannot_be_tampered_or_claimed_by_two_subjects(tmp
             json={"token": token},
         )
         assert second.status_code == 409
+
+
+def test_administrator_can_manage_members_without_granting_or_revoking_ownership(tmp_path):
+    memberships = SQLMembershipStore(
+        f"sqlite:///{tmp_path / 'api-membership-delegation.sqlite3'}",
+        signing_secret="membership-api-secret-that-is-long-enough",
+        create_schema=True,
+    )
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+        membership_store=memberships, shutdown=memberships.close,
+    ))
+    with api:
+        owner_headers = {
+            "Authorization": "Bearer org-a", "Idempotency-Key": "invite-admin-a",
+        }
+        admin_invitation = api.post(
+            "/v2/invitations", headers=owner_headers,
+            json={"roles": ["admin"]},
+        )
+        assert admin_invitation.status_code == 201
+        assert api.post(
+            "/v2/invitations/claim", headers={"Authorization": "Bearer admin-a"},
+            json={"token": admin_invitation.json()["claim_token"]},
+        ).status_code == 200
+
+        delegated = api.post(
+            "/v2/invitations",
+            headers={
+                "Authorization": "Bearer admin-a",
+                "Idempotency-Key": "admin-invite-builder",
+            },
+            json={"roles": ["builder"]},
+        )
+        assert delegated.status_code == 201
+        assert api.post(
+            "/v2/invitations/claim", headers={"Authorization": "Bearer builder-a"},
+            json={"token": delegated.json()["claim_token"]},
+        ).status_code == 200
+
+        for role in ("admin", "owner"):
+            escalation = api.post(
+                "/v2/invitations",
+                headers={
+                    "Authorization": "Bearer admin-a",
+                    "Idempotency-Key": f"admin-cannot-grant-{role}",
+                },
+                json={"roles": [role]},
+            )
+            assert escalation.status_code == 403
+
+        assert api.request(
+            "DELETE", "/v2/memberships/builder-a",
+            headers={
+                "Authorization": "Bearer admin-a",
+                "Idempotency-Key": "admin-revoke-builder",
+            },
+            json={"reason": "Builder assignment ended"},
+        ).status_code == 200
+        assert api.request(
+            "DELETE", "/v2/memberships/admin-a",
+            headers={
+                "Authorization": "Bearer admin-a",
+                "Idempotency-Key": "admin-revoke-admin",
+            },
+            json={"reason": "Privilege escalation attempt"},
+        ).status_code == 403
 
 
 def test_tenant_model_settings_are_owner_controlled_secret_free_and_isolated(tmp_path):
@@ -278,6 +353,10 @@ def test_session_capabilities_and_mission_creation_are_role_consistent():
     operator = api.get("/v2/me", headers={"Authorization": "Bearer operator-a"}).json()
     builder = api.get("/v2/me", headers={"Authorization": "Bearer builder-a"}).json()
     reviewer = api.get("/v2/me", headers={"Authorization": "Bearer reviewer-a"}).json()
+    admin = api.get("/v2/me", headers={"Authorization": "Bearer admin-a"}).json()
+    manager = api.get("/v2/me", headers={"Authorization": "Bearer manager-a"}).json()
+    billing = api.get("/v2/me", headers={"Authorization": "Bearer billing-a"}).json()
+    external_client = api.get("/v2/me", headers={"Authorization": "Bearer client-a"}).json()
     viewer = api.get("/v2/me", headers={"Authorization": "Bearer viewer-a"}).json()
 
     assert owner["persona"] == "executive"
@@ -299,6 +378,17 @@ def test_session_capabilities_and_mission_creation_are_role_consistent():
     assert {"review.read", "notification.respond"} <= set(reviewer["capabilities"])
     assert "artifact.publish" not in reviewer["capabilities"]
     assert "mission.create" not in reviewer["capabilities"]
+    assert admin["persona"] == "administrator"
+    assert "membership.manage" in admin["capabilities"]
+    assert "mission.create" not in admin["capabilities"]
+    assert manager["persona"] == "manager"
+    assert {"mission.create", "workforce.manage"} <= set(manager["capabilities"])
+    assert billing["persona"] == "billing"
+    assert "billing.manage" in billing["capabilities"]
+    assert "mission.create" not in billing["capabilities"]
+    assert external_client["persona"] == "client"
+    assert "review.read" in external_client["capabilities"]
+    assert "company.read" not in external_client["capabilities"]
     assert viewer["persona"] == "viewer"
     assert "mission.create" not in viewer["capabilities"]
     forbidden = api.post(
@@ -307,6 +397,17 @@ def test_session_capabilities_and_mission_creation_are_role_consistent():
         json={"prompt": "Viewer must not launch this"},
     )
     assert forbidden.status_code == 403
+    managed = api.post(
+        "/v2/runs",
+        headers={"Authorization": "Bearer manager-a", "Idempotency-Key": "manager-mission"},
+        json={"prompt": "Manager launches an authorized mission"},
+    )
+    assert managed.status_code == 202
+    assert api.post(
+        "/v2/runs",
+        headers={"Authorization": "Bearer admin-a", "Idempotency-Key": "admin-mission"},
+        json={"prompt": "Administrative access must not imply execution"},
+    ).status_code == 403
 
 
 def test_first_mission_readiness_is_honest_role_aware_and_resumable(tmp_path):

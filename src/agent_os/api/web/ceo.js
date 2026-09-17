@@ -221,8 +221,10 @@ async function connect(token) {
     byId("auth-gate").classList.add("hidden");
     byId("workspace").classList.remove("hidden");
     const requestedRoute = routeFromHash();
-    const roleDefault = ["operator", "reviewer"].includes(state.session?.persona)
-      ? "inbox" : "missions";
+    const persona = state.session?.persona;
+    const roleDefault = ["operator", "reviewer"].includes(persona)
+      ? "inbox"
+      : (persona === "administrator" ? "company" : (persona === "billing" ? "billing" : "missions"));
     await selectView(requestedRoute.view || roleDefault);
     if (requestedRoute.pushDeliveryId) await openPushDelivery(requestedRoute.pushDeliveryId);
     else if (requestedRoute.runId) await openMissionDeepLink(requestedRoute.runId);
@@ -297,17 +299,25 @@ function applyRoleExperience() {
   const persona = state.session?.persona || "viewer";
   const labels = {
     executive: "Executive", operator: "Operations", builder: "Builder",
-    reviewer: "Reviewer", viewer: "Viewer",
+    reviewer: "Reviewer", administrator: "Administrator", manager: "Manager",
+    billing: "Billing", client: "Client", viewer: "Viewer",
   };
   byId("workspace-role-label").textContent = `${labels[persona] || "Member"} workspace`;
   byId("identity-avatar").textContent = {
-    executive: "CEO", operator: "OPS", builder: "BUILD", reviewer: "REVIEW", viewer: "VIEW",
+    executive: "CEO", operator: "OPS", builder: "BUILD", reviewer: "REVIEW",
+    administrator: "ADMIN", manager: "MGR", billing: "BILL", client: "CLIENT",
+    viewer: "VIEW",
   }[persona] || "USER";
   document.querySelectorAll(".requires-mission-create").forEach((node) => node.classList.toggle("hidden", !can("mission.create")));
+  document.querySelectorAll(".requires-company-read").forEach((node) => node.classList.toggle("hidden", !can("company.read")));
   document.querySelectorAll(".requires-integration-manage").forEach((node) => node.classList.toggle("hidden", !can("integration.manage")));
   const billingAvailable = state.config?.billing_mode === "stripe";
   document.querySelectorAll(".requires-billing-manage").forEach((node) => node.classList.toggle("hidden", !can("billing.manage") || !billingAvailable));
-  if ((!can("integration.manage") && state.view === "integrations") || ((!can("billing.manage") || !billingAvailable) && state.view === "billing")) {
+  if (
+    (!can("company.read") && state.view === "company")
+    || (!can("integration.manage") && state.view === "integrations")
+    || ((!can("billing.manage") || !billingAvailable) && state.view === "billing")
+  ) {
     selectView("missions");
   }
 }
@@ -521,7 +531,11 @@ function accessPanel(memberships) {
   if (can("membership.manage")) {
     const invite = el("div", "access-form");
     const role = document.createElement("select");
-    for (const value of ["viewer", "builder", "reviewer", "operator", "owner"]) {
+    const invitationRoles = [
+      "viewer", "client", "builder", "reviewer", "billing", "manager", "operator",
+    ];
+    if (can("ownership.manage")) invitationRoles.push("admin", "owner");
+    for (const value of invitationRoles) {
       const option = el("option", "", value); option.value = value; role.append(option);
     }
     role.setAttribute("aria-label", "Invitation role");
@@ -553,7 +567,12 @@ function accessPanel(memberships) {
       el("strong", "", member.subject_id),
       el("small", "", `${(member.roles || []).join(", ")} · ${member.active ? "active" : "revoked"}`),
     );
-    if (member.active && can("membership.manage")) {
+    const protectedMember = (member.roles || []).some((value) => ["owner", "admin"].includes(value));
+    if (
+      member.active
+      && can("membership.manage")
+      && (!protectedMember || can("ownership.manage"))
+    ) {
       const revoke = el("button", "danger", "Revoke"); revoke.type = "button";
       revoke.addEventListener("click", async () => {
         if (!window.confirm(`Revoke ${member.subject_id}'s access?`)) return;
@@ -1734,6 +1753,10 @@ function selectView(name) {
   if (!["missions", "company", "inbox", "integrations", "previews", "billing"].includes(name)) name = "missions";
   if (name === "integrations" && !can("integration.manage")) {
     setFlash("Your role cannot manage integrations.", "error"); name = "missions";
+  }
+  if (name === "company" && !can("company.read")) {
+    name = "missions";
+    setFlash("Your role does not include company-directory access.", "error");
   }
   if (name === "billing" && (!can("billing.manage") || state.config?.billing_mode !== "stripe")) {
     setFlash("Billing is not available in this deployment.", "error"); name = "missions";

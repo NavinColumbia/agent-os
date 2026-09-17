@@ -90,6 +90,9 @@ decision-response truth defined here.
 - Persona UX can evolve independently without forking workflow semantics.
 - Human builder and reviewer memberships are first-class: reviewers default to their decision queue, builders
   can publish evidence, and both receive only the bounded capabilities returned by the authenticated session.
+- Administrative controls consume the same capability projection: non-managers get read-only policy/access
+  views, staffing actions require mission-steering authority, and operations authority does not imply billing
+  authority. Audit reasons identify the shared workspace rather than claiming every actor is the CEO.
 
 ## Acceptance
 

@@ -452,6 +452,10 @@ function modelPanel(payload) {
       ? `Current: ${current.provider}:${current.model_name} · ${current.credential_source} credentials`
       : "Using the platform default model."),
   );
+  if (!can("model.manage")) {
+    block.append(el("small", "muted", "Your role can inspect this policy but cannot change it."));
+    return block;
+  }
   const form = el("div", "model-form");
   const provider = document.createElement("select");
   provider.setAttribute("aria-label", "Model provider");
@@ -514,30 +518,34 @@ function accessPanel(memberships) {
     block.append(el("small", "muted", "Your current role can use the company but cannot manage access."));
     return block;
   }
-  const invite = el("div", "access-form");
-  const role = document.createElement("select");
-  for (const value of ["viewer", "builder", "reviewer", "operator", "owner"]) {
-    const option = el("option", "", value); option.value = value; role.append(option);
+  if (can("membership.manage")) {
+    const invite = el("div", "access-form");
+    const role = document.createElement("select");
+    for (const value of ["viewer", "builder", "reviewer", "operator", "owner"]) {
+      const option = el("option", "", value); option.value = value; role.append(option);
+    }
+    role.setAttribute("aria-label", "Invitation role");
+    const create = el("button", "primary", "Create invitation"); create.type = "button";
+    create.addEventListener("click", async () => {
+      create.disabled = true;
+      try {
+        const result = await api("/v2/invitations", {
+          method: "POST", headers: {"Idempotency-Key": `invite-${crypto.randomUUID()}`},
+          body: JSON.stringify({roles: [role.value], expires_in_seconds: 86400}),
+        });
+        const output = document.createElement("textarea");
+        output.readOnly = true; output.rows = 3; output.value = result.claim_token;
+        output.setAttribute("aria-label", "New invitation token");
+        block.append(el("small", "muted", "Share this single-use token securely. It expires in 24 hours."), output);
+        output.select();
+        setFlash("Invitation created.");
+      } catch (error) { setFlash(error.message, "error"); }
+      finally { create.disabled = false; }
+    });
+    invite.append(role, create); block.append(invite);
+  } else {
+    block.append(el("small", "muted", "Access inventory is read-only for your role."));
   }
-  role.setAttribute("aria-label", "Invitation role");
-  const create = el("button", "primary", "Create invitation"); create.type = "button";
-  create.addEventListener("click", async () => {
-    create.disabled = true;
-    try {
-      const result = await api("/v2/invitations", {
-        method: "POST", headers: {"Idempotency-Key": `invite-${crypto.randomUUID()}`},
-        body: JSON.stringify({roles: [role.value], expires_in_seconds: 86400}),
-      });
-      const output = document.createElement("textarea");
-      output.readOnly = true; output.rows = 3; output.value = result.claim_token;
-      output.setAttribute("aria-label", "New invitation token");
-      block.append(el("small", "muted", "Share this single-use token securely. It expires in 24 hours."), output);
-      output.select();
-      setFlash("Invitation created.");
-    } catch (error) { setFlash(error.message, "error"); }
-    finally { create.disabled = false; }
-  });
-  invite.append(role, create); block.append(invite);
   const people = el("div", "people");
   for (const member of memberships.items || []) {
     const card = el("div", "person");
@@ -545,14 +553,14 @@ function accessPanel(memberships) {
       el("strong", "", member.subject_id),
       el("small", "", `${(member.roles || []).join(", ")} · ${member.active ? "active" : "revoked"}`),
     );
-    if (member.active) {
+    if (member.active && can("membership.manage")) {
       const revoke = el("button", "danger", "Revoke"); revoke.type = "button";
       revoke.addEventListener("click", async () => {
         if (!window.confirm(`Revoke ${member.subject_id}'s access?`)) return;
         try {
           await api(`/v2/memberships/${encodeURIComponent(member.subject_id)}`, {
             method: "DELETE", headers: {"Idempotency-Key": `revoke-${crypto.randomUUID()}`},
-            body: JSON.stringify({reason: "Revoked in the CEO workspace"}),
+            body: JSON.stringify({reason: "Revoked in the Agent OS workspace"}),
           });
           setFlash("Membership revoked."); await loadCompany();
         } catch (error) { setFlash(error.message, "error"); }
@@ -714,7 +722,7 @@ function renderInbox() {
         const approve = el("button", "", "Approve"); approve.type = "button";
         approve.addEventListener("click", () => resolveHumanRequest(item, {
           action: "approve", approved: true,
-          answer: answer.value.trim() || "Approved in the CEO workspace",
+          answer: answer.value.trim() || "Approved in the Agent OS workspace",
         }, actions));
         controls.push(approve);
       }
@@ -722,7 +730,7 @@ function renderInbox() {
         const decline = el("button", "", "Decline"); decline.type = "button";
         decline.addEventListener("click", () => resolveHumanRequest(item, {
           action: "decline", approved: false,
-          answer: answer.value.trim() || "Declined in the CEO workspace",
+          answer: answer.value.trim() || "Declined in the Agent OS workspace",
         }, actions));
         controls.push(decline);
       }
@@ -1133,7 +1141,7 @@ async function loadIntegrations() {
       const disable = el("button", "danger", "Disable"); disable.type = "button";
       disable.addEventListener("click", () => disableIntegration(
         `/v2/connectors/${encodeURIComponent(connector.connector_id)}`,
-        "Disabled in the CEO workspace",
+        "Disabled in the Agent OS workspace",
       ).catch((error) => setFlash(error.message, "error")));
       item.append(disable);
     }
@@ -1201,7 +1209,7 @@ async function loadIntegrations() {
       const disable = el("button", "danger", "Disable"); disable.type = "button";
       disable.addEventListener("click", () => disableIntegration(
         `/v2/notification-routes/${encodeURIComponent(route.route_id)}`,
-        "Disabled in the CEO workspace",
+        "Disabled in the Agent OS workspace",
       ).catch((error) => setFlash(error.message, "error")));
       item.append(disable);
     }
@@ -1650,7 +1658,11 @@ async function loadMissionDetail(item, silent = false) {
       for (const proposal of managementResult.hiring_requests) {
         const row = el("div", "work-row");
         row.append(el("span", "phase", label(proposal.status)), el("p", "", `${proposal.requested_count || 1} × ${proposal.role}`));
-        if (proposal.status === "pending" && (proposal.participant_kind || "agent") === "agent") {
+        if (
+          proposal.status === "pending"
+          && (proposal.participant_kind || "agent") === "agent"
+          && can("mission.steer")
+        ) {
           const actions = el("div", "proposal-actions");
           const team = el("select"); team.setAttribute("aria-label", "Team for approved agent");
           for (const value of company.teams || []) {
@@ -1698,7 +1710,7 @@ async function decideHiring(item, proposal, approved, teamId, managerId) {
   try {
     await api(`/v2/runs/${encodeURIComponent(item.run_id)}/management/proposals/${encodeURIComponent(proposal.proposal_id)}/hiring-decision`, {
       method: "POST", body: JSON.stringify({
-        approved, reason: approved ? "Approved by the CEO workspace" : "Rejected by the CEO workspace",
+        approved, reason: approved ? "Approved in the Agent OS workspace" : "Rejected in the Agent OS workspace",
         team_id: approved ? teamId : null, manager_id: managerId || "agent:mission-manager",
         tool_grants: [], spending_limit_cents: 0,
       }),
@@ -1712,7 +1724,7 @@ async function cancelMission(item, version) {
   if (!window.confirm("Cancel this mission? Healthy in-progress work will receive a durable cancellation signal.")) return;
   try {
     await api(`/v2/runs/${encodeURIComponent(item.run_id)}/cancel`, {
-      method: "POST", body: JSON.stringify({ event_id: `ceo-cancel-${crypto.randomUUID()}`, expected_version: version, reason: "Cancelled by CEO" }),
+      method: "POST", body: JSON.stringify({ event_id: `workspace-cancel-${crypto.randomUUID()}`, expected_version: version, reason: "Cancelled in the Agent OS workspace" }),
     });
     setFlash("Cancellation accepted."); closeDrawer(); await loadMissions();
   } catch (error) { setFlash(error.message, "error"); }

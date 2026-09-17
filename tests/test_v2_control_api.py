@@ -264,6 +264,10 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert '"Authorization": `Bearer ${state.token}`' in script.text
     assert "#view=" in script.text
     assert 'querySelectorAll(".nav-item[data-view]")' in script.text
+    assert 'can("membership.manage")' in script.text
+    assert 'can("model.manage")' in script.text
+    assert 'can("mission.steer")' in script.text
+    assert "CEO workspace" not in script.text
     assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
     assert api.get("/v2/runs").status_code == 401
 
@@ -271,6 +275,7 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
 def test_session_capabilities_and_mission_creation_are_role_consistent():
     api = client()
     owner = api.get("/v2/me", headers={"Authorization": "Bearer org-a"}).json()
+    operator = api.get("/v2/me", headers={"Authorization": "Bearer operator-a"}).json()
     builder = api.get("/v2/me", headers={"Authorization": "Bearer builder-a"}).json()
     reviewer = api.get("/v2/me", headers={"Authorization": "Bearer reviewer-a"}).json()
     viewer = api.get("/v2/me", headers={"Authorization": "Bearer viewer-a"}).json()
@@ -278,6 +283,13 @@ def test_session_capabilities_and_mission_creation_are_role_consistent():
     assert owner["persona"] == "executive"
     assert "mission.create" in owner["capabilities"]
     assert "decision.redrive" in owner["capabilities"]
+    assert operator["persona"] == "operator"
+    assert {"mission.create", "mission.steer", "integration.manage"} <= set(
+        operator["capabilities"]
+    )
+    assert not {"membership.manage", "model.manage", "billing.manage"} & set(
+        operator["capabilities"]
+    )
     assert builder["persona"] == "builder"
     assert {"work.execute", "artifact.publish", "notification.respond"} <= set(
         builder["capabilities"]

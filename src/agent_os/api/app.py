@@ -1175,7 +1175,7 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, str]:
-            if not (principal.roles & {"owner", "operator", "system"}):
+            if not (principal.roles & {"owner", "system"}):
                 raise HTTPException(status_code=403, detail="billing changes require owner authority")
             try:
                 return billing_service.checkout(
@@ -1193,7 +1193,7 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, str]:
-            if not (principal.roles & {"owner", "operator", "system"}):
+            if not (principal.roles & {"owner", "system"}):
                 raise HTTPException(status_code=403, detail="billing changes require owner authority")
             try:
                 return billing_service.portal(principal.organization_id, idempotency_key)

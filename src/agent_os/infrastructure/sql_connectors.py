@@ -32,6 +32,10 @@ from sqlalchemy.exc import IntegrityError
 
 from agent_os.application.ports import ConnectorRegistry
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 connector_metadata = MetaData()
@@ -156,8 +160,10 @@ class SQLConnectorRegistry(ConnectorRegistry):
         if not database_url.strip():
             raise ValueError("database_url is required")
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
+        self._experience_events = SQLExperienceEventLog(self._tenant_connection)
         if create_schema:
             connector_metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
     @contextmanager
     def _tenant_connection(self, tenant_id: str):
@@ -220,6 +226,20 @@ class SQLConnectorRegistry(ConnectorRegistry):
                 if existing_count >= 256:
                     raise ValueError("tenant connector limit reached")
                 connection.execute(insert(connectors).values(**values))
+                self._experience_events.append(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key(
+                        "integration.connector.registered", model.connector_id,
+                    ),
+                    resource_type="connector",
+                    resource_id=model.connector_id,
+                    projection_revision=1,
+                    kind="integration.connector.registered",
+                    audience_ids=("tenant:members",),
+                    safe_summary="External connector registered.",
+                    occurred_at=now,
+                )
         except IntegrityError as exc:
             with self._tenant_connection(tenant_id) as connection:
                 prior = connection.execute(select(connectors).where(and_(
@@ -303,6 +323,20 @@ class SQLConnectorRegistry(ConnectorRegistry):
                 disabled_reason=reason,
                 disable_idempotency_key=idempotency_key,
             ))
+            self._experience_events.append(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key(
+                    "integration.connector.disabled", connector_id, idempotency_key,
+                ),
+                resource_type="connector",
+                resource_id=connector_id,
+                projection_revision=2,
+                kind="integration.connector.disabled",
+                audience_ids=("tenant:members",),
+                safe_summary="External connector disabled.",
+                occurred_at=now,
+            )
             updated = dict(row)
             updated.update({
                 "active": False,

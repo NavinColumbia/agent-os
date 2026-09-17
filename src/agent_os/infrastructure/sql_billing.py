@@ -14,6 +14,10 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from agent_os.application.billing import BillingAccountStore, BillingCatalog
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 billing_metadata = MetaData()
@@ -80,8 +84,10 @@ class SQLBillingStore(BillingAccountStore):
             raise ValueError("free model budget is outside supported bounds")
         self._free_budget = free_monthly_model_budget_cents
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
+        self._experience_events = SQLExperienceEventLog(self._tenant_connection)
         if create_schema:
             billing_metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
     @contextmanager
     def _tenant_connection(self, tenant_id: str):
@@ -236,6 +242,18 @@ class SQLBillingStore(BillingAccountStore):
                 else:
                     statement = insert(billing_accounts).values(**account_values)
                 connection.execute(statement)
+                self._experience_events.append(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key("billing.account.changed", event_id),
+                    resource_type="billing_account",
+                    resource_id=tenant_id,
+                    projection_revision=created,
+                    kind="billing.account.changed",
+                    audience_ids=("tenant:members",),
+                    safe_summary="Organization billing status changed.",
+                    occurred_at=now,
+                )
             result = connection.execute(select(billing_accounts).where(
                 billing_accounts.c.tenant_id == tenant_id
             )).mappings().one_or_none()

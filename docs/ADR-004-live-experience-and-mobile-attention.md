@@ -93,9 +93,12 @@ ten-second polling path as a degradation fallback.
 Authoritative lifecycle transitions, arbitrary-workflow starts/events, and mission-assurance mutations now
 append to the same stream inside their version-fenced source transactions. Mission creation/revision, evidence,
 claims, hazards, delegated authority, assurance decisions, and effect settlement therefore produce durable live
-invalidations without copying private record content into the stream. Remaining company/integration records
-still need producer coverage. The pinned AG-UI adapter and provisioned Web Push also remain staged; the endpoint
-therefore does not yet claim that every product transition or background device is live.
+invalidations without copying private record content into the stream. Company-roster and external-connector
+changes use that same transactional path, as do membership/invitation changes, model-policy changes, billing
+projection changes, notification-route changes, and preview publication/revocation. Individual artifact writes
+are deliberately coalesced behind their lifecycle, evidence, or deployment event instead of flooding an open
+browser with internal output churn. The pinned AG-UI adapter and provisioned Web Push remain staged; the endpoint
+therefore does not yet claim that every internal transition or background device is live.
 
 ## Acceptance
 

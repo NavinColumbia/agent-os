@@ -39,6 +39,10 @@ from agent_os.domain.organization import (
     ServiceParticipant,
 )
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 company_metadata = MetaData()
@@ -113,8 +117,10 @@ class SQLCompanyDirectory(CompanyDirectory):
         if not database_url.strip():
             raise ValueError("database_url is required")
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
+        self._experience_events = SQLExperienceEventLog(self._tenant_connection)
         if create_schema:
             company_metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
     @contextmanager
     def _tenant_connection(self, tenant_id: str):
@@ -317,6 +323,26 @@ class SQLCompanyDirectory(CompanyDirectory):
                 record=record,
                 created_at=now,
             ))
+            safe_summaries = {
+                "agent_hired": "A standing agent joined the company.",
+                "agent_retired": "A standing agent left active service.",
+                "hiring_proposal_decided": "A staffing proposal was decided.",
+                "external_participant_onboarded": (
+                    "An external participant completed onboarding."
+                ),
+            }
+            self._experience_events.append(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key("company.event", event_id),
+                resource_type="company",
+                resource_id=tenant_id,
+                projection_revision=version,
+                kind=f"company.{kind}",
+                audience_ids=("tenant:members",),
+                safe_summary=safe_summaries.get(kind, "Company roster changed."),
+                occurred_at=now,
+            )
         return {**record, "duplicate": False}
 
     def _existing(

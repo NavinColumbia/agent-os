@@ -12,6 +12,7 @@ from agent_os.infrastructure.http_connector_tools import FileConnectorSecretReso
 from agent_os.infrastructure.mission_workflows import materialize_mission_workflow
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 
 
 def connector_definition(**overrides):
@@ -77,6 +78,47 @@ def test_connector_registry_is_immutable_idempotent_tenant_fenced_and_secretless
         tenant_id="tenant-a", connector_id="issue-tracker", actor_id="human:ceo",
         reason="Credential rotation", idempotency_key="disable-issues",
     )["duplicate"] is True
+
+
+def test_connector_changes_publish_secretless_live_invalidations(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'connector-events.sqlite3'}"
+    registry = SQLConnectorRegistry(database_url, create_schema=True)
+    experience = SQLNotificationStore(database_url, create_schema=True)
+    try:
+        definition = connector_definition(
+            display_name="Confidential acquisition tracker",
+            credential_ref="highly-private-credential-reference",
+        )
+        registry.register_connector(
+            tenant_id="tenant-a", definition=definition, actor_id="human:ceo",
+            idempotency_key="register-private-issues",
+        )
+        assert registry.register_connector(
+            tenant_id="tenant-a", definition=definition, actor_id="human:ceo",
+            idempotency_key="register-private-issues",
+        )["duplicate"] is True
+        registry.disable_connector(
+            tenant_id="tenant-a", connector_id="issue-tracker", actor_id="human:ceo",
+            reason="Private credential may be compromised",
+            idempotency_key="disable-private-issues",
+        )
+
+        events = experience.list_experience_events(
+            "tenant-a", audience_ids=("tenant:members",), limit=100,
+        ).events
+        assert [event["kind"] for event in events] == [
+            "integration.connector.registered", "integration.connector.disabled",
+        ]
+        assert [event["projection_revision"] for event in events] == [1, 2]
+        summaries = " ".join(event["safe_summary"] for event in events)
+        assert "acquisition" not in summaries.lower()
+        assert "credential" not in summaries.lower()
+        assert not experience.list_experience_events(
+            "tenant-b", audience_ids=("tenant:members",), limit=100,
+        ).events
+    finally:
+        experience.close()
+        registry.close()
 
 
 @pytest.mark.parametrize("definition", [

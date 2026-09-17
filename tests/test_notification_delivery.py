@@ -221,6 +221,19 @@ def test_disabling_route_cancels_queued_delivery_and_prevents_future_enqueues(tm
             notification_id="notification-two", source_id="source-two",
         ))
         assert len(notifications.list_notification_deliveries("tenant-a")) == 1
+        route_events = [
+            event for event in notifications.list_experience_events(
+                "tenant-a", audience_ids=("tenant:members",), limit=100,
+            ).events
+            if event["resource_type"] == "notification_route"
+        ]
+        assert [event["kind"] for event in route_events] == [
+            "notification.route.registered", "notification.route.disabled",
+        ]
+        assert [event["projection_revision"] for event in route_events] == [1, 2]
+        summaries = " ".join(event["safe_summary"] for event in route_events)
+        assert "Stop external alerts" not in summaries
+        assert "operator-alerts" not in summaries
     finally:
         notifications.close()
         registry.close()

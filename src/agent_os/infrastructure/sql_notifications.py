@@ -1327,6 +1327,20 @@ class SQLNotificationStore(NotificationStore):
                 if count >= 32:
                     raise ValueError("tenant notification route limit reached")
                 connection.execute(insert(notification_routes).values(**values))
+                self._append_experience_event(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key(
+                        "notification:route:registered", record["route_id"],
+                    ),
+                    resource_type="notification_route",
+                    resource_id=record["route_id"],
+                    projection_revision=1,
+                    kind="notification.route.registered",
+                    audience_ids=("tenant:members",),
+                    safe_summary="An external notification route was registered.",
+                    occurred_at=now,
+                )
         except IntegrityError as exc:
             with self._tenant_connection(tenant_id) as connection:
                 prior = connection.execute(select(notification_routes).where(and_(
@@ -1406,6 +1420,20 @@ class SQLNotificationStore(NotificationStore):
                     "retryable": False,
                 },
             ))
+            self._append_experience_event(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key(
+                    "notification:route:disabled", route_id, idempotency_key,
+                ),
+                resource_type="notification_route",
+                resource_id=route_id,
+                projection_revision=2,
+                kind="notification.route.disabled",
+                audience_ids=("tenant:members",),
+                safe_summary="An external notification route was disabled.",
+                occurred_at=now,
+            )
             updated = dict(row)
             updated.update({
                 "active": False,

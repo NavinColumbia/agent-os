@@ -31,6 +31,10 @@ from sqlalchemy.exc import IntegrityError
 
 from agent_os.application.ports import MembershipStore
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 membership_metadata = MetaData()
@@ -100,8 +104,12 @@ class SQLMembershipStore(MembershipStore):
             raise ValueError("membership invitation signing secret must be at least 32 bytes")
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._experience_events = SQLExperienceEventLog(
+            lambda tenant_id: self._connection(tenant_id=tenant_id),
+        )
         if create_schema:
             membership_metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
     @contextmanager
     def _connection(self, *, tenant_id: str | None = None, subject_id: str | None = None):
@@ -250,6 +258,20 @@ class SQLMembershipStore(MembershipStore):
                     created_at=now,
                     expires_at=expires_at,
                 ))
+                self._experience_events.append(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key(
+                        "membership.invitation.created", invitation_id,
+                    ),
+                    resource_type="invitation",
+                    resource_id=invitation_id,
+                    projection_revision=1,
+                    kind="membership.invitation.created",
+                    audience_ids=("tenant:members",),
+                    safe_summary="A membership invitation was created.",
+                    occurred_at=now,
+                )
         except IntegrityError as exc:
             raise ValueError("invitation registration conflicted with another writer") from exc
         return {
@@ -341,6 +363,20 @@ class SQLMembershipStore(MembershipStore):
                 invitations.c.tenant_id == tenant_id,
                 invitations.c.invitation_id == invitation_id,
             )).values(claimed_by=subject_id, claimed_at=now))
+            self._experience_events.append(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key(
+                    "membership.invitation.claimed", invitation_id, subject_id,
+                ),
+                resource_type="membership",
+                resource_id=subject_id,
+                projection_revision=1,
+                kind="membership.invitation.claimed",
+                audience_ids=("tenant:members", subject_id),
+                safe_summary="A member joined the organization.",
+                occurred_at=now,
+            )
         return {
             "organization_id": tenant_id,
             "subject_id": subject_id,
@@ -380,6 +416,20 @@ class SQLMembershipStore(MembershipStore):
                 active=False, updated_at=now, revoked_by=actor_id, revoked_at=now,
                 revoked_reason=reason, revocation_key=idempotency_key,
             ))
+            self._experience_events.append(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key(
+                    "membership.revoked", subject_id, idempotency_key,
+                ),
+                resource_type="membership",
+                resource_id=subject_id,
+                projection_revision=2,
+                kind="membership.revoked",
+                audience_ids=("tenant:members", subject_id),
+                safe_summary="Organization membership was revoked.",
+                occurred_at=now,
+            )
         return {
             "subject_id": subject_id,
             "active": False,

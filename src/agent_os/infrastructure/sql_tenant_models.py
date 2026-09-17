@@ -29,6 +29,10 @@ from sqlalchemy.exc import IntegrityError
 
 from agent_os.application.ports import TenantModelStore
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 model_setting_metadata = MetaData()
@@ -74,8 +78,10 @@ class SQLTenantModelStore(TenantModelStore):
         if not database_url.strip():
             raise ValueError("database_url is required")
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
+        self._experience_events = SQLExperienceEventLog(self._connection)
         if create_schema:
             model_setting_metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
     @contextmanager
     def _connection(self, tenant_id: str):
@@ -193,6 +199,20 @@ class SQLTenantModelStore(TenantModelStore):
                     actor_id=actor_id,
                     created_at=now,
                 ))
+                self._experience_events.append(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key(
+                        "model.policy.changed", idempotency_key,
+                    ),
+                    resource_type="model_policy",
+                    resource_id=tenant_id,
+                    projection_revision=version,
+                    kind="model.policy.changed",
+                    audience_ids=("tenant:members",),
+                    safe_summary="Organization model policy changed.",
+                    occurred_at=now,
+                )
         except IntegrityError as exc:
             with self._connection(tenant_id) as connection:
                 replay = connection.execute(select(model_setting_events).where(and_(

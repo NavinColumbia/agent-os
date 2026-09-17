@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from agent_os.application.billing import BillingCatalog, BillingPlan, BillingService
 from agent_os.infrastructure.sql_billing import SQLBillingStore
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 
 
@@ -87,6 +88,23 @@ def test_subscription_projection_is_idempotent_ordered_and_never_trusts_checkout
         )
         assert unknown_old_price["plan_id"] == "free"
         assert store.get_account("tenant-b")["stripe_customer_id"] is None
+        experience = SQLNotificationStore(
+            f"sqlite:///{tmp_path / 'billing.sqlite3'}", create_schema=True,
+        )
+        events = experience.list_experience_events(
+            "tenant-a", audience_ids=("tenant:members",), limit=100,
+        ).events
+        assert [event["kind"] for event in events] == [
+            "billing.account.changed",
+            "billing.account.changed",
+            "billing.account.changed",
+            "billing.account.changed",
+        ]
+        assert "cus_123" not in " ".join(event["safe_summary"] for event in events)
+        assert not experience.list_experience_events(
+            "tenant-b", audience_ids=("tenant:members",), limit=100,
+        ).events
+        experience.close()
     finally:
         store.close()
 

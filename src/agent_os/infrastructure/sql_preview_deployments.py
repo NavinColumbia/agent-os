@@ -37,6 +37,10 @@ from sqlalchemy.exc import IntegrityError
 from agent_os.application.command_worker import FatalCommandError
 from agent_os.application.ports import ArtifactStore, PreviewDeploymentStore
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 preview_metadata = MetaData()
@@ -137,8 +141,10 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
         self._secret = capability_secret.encode()
         self._ttl = timedelta(seconds=ttl_seconds)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._experience_events = SQLExperienceEventLog(self._tenant_connection)
         if create_schema:
             preview_metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
     @contextmanager
     def _tenant_connection(self, tenant_id: str):
@@ -317,6 +323,20 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
                     record=record,
                     created_at=created_at,
                 ))
+                self._experience_events.append(
+                    connection,
+                    tenant_id=organization_id,
+                    source_key=experience_source_key(
+                        "deployment.preview.published", deployment_id,
+                    ),
+                    resource_type="preview_deployment",
+                    resource_id=deployment_id,
+                    projection_revision=1,
+                    kind="deployment.preview.published",
+                    audience_ids=("tenant:members",),
+                    safe_summary="A preview deployment was published.",
+                    occurred_at=created_at,
+                )
         except IntegrityError as exc:
             with self._tenant_connection(organization_id) as connection:
                 prior = connection.execute(select(
@@ -546,6 +566,20 @@ class SQLStaticPreviewDeployer(PreviewDeploymentStore):
                 revocation_key=idempotency_key,
                 record=record,
             ))
+            self._experience_events.append(
+                connection,
+                tenant_id=organization_id,
+                source_key=experience_source_key(
+                    "deployment.preview.revoked", deployment_id, idempotency_key,
+                ),
+                resource_type="preview_deployment",
+                resource_id=deployment_id,
+                projection_revision=2,
+                kind="deployment.preview.revoked",
+                audience_ids=("tenant:members",),
+                safe_summary="A preview deployment was revoked.",
+                occurred_at=revoked_at,
+            )
             return record
 
     def close(self) -> None:

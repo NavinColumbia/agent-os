@@ -7,6 +7,7 @@ import pytest
 
 from agent_os.application.ports import MembershipStore
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 
 
 SECRET = "membership-test-secret-that-is-long-enough"
@@ -80,6 +81,24 @@ def test_invitation_claim_membership_selection_and_revocation_are_idempotent(tmp
         assert repeated_revoke == {"subject_id": "user-b", "active": False, "duplicate": True}
         assert memberships.roles_for("org-a", "user-b") is None
         assert memberships.organizations_for("user-b") == ()
+        experience = SQLNotificationStore(
+            f"sqlite:///{tmp_path / 'memberships.sqlite3'}", create_schema=True,
+        )
+        events = experience.list_experience_events(
+            "org-a", audience_ids=("tenant:members",), limit=100,
+        ).events
+        assert [event["kind"] for event in events] == [
+            "membership.invitation.created",
+            "membership.invitation.claimed",
+            "membership.revoked",
+        ]
+        assert "Access no longer required" not in " ".join(
+            event["safe_summary"] for event in events
+        )
+        assert not experience.list_experience_events(
+            "org-b", audience_ids=("tenant:members",), limit=100,
+        ).events
+        experience.close()
     finally:
         memberships.close()
 

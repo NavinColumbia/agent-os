@@ -6,6 +6,7 @@ import pytest
 
 from agent_os.domain.organization import AgentStatus
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +58,41 @@ def test_standing_agent_is_event_sourced_idempotent_and_tenant_scoped(directory)
 
     with pytest.raises(ValueError, match="different content"):
         hire(directory, role="different-role")
+
+
+def test_company_events_publish_safe_tenant_scoped_live_invalidations(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'company-events.sqlite3'}"
+    directory = SQLCompanyDirectory(database_url, create_schema=True)
+    experience = SQLNotificationStore(database_url, create_schema=True)
+    try:
+        first = hire(directory, role="private-merger-adviser", key="hire-private-adviser")
+        assert hire(
+            directory, role="private-merger-adviser", key="hire-private-adviser",
+        )["duplicate"] is True
+        directory.retire_agent(
+            tenant_id="tenant-a",
+            agent_id=first["payload"]["agent_id"],
+            reason="Confidential acquisition was cancelled",
+            actor_id="human:ceo",
+            idempotency_key="retire-private-adviser",
+        )
+
+        events = experience.list_experience_events(
+            "tenant-a", audience_ids=("tenant:members",), limit=100,
+        ).events
+        assert [event["kind"] for event in events] == [
+            "company.agent_hired", "company.agent_retired",
+        ]
+        assert [event["projection_revision"] for event in events] == [1, 2]
+        summaries = " ".join(event["safe_summary"] for event in events)
+        assert "merger" not in summaries.lower()
+        assert "acquisition" not in summaries.lower()
+        assert not experience.list_experience_events(
+            "tenant-b", audience_ids=("tenant:members",), limit=100,
+        ).events
+    finally:
+        experience.close()
+        directory.close()
 
 
 def test_retirement_preserves_history_and_management_invariants(directory):

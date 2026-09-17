@@ -10,6 +10,7 @@ from pydantic_ai.models.openai import OpenAIResponsesModel
 
 from agent_os.application.ports import TenantModelStore
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.tenant_model_resolver import TenantModelResolver
 
 
@@ -52,6 +53,20 @@ def test_tenant_model_policy_is_versioned_idempotent_and_isolated(tmp_path: Path
                 tenant_id="org-a", provider="unknown", model_name="model",
                 credential_ref=None, actor_id="owner-a", idempotency_key="model-setting-bad",
             )
+        experience = SQLNotificationStore(
+            f"sqlite:///{tmp_path / 'tenant-models.sqlite3'}", create_schema=True,
+        )
+        events = experience.list_experience_events(
+            "org-a", audience_ids=("tenant:members",), limit=100,
+        ).events
+        assert [event["kind"] for event in events] == [
+            "model.policy.changed", "model.policy.changed",
+        ]
+        assert [event["projection_revision"] for event in events] == [1, 2]
+        assert "company-anthropic" not in " ".join(
+            event["safe_summary"] for event in events
+        )
+        experience.close()
     finally:
         settings.close()
 

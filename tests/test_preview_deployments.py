@@ -18,6 +18,7 @@ from agent_os.domain.workflow_runtime import begin_node, complete_node, start_wo
 from agent_os.infrastructure.deployment_tool_nodes import DeploymentToolNodeHandlers
 from agent_os.infrastructure.memory import InMemoryWorkflowEngine
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 
 
@@ -66,6 +67,35 @@ def test_static_preview_is_idempotent_tenant_fenced_and_content_backed(tmp_path:
             "tenant-a", first["receipt_artifact_id"],
         )["media_type"] == "application/json"
         assert deployments.resolve_public("dGVuYW50LWI", parts[-1]) is None
+
+        revoked = deployments.revoke(
+            organization_id="tenant-a",
+            deployment_id=first["deployment_id"],
+            idempotency_key="revoke-published-preview",
+        )
+        assert revoked is not None and revoked["status"] == "revoked"
+        assert deployments.revoke(
+            organization_id="tenant-a",
+            deployment_id=first["deployment_id"],
+            idempotency_key="revoke-published-preview",
+        )["status"] == "revoked"
+        experience = SQLNotificationStore(
+            f"sqlite:///{tmp_path / 'previews.sqlite3'}", create_schema=True,
+        )
+        events = experience.list_experience_events(
+            "tenant-a", audience_ids=("tenant:members",), limit=100,
+        ).events
+        assert [event["kind"] for event in events] == [
+            "deployment.preview.published", "deployment.preview.revoked",
+        ]
+        assert [event["projection_revision"] for event in events] == [1, 2]
+        assert first["public_url"] not in " ".join(
+            event["safe_summary"] for event in events
+        )
+        assert not experience.list_experience_events(
+            "tenant-b", audience_ids=("tenant:members",), limit=100,
+        ).events
+        experience.close()
 
         other_id = artifacts.put(
             organization_id="tenant-a",

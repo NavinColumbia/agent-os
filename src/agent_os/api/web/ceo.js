@@ -105,7 +105,10 @@ async function connect(token) {
     await api("/v2/company/organization");
     byId("auth-gate").classList.add("hidden");
     byId("workspace").classList.remove("hidden");
-    await refreshView();
+    const requestedView = window.location.hash.startsWith("#view=")
+      ? window.location.hash.slice(6) : "";
+    const roleDefault = state.session?.persona === "operator" ? "inbox" : "missions";
+    await selectView(requestedView || roleDefault);
     const billingNotice = sessionStorage.getItem("aos.billing.notice");
     if (billingNotice) {
       sessionStorage.removeItem("aos.billing.notice");
@@ -481,9 +484,15 @@ function renderInbox() {
       const decisionMessage = decisionStatus === "pending" || decisionStatus === "executing"
         ? "Your response is durably queued and will resume this work."
         : (decisionStatus === "failed"
-          ? "The response could not be applied. Operator attention is required; your intent remains recorded."
+          ? "The response could not be applied. Your intent remains recorded and can be retried safely."
           : "Resolved or no longer actionable");
       node.append(el("small", "", decisionMessage));
+      if (decisionStatus === "failed" && can("decision.redrive")) {
+        const recover = el("button", "quiet", "Retry recorded response");
+        recover.type = "button";
+        recover.addEventListener("click", () => redriveHumanRequest(item, recover));
+        node.append(recover);
+      }
     }
     const utility = el("div", "notice-utility");
     if (item.run_id) {
@@ -530,6 +539,20 @@ async function resolveHumanRequest(item, response, actions) {
     await loadInbox();
   } catch (error) {
     for (const control of actions.querySelectorAll("button,input")) control.disabled = false;
+    setFlash(error.message, "error");
+  }
+}
+
+async function redriveHumanRequest(item, control) {
+  control.disabled = true;
+  try {
+    await api(`/v2/decisions/${encodeURIComponent(item.notification_id)}/redrive`, {
+      method: "POST", headers: {"Idempotency-Key": `decision-redrive-${crypto.randomUUID()}`},
+    });
+    setFlash("The recorded response is queued for another bounded recovery cycle.");
+    await loadInbox();
+  } catch (error) {
+    control.disabled = false;
     setFlash(error.message, "error");
   }
 }
@@ -1061,7 +1084,11 @@ async function loadMissionDetail(item, silent = false) {
       const signals = detailSection("Manager signals");
       for (const signal of managementResult.management_signals) {
         const row = el("div", "work-row");
-        row.append(el("span", `health ${signal.severity === "critical" ? "failed" : "degraded"}`, label(signal.signal)), el("p", "", signal.reason || signal.recommended_action));
+        row.append(
+          el("span", `health ${signal.severity === "critical" ? "failed" : "degraded"}`, label(signal.signal)),
+          el("p", "", signal.reason || "A manager detected material execution variance."),
+        );
+        if (signal.recommended_action) row.append(el("small", "", `Recommended: ${signal.recommended_action}`));
         signals.append(row);
       }
       content.append(signals);
@@ -1090,10 +1117,53 @@ async function loadMissionDetail(item, silent = false) {
       const work = detailSection("Team execution");
       for (const itemValue of managementResult.work_items) {
         const row = el("div", "work-row");
-        row.append(el("span", `health ${itemValue.health}`, label(itemValue.health)), el("p", "", itemValue.objective), el("small", "", `${itemValue.owner_id || "system"} · attempt ${itemValue.attempt}`));
+        const queueAttempts = itemValue.queue_attempts == null ? "not dispatched" : `${itemValue.queue_attempts} queue attempt(s)`;
+        row.append(
+          el("span", `health ${itemValue.health}`, label(itemValue.health)),
+          el("p", "", itemValue.objective),
+          el("small", "", `${itemValue.owner_id || "system"} · ${label(itemValue.status)} · iteration ${itemValue.iteration} · node attempt ${itemValue.attempt} · ${queueAttempts}`),
+        );
+        const diagnostics = el("details", "work-diagnostics");
+        diagnostics.append(el("summary", "", "Execution diagnostics"));
+        const facts = el("dl", "diagnostic-grid");
+        const fact = (name, value) => {
+          if (value == null || value === "") return;
+          facts.append(el("dt", "", name), el("dd", "", String(value)));
+        };
+        fact("Health reason", itemValue.diagnostic_reason || "No abnormal condition is currently detected.");
+        fact("Queue state", itemValue.queue_status ? label(itemValue.queue_status) : "Not dispatched");
+        fact("Last proven progress", itemValue.last_progress_at ? new Date(itemValue.last_progress_at).toLocaleString() : "No action receipt yet");
+        fact("Recovery checkpoint", itemValue.next_infrastructure_checkpoint_at ? new Date(itemValue.next_infrastructure_checkpoint_at).toLocaleString() : "Not scheduled");
+        fact("Waiting for", itemValue.wait_reason);
+        fact("Manager", itemValue.manager_id);
+        fact("Evidence", (itemValue.evidence_ids || []).length ? `${itemValue.evidence_ids.length} retained item(s)` : "None yet");
+        fact("Last error", itemValue.last_error);
+        diagnostics.append(facts);
+        row.append(diagnostics);
         work.append(row);
       }
       content.append(work);
+    }
+    if (managementResult?.execution_timeline?.length) {
+      const timeline = detailSection("Execution timeline");
+      timeline.append(el("p", "program-rationale", "Newest durable queue actions first. Payloads and secrets are intentionally omitted."));
+      for (const action of managementResult.execution_timeline) {
+        const row = el("div", "work-row timeline-row");
+        const started = action.created_at ? new Date(action.created_at) : null;
+        const ended = action.completed_at ? new Date(action.completed_at) : null;
+        const elapsed = started && ended
+          ? `${Math.max(0, Math.round((ended - started) / 1000))}s elapsed`
+          : (started ? `queued ${started.toLocaleString()}` : "time unavailable");
+        row.append(
+          el("span", `health ${action.status === "failed" ? "failed" : (action.status === "succeeded" ? "healthy" : "degraded")}`, label(action.status)),
+          el("p", "", `${label(action.kind || "workflow action")} · ${label(action.node_id || "system")}`),
+          el("small", "", `state v${action.state_version} · ${action.attempts || 0} attempt(s) · ${elapsed} · ${shortId(action.action_id)}`),
+        );
+        if (action.error?.message) row.append(el("small", "timeline-error", `${label(action.error.type || "error")}: ${action.error.message}`));
+        timeline.append(row);
+      }
+      if (managementResult.execution_timeline_truncated) timeline.append(el("small", "muted", "Older actions are retained but omitted from this bounded view."));
+      content.append(timeline);
     }
     if (managementResult?.hiring_requests?.length) {
       const proposals = detailSection("Staffing proposals");
@@ -1169,8 +1239,13 @@ async function cancelMission(item, version) {
 }
 
 function selectView(name) {
-  if (name === "integrations" && !can("integration.manage")) return setFlash("Your role cannot manage integrations.", "error");
-  if (name === "billing" && (!can("billing.manage") || state.config?.billing_mode !== "stripe")) return setFlash("Billing is not available in this deployment.", "error");
+  if (!["missions", "company", "inbox", "integrations", "previews", "billing"].includes(name)) name = "missions";
+  if (name === "integrations" && !can("integration.manage")) {
+    setFlash("Your role cannot manage integrations.", "error"); name = "missions";
+  }
+  if (name === "billing" && (!can("billing.manage") || state.config?.billing_mode !== "stripe")) {
+    setFlash("Billing is not available in this deployment.", "error"); name = "missions";
+  }
   state.view = name;
   byId("mobile-more-menu").classList.add("hidden");
   byId("mobile-more-toggle").setAttribute("aria-expanded", "false");
@@ -1179,7 +1254,8 @@ function selectView(name) {
   document.querySelectorAll(".view").forEach((node) => node.classList.add("hidden"));
   byId(`${name}-view`).classList.remove("hidden");
   byId("view-title").textContent = { missions: "Missions", company: "Company", inbox: "Inbox", integrations: "Integrations", previews: "Releases", billing: "Billing" }[name];
-  closeDrawer(); refreshView();
+  history.replaceState({}, document.title, `#view=${name}`);
+  closeDrawer(); return refreshView();
 }
 
 async function bootstrap() {
@@ -1300,6 +1376,12 @@ document.querySelectorAll("[data-inbox-filter]").forEach((node) => node.addEvent
   renderInbox();
 }));
 document.querySelectorAll(".nav-item[data-view]").forEach((node) => node.addEventListener("click", () => selectView(node.dataset.view)));
+window.addEventListener("hashchange", () => {
+  if (!state.token) return;
+  if (!window.location.hash.startsWith("#view=")) return;
+  const requested = window.location.hash.slice(6);
+  if (requested && requested !== state.view) selectView(requested);
+});
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     closeDrawer();

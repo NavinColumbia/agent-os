@@ -54,6 +54,7 @@ GET /v2/me
 GET/PUT /v2/notification-preferences
 PUT /v2/notifications/{notification_id}/state
 POST /v2/decisions/{decision_id}/responses
+POST /v2/decisions/{decision_id}/redrive             # owner/operator recovery
 
 GET /v2/inbox?status=open&cursor=...             # next increment
 GET /v2/events?cursor=...                        # next increment, SSE
@@ -65,6 +66,11 @@ POST /v2/me/push-subscriptions                   # after VAPID provisioning
 - Existing mission/runtime/assurance ports remain stable.
 - Mutable attention projections require RLS-protected tables and idempotent updates.
 - Human responses add a small durable queue so a process crash cannot lose accepted intent or apply it twice.
+- An exhausted response keeps its original human intent and deterministic event ID; authorized redrive starts
+  a fresh bounded retry cycle while an append-only redrive ledger retains every idempotency key, lifetime
+  attempt boundary, and recovery actor.
+- Owners/operators receive bounded payload-redacted action timelines; raw payloads, secrets, and lease-owner
+  internals remain outside the experience projection.
 - External delivery routes must evolve from tenant-wide category matching to recipient/audience-aware policy.
 - Read models and cursor pagination become necessary before very large mission histories.
 - Persona UX can evolve independently without forking workflow semantics.

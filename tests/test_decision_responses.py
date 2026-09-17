@@ -27,6 +27,8 @@ class Identity:
             return {"sub": "ceo-subject", "org": "tenant-a", "roles": ["owner"]}
         if authorization == "Bearer viewer":
             return {"sub": "viewer-subject", "org": "tenant-a", "roles": ["viewer"]}
+        if authorization == "Bearer operator":
+            return {"sub": "operator-subject", "org": "tenant-a", "roles": ["operator"]}
         raise ValueError("authentication required")
 
 
@@ -234,6 +236,133 @@ def test_decision_recovers_after_graph_commit_before_inbox_settlement(tmp_path: 
         graph.close()
 
 
+def test_failed_decision_can_be_authoritatively_redriven_with_a_fresh_retry_budget(
+    tmp_path: Path,
+):
+    database_url = f"sqlite:///{tmp_path / 'decision-redrive.sqlite3'}"
+    graph = SQLGraphWorkflowEngine(database_url, create_schema=True)
+    notifications = SQLNotificationStore(database_url, create_schema=True)
+    waiting_graph(graph)
+    publish_decision(notifications)
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=Identity(),
+        graph_engine=graph, notification_store=notifications,
+    ))
+    try:
+        accepted = api.post(
+            "/v2/decisions/notice-release/responses",
+            headers={
+                "Authorization": "Bearer owner",
+                "Idempotency-Key": "answer-before-redrive",
+            },
+            json={"response": {"approved": True, "answer": "Ship after recovery"}},
+        )
+        assert accepted.status_code == 202
+        lease = notifications.claim_decision_response(
+            "tenant-a", worker_id="broken-worker", lease_seconds=30,
+        )
+        assert lease is not None
+        assert notifications.fail_decision_response(
+            "tenant-a", lease.response_id, worker_id="broken-worker",
+            error={"type": "DependencyError", "message": "provider unavailable"},
+        ) is True
+
+        failed_item = api.get(
+            "/v2/notifications", headers={"Authorization": "Bearer owner"},
+        ).json()["items"][0]["decision_response"]
+        assert failed_item["status"] == "failed"
+        assert failed_item["attempts"] == 1
+        assert failed_item["total_attempts"] == 1
+
+        forbidden = api.post(
+            "/v2/decisions/notice-release/redrive",
+            headers={
+                "Authorization": "Bearer viewer",
+                "Idempotency-Key": "viewer-redrive-denied",
+            },
+        )
+        assert forbidden.status_code == 403
+        headers = {
+            "Authorization": "Bearer operator",
+            "Idempotency-Key": "operator-redrive-one",
+        }
+        redriven = api.post(
+            "/v2/decisions/notice-release/redrive", headers=headers,
+        )
+        assert redriven.status_code == 202
+        assert redriven.json() == {
+            "response_id": lease.response_id,
+            "notification_id": "notice-release",
+            "status": "pending",
+            "attempts": 0,
+            "total_attempts": 1,
+            "redrive_count": 1,
+            "redriven_by": "operator-subject",
+            "duplicate": False,
+        }
+        assert "Ship after recovery" not in redriven.text
+        replay = api.post(
+            "/v2/decisions/notice-release/redrive", headers=headers,
+        )
+        assert replay.status_code == 202
+        assert replay.json()["duplicate"] is True
+        assert api.post(
+            "/v2/decisions/notice-release/redrive",
+            headers={
+                "Authorization": "Bearer owner",
+                "Idempotency-Key": "second-redrive-while-pending",
+            },
+        ).status_code == 409
+
+        second_lease = notifications.claim_decision_response(
+            "tenant-a", worker_id="still-broken-worker", lease_seconds=30,
+        )
+        assert second_lease is not None
+        assert notifications.fail_decision_response(
+            "tenant-a", second_lease.response_id, worker_id="still-broken-worker",
+            error={"type": "DependencyError", "message": "provider still unavailable"},
+        ) is True
+        second_redrive = api.post(
+            "/v2/decisions/notice-release/redrive",
+            headers={
+                "Authorization": "Bearer owner",
+                "Idempotency-Key": "owner-redrive-two",
+            },
+        )
+        assert second_redrive.status_code == 202
+        assert second_redrive.json()["redrive_count"] == 2
+        assert second_redrive.json()["total_attempts"] == 2
+        old_replay = api.post(
+            "/v2/decisions/notice-release/redrive", headers=headers,
+        )
+        assert old_replay.status_code == 202
+        assert old_replay.json()["duplicate"] is True
+        assert old_replay.json()["redrive_count"] == 2
+
+        report = DurableDecisionResponseWorker(
+            store=notifications, graph=graph,
+            worker_id="recovered-worker", lease_seconds=30,
+        ).run_one("tenant-a")
+        assert report.status is CommandRunStatus.SUCCEEDED
+        settled = notifications.get_decision_response(
+            "tenant-a", notification_id="notice-release",
+        )
+        assert settled is not None
+        assert settled["status"] == "applied"
+        assert settled["attempts"] == 1
+        assert settled["total_attempts"] == 3
+        assert settled["redrive_count"] == 2
+        completed_replay = api.post(
+            "/v2/decisions/notice-release/redrive", headers=headers,
+        )
+        assert completed_replay.status_code == 202
+        assert completed_replay.json()["status"] == "applied"
+        assert completed_replay.json()["duplicate"] is True
+    finally:
+        notifications.close()
+        graph.close()
+
+
 def test_structured_decision_migration_is_tenant_fenced_and_worker_narrow():
     migration = (
         ROOT / "postgres/initdb/103-structured-decision-responses-v2.sql"
@@ -245,3 +374,19 @@ def test_structured_decision_migration_is_tenant_fenced_and_worker_narrow():
     assert "FOR SELECT TO agentos_worker" in migration
     assert "SELECT (tenant_id, status, available_at, lease_expires_at)" in migration
     assert "GRANT INSERT" not in migration.split("FROM agentos_worker")[-1]
+
+
+def test_decision_redrive_migration_preserves_auditable_bounded_attempt_cycles():
+    migration = (
+        ROOT / "postgres/initdb/104-decision-response-redrive-v2.sql"
+    ).read_text()
+
+    assert "total_attempts = attempts" in migration
+    assert "total_attempts >= attempts" in migration
+    assert "redrive_count >= 0" in migration
+    assert "redrive_idempotency_key" in migration
+    assert "redriven_by" in migration
+    assert "CREATE TABLE IF NOT EXISTS public.aos_v2_decision_response_redrives" in migration
+    assert "PRIMARY KEY (tenant_id, notification_id, idempotency_key)" in migration
+    assert "FORCE ROW LEVEL SECURITY" in migration
+    assert "REVOKE ALL ON TABLE public.aos_v2_decision_response_redrives FROM agentos_worker" in migration

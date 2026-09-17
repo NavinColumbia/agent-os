@@ -691,6 +691,15 @@ class NotificationStore(Protocol):
         error: Mapping[str, Any],
     ) -> bool: ...
 
+    def redrive_decision_response(
+        self,
+        *,
+        tenant_id: str,
+        notification_id: str,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
+
     def register_notification_route(
         self,
         *,

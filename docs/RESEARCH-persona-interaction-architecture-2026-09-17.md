@@ -199,6 +199,12 @@ responses enter through a structured endpoint backed by durable intent, determin
 lease recovery, conflict rejection, and immutable notification truth. Remaining priorities above are retained
 as product requirements rather than represented as already complete.
 
+The operator projection now defaults to the decision inbox, keeps role-aware deep links, explains manager
+signals, exposes bounded and payload-redacted execution diagnostics, and shows the durable queue timeline only
+to owners/operators. A failed human response can be redriven explicitly without asking the person to repeat
+their decision: the immutable intent and event identity remain fixed, a new bounded retry cycle starts, and
+lifetime attempts plus the redriving actor remain auditable.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

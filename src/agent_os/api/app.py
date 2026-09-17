@@ -594,7 +594,8 @@ def _principal_experience(principal: Principal) -> Mapping[str, Any]:
     if owner or operator:
         capabilities.update({
             "mission.create", "mission.cancel", "mission.steer",
-            "notification.respond", "company.read", "integration.manage",
+            "notification.respond", "decision.redrive", "company.read",
+            "integration.manage",
         })
     if owner:
         capabilities.update({
@@ -1907,6 +1908,44 @@ def create_app(
                     "duplicate": admitted["duplicate"],
                 }
 
+            @app.post("/v2/decisions/{notification_id}/redrive", status_code=202)
+            def redrive_decision_response(
+                notification_id: str,
+                principal: Annotated[Principal, Depends(current_principal)],
+                idempotency_key: Annotated[
+                    str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+                ],
+            ) -> Mapping[str, Any]:
+                if not principal.roles & {"owner", "operator", "system"}:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="decision recovery requires owner or operator authority",
+                    )
+                redriver = getattr(notification_store, "redrive_decision_response", None)
+                if redriver is None:
+                    raise HTTPException(status_code=503, detail="decision recovery is unavailable")
+                try:
+                    result = redriver(
+                        tenant_id=principal.organization_id,
+                        notification_id=notification_id,
+                        actor_id=principal.subject_id,
+                        idempotency_key=idempotency_key,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if result is None:
+                    raise HTTPException(status_code=404, detail="decision response not found")
+                return {
+                    "response_id": result["response_id"],
+                    "notification_id": result["notification_id"],
+                    "status": result["status"],
+                    "attempts": result["attempts"],
+                    "total_attempts": result["total_attempts"],
+                    "redrive_count": result["redrive_count"],
+                    "redriven_by": result["redriven_by"],
+                    "duplicate": result["duplicate"],
+                }
+
         @app.get("/v2/notifications")
         def list_notifications(
             principal: Annotated[Principal, Depends(current_principal)],
@@ -1978,6 +2017,9 @@ def create_app(
                         "status": decision["status"],
                         "actor_id": decision["actor_id"],
                         "attempts": decision["attempts"],
+                        "total_attempts": decision["total_attempts"],
+                        "redrive_count": decision["redrive_count"],
+                        "redriven_by": decision["redriven_by"],
                         "last_error": decision["last_error"],
                         "completed_at": decision["completed_at"],
                     }
@@ -2292,6 +2334,37 @@ def create_app(
                 company_events=company_events,
                 slow_after_seconds=slow_after_seconds,
             ))
+            if observation is not None and principal.roles & {"owner", "operator", "system"}:
+                action_rows = observation.get("actions", ())
+                action_rows = action_rows if isinstance(action_rows, list) else []
+                bounded_actions = action_rows[:200]
+                timeline = []
+                for row in bounded_actions:
+                    if not isinstance(row, Mapping):
+                        continue
+                    action = row.get("action")
+                    action_value = action if isinstance(action, Mapping) else {}
+                    error = row.get("last_error")
+                    error_value = error if isinstance(error, Mapping) else {}
+                    timeline.append({
+                        "action_id": row.get("action_id"),
+                        "state_version": row.get("state_version"),
+                        "kind": action_value.get("kind"),
+                        "node_id": action_value.get("node_id"),
+                        "token_id": action_value.get("token_id"),
+                        "status": row.get("status"),
+                        "attempts": row.get("attempts"),
+                        "available_at": row.get("available_at"),
+                        "created_at": row.get("created_at"),
+                        "completed_at": row.get("completed_at"),
+                        "error": None if not error_value else {
+                            "type": error_value.get("type"),
+                            "message": str(error_value.get("message") or "")[:2_000],
+                            "retryable": error_value.get("retryable"),
+                        },
+                    })
+                projection["execution_timeline"] = timeline
+                projection["execution_timeline_truncated"] = len(action_rows) > len(timeline)
             subprograms, truncated = _project_mission_subprograms(
                 graph_engine, principal.organization_id, execution_run_id,
             )

@@ -145,6 +145,8 @@ decision_responses = Table(
     Column("fingerprint", String(64), nullable=False),
     Column("status", String(32), nullable=False),
     Column("attempts", Integer, nullable=False),
+    Column("total_attempts", Integer, nullable=False, default=0),
+    Column("redrive_count", Integer, nullable=False, default=0),
     Column("available_at", DateTime(timezone=True), nullable=False),
     Column("lease_owner", String(256), nullable=True),
     Column("lease_expires_at", DateTime(timezone=True), nullable=True),
@@ -152,6 +154,8 @@ decision_responses = Table(
     Column("result", JSON, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("completed_at", DateTime(timezone=True), nullable=True),
+    Column("redrive_idempotency_key", String(200), nullable=True),
+    Column("redriven_by", String(256), nullable=True),
     UniqueConstraint("tenant_id", "notification_id"),
     UniqueConstraint("tenant_id", "idempotency_key"),
     ForeignKeyConstraint(
@@ -166,6 +170,26 @@ Index(
     decision_responses.c.tenant_id,
     decision_responses.c.status,
     decision_responses.c.available_at,
+)
+
+decision_response_redrives = Table(
+    "aos_v2_decision_response_redrives",
+    notification_metadata,
+    Column("tenant_id", String(128), primary_key=True),
+    Column("notification_id", String(128), primary_key=True),
+    Column("idempotency_key", String(200), primary_key=True),
+    Column("response_id", String(96), nullable=False),
+    Column("redrive_number", Integer, nullable=False),
+    Column("actor_id", String(256), nullable=False),
+    Column("previous_attempts", Integer, nullable=False),
+    Column("total_attempts_at_redrive", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("tenant_id", "notification_id", "redrive_number"),
+    ForeignKeyConstraint(
+        ["tenant_id", "response_id"],
+        ["aos_v2_decision_responses.tenant_id", "aos_v2_decision_responses.response_id"],
+        ondelete="CASCADE",
+    ),
 )
 
 notification_routes = Table(
@@ -680,12 +704,15 @@ class SQLNotificationStore(NotificationStore):
             "actor_id": row["actor_id"],
             "status": row["status"],
             "attempts": int(row["attempts"]),
+            "total_attempts": int(row["total_attempts"]),
+            "redrive_count": int(row["redrive_count"]),
             "last_error": row["last_error"],
             "result": row["result"],
             "created_at": row["created_at"].isoformat(),
             "completed_at": (
                 None if row["completed_at"] is None else row["completed_at"].isoformat()
             ),
+            "redriven_by": row["redriven_by"],
             "duplicate": duplicate,
         }
 
@@ -756,6 +783,8 @@ class SQLNotificationStore(NotificationStore):
             "fingerprint": fingerprint,
             "status": "pending",
             "attempts": 0,
+            "total_attempts": 0,
+            "redrive_count": 0,
             "available_at": now,
             "lease_owner": None,
             "lease_expires_at": None,
@@ -763,6 +792,8 @@ class SQLNotificationStore(NotificationStore):
             "result": None,
             "created_at": now,
             "completed_at": None,
+            "redrive_idempotency_key": None,
+            "redriven_by": None,
         }
         prior_filter = and_(
             decision_responses.c.tenant_id == tenant_id,
@@ -880,6 +911,7 @@ class SQLNotificationStore(NotificationStore):
             )).values(
                 status="executing",
                 attempts=int(row["attempts"]) + 1,
+                total_attempts=int(row["total_attempts"]) + 1,
                 lease_owner=worker_id,
                 lease_expires_at=expires,
             )).rowcount
@@ -1039,6 +1071,72 @@ class SQLNotificationStore(NotificationStore):
                 last_error=dict(error),
             )).rowcount
         return changed == 1
+
+    def redrive_decision_response(
+        self,
+        *,
+        tenant_id: str,
+        notification_id: str,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None:
+        """Start a fresh bounded attempt cycle for durable intent that exhausted retries."""
+
+        actor_id = actor_id.strip()
+        idempotency_key = idempotency_key.strip()
+        if not actor_id or not 8 <= len(idempotency_key) <= 200:
+            raise ValueError("decision redrive actor and bounded idempotency key are required")
+        key = and_(
+            decision_responses.c.tenant_id == tenant_id,
+            decision_responses.c.notification_id == notification_id,
+        )
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(
+                select(decision_responses).where(key).with_for_update()
+            ).mappings().one_or_none()
+            if row is None:
+                return None
+            prior_redrive = connection.execute(select(
+                decision_response_redrives.c.notification_id,
+            ).where(and_(
+                decision_response_redrives.c.tenant_id == tenant_id,
+                decision_response_redrives.c.notification_id == notification_id,
+                decision_response_redrives.c.idempotency_key == idempotency_key,
+            ))).scalar_one_or_none()
+            if prior_redrive is not None:
+                return self._decision_record(row, duplicate=True)
+            if row["status"] != "failed":
+                raise ValueError("only failed decision responses can be redriven")
+            now = self._clock()
+            redrive_number = int(row["redrive_count"]) + 1
+            connection.execute(insert(decision_response_redrives).values(
+                tenant_id=tenant_id,
+                notification_id=notification_id,
+                idempotency_key=idempotency_key,
+                response_id=row["response_id"],
+                redrive_number=redrive_number,
+                actor_id=actor_id,
+                previous_attempts=int(row["attempts"]),
+                total_attempts_at_redrive=int(row["total_attempts"]),
+                created_at=now,
+            ))
+            values = {
+                "status": "pending",
+                "attempts": 0,
+                "available_at": now,
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "last_error": None,
+                "result": None,
+                "completed_at": None,
+                "redrive_count": redrive_number,
+                "redrive_idempotency_key": idempotency_key,
+                "redriven_by": actor_id,
+            }
+            connection.execute(update(decision_responses).where(key).values(**values))
+            updated = dict(row)
+            updated.update(values)
+        return self._decision_record(updated)
 
     def register_notification_route(
         self,

@@ -232,6 +232,10 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert script.status_code == 200
     assert "Program command" in script.text
     assert "Independent work is continuing" in script.text
+    assert "Execution diagnostics" in script.text
+    assert "Execution timeline" in script.text
+    assert "Retry recorded response" in script.text
+    assert "#view=" in script.text
     assert 'querySelectorAll(".nav-item[data-view]")' in script.text
     assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
     assert api.get("/v2/runs").status_code == 401
@@ -244,6 +248,7 @@ def test_session_capabilities_and_mission_creation_are_role_consistent():
 
     assert owner["persona"] == "executive"
     assert "mission.create" in owner["capabilities"]
+    assert "decision.redrive" in owner["capabilities"]
     assert viewer["persona"] == "viewer"
     assert "mission.create" not in viewer["capabilities"]
     forbidden = api.post(
@@ -786,6 +791,32 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
                 "agent:mission-architect",
             )
 
+        def inspect_graph_run(self, tenant_id, run_id, *, action_limit=1_000):
+            assert tenant_id == "org-a" and action_limit == 1_000
+            return {
+                "run_id": run_id,
+                "workflow_id": "mission-workflow",
+                "workflow_version": 1,
+                "state_version": 4,
+                "created_at": "2026-09-17T12:00:00+00:00",
+                "updated_at": "2026-09-17T12:00:09+00:00",
+                "actions": [{
+                    "action_id": "action-work-one",
+                    "state_version": 4,
+                    "action": {
+                        "action_id": "action-work-one", "kind": "execute_node",
+                        "token_id": "work-token", "node_id": "work",
+                        "payload": {"secret": "must-not-project"},
+                    },
+                    "status": "executing", "attempts": 2,
+                    "available_at": "2026-09-17T12:00:01+00:00",
+                    "lease_owner": "private-worker-host",
+                    "lease_expires_at": "2026-09-17T12:01:00+00:00",
+                    "created_at": "2026-09-17T12:00:01+00:00",
+                    "completed_at": None, "last_error": None,
+                }],
+            }
+
     directory = SQLCompanyDirectory(
         f"sqlite:///{tmp_path / 'mission-company.sqlite3'}", create_schema=True,
     )
@@ -843,6 +874,22 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
     assert management.json()["execution_run_id"] == child_run_id
     assert management.json()["work_items"][0]["owner_id"] == "agent:engineer"
     assert management.json()["progress"]["live"] == 1
+    assert management.json()["execution_timeline"] == [{
+        "action_id": "action-work-one", "state_version": 4,
+        "kind": "execute_node", "node_id": "work", "token_id": "work-token",
+        "status": "executing", "attempts": 2,
+        "available_at": "2026-09-17T12:00:01+00:00",
+        "created_at": "2026-09-17T12:00:01+00:00",
+        "completed_at": None, "error": None,
+    }]
+    assert "must-not-project" not in str(management.json())
+    assert "private-worker-host" not in str(management.json())
+    viewer_management = api.get(
+        f"/v2/runs/{created['run_id']}/management",
+        headers={"Authorization": "Bearer viewer-a"},
+    )
+    assert viewer_management.status_code == 200
+    assert "execution_timeline" not in viewer_management.json()
     assert management.json()["subprograms"][0]["run_id"] == subprogram_run_id
     proposal = management.json()["hiring_requests"][0]
     assert proposal["status"] == "pending"

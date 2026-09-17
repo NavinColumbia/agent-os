@@ -77,6 +77,7 @@ services:
       - ../postgres/initdb/101-mission-revision-history-v2.sql:/migrations/101-mission-revision-history-v2.sql:ro
       - ../postgres/initdb/102-personal-attention-state-v2.sql:/migrations/102-personal-attention-state-v2.sql:ro
       - ../postgres/initdb/103-structured-decision-responses-v2.sql:/migrations/103-structured-decision-responses-v2.sql:ro
+      - ../postgres/initdb/104-decision-response-redrive-v2.sql:/migrations/104-decision-response-redrive-v2.sql:ro
     command:
       - sh
       - -ec
@@ -104,6 +105,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/101-mission-revision-history-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/102-personal-attention-state-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/103-structured-decision-responses-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/104-decision-response-redrive-v2.sql
         psql -v ON_ERROR_STOP=1 \
           -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
         SELECT format(

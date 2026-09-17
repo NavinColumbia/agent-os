@@ -134,12 +134,14 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "101-mission-revision-history-v2.sql" in compose
     assert "102-personal-attention-state-v2.sql" in compose
     assert "103-structured-decision-responses-v2.sql" in compose
+    assert "104-decision-response-redrive-v2.sql" in compose
     migration_image = (ROOT / "deploy" / "Dockerfile.migrations-v2").read_text()
     assert "99zzzzz-notification-delivery-v2.sql" in migration_image
     assert "100-mission-assurance-kernel-v2.sql" in migration_image
     assert "101-mission-revision-history-v2.sql" in migration_image
     assert "102-personal-attention-state-v2.sql" in migration_image
     assert "103-structured-decision-responses-v2.sql" in migration_image
+    assert "104-decision-response-redrive-v2.sql" in migration_image
     assert '127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080' in compose
     assert "GEMINI_API_KEY" in compose
     assert "AOS_V2_DATABASE_RUNTIME_PASSWORD" in compose

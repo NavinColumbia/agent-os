@@ -183,3 +183,10 @@ def test_membership_migration_forces_tenant_and_subject_scoped_rls():
     assert "GRANT SELECT, INSERT, UPDATE" in migration
     assert "GRANT DELETE" not in migration
     assert "token_digest" in migration
+    for role in (
+        "owner", "admin", "manager", "operator", "builder", "reviewer",
+        "billing", "client", "viewer",
+    ):
+        assert f'"{role}"' in migration
+    assert "DROP CONSTRAINT IF EXISTS aos_v2_memberships_roles_check" in migration
+    assert "DROP CONSTRAINT IF EXISTS aos_v2_invitations_roles_check" in migration

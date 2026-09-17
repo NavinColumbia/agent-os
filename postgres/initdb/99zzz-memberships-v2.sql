@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS public.aos_v2_memberships (
     roles jsonb NOT NULL CHECK (
         jsonb_typeof(roles) = 'array'
         AND jsonb_array_length(roles) BETWEEN 1 AND 3
-        AND roles <@ '["owner", "operator", "viewer"]'::jsonb
+        AND roles <@ '["owner", "admin", "manager", "operator", "builder", "reviewer", "billing", "client", "viewer"]'::jsonb
     ),
     active boolean NOT NULL DEFAULT true,
     invitation_id text NOT NULL CHECK (invitation_id ~ '^invitation-[0-9a-f]{64}$'),
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS public.aos_v2_invitations (
     roles jsonb NOT NULL CHECK (
         jsonb_typeof(roles) = 'array'
         AND jsonb_array_length(roles) BETWEEN 1 AND 3
-        AND roles <@ '["owner", "operator", "viewer"]'::jsonb
+        AND roles <@ '["owner", "admin", "manager", "operator", "builder", "reviewer", "billing", "client", "viewer"]'::jsonb
     ),
     idempotency_key text NOT NULL CHECK (length(idempotency_key) BETWEEN 8 AND 200),
     expires_in_seconds integer NOT NULL CHECK (expires_in_seconds BETWEEN 300 AND 2592000),
@@ -61,6 +61,27 @@ CREATE TABLE IF NOT EXISTS public.aos_v2_invitations (
 CREATE INDEX IF NOT EXISTS aos_v2_invitations_expiry_idx
     ON public.aos_v2_invitations (expires_at)
     WHERE claimed_at IS NULL;
+
+-- CREATE TABLE IF NOT EXISTS does not revise constraints on an existing
+-- deployment. Replace both historical three-role checks before application
+-- processes begin accepting the expanded, least-privilege role vocabulary.
+ALTER TABLE public.aos_v2_memberships
+    DROP CONSTRAINT IF EXISTS aos_v2_memberships_roles_check;
+ALTER TABLE public.aos_v2_memberships
+    ADD CONSTRAINT aos_v2_memberships_roles_check CHECK (
+        jsonb_typeof(roles) = 'array'
+        AND jsonb_array_length(roles) BETWEEN 1 AND 3
+        AND roles <@ '["owner", "admin", "manager", "operator", "builder", "reviewer", "billing", "client", "viewer"]'::jsonb
+    );
+
+ALTER TABLE public.aos_v2_invitations
+    DROP CONSTRAINT IF EXISTS aos_v2_invitations_roles_check;
+ALTER TABLE public.aos_v2_invitations
+    ADD CONSTRAINT aos_v2_invitations_roles_check CHECK (
+        jsonb_typeof(roles) = 'array'
+        AND jsonb_array_length(roles) BETWEEN 1 AND 3
+        AND roles <@ '["owner", "admin", "manager", "operator", "builder", "reviewer", "billing", "client", "viewer"]'::jsonb
+    );
 
 ALTER TABLE public.aos_v2_memberships ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.aos_v2_memberships FORCE ROW LEVEL SECURITY;

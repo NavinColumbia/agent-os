@@ -131,7 +131,9 @@ class GraphOrganizationEffectHandler:
             ),
         )
         try:
-            plan = plan_agent_turn(context, output, organization=organization)
+            plan = plan_agent_turn(
+                context, output, organization=organization, history=history,
+            )
             receipts = commit_agent_turn(self._ledger, plan)
         except (LookupError, TypeError, ValueError) as exc:
             # This outbox action remains retryable. If a concurrent writer won,

@@ -41,11 +41,14 @@ class ProposedMessage(BaseModel):
     body: str
     requires_response: bool = False
     correlation_id: str | None = None
+    related_work_id: str | None = None
 
     @model_validator(mode="after")
     def response_is_correlated(self) -> "ProposedMessage":
         if self.requires_response and not self.correlation_id:
             raise ValueError("messages requesting a response require a correlation_id")
+        if self.kind == "response" and not self.correlation_id:
+            raise ValueError("response messages require the pending request correlation_id")
         return self
 
 

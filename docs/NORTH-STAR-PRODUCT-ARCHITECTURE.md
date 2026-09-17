@@ -1,6 +1,6 @@
 # North-Star product and platform architecture
 
-**Decision date:** 2026-09-08
+**Decision date:** 2026-09-08; assurance/reconciliation revision 2026-09-17
 **Scope:** the commercial Agent OS product, from a CEO's first prompt through operating one or more companies
 **Status:** normative direction; implementation is incremental and the legacy runtime remains only while runs drain
 
@@ -28,16 +28,24 @@ first-time hosted experience.
 
 Keep the differentiated Agent OS domain semantics and replace the overlapping custom durability machinery:
 
+- A tenant/cell/mission-scoped intent model is business truth: outcomes, constraints, assumptions, hazards,
+  claims, evidence, authority, budgets, commitments, and observations. The six lifecycle stages are its
+  customer-facing milestone projection, not a universal state machine.
+- Bounded specialist reconcilers propose version-fenced changes. They cannot directly mutate truth or perform
+  effects. Material work passes a deterministic assurance kernel with safe fallback.
 - Python modular monolith for the product, agents, API, workflow definitions, policy integration, and QA.
 - TypeScript/React for the web console.
-- A framework-neutral `WorkflowEngine`: DBOS Transact is permitted for the near-zero-fixed-cost bootstrap
-  profile; Temporal is the managed growth engine after its explicit revenue/SLO gate. PostgreSQL owns business
-  records and projections. A run never has two authoritative workflow engines.
+- A framework-neutral `WorkflowEngine`: DBOS Transact is the near-zero-fixed-cost bootstrap profile. Temporal
+  and Restate are growth candidates and must pass the same failure-injection/contract corpus before selection.
+  PostgreSQL owns business records and projections. A run never has two workflow engines.
 - PydanticAI behind an Agent OS-owned `AgentRuntime`; all model access behind `ModelGateway`.
 - MCP for agent-to-tool integration, AG-UI/SSE for agent-to-user events, and A2A only at boundaries with
   independent external agent systems.
 - Cloud Run first; GKE Autopilot and KEDA when measured workload or sandbox requirements justify them.
-- OpenTofu, OIDC/SCIM, OPA, PostgreSQL RLS, OCI, object storage, and OpenTelemetry as portable foundations.
+- AuthZEN as the application authorization API, with Cedar preferred for analyzable effect policy, OPA for
+  infrastructure/admission policy, and PostgreSQL RLS as defense in depth. Authority is short-lived and bound
+  to a proposed effect, resource, tenant, budget, time window, principal, and delegation chain.
+- OpenTofu, OIDC/SCIM, PostgreSQL, OCI, object storage, signed provenance, and OpenTelemetry as portable foundations.
 
 Do **not** rewrite the product in Go or Rust. A second backend language may be introduced later only for a
 measured, narrow data-plane boundary. Go is the preferred future language for a Kubernetes controller or
@@ -46,7 +54,7 @@ critical component. Neither may own product lifecycle or policy truth.
 
 ## Product boundary
 
-The complete product contains four related systems. Shipping only the first one is not the North Star.
+The complete product contains five related systems. Shipping only the first one is not the North Star.
 
 1. **CEO control plane** — portfolio, company creation, directive chat, prerequisite packet, approvals,
    budgets, status, evidence, incidents, economics, and decisions.
@@ -56,6 +64,8 @@ The complete product contains four related systems. Shipping only the first one 
    sales support, analytics, support, operations, and continuous improvement.
 4. **Platform plane** — accounts, organizations, tenancy, billing, metering, model/provider routing,
    integrations, sandboxing, deployment, observability, administration, security, and compliance evidence.
+5. **Assurance and knowledge plane** — bitemporal claims, provenance, hazard/control models, effect-specific
+   authority, safe modes, balanced commitments, independent verification, retention, and continuous assurance cases.
 
 The first sellable vertical is smaller than the whole vision but must cut through all four systems:
 

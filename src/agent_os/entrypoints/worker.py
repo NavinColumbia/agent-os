@@ -16,11 +16,14 @@ from urllib.parse import urlparse
 from agent_os.application.command_worker import DurableCommandWorker, RetryPolicy
 from agent_os.application.graph_action_worker import DurableGraphActionWorker
 from agent_os.application.management_monitor import DurableManagementMonitor
+from agent_os.application.assurance import AssuranceKernel
+from agent_os.application.runtime_effects import WorkflowEffectGuard
 from agent_os.application.work_multiplexer import TenantWorkMultiplexer
 from agent_os.application.worker_loop import CommandWorkerLoop
 from agent_os.domain.lifecycle import CommandKind
 from agent_os.entrypoints.server import ServerSettings
 from agent_os.infrastructure.agent_command_executor import DurableAgentCommandExecutor
+from agent_os.infrastructure.authzen_policy import baseline_effect_policy
 from agent_os.infrastructure.artifact_tool_nodes import ArtifactToolNodeHandlers
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.cloud_run_apps import CloudRunServiceDeployer
@@ -57,6 +60,7 @@ from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
+from agent_os.infrastructure.sql_mission_control import SQLMissionControl
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_ready_tenants import SQLReadyTenantSource
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
@@ -396,6 +400,12 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(notification_store.close)
+        mission_control = SQLMissionControl(
+            settings.server.application_database_url,
+            assurance_kernel=AssuranceKernel(baseline_effect_policy()),
+            create_schema=settings.server.create_schema,
+        )
+        resources.callback(mission_control.close)
         artifact_store = build_artifact_store(
             settings.server.application_database_url,
             backend=settings.server.artifact_backend,
@@ -521,7 +531,10 @@ def run_worker(
                 available_tools=available_mission_tools,
             ).named_handlers()
         )
-        tool_router = GraphToolNodeRouter(named_tool_handlers)
+        tool_router = GraphToolNodeRouter(
+            named_tool_handlers,
+            effect_guard=WorkflowEffectGuard(mission_control),
+        )
         runtime = PydanticAgentRuntime(
             runtime_model,
             request_limit=settings.request_limit,
@@ -639,6 +652,7 @@ def run_worker(
             escalation_checks=settings.management_escalation_checks,
             retry_delay_seconds=max(1, int(settings.error_backoff_seconds)),
             manager_runtime=runtime,
+            mission_control=mission_control,
             manager_turn_budget_cents=settings.manager_turn_budget_cents,
         )
         notification_worker = DurableNotificationDeliveryWorker(

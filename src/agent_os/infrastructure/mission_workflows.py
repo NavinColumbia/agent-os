@@ -340,8 +340,10 @@ def mission_bootstrap_definition(
             (
                 "Every success measure must be covered by verification; verification nodes must "
                 "be agent, decision, or tool nodes and every failure route must reference a real "
-                "repair node. Human-governed acquisition and external capability expansion must "
-                "include a human node."
+                "repair node. Set independence_required=true with explicit maker_role_ids for "
+                "security, financial, safety-critical, irreversible, and release claims; the "
+                "reviewer must then be a different role. Human-governed acquisition and external "
+                "capability expansion must include a human node."
             ),
             "Every non-terminal workflow node must be covered by at least one governance section.",
         ],

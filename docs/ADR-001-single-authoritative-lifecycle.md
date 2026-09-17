@@ -1,6 +1,7 @@
-# ADR-001: Replace overlapping controllers with one authoritative lifecycle
+# ADR-001: Replace overlapping controllers with one authoritative milestone lifecycle
 
-**Status:** accepted; implementation started 2026-09-07
+**Status:** accepted for milestone projection and workflow-engine migration; superseded for live mission
+governance by [ADR-002](ADR-002-intent-reconciliation-assurance.md)
 **Decision owner:** Agent OS platform
 **Scope:** CEO prompt through deployed product
 
@@ -8,7 +9,7 @@
 
 Replace the current controller/orchestra/queue state machinery rather than extending it.
 
-Agent OS will have one framework-neutral product lifecycle aggregate:
+Agent OS will have one framework-neutral customer-visible milestone lifecycle aggregate:
 
 ```text
 INTAKE -> RESEARCH -> SPECIFY -> BUILD -> VERIFY -> RELEASE
@@ -20,7 +21,11 @@ Its execution condition is a separate dimension:
 ACTIVE | WAITING | FAILED | SUCCEEDED | CANCELLED
 ```
 
-Temporal will persist and replay lifecycle execution. It will not define the business transitions. Pure domain code in [`lifecycle.py`](../src/agent_os/domain/lifecycle.py) owns valid transitions and emits typed application commands. PydanticAI performs bounded model/tool work inside activities. PostgreSQL stores product projections, audit records and idempotent external side-effect receipts; it is not another workflow engine.
+The selected `WorkflowEngine` adapter persists and replays lifecycle execution. It does not define business
+transitions. Pure domain code in [`lifecycle.py`](../src/agent_os/domain/lifecycle.py) owns valid milestone
+transitions and emits typed application commands. The mission/assurance model from ADR-002 governs concurrent
+internal work, authority, hazards, evidence, and effects. PostgreSQL stores business records and projections;
+workflow history is not the only copy of business truth.
 
 ## Why a replacement is warranted
 

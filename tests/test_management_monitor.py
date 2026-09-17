@@ -6,6 +6,7 @@ import time
 from agent_os.application.management_monitor import DurableManagementMonitor
 from agent_os.application.ports import ManagementWatchLease
 from agent_os.domain.notifications import NotificationCategory
+from agent_os.domain.mission_model import MissionSpec
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.domain.workflow_runtime import NodeToken, TokenStatus, WorkflowRunState, WorkflowRunStatus
 
@@ -114,6 +115,34 @@ class Notifications:
         self.items.append(notification)
         return True
 
+    def list_notifications(self, tenant_id, *, run_id=None, recipient_id=None, limit=100):
+        values = [item.to_dict() for item in reversed(self.items) if item.tenant_id == tenant_id]
+        if run_id is not None:
+            values = [item for item in values if item["run_id"] == run_id]
+        if recipient_id is not None:
+            values = [item for item in values if recipient_id in item["recipient_ids"]]
+        return tuple(values[:limit])
+
+
+class Missions:
+    def __init__(self, *, mode="balanced", daily_interrupt_limit=8):
+        self.spec = MissionSpec(
+            mission_id="lifecycle-run",
+            tenant_id="tenant-a",
+            objective="Complete the mission",
+            principal_id="human:ceo",
+            accountable_owner_id="human:ceo",
+            budget_limit_cents=1_000,
+            success_measures=("verified outcome",),
+            human_involvement_mode=mode,
+            daily_interrupt_limit=daily_interrupt_limit,
+        )
+
+    def get_mission(self, tenant_id, mission_id):
+        if (tenant_id, mission_id) == ("tenant-a", "lifecycle-run"):
+            return self.spec
+        return None
+
 
 def test_monitor_alerts_manager_escalates_persistent_delay_and_reports_recovery():
     watches = Watches()
@@ -147,6 +176,27 @@ def test_monitor_alerts_manager_escalates_persistent_delay_and_reports_recovery(
     assert notifications.items[2].recipient_ids == ("agent:mission-manager", "human:ceo")
     assert watches.last_fingerprint is None
     assert watches.consecutive == 0
+
+
+def test_monitor_batches_human_alert_after_mission_attention_budget_is_exhausted():
+    watches = Watches()
+    graph = Graph()
+    notifications = Notifications()
+    monitor = DurableManagementMonitor(
+        watches=watches, graph=graph, inspector=graph, notifications=notifications,
+        mission_control=Missions(daily_interrupt_limit=0), worker_id="manager",
+        check_interval_seconds=30, slow_after_seconds=300,
+        escalation_checks=2, clock=lambda: NOW,
+    )
+
+    monitor.run_one("tenant-a")
+    watches.make_due()
+    monitor.run_one("tenant-a")
+
+    executive = notifications.items[-1]
+    assert "human:ceo" in executive.recipient_ids
+    assert executive.payload["attention_disposition"] == "batch"
+    assert "decision digest" in executive.payload["attention_reason"]
 
 
 def test_monitor_retires_terminal_run_without_manufacturing_recovery_notice():

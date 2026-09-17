@@ -287,9 +287,17 @@ class SQLNotificationStore(NotificationStore):
                 )).order_by(notification_routes.c.route_id).limit(33)).mappings().all()
                 if len(route_rows) > 32:
                     raise RuntimeError("tenant notification route limit was exceeded")
+                # Batched/deferred attention remains durable and visible in the
+                # in-app decision digest, but must not escape through an
+                # interrupting external route. Critical decisions explicitly
+                # marked ``interrupt`` continue through the outbox normally.
+                externally_interrupting = notification.payload.get(
+                    "attention_disposition"
+                ) not in {"batch", "defer"}
                 eligible_routes = [
                     row for row in route_rows
-                    if notification.category.value in row["categories"]
+                    if externally_interrupting
+                    and notification.category.value in row["categories"]
                 ]
                 if eligible_routes:
                     connection.execute(insert(notification_deliveries), [{

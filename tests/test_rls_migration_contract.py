@@ -219,6 +219,17 @@ def test_browser_sessions_are_tenant_scoped_but_pre_auth_resolution_stays_explic
     assert "with _conn() as c" in auth_source
 
 
+def test_mission_revision_history_is_tenant_fenced_and_authority_bound():
+    migration = _migration(101)
+    assert "CREATE TABLE IF NOT EXISTS aos_v2_mission_revisions" in migration
+    assert "ON CONFLICT (tenant_id, mission_id, revision) DO NOTHING" in migration
+    assert "aos_v2_mission_authorities_revision_valid" in migration
+    assert "ALTER TABLE aos_v2_mission_revisions FORCE ROW LEVEL SECURITY" in migration
+    assert "CREATE POLICY aos_v2_mission_revisions_tenant_guc" in migration
+    assert "GRANT SELECT, INSERT ON TABLE aos_v2_mission_revisions TO agentos_app" in migration
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE" not in migration
+
+
 def test_controller_execution_scope_migration_preserves_tenant_rls_tables():
     migration = _migration(73)
     for table in ("controller_state", "controller_jobs"):
@@ -254,3 +265,26 @@ def test_post_prep_tenant_tables_define_tenant_leading_indexes():
 def test_special_policy_and_parent_scope_metadata_remain_distinct():
     assert set(readiness.SPECIAL_POLICY_TABLES) == {"audit_log", "role_lessons"}
     assert readiness.PARENT_SCOPED_TABLES["research_options"].startswith("research_runs.id")
+
+
+def test_mission_assurance_tables_are_tenant_fenced_and_privacy_aware():
+    migration = _migration(100)
+    tables = (
+        "aos_v2_missions", "aos_v2_mission_evidence",
+        "aos_v2_mission_evidence_tombstones", "aos_v2_mission_claims",
+        "aos_v2_mission_hazards", "aos_v2_mission_authorities",
+        "aos_v2_mission_effects", "aos_v2_assurance_decisions",
+        "aos_v2_mission_budget_entries",
+    )
+    for table in tables:
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in migration
+        assert f"'{table}'" in migration
+    assert "FORCE ROW LEVEL SECURITY" in migration
+    assert "current_setting(''app.tenant_id'', true)" in migration
+    assert "NOT contains_personal_data OR retention_until IS NOT NULL" in migration
+    assert "UNIQUE (tenant_id, mission_id, idempotency_key)" in migration
+    assert "account IN ('authorized', 'available', 'reserved', 'spent')" in migration
+    assert "GRANT SELECT, INSERT ON TABLE aos_v2_mission_evidence TO agentos_app" in migration
+    assert "GRANT SELECT, INSERT ON TABLE aos_v2_assurance_decisions TO agentos_app" in migration
+    assert "GRANT SELECT, INSERT ON TABLE aos_v2_mission_budget_entries TO agentos_app" in migration
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE" not in migration

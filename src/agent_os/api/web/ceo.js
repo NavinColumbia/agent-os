@@ -766,6 +766,64 @@ async function loadMissionDetail(item, silent = false) {
       content.append(command);
     }
 
+    const assurance = managementResult?.assurance || missionResult?.assurance;
+    if (assurance) {
+      const trust = detailSection("Authority, safety, and evidence");
+      const budget = assurance.budget || {};
+      const mission = assurance.mission || {};
+      const authorities = assurance.authorities || [];
+      const activeAuthorities = authorities.filter((value) => !value.revoked);
+      const trustGrid = el("div", "detail-grid");
+      for (const [name, value] of [
+        ["Mission revision", Number(mission.revision || 1)],
+        ["Human mode", label(mission.human_involvement_mode || "balanced")],
+        ["Daily interrupts", Number(mission.daily_interrupt_limit ?? 8)],
+        ["Available", `$${(Number(budget.available_cents || 0) / 100).toFixed(2)}`],
+        ["Reserved", `$${(Number(budget.reserved_cents || 0) / 100).toFixed(2)}`],
+        ["Spent", `$${(Number(budget.spent_cents || 0) / 100).toFixed(2)}`],
+        ["Evidence", Number(assurance.evidence?.length || 0)],
+        ["Active grants", activeAuthorities.length],
+      ]) {
+        const cell = el("div");
+        cell.append(el("small", "", name), el("strong", "", value));
+        trustGrid.append(cell);
+      }
+      const revisions = assurance.mission_revisions || [];
+      if (revisions.length > 1) {
+        const latest = revisions[revisions.length - 1];
+        const row = el("div", "work-row");
+        row.append(
+          el("span", "phase", `Revision ${latest.revision}`),
+          el("p", "", latest.revision_reason || "Mission contract revised"),
+          el("small", "", `Revised by ${label(latest.revised_by || "system")}`),
+        );
+        trust.append(row);
+      }
+      trust.append(trustGrid);
+      const held = (assurance.effects || []).filter((value) =>
+        ["denied", "human_required", "restricted"].includes(value.status));
+      for (const value of held) {
+        const decision = value.decision || {};
+        const row = el("div", "work-row");
+        row.append(
+          el("span", `health ${value.status === "denied" ? "failed" : "degraded"}`, label(value.status)),
+          el("p", "", `${label(value.request?.action || "effect")} · ${decision.reasons?.join(" · ") || "held by assurance"}`),
+          el("small", "", `Safe mode: ${label(decision.safe_mode || "freeze")}`),
+        );
+        trust.append(row);
+      }
+      for (const hazard of assurance.hazards || []) {
+        const row = el("div", "work-row");
+        row.append(
+          el("span", `health ${hazard.severity === "critical" ? "failed" : "degraded"}`, label(hazard.severity)),
+          el("p", "", hazard.description),
+          el("small", "", `Fallback: ${label(hazard.fallback_mode)}`),
+        );
+        trust.append(row);
+      }
+      content.append(trust);
+    }
+
     if (managementResult?.management_signals?.length) {
       const signals = detailSection("Manager signals");
       for (const signal of managementResult.management_signals) {

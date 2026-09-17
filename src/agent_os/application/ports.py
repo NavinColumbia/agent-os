@@ -11,6 +11,14 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from agent_os.domain.lifecycle import Event, LifecycleState
+from agent_os.domain.mission_model import (
+    AuthorityGrant,
+    Claim,
+    EffectRequest,
+    EvidenceRef,
+    Hazard,
+    MissionSpec,
+)
 from agent_os.domain.notifications import Notification
 from agent_os.domain.organization import Organization
 from agent_os.domain.organization_events import OrganizationEvent
@@ -721,6 +729,68 @@ class PolicyEngine(Protocol):
         action: str,
         resource: Mapping[str, Any],
     ) -> bool: ...
+
+
+@runtime_checkable
+class MissionControlStore(Protocol):
+    """Canonical mission intent, authority, assurance, and evidence boundary."""
+
+    def create_mission(self, spec: MissionSpec) -> Mapping[str, Any]: ...
+
+    def revise_mission(
+        self,
+        spec: MissionSpec,
+        *,
+        expected_revision: int,
+        revised_by: str,
+        reason: str,
+    ) -> Mapping[str, Any]: ...
+
+    def get_mission(self, tenant_id: str, mission_id: str) -> MissionSpec | None: ...
+
+    def add_evidence(self, tenant_id: str, evidence: EvidenceRef) -> bool: ...
+
+    def tombstone_evidence(
+        self,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        evidence_id: str,
+        erased_by: str,
+        reason: str,
+    ) -> Mapping[str, Any]: ...
+
+    def add_claim(self, tenant_id: str, claim: Claim) -> bool: ...
+
+    def add_hazard(self, tenant_id: str, hazard: Hazard) -> bool: ...
+
+    def grant_authority(self, grant: AuthorityGrant) -> bool: ...
+
+    def revoke_authority(
+        self,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        grant_id: str,
+        revoked_by: str,
+        reason: str,
+    ) -> Mapping[str, Any]: ...
+
+    def admit_effect(self, effect: EffectRequest) -> Mapping[str, Any]: ...
+
+    def settle_effect(
+        self,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        effect_id: str,
+        actual_cost_cents: int,
+        succeeded: bool,
+    ) -> Mapping[str, Any]: ...
+
+    def control_view(
+        self, tenant_id: str, mission_id: str,
+    ) -> Mapping[str, Any] | None: ...
 
 
 @runtime_checkable

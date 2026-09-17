@@ -207,9 +207,17 @@ class VerificationClaim(BaseModel):
     claim: str = Field(min_length=1, max_length=4_000)
     success_measure_ids: list[str] = Field(min_length=1, max_length=64)
     reviewer_role_id: str = Field(min_length=1, max_length=64)
+    maker_role_ids: list[str] = Field(default_factory=list, max_length=64)
+    independence_required: bool = False
     verification_node_ids: list[str] = Field(min_length=1, max_length=64)
     required_evidence: list[str] = Field(min_length=1, max_length=64)
     failure_routes_to_node_id: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def independent_checker_is_explicit(self) -> "VerificationClaim":
+        if self.independence_required and not self.maker_role_ids:
+            raise ValueError("independent verification requires explicit maker roles")
+        return self
 
 
 class ReplanningPolicy(BaseModel):
@@ -414,11 +422,19 @@ def validate_program_graph(
         _require_known(claim.success_measure_ids, measure_ids, "verification success measure")
         covered_measures.update(claim.success_measure_ids)
         _require_known([claim.reviewer_role_id], role_ids, "verification reviewer")
+        _require_known(claim.maker_role_ids, role_ids, "verification maker")
+        if claim.independence_required and claim.reviewer_role_id in claim.maker_role_ids:
+            raise ValueError("independent verification reviewer cannot be a maker")
         _require_known(claim.verification_node_ids, node_ids, "verification node")
         _require_known([claim.failure_routes_to_node_id], node_ids, "verification repair route")
         for node_id in claim.verification_node_ids:
             if node_by_id[node_id].kind not in {"agent", "decision", "tool"}:
                 raise ValueError("verification claims require agent, decision, or tool nodes")
+            owner = node_by_id[node_id].owner_role
+            if owner is not None and owner != claim.reviewer_role_id:
+                raise ValueError(
+                    f"verification node {node_id} is not owned by its declared reviewer"
+                )
     if covered_measures != measure_ids:
         raise ValueError(
             f"mission program has success measures without verification: {sorted(measure_ids - covered_measures)}"

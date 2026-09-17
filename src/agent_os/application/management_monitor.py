@@ -16,9 +16,21 @@ from agent_os.application.ports import (
     AgentRuntime,
     ManagementWatchLease,
     ManagementWatchStore,
+    MissionControlStore,
     NotificationStore,
 )
 from agent_os.domain.notifications import Notification, NotificationCategory
+from agent_os.domain.operational_governance import (
+    AttentionDisposition,
+    AttentionPolicy,
+    AttentionRequest,
+    HumanInvolvementMode,
+    TrajectoryAction,
+    TrajectoryDecision,
+    TrajectorySample,
+    evaluate_trajectory,
+    route_attention,
+)
 from agent_os.domain.workflow_runtime import WorkflowRunStatus
 
 
@@ -76,6 +88,7 @@ class DurableManagementMonitor:
         escalation_checks: int = 3,
         retry_delay_seconds: int = 10,
         manager_runtime: AgentRuntime | None = None,
+        mission_control: MissionControlStore | None = None,
         manager_turn_budget_cents: int = 25,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -96,6 +109,7 @@ class DurableManagementMonitor:
         self._escalation_checks = escalation_checks
         self._retry_delay_seconds = retry_delay_seconds
         self._manager_runtime = manager_runtime
+        self._mission_control = mission_control
         self._manager_turn_budget_cents = manager_turn_budget_cents
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -123,7 +137,78 @@ class DurableManagementMonitor:
             "known_risks": list(projection.get("risks") or ())[:64],
             "prior_decisions": list(projection.get("decisions") or ())[:64],
             "current_next_actions": list(projection.get("next_actions") or ())[:64],
+            "trajectory": projection.get("trajectory"),
         }
+
+    def _trajectory(
+        self,
+        lease: ManagementWatchLease,
+        *,
+        state_version: int,
+        projection: Mapping[str, Any],
+        signal_fingerprint: str | None,
+        signals: list[Mapping[str, Any]],
+    ) -> tuple[tuple[TrajectorySample, ...], TrajectoryDecision]:
+        prior: list[TrajectorySample] = []
+        if lease.last_result is not None:
+            raw_samples = lease.last_result.get("trajectory_samples", ())
+            if isinstance(raw_samples, list):
+                for raw in raw_samples[-11:]:
+                    if not isinstance(raw, dict):
+                        continue
+                    try:
+                        prior.append(TrajectorySample.from_dict(raw))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+        work_items = list(projection.get("work_items") or ())
+        evidence_material = [{
+            "work_id": item.get("work_id"),
+            "status": item.get("status"),
+            "health": item.get("health"),
+            "attempt": item.get("attempt"),
+            "evidence_ids": item.get("evidence_ids"),
+            "last_error": item.get("last_error"),
+        } for item in work_items if isinstance(item, Mapping)]
+        evidence_digest = hashlib.sha256(json.dumps(
+            evidence_material,
+            allow_nan=False,
+            default=str,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()).hexdigest()
+        progress = projection.get("progress", {})
+        score = (
+            float(progress.get("materialized_completion_ratio") or 0.0)
+            if isinstance(progress, Mapping) else 0.0
+        )
+        context_bytes = len(json.dumps(
+            projection.get("program"), allow_nan=False, default=str,
+            separators=(",", ":"), sort_keys=True,
+        ).encode())
+        repeated_failure = signal_fingerprint if any(
+            item.get("severity") == "critical" for item in signals
+        ) else None
+        current = TrajectorySample(
+            state_version=state_version,
+            observed_at=self._clock().isoformat(),
+            progress_score=max(0.0, min(1.0, score)),
+            evidence_digest=evidence_digest,
+            failure_signature=repeated_failure,
+            iteration=max(
+                (int(item.get("iteration") or 0) for item in work_items
+                 if isinstance(item, Mapping)),
+                default=0,
+            ),
+            context_bytes=context_bytes,
+        )
+        samples = tuple((*prior, current)[-12:])
+        if not signals:
+            return samples, TrajectoryDecision(
+                TrajectoryAction.CONTINUE,
+                ("no actionable execution-health signal is present",),
+                preserve_work=True,
+            )
+        return samples, evaluate_trajectory(samples)
 
     @staticmethod
     def _bounded_review(raw: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -241,6 +326,89 @@ class DurableManagementMonitor:
         body: str,
         payload: Mapping[str, Any],
     ) -> bool:
+        governed_payload = dict(payload)
+        attention_recipients = tuple(
+            value for value in recipients
+            if value.startswith("human:") or value.startswith("operator:")
+        )
+        if attention_recipients and self._mission_control is not None:
+            # Reuse the previously committed decision if publication is being
+            # retried. This keeps notification idempotency independent of later
+            # activity against the daily attention budget.
+            prior = next((
+                value for value in self._notifications.list_notifications(
+                    lease.tenant_id, run_id=notification_run_id, limit=500,
+                )
+                if value.get("source_id") == source_id
+            ), None)
+            prior_payload = prior.get("payload") if isinstance(prior, Mapping) else None
+            if isinstance(prior_payload, Mapping) and prior_payload.get("attention_disposition"):
+                for name in (
+                    "attention_disposition", "attention_reason",
+                    "attention_budget_bypassed", "attention_interrupts_used_today",
+                ):
+                    if name in prior_payload:
+                        governed_payload[name] = prior_payload[name]
+            else:
+                mission = self._mission_control.get_mission(
+                    lease.tenant_id, notification_run_id,
+                )
+                if mission is not None:
+                    today = self._clock().date()
+                    interrupts_used = 0
+                    for value in self._notifications.list_notifications(
+                        lease.tenant_id, run_id=notification_run_id, limit=500,
+                    ):
+                        raw_payload = value.get("payload")
+                        if not isinstance(raw_payload, Mapping):
+                            continue
+                        if raw_payload.get("attention_disposition") != AttentionDisposition.INTERRUPT.value:
+                            continue
+                        try:
+                            observed = datetime.fromisoformat(
+                                str(value.get("created_at") or "").replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            continue
+                        if observed.date() == today:
+                            interrupts_used += 1
+                    signals = payload.get("signals")
+                    signal_values = signals if isinstance(signals, list) else []
+                    severity = (
+                        "critical" if any(
+                            isinstance(value, Mapping) and value.get("severity") == "critical"
+                            for value in signal_values
+                        ) else "warning"
+                    )
+                    level = int(payload.get("level") or 1)
+                    decision = route_attention(
+                        AttentionRequest(
+                            request_id=source_id,
+                            recipient_id=attention_recipients[0],
+                            severity=severity,
+                            blocking=any(
+                                isinstance(value, Mapping)
+                                and value.get("signal") == "attention_required"
+                                for value in signal_values
+                            ),
+                            irreversible=bool(payload.get("irreversible", False)),
+                            deadline_minutes=None,
+                            value_of_information=(
+                                1.0 if severity == "critical" else (0.75 if level >= 2 else 0.5)
+                            ),
+                        ),
+                        AttentionPolicy(
+                            HumanInvolvementMode(mission.human_involvement_mode),
+                            mission.daily_interrupt_limit,
+                        ),
+                        interrupts_used_today=interrupts_used,
+                    )
+                    governed_payload.update({
+                        "attention_disposition": decision.disposition.value,
+                        "attention_reason": decision.reason,
+                        "attention_budget_bypassed": decision.bypassed_budget,
+                        "attention_interrupts_used_today": interrupts_used,
+                    })
         notification = Notification(
             notification_id=_notification_id(source_id, category),
             tenant_id=lease.tenant_id,
@@ -251,7 +419,7 @@ class DurableManagementMonitor:
             body=body,
             source_id=source_id,
             created_at=self._clock().isoformat(),
-            payload=dict(payload),
+            payload=governed_payload,
         )
         return self._notifications.publish_notification(notification)
 
@@ -335,6 +503,14 @@ class DurableManagementMonitor:
                 if item.get("signal") in _ACTIONABLE
             ]
             fingerprint = _fingerprint(signals)
+            trajectory_samples, trajectory = self._trajectory(
+                lease,
+                state_version=state.version,
+                projection=projection,
+                signal_fingerprint=fingerprint,
+                signals=signals,
+            )
+            projection = {**projection, "trajectory": trajectory.to_dict()}
             same = fingerprint is not None and fingerprint == lease.last_signal_fingerprint
             consecutive = lease.consecutive_signal_checks + 1 if same else (1 if fingerprint else 0)
             notified_level = lease.notified_level if same else 0
@@ -378,6 +554,7 @@ class DurableManagementMonitor:
                         "level": level,
                         "consecutive_checks": consecutive,
                         "signals": signals,
+                        "trajectory": trajectory.to_dict(),
                         "manager_review": manager_review,
                     },
                 )
@@ -428,6 +605,7 @@ class DurableManagementMonitor:
                             "level": level,
                             "consecutive_checks": consecutive,
                             "signals": signals,
+                            "trajectory": trajectory.to_dict(),
                             "manager_review": manager_review,
                         },
                     )
@@ -471,6 +649,8 @@ class DurableManagementMonitor:
                 "manager_review": manager_review,
                 "manager_review_error": manager_review_error,
                 "manager_review_attempts": manager_review_attempts,
+                "trajectory": trajectory.to_dict(),
+                "trajectory_samples": [item.to_dict() for item in trajectory_samples],
             }
             return self._complete(
                 lease,

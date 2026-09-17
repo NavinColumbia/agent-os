@@ -130,6 +130,28 @@ def test_notification_publication_enqueues_only_matching_routes_and_delivers_sec
         registry.close()
 
 
+def test_batched_attention_is_kept_in_app_without_external_delivery(tmp_path):
+    now = [datetime(2026, 9, 13, 12, tzinfo=timezone.utc)]
+    registry, notifications = stores(tmp_path, lambda: now[0])
+    try:
+        value = notification(
+            notification_id="notification-batched",
+            source_id="source-batched",
+            category=NotificationCategory.MANAGEMENT_ATTENTION,
+            payload={
+                "attention_disposition": "batch",
+                "attention_reason": "retain for the decision digest",
+            },
+        )
+
+        assert notifications.publish_notification(value) is True
+        assert notifications.list_notifications("tenant-a")[0]["notification_id"] == value.notification_id
+        assert notifications.list_notification_deliveries("tenant-a") == ()
+    finally:
+        notifications.close()
+        registry.close()
+
+
 def test_transient_delivery_retries_and_failed_delivery_can_be_redriven(tmp_path):
     now = [datetime(2026, 9, 13, 12, tzinfo=timezone.utc)]
     registry, notifications = stores(tmp_path, lambda: now[0])

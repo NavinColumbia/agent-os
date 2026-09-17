@@ -257,6 +257,20 @@ def test_program_cannot_claim_an_unavailable_runtime_tool_as_a_capability():
         )
 
 
+def test_independent_verification_cannot_name_the_maker_as_checker():
+    proposal = mission_program()
+    proposal["verification"][0].update({
+        "independence_required": True,
+        "maker_role_ids": ["reviewer"],
+    })
+
+    with pytest.raises(FatalCommandError, match="reviewer cannot be a maker"):
+        materialize_mission_program(
+            proposal, tenant_id="tenant-a", planning_run_id="planning-a",
+            artifact_id="artifact-program", allowed_tools=set(),
+        )
+
+
 def test_program_cannot_invent_budget_authority_or_hide_a_budget_gap():
     proposal = mission_program()
     with pytest.raises(FatalCommandError, match="CEO-authorized budget"):

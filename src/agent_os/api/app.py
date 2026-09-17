@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 from typing import Any, Annotated, Mapping
@@ -20,6 +21,7 @@ from agent_os.api.auth import Authenticator, Principal
 from agent_os.application.billing import BillingService
 from agent_os.application.mission import mission_planning_run_id
 from agent_os.application.mission_control import project_mission_control
+from agent_os.application.runtime_effects import build_runtime_authority
 from agent_os.application.ports import (
     ArtifactStore,
     CompanyDirectory,
@@ -27,6 +29,7 @@ from agent_os.application.ports import (
     GraphWorkflowEngine,
     GraphRunInspector,
     MembershipStore,
+    MissionControlStore,
     NotificationStore,
     OrganizationLedger,
     PreviewDeploymentStore,
@@ -36,6 +39,19 @@ from agent_os.application.ports import (
     WorkflowReceipt,
 )
 from agent_os.domain.lifecycle import Event, EventKind, LifecycleState, TransitionRejected
+from agent_os.domain.mission_model import (
+    AuthorityGrant,
+    Claim,
+    ClaimStatus,
+    EffectRequest,
+    EffectRisk,
+    EvidenceKind,
+    EvidenceRef,
+    Hazard,
+    HazardSeverity,
+    MissionSpec,
+    SafeMode,
+)
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.domain.workflow_runtime import (
     TokenStatus,
@@ -126,6 +142,10 @@ class DirectiveRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=50_000)
     title: str | None = Field(default=None, max_length=200)
     budget_limit_cents: int = Field(default=0, ge=0, le=100_000_000_000)
+    human_involvement_mode: str = Field(
+        default="balanced", pattern=r"^(autonomous|balanced|collaborative)$",
+    )
+    daily_interrupt_limit: int = Field(default=8, ge=0, le=100)
 
 
 class EventRequest(BaseModel):
@@ -318,6 +338,138 @@ class BillingCheckoutRequest(BaseModel):
     plan_id: str = Field(min_length=1, max_length=64)
 
 
+class MissionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mission_id: str = Field(min_length=1, max_length=256)
+    objective: str = Field(min_length=1, max_length=50_000)
+    accountable_owner_id: str | None = Field(default=None, min_length=1, max_length=256)
+    budget_limit_cents: int = Field(default=0, ge=0, le=100_000_000_000)
+    success_measures: list[str] = Field(min_length=1, max_length=64)
+    constraints: list[str] = Field(default_factory=list, max_length=64)
+    prohibited_effects: list[str] = Field(default_factory=list, max_length=64)
+    risk_tier: str = Field(default="moderate", pattern=r"^(low|moderate|high|critical)$")
+    human_involvement_mode: str = Field(
+        default="balanced", pattern=r"^(autonomous|balanced|collaborative)$",
+    )
+    daily_interrupt_limit: int = Field(default=8, ge=0, le=100)
+
+
+class MissionRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=2_000)
+    objective: str = Field(min_length=1, max_length=50_000)
+    accountable_owner_id: str = Field(min_length=1, max_length=256)
+    budget_limit_cents: int = Field(ge=0, le=100_000_000_000)
+    success_measures: list[str] = Field(min_length=1, max_length=64)
+    constraints: list[str] = Field(default_factory=list, max_length=64)
+    prohibited_effects: list[str] = Field(default_factory=list, max_length=64)
+    risk_tier: str = Field(default="moderate", pattern=r"^(low|moderate|high|critical)$")
+    human_involvement_mode: str = Field(
+        default="balanced", pattern=r"^(autonomous|balanced|collaborative)$",
+    )
+    daily_interrupt_limit: int = Field(default=8, ge=0, le=100)
+
+
+class MissionEvidenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str = Field(min_length=1, max_length=256)
+    kind: EvidenceKind
+    artifact_ref: str = Field(min_length=1, max_length=2_000)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_at: str
+    recorded_at: str
+    media_type: str = Field(default="application/octet-stream", min_length=1, max_length=256)
+    contains_personal_data: bool = False
+    retention_until: str | None = None
+    source_uri: str | None = Field(default=None, max_length=2_000)
+
+
+class MissionClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: str = Field(min_length=1, max_length=256)
+    statement: str = Field(min_length=1, max_length=8_000)
+    status: ClaimStatus
+    valid_from: str
+    recorded_at: str
+    evidence_ids: list[str] = Field(default_factory=list, max_length=128)
+    depends_on_claim_ids: list[str] = Field(default_factory=list, max_length=128)
+    valid_to: str | None = None
+    supersedes_claim_id: str | None = Field(default=None, max_length=256)
+
+
+class MissionHazardRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    hazard_id: str = Field(min_length=1, max_length=256)
+    description: str = Field(min_length=1, max_length=4_000)
+    unacceptable_loss: str = Field(min_length=1, max_length=4_000)
+    severity: HazardSeverity
+    safety_constraints: list[str] = Field(min_length=1, max_length=64)
+    unsafe_control_actions: list[str] = Field(min_length=1, max_length=64)
+    fallback_mode: SafeMode
+    requires_human_release: bool = False
+
+
+class AuthorityGrantRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    grant_id: str = Field(min_length=1, max_length=256)
+    delegate_id: str = Field(min_length=1, max_length=256)
+    allowed_effects: list[str] = Field(min_length=1, max_length=64)
+    allowed_resources: list[str] = Field(min_length=1, max_length=64)
+    budget_limit_cents: int = Field(default=0, ge=0, le=100_000_000_000)
+    valid_from: str
+    expires_at: str
+    delegation_chain: list[str] = Field(min_length=1, max_length=32)
+    parent_grant_id: str | None = Field(default=None, max_length=256)
+    human_approved: bool = False
+    approval_binding_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    approval_evidence_ids: list[str] = Field(default_factory=list, max_length=64)
+    policy_version: str = Field(default="agent-os-baseline-policy-v1", min_length=1, max_length=256)
+
+
+class MissionEffectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    effect_id: str = Field(min_length=1, max_length=256)
+    actor_id: str = Field(min_length=1, max_length=256)
+    authority_grant_id: str = Field(min_length=1, max_length=256)
+    action: str = Field(min_length=1, max_length=256)
+    resource: str = Field(min_length=1, max_length=2_000)
+    risk: EffectRisk
+    estimated_cost_cents: int = Field(default=0, ge=0, le=100_000_000_000)
+    reversible: bool
+    idempotency_key: str = Field(min_length=8, max_length=256)
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    hazard_ids: list[str] = Field(default_factory=list, max_length=64)
+    purpose: str = Field(default="", max_length=4_000)
+    requires_human_approval: bool = False
+
+
+class AuthorityRevocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2_000)
+
+
+class EvidenceErasureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2_000)
+
+
+class MissionEffectSettlementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actual_cost_cents: int = Field(ge=0, le=100_000_000_000)
+    succeeded: bool
+
+
 _HUMAN_EVENTS = {
     EventKind.WAIT_RESOLVED,
     EventKind.RECOVERY_REQUESTED,
@@ -444,6 +596,7 @@ def create_app(
     membership_store: MembershipStore | None = None,
     tenant_model_store: TenantModelStore | None = None,
     usage_meter: UsageMeter | None = None,
+    mission_control: MissionControlStore | None = None,
     billing_service: BillingService | None = None,
     client_identity_config: Mapping[str, str] | None = None,
     shutdown: Callable[[], None] | None = None,
@@ -1020,6 +1173,290 @@ def create_app(
                 },
             )
 
+    if mission_control is not None:
+        @app.post("/v2/missions", status_code=201)
+        def create_mission_contract(
+            body: MissionCreateRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not principal.roles & {"owner", "operator", "system"}:
+                raise HTTPException(status_code=403, detail="mission creation requires owner authority")
+            try:
+                return mission_control.create_mission(MissionSpec(
+                    mission_id=body.mission_id,
+                    tenant_id=principal.organization_id,
+                    objective=body.objective,
+                    principal_id=principal.subject_id,
+                    accountable_owner_id=body.accountable_owner_id or principal.subject_id,
+                    budget_limit_cents=body.budget_limit_cents,
+                    success_measures=tuple(body.success_measures),
+                    constraints=tuple(body.constraints),
+                    prohibited_effects=tuple(body.prohibited_effects),
+                    risk_tier=body.risk_tier,
+                    human_involvement_mode=body.human_involvement_mode,
+                    daily_interrupt_limit=body.daily_interrupt_limit,
+                ))
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.get("/v2/missions/{mission_id}/control")
+        def get_mission_contract(
+            mission_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            view = mission_control.control_view(principal.organization_id, mission_id)
+            if view is None:
+                raise HTTPException(status_code=404, detail="mission not found")
+            return view
+
+        @app.put("/v2/missions/{mission_id}")
+        def revise_mission_contract(
+            mission_id: str,
+            body: MissionRevisionRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not principal.roles & {"owner", "operator", "system"}:
+                raise HTTPException(status_code=403, detail="mission revision requires owner authority")
+            current = mission_control.get_mission(principal.organization_id, mission_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="mission not found")
+            retrying_committed_revision = current.revision == body.expected_revision + 1
+            revised = MissionSpec(
+                mission_id=mission_id,
+                tenant_id=principal.organization_id,
+                objective=body.objective,
+                principal_id=current.principal_id,
+                accountable_owner_id=body.accountable_owner_id,
+                budget_limit_cents=body.budget_limit_cents,
+                success_measures=tuple(body.success_measures),
+                constraints=tuple(body.constraints),
+                prohibited_effects=tuple(body.prohibited_effects),
+                risk_tier=body.risk_tier,
+                human_involvement_mode=body.human_involvement_mode,
+                daily_interrupt_limit=body.daily_interrupt_limit,
+                revision=body.expected_revision + 1,
+                created_at=current.created_at,
+                revised_at=(
+                    current.revised_at
+                    if retrying_committed_revision
+                    else datetime.now(timezone.utc).isoformat()
+                ),
+            )
+            try:
+                result = mission_control.revise_mission(
+                    revised,
+                    expected_revision=body.expected_revision,
+                    revised_by=principal.subject_id,
+                    reason=body.reason,
+                )
+                # Grant creation is deterministic and idempotent. Repeating it
+                # closes the crash window where the revision committed but the
+                # HTTP process stopped before materializing runtime authority.
+                mission_control.grant_authority(
+                    build_runtime_authority(MissionSpec.from_dict(result))
+                )
+                return result
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.post("/v2/missions/{mission_id}/evidence", status_code=201)
+        def add_mission_evidence(
+            mission_id: str,
+            body: MissionEvidenceRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            try:
+                created = mission_control.add_evidence(
+                    principal.organization_id,
+                    EvidenceRef(
+                        evidence_id=body.evidence_id, mission_id=mission_id, kind=body.kind,
+                        artifact_ref=body.artifact_ref, sha256=body.sha256,
+                        produced_by=principal.subject_id, observed_at=body.observed_at,
+                        recorded_at=body.recorded_at, media_type=body.media_type,
+                        contains_personal_data=body.contains_personal_data,
+                        retention_until=body.retention_until, source_uri=body.source_uri,
+                    ),
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"created": created, "evidence_id": body.evidence_id}
+
+        @app.post("/v2/missions/{mission_id}/claims", status_code=201)
+        def add_mission_claim(
+            mission_id: str,
+            body: MissionClaimRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            try:
+                created = mission_control.add_claim(
+                    principal.organization_id,
+                    Claim(
+                        claim_id=body.claim_id, mission_id=mission_id,
+                        statement=body.statement, status=body.status,
+                        asserted_by=principal.subject_id, valid_from=body.valid_from,
+                        recorded_at=body.recorded_at,
+                        evidence_ids=tuple(body.evidence_ids),
+                        depends_on_claim_ids=tuple(body.depends_on_claim_ids),
+                        valid_to=body.valid_to,
+                        supersedes_claim_id=body.supersedes_claim_id,
+                    ),
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"created": created, "claim_id": body.claim_id}
+
+        @app.delete("/v2/missions/{mission_id}/evidence/{evidence_id}")
+        def erase_mission_evidence_reference(
+            mission_id: str,
+            evidence_id: str,
+            body: EvidenceErasureRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not principal.roles & {"owner", "operator", "system"}:
+                raise HTTPException(status_code=403, detail="evidence erasure requires owner authority")
+            try:
+                return mission_control.tombstone_evidence(
+                    tenant_id=principal.organization_id, mission_id=mission_id,
+                    evidence_id=evidence_id, erased_by=principal.subject_id,
+                    reason=body.reason,
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.post("/v2/missions/{mission_id}/hazards", status_code=201)
+        def add_mission_hazard(
+            mission_id: str,
+            body: MissionHazardRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not principal.roles & {"owner", "operator", "system", "agent"}:
+                raise HTTPException(status_code=403, detail="hazard registration requires mission authority")
+            try:
+                created = mission_control.add_hazard(
+                    principal.organization_id,
+                    Hazard(
+                        hazard_id=body.hazard_id, mission_id=mission_id,
+                        description=body.description, unacceptable_loss=body.unacceptable_loss,
+                        severity=body.severity,
+                        safety_constraints=tuple(body.safety_constraints),
+                        unsafe_control_actions=tuple(body.unsafe_control_actions),
+                        fallback_mode=body.fallback_mode,
+                        requires_human_release=body.requires_human_release,
+                    ),
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"created": created, "hazard_id": body.hazard_id}
+
+        @app.post("/v2/missions/{mission_id}/authorities", status_code=201)
+        def grant_mission_authority(
+            mission_id: str,
+            body: AuthorityGrantRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not principal.roles & {"owner", "operator", "system"}:
+                raise HTTPException(status_code=403, detail="authority delegation requires owner authority")
+            mission = mission_control.get_mission(principal.organization_id, mission_id)
+            if mission is None:
+                raise HTTPException(status_code=404, detail="mission not found")
+            try:
+                created = mission_control.grant_authority(AuthorityGrant(
+                    grant_id=body.grant_id, tenant_id=principal.organization_id,
+                    mission_id=mission_id, principal_id=mission.principal_id,
+                    delegate_id=body.delegate_id,
+                    allowed_effects=tuple(body.allowed_effects),
+                    allowed_resources=tuple(body.allowed_resources),
+                    budget_limit_cents=body.budget_limit_cents,
+                    valid_from=body.valid_from, expires_at=body.expires_at,
+                    delegation_chain=tuple(body.delegation_chain),
+                    mission_revision=mission.revision,
+                    parent_grant_id=body.parent_grant_id,
+                    human_approved=body.human_approved,
+                    approval_binding_sha256=body.approval_binding_sha256,
+                    approval_evidence_ids=tuple(body.approval_evidence_ids),
+                    policy_version=body.policy_version,
+                ))
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"created": created, "grant_id": body.grant_id}
+
+        @app.post("/v2/missions/{mission_id}/effects", status_code=202)
+        def propose_mission_effect(
+            mission_id: str,
+            body: MissionEffectRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if body.actor_id != principal.subject_id and not principal.roles & {
+                "owner", "operator", "system",
+            }:
+                raise HTTPException(status_code=403, detail="agents may propose only their own effects")
+            try:
+                return mission_control.admit_effect(EffectRequest(
+                    effect_id=body.effect_id, tenant_id=principal.organization_id,
+                    mission_id=mission_id, actor_id=body.actor_id,
+                    authority_grant_id=body.authority_grant_id, action=body.action,
+                    resource=body.resource, risk=body.risk,
+                    estimated_cost_cents=body.estimated_cost_cents,
+                    reversible=body.reversible, idempotency_key=body.idempotency_key,
+                    requested_at=datetime.now(timezone.utc).isoformat(),
+                    input_sha256=body.input_sha256,
+                    hazard_ids=tuple(body.hazard_ids), purpose=body.purpose,
+                    requires_human_approval=body.requires_human_approval,
+                ))
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.delete("/v2/missions/{mission_id}/authorities/{grant_id}")
+        def revoke_mission_authority(
+            mission_id: str,
+            grant_id: str,
+            body: AuthorityRevocationRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not principal.roles & {"owner", "operator", "system"}:
+                raise HTTPException(status_code=403, detail="authority revocation requires owner authority")
+            try:
+                return mission_control.revoke_authority(
+                    tenant_id=principal.organization_id, mission_id=mission_id,
+                    grant_id=grant_id, revoked_by=principal.subject_id, reason=body.reason,
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.post("/v2/missions/{mission_id}/effects/{effect_id}/settle")
+        def settle_mission_effect(
+            mission_id: str,
+            effect_id: str,
+            body: MissionEffectSettlementRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not principal.roles & {"owner", "operator", "system"}:
+                raise HTTPException(status_code=403, detail="effect settlement requires operator authority")
+            try:
+                return mission_control.settle_effect(
+                    tenant_id=principal.organization_id, mission_id=mission_id,
+                    effect_id=effect_id, actual_cost_cents=body.actual_cost_cents,
+                    succeeded=body.succeeded,
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/v2/runs", response_model=MutationResponse, status_code=202)
     def create_run(
         body: DirectiveRequest,
@@ -1027,6 +1464,29 @@ def create_app(
         idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
     ) -> MutationResponse:
         run_id = _run_id(principal.organization_id, idempotency_key)
+        if mission_control is not None:
+            try:
+                mission_spec = MissionSpec(
+                    mission_id=run_id,
+                    tenant_id=principal.organization_id,
+                    objective=body.prompt,
+                    principal_id=principal.subject_id,
+                    accountable_owner_id=principal.subject_id,
+                    budget_limit_cents=body.budget_limit_cents,
+                    success_measures=(
+                        "all admitted mission-program verification claims pass with retained evidence",
+                    ),
+                    constraints=(
+                        "all material external effects pass deterministic assurance admission",
+                    ),
+                    prohibited_effects=("credential.export", "secret.export"),
+                    human_involvement_mode=body.human_involvement_mode,
+                    daily_interrupt_limit=body.daily_interrupt_limit,
+                )
+                mission_control.create_mission(mission_spec)
+                mission_control.grant_authority(build_runtime_authority(mission_spec))
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         initial = LifecycleState(run_id=run_id, organization_id=principal.organization_id)
         event = Event(
             event_id=f"directive-{hashlib.sha256(idempotency_key.encode()).hexdigest()}",
@@ -1037,6 +1497,8 @@ def create_app(
                 "title": body.title,
                 "requested_by": principal.subject_id,
                 "budget_limit_cents": body.budget_limit_cents,
+                "human_involvement_mode": body.human_involvement_mode,
+                "daily_interrupt_limit": body.daily_interrupt_limit,
             },
         )
         try:
@@ -1463,6 +1925,11 @@ def create_app(
             )
             projection["subprograms"] = subprograms
             projection["subprograms_truncated"] = truncated
+            projection["assurance"] = (
+                None if mission_control is None else mission_control.control_view(
+                    principal.organization_id, run_id,
+                )
+            )
             return projection
 
         if company_directory is not None:
@@ -1600,6 +2067,11 @@ def create_app(
                 "deliverables": deliverables,
                 "subprograms": subprograms,
                 "subprograms_truncated": truncated,
+                "assurance": (
+                    None if mission_control is None else mission_control.control_view(
+                        principal.organization_id, run_id,
+                    )
+                ),
             }
 
         @app.post("/v2/workflows", status_code=201)

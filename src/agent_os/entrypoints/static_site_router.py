@@ -30,7 +30,7 @@ _HTML_CSP = (
 @dataclass(frozen=True)
 class StaticSiteRouterSettings:
     bucket_name: str
-    host: str = "0.0.0.0"
+    host: str = "0.0.0.0"  # secscan:allow Cloud Run requires container-wide ingress
     port: int = 8080
     storage_timeout_seconds: float = 30.0
 
@@ -47,7 +47,7 @@ class StaticSiteRouterSettings:
             raise ValueError("static-site storage timeout must be between 0 and 300 seconds")
         return cls(
             bucket_name=bucket_name,
-            host=os.getenv("AOS_V2_HOST", "0.0.0.0").strip() or "0.0.0.0",
+            host=os.getenv("AOS_V2_HOST", "0.0.0.0").strip() or "0.0.0.0",  # secscan:allow Cloud Run ingress
             port=port,
             storage_timeout_seconds=timeout,
         )

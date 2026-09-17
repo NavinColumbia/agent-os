@@ -4,6 +4,16 @@
 **Audience:** Founder/CEO and platform engineers
 **Horizon:** first 10–50 customers, then multi-region growth toward millions of users
 
+> **2026-09-17 superseding research note:** The runtime and authorization selections below were too final.
+> Broad research across durable execution, runtime assurance, delegated identity, policy standards,
+> provenance, human factors, organizational reliability, privacy, formal methods, and current hyperscaler
+> agent platforms changed the governing design. [ADR-002](ADR-002-intent-reconciliation-assurance.md) is now
+> normative: mission intent plus bounded reconcilers sits above a replaceable workflow engine; DBOS, Temporal,
+> and Restate require an empirical bakeoff; AuthZEN is the policy API; Cedar is preferred for application/effect
+> policy while OPA remains infrastructure policy; the lifecycle is a milestone projection; and generic runtime,
+> memory, sandbox, gateway, registry, and tracing features are treated as replaceable infrastructure rather than
+> the product moat.
+
 ## Executive decision
 
 Do not discard Agent OS, and do not continue extending its custom runtime.
@@ -12,12 +22,13 @@ Rebuild the *boundaries*, not the product, around this reference stack:
 
 - **Modular monolith:** one versioned Python codebase with enforced domain boundaries; four deployable units rather than dozens of ad hoc services.
 - **Agents:** PydanticAI behind an internal `AgentRuntime` interface, with every vendor call routed through an Agent OS-owned `ModelGateway` and capability registry.
-- **Durable orchestration:** Temporal behind a `WorkflowEngine` interface for the managed growth platform;
-  activate Temporal Cloud only after the revenue/SLO cost gate. The low-volume bootstrap profile may use the
-  existing open-source DBOS Transact adapter if it passes the same V2 acceptance corpus.
+- **Durable orchestration:** DBOS for the bootstrap profile; Temporal and Restate as growth candidates behind
+  `WorkflowEngine`, selected only after replay, versioning, outage, cancellation, cost, and operational bakeoffs.
 - **API and live UI protocol:** FastAPI plus AG-UI/SSE, consumed by one consolidated React/Vite console and the CLI.
 - **State:** managed PostgreSQL for transactional product data, object storage for large artifacts/evidence, and an OCI registry for deployable images.
-- **Identity and authorization:** managed OIDC identity with organization/tenant claims; keep identity provider-specific code behind OIDC/SCIM adapters. Standardize product authorization on Open Policy Agent (OPA) plus PostgreSQL RLS as defense in depth. The current small Cerbos proof is a transition adapter, not a paid-platform dependency. Keycloak is the permissively licensed self-host identity escape hatch.
+- **Identity and authorization:** managed OIDC identity with organization/tenant claims; AuthZEN at the
+  application PEP/PDP boundary; Cedar for application/effect policy; OPA for infrastructure policy; local signed
+  policy evaluation and PostgreSQL RLS as defense in depth. Agent identity never implies standing authority.
 - **Infrastructure:** Docker/Compose for local development; Cloud Run services, worker pools and Jobs for the first production plane; GKE Autopilot only when Kubernetes-specific scheduling, sandbox density or networking is justified.
 - **Infrastructure as code:** OpenTofu with encrypted remote state, not new Terraform-specific dependencies.
 - **Observability:** OpenTelemetry Collector feeding Google Cloud operations backends and optional Langfuse agent traces.

@@ -13,11 +13,14 @@ from fastapi import FastAPI
 from agent_os.api.app import create_app
 from agent_os.api.auth import Authenticator, HMACTokenIdentity, OIDCTokenIdentity
 from agent_os.application.billing import BillingCatalog, BillingPlan, BillingService
+from agent_os.application.assurance import AssuranceKernel
+from agent_os.infrastructure.authzen_policy import baseline_effect_policy
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine
 from agent_os.infrastructure.gcs_artifacts import build_artifact_store
 from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
+from agent_os.infrastructure.sql_mission_control import SQLMissionControl
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
@@ -352,6 +355,12 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(graph_engine.close)
+        mission_control = SQLMissionControl(
+            settings.application_database_url,
+            assurance_kernel=AssuranceKernel(baseline_effect_policy()),
+            create_schema=settings.create_schema,
+        )
+        resources.callback(mission_control.close)
         company_directory = SQLCompanyDirectory(
             settings.application_database_url,
             create_schema=settings.create_schema,
@@ -451,6 +460,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             membership_store=membership_store,
             tenant_model_store=tenant_model_store,
             usage_meter=usage_meter,
+            mission_control=mission_control,
             billing_service=billing_service,
             client_identity_config=browser_identity_config(settings),
             shutdown=resources.close,
@@ -468,6 +478,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.membership_store = membership_store
     app.state.tenant_model_store = tenant_model_store
     app.state.usage_meter = usage_meter
+    app.state.mission_control = mission_control
     app.state.billing_store = billing_store
     app.state.billing_service = billing_service
     app.state.settings = settings

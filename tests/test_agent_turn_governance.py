@@ -226,6 +226,65 @@ def test_agent_turn_output_accepts_top_level_artifact_as_completion_evidence():
     assert turn.artifacts[0].label == "implementation-report"
 
 
+def test_response_protocol_requires_one_pending_correlation_and_original_requester():
+    prior = [{
+        "event_id": "request-event", "kind": "message_sent", "actor_id": "chief",
+        "correlation_id": "question-1",
+        "payload": {"kind": "request", "requires_response": True},
+    }]
+    turn = {
+        **output(), "disposition": "continue", "messages": [{
+            "audience": "direct", "kind": "response", "recipient_ids": ["chief"],
+            "subject": "Answer", "body": "The verified answer.",
+            "correlation_id": "question-1",
+        }],
+        "hiring_requests": [], "decisions": [],
+    }
+    context = AgentTurnContext(
+        "tenant-1", "run-1", "agent:analyst", "response-command",
+        "2026-09-08T09:00:00Z", 1,
+    )
+
+    accepted = plan_agent_turn(context, turn, history=prior)
+    message = next(event for event in accepted.events if event.kind.value == "message_sent")
+    assert message.correlation_id == "question-1"
+    assert message.payload["protocol_version"] == "agent-os.communication.v1"
+
+    turn["messages"][0]["correlation_id"] = "invented-question"
+    rejected = plan_agent_turn(context, turn, history=prior)
+    assert rejected.rejected_actions[0]["action"] == "message"
+    assert "pending request" in rejected.rejected_actions[0]["reason"]
+
+
+def test_conflicting_decision_is_explicitly_reconciled_instead_of_silently_overwritten():
+    prior = [{
+        "event_id": "decision-old", "kind": "decision_recorded", "actor_id": "chief",
+        "payload": {"intent": "Select region", "chosen_option": "us-west1"},
+    }]
+    turn = {
+        **output(), "messages": [], "hiring_requests": [], "decisions": [{
+            "intent": "Select region", "considered_options": ["us-west1", "us-east1"],
+            "chosen_option": "us-east1", "rationale": "New latency evidence",
+            "evidence_ids": ["latency-proof"], "confidence": 0.9,
+            "reversible": True, "needs_human_approval": False,
+        }],
+    }
+    plan = plan_agent_turn(
+        AgentTurnContext(
+            "tenant-1", "run-1", "chief", "decision-command",
+            "2026-09-08T09:00:00Z", 1,
+        ),
+        turn,
+        history=prior,
+    )
+
+    proposed = next(event for event in plan.events if event.kind.value == "decision_proposed")
+    assert proposed.payload["conflicts_with_event_id"] == "decision-old"
+    assert proposed.payload["needs_human_approval"] is True
+    assert any(event.kind.value == "risk_raised" for event in plan.events)
+    assert any(event.kind.value == "approval_requested" for event in plan.events)
+
+
 def test_lifecycle_completion_persists_proposed_evidence_and_replays_without_model_spend(tmp_path):
     complete = {
         **output(),

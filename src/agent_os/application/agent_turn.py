@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from agent_os.application.ports import OrganizationEventReceipt, OrganizationLedger
 from agent_os.domain.organization import Audience, Message, MessageKind, Organization
@@ -56,6 +56,7 @@ def plan_agent_turn(
     output: Mapping[str, Any],
     *,
     organization: Organization | None = None,
+    history: Sequence[Mapping[str, Any]] = (),
 ) -> AgentTurnPlan:
     """Create an ordered event batch; external effects remain unexecuted."""
 
@@ -86,6 +87,27 @@ def plan_agent_turn(
         None,
     )]
     rejected: list[Mapping[str, Any]] = []
+    pending_requests: dict[str, str] = {}
+    answered_requests: set[str] = set()
+    prior_decisions: dict[str, tuple[str, str]] = {}
+    for prior in history:
+        payload = prior.get("payload", {})
+        if not isinstance(payload, Mapping):
+            continue
+        correlation = prior.get("correlation_id")
+        if prior.get("kind") == OrganizationEventKind.MESSAGE_SENT.value and correlation:
+            if payload.get("kind") == MessageKind.REQUEST.value and payload.get("requires_response"):
+                pending_requests[str(correlation)] = str(prior.get("actor_id") or "")
+            elif payload.get("kind") == MessageKind.RESPONSE.value:
+                answered_requests.add(str(correlation))
+        if prior.get("kind") in {
+            OrganizationEventKind.DECISION_PROPOSED.value,
+            OrganizationEventKind.DECISION_RECORDED.value,
+        }:
+            intent = str(payload.get("intent") or "").strip()
+            choice = str(payload.get("chosen_option") or "").strip()
+            if intent and choice:
+                prior_decisions[intent] = (choice, str(prior.get("event_id") or ""))
 
     if evidence_ids:
         drafts.append((
@@ -118,10 +140,28 @@ def plan_agent_turn(
                 subject=str(raw["subject"]),
                 body=str(raw["body"]),
                 created_at=context.occurred_at,
+                related_work_id=(
+                    None if raw.get("related_work_id") is None
+                    else str(raw["related_work_id"])
+                ),
                 requires_response=bool(raw.get("requires_response", False)),
                 correlation_id=raw.get("correlation_id"),
             )
             routed = message.recipient_ids if organization is None else organization.route(message)
+            if message.kind is MessageKind.REQUEST and message.requires_response:
+                if (
+                    message.correlation_id in pending_requests
+                    and message.correlation_id not in answered_requests
+                ):
+                    raise ValueError("request correlation is already awaiting a response")
+            if message.kind is MessageKind.RESPONSE:
+                if not message.correlation_id:
+                    raise ValueError("a response requires the request correlation_id")
+                requester = pending_requests.get(message.correlation_id)
+                if requester is None or message.correlation_id in answered_requests:
+                    raise ValueError("response does not match one pending request")
+                if requester and requester not in routed:
+                    raise ValueError("response must route back to the original requester")
         except (KeyError, TypeError, ValueError) as exc:
             rejected.append({"action": "message", "position": position, "reason": str(exc)})
             continue
@@ -132,6 +172,8 @@ def plan_agent_turn(
             "subject": message.subject,
             "body": message.body,
             "requires_response": message.requires_response,
+            "related_work_id": message.related_work_id,
+            "protocol_version": "agent-os.communication.v1",
         }, message.correlation_id))
         if message.requires_response:
             drafts.append((OrganizationEventKind.PREREQUISITE_IDENTIFIED, {
@@ -161,6 +203,20 @@ def plan_agent_turn(
 
     for raw in _items(output, "decisions"):
         decision = dict(raw)
+        intent = str(decision.get("intent") or "").strip()
+        choice = str(decision.get("chosen_option") or "").strip()
+        conflict = prior_decisions.get(intent)
+        if conflict is not None and conflict[0] != choice:
+            decision["conflicts_with_event_id"] = conflict[1]
+            decision["prior_chosen_option"] = conflict[0]
+            decision["needs_human_approval"] = True
+            drafts.append((OrganizationEventKind.RISK_RAISED, {
+                "description": "A proposed decision conflicts with an earlier durable decision",
+                "intent": intent,
+                "prior_chosen_option": conflict[0],
+                "proposed_chosen_option": choice,
+                "conflicts_with_event_id": conflict[1],
+            }, None))
         drafts.append((OrganizationEventKind.DECISION_PROPOSED, decision, None))
         needs_approval = (
             bool(decision.get("needs_human_approval"))

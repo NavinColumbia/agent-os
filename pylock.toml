@@ -2,6 +2,17 @@ lock-version = "1.0"
 created-by = "pip"
 
 [[packages]]
+name = "ag-ui-protocol"
+version = "0.1.22"
+
+[[packages.wheels]]
+name = "ag_ui_protocol-0.1.22-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/be/6c/af3d577e68c9474c99600e65b2c6283772aae187edca6f0f2f5cbd9f565a/ag_ui_protocol-0.1.22-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "fca13ee7820f8f53e869c19e09ddd75826c1799b27c2adb6f2e567295433c704"
+
+[[packages]]
 name = "aiofile"
 version = "3.12.3"
 

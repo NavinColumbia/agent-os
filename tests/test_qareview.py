@@ -341,6 +341,7 @@ def test_grounded_fresh_browser_step_is_sealed_redacted_and_artifact_bound(tmp_p
     assert receipt["screenshot_sha256"] == hashlib.sha256(screenshot.read_bytes()).hexdigest()
     assert receipt["finding_state_sha256"] == hashlib.sha256(finding_state.read_bytes()).hexdigest()
     assert "alice@example.com" not in human_readable and "415" not in human_readable
+    assert str(artifacts) not in human_readable
     assert "plainsecret123456" not in human_readable and "eyJhbGci" not in human_readable
     assert "EMAIL-REDACTED" in human_readable and "REDACTED" in human_readable
 

@@ -785,6 +785,37 @@ def test_experience_sse_uses_authenticated_resume_cursor_and_bounded_connection(
                 "Last-Event-ID": "different-cursor",
             },
         ).status_code == 400
+
+        ag_ui_page = api.get(
+            "/v2/events?protocol=ag-ui",
+            headers={"Authorization": "Bearer org-a"},
+        )
+        assert ag_ui_page.status_code == 200
+        assert ag_ui_page.json()["protocol"] == "ag-ui-protocol/0.1.22"
+        ag_ui_item = ag_ui_page.json()["items"][0]
+        assert ag_ui_item["type"] == "CUSTOM"
+        assert ag_ui_item["name"] == "agent_os.experience.v1"
+        assert ag_ui_item["value"]["kind"] == "notification.published"
+        assert "Sensitive decision detail" not in str(ag_ui_item)
+
+        with api.stream(
+            "GET", "/v2/events/stream?protocol=ag-ui",
+            headers={"Authorization": "Bearer org-a"},
+        ) as ag_ui_response:
+            ag_ui_body = "".join(ag_ui_response.iter_text())
+            assert ag_ui_response.headers[
+                "x-agent-os-event-protocol"
+            ] == "ag-ui-protocol/0.1.22"
+        assert "event: experience" not in ag_ui_body
+        data = next(
+            json.loads(line.removeprefix("data: "))
+            for line in ag_ui_body.splitlines()
+            if line.startswith("data: ")
+        )
+        assert data["type"] == "CUSTOM"
+        assert data["name"] == "agent_os.experience.v1"
+        assert data["value"]["resource"]["type"] == "notification"
+        assert "Sensitive decision detail" not in str(data)
     finally:
         api.close()
         notifications.close()

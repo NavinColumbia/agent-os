@@ -26,6 +26,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from agent_os.api.auth import Authenticator, Principal
+from agent_os.api.ag_ui import (
+    AG_UI_CURSOR_EVENT_NAME,
+    AG_UI_PROTOCOL_VERSION,
+    AG_UI_RESET_EVENT_NAME,
+    experience_event_to_ag_ui,
+    stream_control_to_ag_ui,
+)
 from agent_os.application.billing import BillingService
 from agent_os.application.mission import mission_planning_run_id
 from agent_os.application.mission_control import project_mission_control
@@ -1888,6 +1895,9 @@ def create_app(
                 principal: Annotated[Principal, Depends(current_principal)],
                 limit: Annotated[int, Query(ge=1, le=500)] = 100,
                 cursor: Annotated[str | None, Query(max_length=1_024)] = None,
+                protocol: Annotated[
+                    str, Query(pattern=r"^(agent-os|ag-ui)$")
+                ] = "agent-os",
             ) -> Mapping[str, Any]:
                 try:
                     after_sequence = (
@@ -1904,7 +1914,16 @@ def create_app(
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 return {
-                    "items": list(page.events),
+                    "protocol": (
+                        "agent-os.experience.v1"
+                        if protocol == "agent-os"
+                        else f"ag-ui-protocol/{AG_UI_PROTOCOL_VERSION}"
+                    ),
+                    "items": (
+                        list(page.events)
+                        if protocol == "agent-os"
+                        else [experience_event_to_ag_ui(item) for item in page.events]
+                    ),
                     "cursor": _encode_experience_cursor(
                         principal.organization_id, page.cursor_sequence,
                     ),
@@ -1927,6 +1946,9 @@ def create_app(
                 last_event_id: Annotated[
                     str | None, Header(alias="Last-Event-ID", max_length=1_024)
                 ] = None,
+                protocol: Annotated[
+                    str, Query(pattern=r"^(agent-os|ag-ui)$")
+                ] = "agent-os",
             ) -> StreamingResponse:
                 if cursor is not None and last_event_id is not None and cursor != last_event_id:
                     raise HTTPException(
@@ -1962,10 +1984,20 @@ def create_app(
                             reset_cursor = _encode_experience_cursor(
                                 principal.organization_id, page.cursor_sequence,
                             )
+                            reset_payload = (
+                                {"reset_required": True, "cursor": reset_cursor}
+                                if protocol == "agent-os"
+                                else stream_control_to_ag_ui(
+                                    AG_UI_RESET_EVENT_NAME,
+                                    cursor=reset_cursor,
+                                    reset_required=True,
+                                )
+                            )
+                            reset_event = "event: reset\n" if protocol == "agent-os" else ""
                             yield (
                                 f"id: {reset_cursor}\n"
-                                "event: reset\n"
-                                f"data: {json.dumps({'reset_required': True, 'cursor': reset_cursor}, separators=(',', ':'))}\n\n"
+                                f"{reset_event}"
+                                f"data: {json.dumps(reset_payload, separators=(',', ':'))}\n\n"
                             )
                             return
                         for item in page.events:
@@ -1973,12 +2005,20 @@ def create_app(
                             item_cursor = _encode_experience_cursor(
                                 principal.organization_id, item_sequence,
                             )
+                            payload_record = (
+                                {"cursor": item_cursor, "event": item}
+                                if protocol == "agent-os"
+                                else experience_event_to_ag_ui(item)
+                            )
                             payload = json.dumps(
-                                {"cursor": item_cursor, "event": item},
+                                payload_record,
                                 allow_nan=False, ensure_ascii=False,
                                 separators=(",", ":"), sort_keys=True,
                             )
-                            yield f"id: {item_cursor}\nevent: experience\ndata: {payload}\n\n"
+                            event_name = (
+                                "event: experience\n" if protocol == "agent-os" else ""
+                            )
+                            yield f"id: {item_cursor}\n{event_name}data: {payload}\n\n"
                         previous_sequence = current_sequence
                         emitted_sequence = (
                             int(page.events[-1]["tenant_sequence"])
@@ -1992,10 +2032,21 @@ def create_app(
                             cursor_value = _encode_experience_cursor(
                                 principal.organization_id, current_sequence,
                             )
+                            cursor_payload = (
+                                {"cursor": cursor_value}
+                                if protocol == "agent-os"
+                                else stream_control_to_ag_ui(
+                                    AG_UI_CURSOR_EVENT_NAME,
+                                    cursor=cursor_value,
+                                )
+                            )
+                            cursor_event = (
+                                "event: cursor\n" if protocol == "agent-os" else ""
+                            )
                             yield (
                                 f"id: {cursor_value}\n"
-                                "event: cursor\n"
-                                f"data: {json.dumps({'cursor': cursor_value}, separators=(',', ':'))}\n\n"
+                                f"{cursor_event}"
+                                f"data: {json.dumps(cursor_payload, separators=(',', ':'))}\n\n"
                             )
                         if await request.is_disconnected():
                             return
@@ -2030,6 +2081,11 @@ def create_app(
                         "Cache-Control": "no-store, no-transform",
                         "X-Accel-Buffering": "no",
                         "X-Content-Type-Options": "nosniff",
+                        "X-Agent-OS-Event-Protocol": (
+                            "agent-os.experience.v1"
+                            if protocol == "agent-os"
+                            else f"ag-ui-protocol/{AG_UI_PROTOCOL_VERSION}"
+                        ),
                     },
                 )
 

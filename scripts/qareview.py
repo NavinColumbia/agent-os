@@ -679,6 +679,19 @@ def _sealed_fresh_browser_evidence(case, review, state) -> list[dict]:
         if row.get("coverage_grounded") is not True or not covers or not actual:
             continue
         bug = row.get("bug")
+        # Browser runners attach local artifact paths to findings so the
+        # sealer can hash them below. Those host paths are neither behavioral
+        # evidence nor safe model/UI content. Admit only bounded finding prose;
+        # the separate path-confined artifact receipts preserve provenance.
+        safe_bug = (
+            {
+                key: bug[key]
+                for key in ("title", "detail", "severity", "kind", "blocking")
+                if key in bug and bug[key] not in (None, "")
+            }
+            if isinstance(bug, dict)
+            else bug
+        )
         receipt = {
             "kind": "sealed_fresh_browser_step", "state_digest": state_digest,
             "story": finding_story, "recovery_scope": scope, "product_revision": product_revision,
@@ -687,7 +700,7 @@ def _sealed_fresh_browser_evidence(case, review, state) -> list[dict]:
             "expected": _behavior_text(row.get("expected"), 3000),
             "actual": actual, "verdict": _behavior_text(row.get("verdict"), 1200),
             "covers": covers, "coverage_grounded": True,
-            "bug": _behavior_text(bug, 3000),
+            "bug": _behavior_text(safe_bug, 3000),
         }
         receipt.update(_artifact_receipt(artifact_root, row.get("screenshot"), "screenshot"))
         finding_state = bug.get("finding_state_path") if isinstance(bug, dict) else None

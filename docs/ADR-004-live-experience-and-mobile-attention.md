@@ -1,6 +1,6 @@
 # ADR-004: Live Experience Transport and Mobile Attention
 
-- **Status:** accepted; durable catch-up foundation implemented, streaming and push staged
+- **Status:** accepted; durable catch-up, streaming, and AG-UI edge adapter implemented; push staged
 - **Date:** 2026-09-17
 - **Owners:** experience, runtime assurance, platform operations
 
@@ -97,8 +97,14 @@ invalidations without copying private record content into the stream. Company-ro
 changes use that same transactional path, as do membership/invitation changes, model-policy changes, billing
 projection changes, notification-route changes, and preview publication/revocation. Individual artifact writes
 are deliberately coalesced behind their lifecycle, evidence, or deployment event instead of flooding an open
-browser with internal output churn. The pinned AG-UI adapter and provisioned Web Push remain staged; the endpoint
-therefore does not yet claim that every internal transition or background device is live.
+browser with internal output churn.
+
+The public catch-up and SSE endpoints now accept `protocol=ag-ui`. The adapter uses the exact-pinned official
+Python package `ag-ui-protocol==0.1.22` and emits disclosure-narrowing `CUSTOM` events; official Pydantic models
+validate the boundary in regression tests. The default Agent OS contract is unchanged. Tenant identity, audience
+membership, private payloads, approval authority, and workflow internals are not copied into the AG-UI value.
+AG-UI remains an edge representation rather than persistence or authorization truth. Provisioned Web Push remains
+staged, so the endpoint does not yet claim that every background device is live.
 
 ## Acceptance
 

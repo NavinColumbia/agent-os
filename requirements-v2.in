@@ -1,4 +1,5 @@
 # V2 production service dependencies. Keep aligned with pyproject.toml.
+ag-ui-protocol==0.1.22
 click==8.2.1
 cryptography==49.0.0
 dbos==2.24.0

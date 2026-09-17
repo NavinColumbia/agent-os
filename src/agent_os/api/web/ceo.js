@@ -24,7 +24,14 @@ function routeFromHash() {
   return {
     view: parameters.get("view") || "",
     pushDeliveryId: parameters.get("push") || "",
+    runId: parameters.get("run") || "",
   };
+}
+
+function workspaceRoute(view = state.view, runId = "") {
+  const parameters = new URLSearchParams({view});
+  if (runId) parameters.set("run", runId);
+  return `#${parameters}`;
 }
 
 function setFlash(message, kind = "") {
@@ -217,6 +224,7 @@ async function connect(token) {
     const roleDefault = state.session?.persona === "operator" ? "inbox" : "missions";
     await selectView(requestedRoute.view || roleDefault);
     if (requestedRoute.pushDeliveryId) await openPushDelivery(requestedRoute.pushDeliveryId);
+    else if (requestedRoute.runId) await openMissionDeepLink(requestedRoute.runId);
     const billingNotice = sessionStorage.getItem("aos.billing.notice");
     if (billingNotice) {
       sessionStorage.removeItem("aos.billing.notice");
@@ -253,7 +261,7 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   state.browserAlertBaseline = null;
   state.eventCursor = null;
   state.pushSubscriptionId = null;
-  closeDrawer();
+  closeDrawer({updateRoute: false});
   byId("workspace").classList.add("hidden");
   byId("auth-gate").classList.remove("hidden");
   byId("token-input").value = "";
@@ -1324,9 +1332,12 @@ function detailSection(title) {
   return section;
 }
 
-async function openMission(item) {
+async function openMission(item, {updateRoute = true} = {}) {
   state.drawerReturnFocus = document.activeElement;
   state.selectedRun = item;
+  if (updateRoute) {
+    history.pushState({}, document.title, workspaceRoute(state.view, item.run_id));
+  }
   byId("drawer-title").textContent = item.title || "Mission";
   byId("mission-drawer").classList.add("open");
   byId("mission-drawer").setAttribute("aria-hidden", "false");
@@ -1334,10 +1345,30 @@ async function openMission(item) {
   await loadMissionDetail(item);
 }
 
-function closeDrawer() {
+async function openMissionDeepLink(runId) {
+  if (!runId || runId.length > 256 || runId.includes("\0")) {
+    history.replaceState({}, document.title, workspaceRoute(state.view));
+    setFlash("This mission link is invalid.", "error");
+    return;
+  }
+  try {
+    const run = await api(`/v2/runs/${encodeURIComponent(runId)}`);
+    await openMission(run, {updateRoute: false});
+    history.replaceState({}, document.title, workspaceRoute(state.view, runId));
+  } catch (_) {
+    history.replaceState({}, document.title, workspaceRoute(state.view));
+    closeDrawer({updateRoute: false});
+    setFlash("This mission is unavailable or no longer authorized.", "error");
+  }
+}
+
+function closeDrawer({updateRoute = true} = {}) {
   state.selectedRun = null;
   byId("mission-drawer").classList.remove("open");
   byId("mission-drawer").setAttribute("aria-hidden", "true");
+  if (updateRoute && state.token) {
+    history.replaceState({}, document.title, workspaceRoute(state.view));
+  }
   if (state.drawerReturnFocus?.isConnected) state.drawerReturnFocus.focus();
   state.drawerReturnFocus = null;
 }
@@ -1369,6 +1400,20 @@ async function loadMissionDetail(item, silent = false) {
       track.setAttribute("aria-valuemax", "100"); track.setAttribute("aria-valuenow", String(Math.min(100, ratio)));
       const bar = el("span"); bar.style.width = `${Math.min(100, ratio)}%`; track.append(bar);
       overview.append(track, el("small", "muted", `${ratio}% of currently materialized work complete · ${label(managementResult.health)}`));
+    }
+    if (navigator.clipboard?.writeText) {
+      const share = el("button", "quiet", "Copy authorized mission link");
+      share.type = "button";
+      share.addEventListener("click", async () => {
+        try {
+          const target = new URL(workspaceRoute(state.view, item.run_id), window.location.href);
+          await navigator.clipboard.writeText(target.href);
+          setFlash("Mission link copied. Teammates still need access to this company.");
+        } catch (_) {
+          setFlash("The browser blocked clipboard access; copy the current address instead.", "error");
+        }
+      });
+      overview.append(share);
     }
     content.append(overview);
     for (const [name, result] of [["Execution projection", missionFetch], ["Management projection", managementFetch]]) {
@@ -1687,8 +1732,8 @@ function selectView(name) {
   document.querySelectorAll(".view").forEach((node) => node.classList.add("hidden"));
   byId(`${name}-view`).classList.remove("hidden");
   byId("view-title").textContent = { missions: "Missions", company: "Company", inbox: "Inbox", integrations: "Integrations", previews: "Releases", billing: "Billing" }[name];
-  history.replaceState({}, document.title, `#view=${name}`);
-  closeDrawer(); return refreshView();
+  history.replaceState({}, document.title, workspaceRoute(name));
+  closeDrawer({updateRoute: false}); return refreshView();
 }
 
 async function bootstrap() {
@@ -1832,7 +1877,16 @@ window.addEventListener("hashchange", () => {
     openPushDelivery(requested.pushDeliveryId);
     return;
   }
-  if (requested.view && requested.view !== state.view) selectView(requested.view);
+  (async () => {
+    if (requested.view && requested.view !== state.view) await selectView(requested.view);
+    if (requested.runId) {
+      if (requested.runId !== state.selectedRun?.run_id) {
+        await openMissionDeepLink(requested.runId);
+      }
+    } else if (state.selectedRun) {
+      closeDrawer({updateRoute: false});
+    }
+  })();
 });
 document.addEventListener("visibilitychange", () => {
   if (!state.token) return;

@@ -235,6 +235,12 @@ default, material cost/deadline, and only the actions the workflow declares vali
 execution enforce the same action set, so a free-text response cannot silently become an approval and “request
 changes” appears only when the rejection route is explicitly designed to accept it.
 
+Mission drawers are now addressable by an opaque run ID in the workspace route. The client resolves the run
+only after authentication and active-organization selection, and the existing tenant-fenced endpoint makes a
+foreign and nonexistent mission indistinguishable. Opening, closing, reloading, and browser-back navigation
+retain the familiar drawer interaction while producing a link a teammate can use inside the same authorized
+company.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

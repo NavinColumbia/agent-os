@@ -246,6 +246,10 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert "routeFromHash" in script.text
     assert "focusInboxItem" in script.text
     assert "pushDeliveryId" in script.text
+    assert "openMissionDeepLink" in script.text
+    assert "workspaceRoute" in script.text
+    assert 'parameters.get("run")' in script.text
+    assert "Copy authorized mission link" in script.text
     assert "PushManager" in script.text
     assert "AbortController" in script.text
     assert "EventSource" not in script.text

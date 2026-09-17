@@ -267,7 +267,19 @@ def signal(dedupe_key: str, subject: str, trigger: str, state: dict | None = Non
                 # This timeout must be set in the SAME transaction as the
                 # conflicting unique-key upsert. `_ensure` uses a separate
                 # transaction, so its SET LOCAL cannot protect this operation.
-                _set_db_timeouts(cur)
+                # Keep every attempt bounded, but widen the lock window after
+                # confirmed contention. A fixed tiny window can exhaust all
+                # retries before an already-committing owner gets scheduled on
+                # a loaded host. The statement deadline remains the hard cap.
+                lock_ms = min(
+                    MANAGEMENT_DB_STATEMENT_TIMEOUT_MS,
+                    MANAGEMENT_DB_LOCK_TIMEOUT_MS * (2 ** attempt),
+                )
+                _set_db_timeouts(
+                    cur,
+                    lock_ms=lock_ms,
+                    statement_ms=MANAGEMENT_DB_STATEMENT_TIMEOUT_MS,
+                )
                 cur.execute("""INSERT INTO management_cases
                                  (case_id,dedupe_key,tenant_id,product,work_id,subject,worker,
                                   manager_role,trigger,state,semantic_state,observation,state_fingerprint,

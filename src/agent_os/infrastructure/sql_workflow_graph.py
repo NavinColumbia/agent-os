@@ -44,6 +44,10 @@ from agent_os.domain.workflow_runtime import (
     workflow_event_fingerprint,
 )
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 graph_metadata = MetaData()
@@ -172,8 +176,10 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox, ManagementW
         if not database_url.strip():
             raise ValueError("database_url is required")
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
+        self._experience_events = SQLExperienceEventLog(self._tenant_connection)
         if create_schema:
             graph_metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
     @contextmanager
     def _tenant_connection(self, tenant_id: str):
@@ -333,6 +339,20 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox, ManagementW
             self._insert_actions(
                 connection, tenant_id, run_id, request_id, 0, mutation.actions,
             )
+            self._experience_events.append(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key(
+                    "workflow:started", run_id, request_id,
+                ),
+                resource_type="workflow_run",
+                resource_id=run_id,
+                projection_revision=mutation.state.version,
+                kind="workflow.run.started",
+                audience_ids=("tenant:members",),
+                safe_summary="Mission workflow started.",
+                occurred_at=now,
+            )
             return GraphWorkflowReceipt(mutation.state, mutation.actions)
 
     def _actions_for_event(self, connection, tenant_id, run_id, event_id):
@@ -387,6 +407,7 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox, ManagementW
             )
             current = WorkflowRunState.from_dict(row["state"])
             mutation = evolve_workflow(definition, current, event)
+            now = _now()
             changed = connection.execute(update(workflow_runs).where(and_(
                 run_key,
                 workflow_runs.c.state_version == row["state_version"],
@@ -394,7 +415,7 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox, ManagementW
                 workflow_version=mutation.state.workflow_version,
                 state_version=mutation.state.version,
                 state=mutation.state.to_dict(),
-                updated_at=_now(),
+                updated_at=now,
             ))
             if changed.rowcount != 1:
                 raise RuntimeError("concurrent graph writer lost its version fence")
@@ -405,11 +426,27 @@ class SQLGraphWorkflowEngine(GraphWorkflowEngine, GraphActionOutbox, ManagementW
                 state_version=mutation.state.version,
                 fingerprint=fingerprint,
                 event=event.to_dict(),
-                created_at=_now(),
+                created_at=now,
             ))
             self._insert_actions(
                 connection, tenant_id, run_id, event.event_id,
                 mutation.state.version, mutation.actions,
+            )
+            self._experience_events.append(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key(
+                    "workflow:event", run_id, event.event_id,
+                ),
+                resource_type="workflow_run",
+                resource_id=run_id,
+                projection_revision=mutation.state.version,
+                kind=f"workflow.{event.kind.value}",
+                audience_ids=("tenant:members",),
+                safe_summary=(
+                    f"Mission workflow is now {mutation.state.status.value}."
+                ),
+                occurred_at=now,
             )
             return GraphWorkflowReceipt(mutation.state, mutation.actions)
 

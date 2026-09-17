@@ -90,9 +90,12 @@ consumed through streaming `fetch` so bearer and organization headers stay in me
 stream while hidden, reconnects with backoff, coalesces invalidations, preserves typed input, and retains the
 ten-second polling path as a degradation fallback.
 
-Mission/workflow producers, the pinned AG-UI adapter, and provisioned Web Push remain staged. Until those
-producers are transactionally connected, `/v2/events` is an attention/decision live stream—not a claim that
-every product transition is live.
+Authoritative lifecycle transitions, arbitrary-workflow starts/events, and mission-assurance mutations now
+append to the same stream inside their version-fenced source transactions. Mission creation/revision, evidence,
+claims, hazards, delegated authority, assurance decisions, and effect settlement therefore produce durable live
+invalidations without copying private record content into the stream. Remaining company/integration records
+still need producer coverage. The pinned AG-UI adapter and provisioned Web Push also remain staged; the endpoint
+therefore does not yet claim that every product transition or background device is live.
 
 ## Acceptance
 

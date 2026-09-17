@@ -7,6 +7,7 @@ import pytest
 
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.domain.workflow_runtime import WorkflowEvent, WorkflowEventKind
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 
 
@@ -97,6 +98,36 @@ def test_graph_events_commit_state_and_actions_together_with_full_history_dedup(
             "stale", WorkflowEventKind.NODE_BEGAN, 0,
             {"token_id": completed.state.ready()[0].token_id},
         ))
+
+
+def test_graph_mutations_publish_safe_transactional_experience_invalidations(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'graph-experience.sqlite3'}"
+    runtime = SQLGraphWorkflowEngine(database_url, create_schema=True)
+    events = SQLNotificationStore(database_url, create_schema=True)
+    try:
+        runtime.register_workflow(graph())
+        started = runtime.start_graph_run(
+            "tenant-a", "delivery", 1, run_id="live-run", request_id="live-start",
+        )
+        token_id = started.state.ready()[0].token_id
+        began = WorkflowEvent(
+            "live-begin", WorkflowEventKind.NODE_BEGAN, 0, {"token_id": token_id},
+        )
+        runtime.submit_graph_event("tenant-a", "live-run", began)
+        assert runtime.submit_graph_event(
+            "tenant-a", "live-run", began,
+        ).duplicate is True
+
+        page = events.list_experience_events("tenant-a")
+        assert [item["kind"] for item in page.events] == [
+            "workflow.run.started", "workflow.node_began",
+        ]
+        assert [item["projection_revision"] for item in page.events] == [0, 1]
+        assert all(item["audience_ids"] == ["tenant:members"] for item in page.events)
+        assert events.list_experience_events("tenant-b").events == ()
+    finally:
+        events.close()
+        runtime.close()
 
 
 def test_workflow_revision_updates_indexed_version_and_executes_replacement(engine):

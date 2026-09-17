@@ -53,6 +53,10 @@ from agent_os.domain.organization_events import (
     OrganizationEventKind,
     organization_event_fingerprint,
 )
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 metadata = MetaData()
@@ -234,8 +238,10 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
         self._system_database_url = sqlalchemy_url(system_database_url)
         self._application_database_url = sqlalchemy_url(application_database_url)
         self._engine = create_engine(self._application_database_url, pool_pre_ping=True)
+        self._experience_events = SQLExperienceEventLog(self._tenant_connection)
         if create_schema:
             metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
         config: DBOSConfig = {
             "name": "agent-os-v2",
@@ -417,6 +423,23 @@ class DBOSLifecycleEngine(WorkflowEngine, CommandOutbox, OrganizationLedger):
                     event=mission_raw,
                     created_at=now,
                 ))
+            self._experience_events.append(
+                DBOS.sql_session.connection(),
+                tenant_id=organization_id,
+                source_key=experience_source_key(
+                    "lifecycle:event", run_id, event.event_id,
+                ),
+                resource_type="lifecycle_run",
+                resource_id=run_id,
+                projection_revision=next_state.version,
+                kind=f"lifecycle.{event.kind.value}",
+                audience_ids=("tenant:members",),
+                safe_summary=(
+                    f"Mission lifecycle is {next_state.status.value} "
+                    f"in {next_state.phase.value}."
+                ),
+                occurred_at=now,
+            )
             return _finish_dbos_transaction({
                 "duplicate": False,
                 "state": next_state.to_dict(),

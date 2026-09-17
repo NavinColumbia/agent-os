@@ -41,6 +41,10 @@ from agent_os.domain.mission_model import (
     canonical_fingerprint,
 )
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 mission_metadata = MetaData()
@@ -263,8 +267,10 @@ class SQLMissionControl:
             raise ValueError("database_url is required")
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
         self._assurance = assurance_kernel
+        self._experience_events = SQLExperienceEventLog(self._tenant_connection)
         if create_schema:
             mission_metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
     @contextmanager
     def _tenant_connection(self, tenant_id: str):
@@ -288,6 +294,34 @@ class SQLMissionControl:
         if lock:
             query = query.with_for_update()
         return connection.execute(query).mappings().first()
+
+    def _append_mission_event(
+        self,
+        connection,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        mission_revision: int,
+        source_operation: str,
+        source_identity: str,
+        kind: str,
+        safe_summary: str,
+        occurred_at: datetime,
+    ) -> None:
+        self._experience_events.append(
+            connection,
+            tenant_id=tenant_id,
+            source_key=experience_source_key(
+                f"mission.{source_operation}", mission_id, source_identity,
+            ),
+            resource_type="mission",
+            resource_id=mission_id,
+            projection_revision=mission_revision,
+            kind=kind,
+            audience_ids=("tenant:members",),
+            safe_summary=safe_summary,
+            occurred_at=occurred_at,
+        )
 
     def create_mission(self, spec: MissionSpec) -> Mapping[str, Any]:
         raw = spec.to_dict()
@@ -334,6 +368,17 @@ class SQLMissionControl:
                 effect_id=None,
                 reason="mission budget authorized",
                 now=now,
+            )
+            self._append_mission_event(
+                connection,
+                tenant_id=spec.tenant_id,
+                mission_id=spec.mission_id,
+                mission_revision=spec.revision,
+                source_operation="created",
+                source_identity=str(spec.revision),
+                kind="mission.created",
+                safe_summary="Mission created.",
+                occurred_at=now,
             )
         return {**raw, "status": "active", "duplicate": False}
 
@@ -412,6 +457,17 @@ class SQLMissionControl:
                 reason=reason,
                 created_at=now,
             ))
+            self._append_mission_event(
+                connection,
+                tenant_id=spec.tenant_id,
+                mission_id=spec.mission_id,
+                mission_revision=spec.revision,
+                source_operation="revised",
+                source_identity=str(spec.revision),
+                kind="mission.revised",
+                safe_summary="Mission requirements revised.",
+                occurred_at=now,
+            )
         return {**raw, "status": str(row["status"]), "duplicate": False}
 
     def get_mission(self, tenant_id: str, mission_id: str) -> MissionSpec | None:
@@ -442,10 +498,12 @@ class SQLMissionControl:
             raise ValueError("tenant and evidence mission are required")
         raw = evidence.to_dict()
         fingerprint = canonical_fingerprint(raw)
+        now = _now()
         with self._tenant_connection(tenant_id) as connection:
-            if self._mission_row(connection, tenant_id, evidence.mission_id) is None:
+            mission = self._mission_row(connection, tenant_id, evidence.mission_id)
+            if mission is None:
                 raise LookupError("mission does not exist")
-            return self._idempotent_record(
+            inserted = self._idempotent_record(
                 connection,
                 table=mission_evidence,
                 key=and_(
@@ -465,12 +523,27 @@ class SQLMissionControl:
                 },
                 label="evidence",
             )
+            if inserted:
+                self._append_mission_event(
+                    connection,
+                    tenant_id=tenant_id,
+                    mission_id=evidence.mission_id,
+                    mission_revision=int(mission["revision"]),
+                    source_operation="evidence-added",
+                    source_identity=evidence.evidence_id,
+                    kind="mission.evidence.added",
+                    safe_summary="Mission evidence recorded.",
+                    occurred_at=now,
+                )
+            return inserted
 
     def add_claim(self, tenant_id: str, claim: Claim) -> bool:
         raw = claim.to_dict()
         fingerprint = canonical_fingerprint(raw)
+        now = _now()
         with self._tenant_connection(tenant_id) as connection:
-            if self._mission_row(connection, tenant_id, claim.mission_id) is None:
+            mission = self._mission_row(connection, tenant_id, claim.mission_id)
+            if mission is None:
                 raise LookupError("mission does not exist")
             if claim.evidence_ids:
                 rows = connection.execute(select(mission_evidence.c.evidence_id).where(and_(
@@ -491,7 +564,7 @@ class SQLMissionControl:
                 ))).scalars().all()
                 if set(rows) != referenced:
                     raise ValueError("claim references unknown claim dependencies")
-            return self._idempotent_record(
+            inserted = self._idempotent_record(
                 connection,
                 table=mission_claims,
                 key=and_(
@@ -509,6 +582,19 @@ class SQLMissionControl:
                 },
                 label="claim",
             )
+            if inserted:
+                self._append_mission_event(
+                    connection,
+                    tenant_id=tenant_id,
+                    mission_id=claim.mission_id,
+                    mission_revision=int(mission["revision"]),
+                    source_operation="claim-added",
+                    source_identity=claim.claim_id,
+                    kind="mission.claim.added",
+                    safe_summary="Mission claim recorded.",
+                    occurred_at=now,
+                )
+            return inserted
 
     def tombstone_evidence(
         self,
@@ -538,19 +624,35 @@ class SQLMissionControl:
                 if prior["erased_by"] != erased_by or prior["reason"] != reason:
                     raise ValueError("evidence was already erased with different facts")
                 return {"evidence_id": evidence_id, "erased": True, "duplicate": True}
+            now = _now()
             connection.execute(insert(evidence_tombstones).values(
                 tenant_id=tenant_id, mission_id=mission_id, evidence_id=evidence_id,
-                erased_at=_now(), erased_by=erased_by, reason=reason,
+                erased_at=now, erased_by=erased_by, reason=reason,
             ))
+            mission = self._mission_row(connection, tenant_id, mission_id)
+            assert mission is not None
+            self._append_mission_event(
+                connection,
+                tenant_id=tenant_id,
+                mission_id=mission_id,
+                mission_revision=int(mission["revision"]),
+                source_operation="evidence-erased",
+                source_identity=evidence_id,
+                kind="mission.evidence.erased",
+                safe_summary="Mission evidence erased under retention policy.",
+                occurred_at=now,
+            )
             return {"evidence_id": evidence_id, "erased": True, "duplicate": False}
 
     def add_hazard(self, tenant_id: str, hazard: Hazard) -> bool:
         raw = hazard.to_dict()
         fingerprint = canonical_fingerprint(raw)
+        now = _now()
         with self._tenant_connection(tenant_id) as connection:
-            if self._mission_row(connection, tenant_id, hazard.mission_id) is None:
+            mission = self._mission_row(connection, tenant_id, hazard.mission_id)
+            if mission is None:
                 raise LookupError("mission does not exist")
-            return self._idempotent_record(
+            inserted = self._idempotent_record(
                 connection,
                 table=mission_hazards,
                 key=and_(
@@ -562,10 +664,23 @@ class SQLMissionControl:
                 values={
                     "tenant_id": tenant_id, "mission_id": hazard.mission_id,
                     "hazard_id": hazard.hazard_id, "fingerprint": fingerprint,
-                    "severity": hazard.severity.value, "hazard": raw, "created_at": _now(),
+                    "severity": hazard.severity.value, "hazard": raw, "created_at": now,
                 },
                 label="hazard",
             )
+            if inserted:
+                self._append_mission_event(
+                    connection,
+                    tenant_id=tenant_id,
+                    mission_id=hazard.mission_id,
+                    mission_revision=int(mission["revision"]),
+                    source_operation="hazard-added",
+                    source_identity=hazard.hazard_id,
+                    kind="mission.hazard.added",
+                    safe_summary="Mission hazard recorded.",
+                    occurred_at=now,
+                )
+            return inserted
 
     def grant_authority(self, grant: AuthorityGrant) -> bool:
         raw = grant.to_dict()
@@ -594,7 +709,8 @@ class SQLMissionControl:
                 if parent_raw is None or parent_raw["revoked"]:
                     raise ValueError("parent authority is missing or revoked")
                 validate_delegation(grant, AuthorityGrant.from_dict(parent_raw["grant_record"]))
-            return self._idempotent_record(
+            now = _now()
+            inserted = self._idempotent_record(
                 connection,
                 table=mission_authorities,
                 key=and_(
@@ -609,10 +725,23 @@ class SQLMissionControl:
                     "delegate_id": grant.delegate_id,
                     "parent_grant_id": grant.parent_grant_id,
                     "expires_at": _time(grant.expires_at), "revoked": False,
-                    "grant_record": raw, "created_at": _now(),
+                    "grant_record": raw, "created_at": now,
                 },
                 label="authority grant",
             )
+            if inserted:
+                self._append_mission_event(
+                    connection,
+                    tenant_id=grant.tenant_id,
+                    mission_id=grant.mission_id,
+                    mission_revision=int(mission["revision"]),
+                    source_operation="authority-granted",
+                    source_identity=grant.grant_id,
+                    kind="mission.authority.granted",
+                    safe_summary="Mission authority granted.",
+                    occurred_at=now,
+                )
+            return inserted
 
     def revoke_authority(
         self,
@@ -637,14 +766,28 @@ class SQLMissionControl:
                 if row["revoked_by"] != revoked_by or row["revocation_reason"] != reason:
                     raise ValueError("authority was already revoked with different facts")
                 return {"grant_id": grant_id, "revoked": True, "duplicate": True}
+            now = _now()
             connection.execute(update(mission_authorities).where(and_(
                 mission_authorities.c.tenant_id == tenant_id,
                 mission_authorities.c.mission_id == mission_id,
                 mission_authorities.c.grant_id == grant_id,
             )).values(
-                revoked=True, revoked_at=_now(), revoked_by=revoked_by,
+                revoked=True, revoked_at=now, revoked_by=revoked_by,
                 revocation_reason=reason,
             ))
+            mission = self._mission_row(connection, tenant_id, mission_id)
+            assert mission is not None
+            self._append_mission_event(
+                connection,
+                tenant_id=tenant_id,
+                mission_id=mission_id,
+                mission_revision=int(mission["revision"]),
+                source_operation="authority-revoked",
+                source_identity=grant_id,
+                kind="mission.authority.revoked",
+                safe_summary="Mission authority revoked.",
+                occurred_at=now,
+            )
             return {"grant_id": grant_id, "revoked": True, "duplicate": False}
 
     @staticmethod
@@ -873,6 +1016,17 @@ class SQLMissionControl:
                 disposition=decision.disposition.value, decision=decision.to_dict(),
                 created_at=now,
             ))
+            self._append_mission_event(
+                connection,
+                tenant_id=effect.tenant_id,
+                mission_id=effect.mission_id,
+                mission_revision=int(mission["revision"]),
+                source_operation="effect-admitted",
+                source_identity=effect.effect_id,
+                kind=f"mission.effect.{status}",
+                safe_summary=f"Mission effect admission resolved as {status}.",
+                occurred_at=now,
+            )
             return {
                 "effect": raw, "decision": decision.to_dict(), "status": status,
                 "duplicate": False,
@@ -936,6 +1090,19 @@ class SQLMissionControl:
                 mission_effects.c.mission_id == mission_id,
                 mission_effects.c.effect_id == effect_id,
             )).values(status=status, actual_cents=actual_cost_cents, completed_at=now))
+            mission = self._mission_row(connection, tenant_id, mission_id)
+            assert mission is not None
+            self._append_mission_event(
+                connection,
+                tenant_id=tenant_id,
+                mission_id=mission_id,
+                mission_revision=int(mission["revision"]),
+                source_operation="effect-settled",
+                source_identity=effect_id,
+                kind=f"mission.effect.{status}",
+                safe_summary=f"Mission effect settled as {status}.",
+                occurred_at=now,
+            )
             return {"effect_id": effect_id, "status": status, "duplicate": False}
 
     def control_view(self, tenant_id: str, mission_id: str) -> Mapping[str, Any] | None:

@@ -11,10 +11,14 @@ from agent_os.domain.mission_model import (
     EffectRisk,
     EvidenceKind,
     EvidenceRef,
+    Hazard,
+    HazardSeverity,
     MissionSpec,
+    SafeMode,
 )
 from agent_os.infrastructure.authzen_policy import baseline_effect_policy
 from agent_os.infrastructure.sql_mission_control import SQLMissionControl
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 
 
 NOW = datetime.now(timezone.utc)
@@ -66,6 +70,18 @@ def test_effect_admission_is_atomic_with_double_entry_budget(tmp_path):
         recorded_at=(NOW + timedelta(seconds=2)).isoformat(),
         supersedes_claim_id="claim-1",
     )) is True
+    hazard = Hazard(
+        hazard_id="hazard-1",
+        mission_id="mission-1",
+        description="Private customer data could escape into public logs",
+        unacceptable_loss="Customer trust and privacy",
+        severity=HazardSeverity.LOW,
+        safety_constraints=("Keep private content out of summaries",),
+        unsafe_control_actions=("Publish raw evidence",),
+        fallback_mode=SafeMode.FREEZE,
+    )
+    assert store.add_hazard("tenant-a", hazard) is True
+    assert store.add_hazard("tenant-a", hazard) is False
     grant = AuthorityGrant(
         grant_id="grant-1", tenant_id="tenant-a", mission_id="mission-1",
         principal_id="human:ceo", delegate_id="agent:release",
@@ -149,6 +165,38 @@ def test_effect_admission_is_atomic_with_double_entry_budget(tmp_path):
     assert view["evidence"][0]["erasure_reason"] == "retention period elapsed"
     assert any(item["status"] == "succeeded" for item in view["effects"])
     assert view["authorities"][0]["revocation_reason"] == "release window closed"
+    events = SQLNotificationStore(
+        f"sqlite:///{tmp_path / 'mission.sqlite3'}",
+        create_schema=True,
+    )
+    event_page = events.list_experience_events(
+        "tenant-a", audience_ids=("tenant:members",), limit=100,
+    )
+    assert [event["kind"] for event in event_page.events] == [
+        "mission.created",
+        "mission.evidence.added",
+        "mission.claim.added",
+        "mission.claim.added",
+        "mission.claim.added",
+        "mission.hazard.added",
+        "mission.authority.granted",
+        "mission.effect.admitted",
+        "mission.effect.denied",
+        "mission.effect.succeeded",
+        "mission.authority.revoked",
+        "mission.effect.denied",
+        "mission.evidence.erased",
+    ]
+    assert all(event["resource_id"] == "mission-1" for event in event_page.events)
+    assert all(event["projection_revision"] == 1 for event in event_page.events)
+    summaries = " ".join(event["safe_summary"] for event in event_page.events)
+    assert "Acceptance passed" not in summaries
+    assert "Private customer data" not in summaries
+    assert "release window closed" not in summaries
+    assert not events.list_experience_events(
+        "tenant-b", audience_ids=("tenant:members",), limit=100,
+    ).events
+    events.close()
     store.close()
 
 
@@ -206,4 +254,17 @@ def test_mission_revision_is_immutable_history_and_fences_old_authority(tmp_path
     view = store.control_view("tenant-a", "mission-revision")
     assert [item["revision"] for item in view["mission_revisions"]] == [1, 2]
     assert view["mission_revisions"][1]["revision_reason"] == "customer clarified the outcome"
+    events = SQLNotificationStore(
+        f"sqlite:///{tmp_path / 'mission-revision.sqlite3'}",
+        create_schema=True,
+    )
+    event_page = events.list_experience_events(
+        "tenant-a", audience_ids=("tenant:members",), limit=100,
+    )
+    assert [event["kind"] for event in event_page.events[:3]] == [
+        "mission.created", "mission.authority.granted", "mission.revised",
+    ]
+    assert event_page.events[2]["projection_revision"] == 2
+    assert "customer clarified" not in event_page.events[2]["safe_summary"]
+    events.close()
     store.close()

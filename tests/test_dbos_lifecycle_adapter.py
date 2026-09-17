@@ -12,6 +12,7 @@ from agent_os.domain.lifecycle import CommandKind, Event, EventKind, LifecyclePh
 from agent_os.domain.organization_events import OrganizationEvent, OrganizationEventKind
 from agent_os.infrastructure.command_router import LifecycleCommandRouter
 from agent_os.infrastructure.dbos_lifecycle import DBOSLifecycleEngine, sqlalchemy_url
+from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.retry_effects import RetryScheduleHandler
 
 
@@ -73,6 +74,28 @@ def test_start_run_can_atomically_accept_the_initial_directive(engine):
     assert len(activity) == 1
     assert activity[0]["kind"] == "mission_chartered"
     assert activity[0]["payload"]["outcome"] == "Build a human-governed Jira engineering team"
+
+
+def test_lifecycle_transition_publishes_one_safe_transactional_experience_event(engine):
+    events = SQLNotificationStore(engine._application_database_url, create_schema=True)
+    try:
+        receipt = engine.start_run(
+            LifecycleState(run_id="run-live", organization_id="org-live"),
+            Event(
+                "scope-live", EventKind.SCOPE_ACCEPTED, 0,
+                {"prompt": "Sensitive customer objective"},
+            ),
+        )
+        engine.get_result(receipt.workflow_id)
+        page = events.list_experience_events("org-live")
+
+        assert [item["kind"] for item in page.events] == ["lifecycle.scope_accepted"]
+        assert page.events[0]["projection_revision"] == 1
+        assert page.events[0]["audience_ids"] == ["tenant:members"]
+        assert "Sensitive customer objective" not in page.events[0]["safe_summary"]
+        assert events.list_experience_events("another-org").events == ()
+    finally:
+        events.close()
 
 
 def test_run_inventory_is_ordered_bounded_and_tenant_scoped(engine):

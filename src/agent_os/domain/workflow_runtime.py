@@ -410,6 +410,9 @@ def wait_node(
         "reason": reason,
         "recipient_ids": list(recipient_ids),
     }
+    lifecycle_run_id = str(state.context.get("lifecycle_run_id") or "").strip()
+    if lifecycle_run_id:
+        action_payload["lifecycle_run_id"] = lifecycle_run_id
     if normalized_context is not None:
         action_payload["decision_context"] = normalized_context
     action = _action(

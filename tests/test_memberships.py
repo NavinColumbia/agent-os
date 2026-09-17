@@ -138,6 +138,12 @@ def test_membership_authority_validates_roles_and_prevents_self_revocation(tmp_p
                 tenant_id="org-a", roles=("system",), actor_id="owner-a",
                 expires_in_seconds=3600, idempotency_key="invalid-role",
             )
+        with pytest.raises(ValueError, match="one to three roles"):
+            memberships.create_invitation(
+                tenant_id="org-a", roles=("viewer", "builder", "reviewer", "billing"),
+                actor_id="owner-a", expires_in_seconds=3600,
+                idempotency_key="too-many-roles",
+            )
         assert memberships.revoke_member(
             tenant_id="org-a", subject_id="missing", actor_id="owner-a",
             reason="Not present", idempotency_key="missing-user",

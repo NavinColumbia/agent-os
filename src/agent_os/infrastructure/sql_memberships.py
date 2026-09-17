@@ -134,9 +134,10 @@ class SQLMembershipStore(MembershipStore):
     @staticmethod
     def _roles(raw: tuple[str, ...] | list[str]) -> tuple[str, ...]:
         roles = tuple(sorted(set(str(item).strip() for item in raw if str(item).strip())))
-        if not roles or set(roles) - _MEMBER_ROLES:
+        if not roles or len(roles) > 3 or set(roles) - _MEMBER_ROLES:
             raise ValueError(
-                "membership roles must be one of: " + ", ".join(sorted(_MEMBER_ROLES))
+                "membership must contain one to three roles from: "
+                + ", ".join(sorted(_MEMBER_ROLES))
             )
         return roles
 

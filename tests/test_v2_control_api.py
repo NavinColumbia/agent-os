@@ -23,6 +23,7 @@ from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
+from agent_os.infrastructure.sql_mission_participants import SQLMissionParticipantStore
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
@@ -342,6 +343,8 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert 'can("membership.manage")' in script.text
     assert 'can("model.manage")' in script.text
     assert 'can("mission.steer")' in script.text
+    assert 'detailSection("Mission collaborators")' in script.text
+    assert 'participation_role: role.value' in script.text
     assert "CEO workspace" not in script.text
     assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
     assert api.get("/v2/runs").status_code == 401
@@ -408,6 +411,148 @@ def test_session_capabilities_and_mission_creation_are_role_consistent():
         headers={"Authorization": "Bearer admin-a", "Idempotency-Key": "admin-mission"},
         json={"prompt": "Administrative access must not imply execution"},
     ).status_code == 403
+
+
+def test_mission_participation_limits_builder_reviewer_and_client_to_assigned_runs(tmp_path):
+    participants = SQLMissionParticipantStore(
+        f"sqlite:///{tmp_path / 'api-mission-participants.sqlite3'}", create_schema=True,
+    )
+    engine = InMemoryWorkflowEngine()
+    api = TestClient(create_app(
+        engine=engine, identity=FakeIdentity(), mission_participant_store=participants,
+        shutdown=participants.close,
+    ))
+    with api:
+        first = api.post(
+            "/v2/runs",
+            headers={
+                "Authorization": "Bearer manager-a",
+                "Idempotency-Key": "scoped-mission-one",
+            },
+            json={"prompt": "First scoped mission", "title": "First"},
+        ).json()["run_id"]
+        second = api.post(
+            "/v2/runs",
+            headers={
+                "Authorization": "Bearer manager-a",
+                "Idempotency-Key": "scoped-mission-two",
+            },
+            json={"prompt": "Second scoped mission", "title": "Second"},
+        ).json()["run_id"]
+
+        for token in ("builder-a", "reviewer-a", "client-a", "viewer-a"):
+            assert api.get(
+                "/v2/runs", headers={"Authorization": f"Bearer {token}"},
+            ).json()["items"] == []
+
+        review_grant = api.post(
+            f"/v2/runs/{first}/participants",
+            headers={
+                "Authorization": "Bearer manager-a",
+                "Idempotency-Key": "assign-reviewer-first",
+            },
+            json={"subject_id": "reviewer-a", "participation_role": "reviewer"},
+        )
+        build_grant = api.post(
+            f"/v2/runs/{second}/participants",
+            headers={
+                "Authorization": "Bearer manager-a",
+                "Idempotency-Key": "assign-builder-second",
+            },
+            json={"subject_id": "builder-a", "participation_role": "builder"},
+        )
+        assert review_grant.status_code == build_grant.status_code == 201
+        assert [item["run_id"] for item in api.get(
+            "/v2/runs", headers={"Authorization": "Bearer reviewer-a"},
+        ).json()["items"]] == [first]
+        assert [item["run_id"] for item in api.get(
+            "/v2/runs", headers={"Authorization": "Bearer builder-a"},
+        ).json()["items"]] == [second]
+        assert api.get(
+            f"/v2/runs/{second}", headers={"Authorization": "Bearer reviewer-a"},
+        ).status_code == 404
+        assert api.get(
+            f"/v2/runs/{first}", headers={"Authorization": "Bearer reviewer-a"},
+        ).status_code == 200
+        assert len(api.get(
+            "/v2/runs", headers={"Authorization": "Bearer manager-a"},
+        ).json()["items"]) == 2
+
+        assert api.get(
+            f"/v2/runs/{first}/participants",
+            headers={"Authorization": "Bearer reviewer-a"},
+        ).status_code == 403
+        inventory = api.get(
+            f"/v2/runs/{first}/participants",
+            headers={"Authorization": "Bearer manager-a"},
+        )
+        assert inventory.status_code == 200
+        assert inventory.json()["items"][0]["subject_id"] == "reviewer-a"
+
+        revoked = api.request(
+            "DELETE", f"/v2/runs/{first}/participants/reviewer-a",
+            headers={
+                "Authorization": "Bearer manager-a",
+                "Idempotency-Key": "revoke-reviewer-first",
+            },
+            json={"reason": "Independent review completed"},
+        )
+        assert revoked.status_code == 200
+        assert api.get(
+            "/v2/runs", headers={"Authorization": "Bearer reviewer-a"},
+        ).json()["items"] == []
+
+
+def test_mission_grant_requires_an_active_matching_organization_role(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'api-participant-membership.sqlite3'}"
+    memberships = SQLMembershipStore(
+        database_url,
+        signing_secret="membership-api-secret-that-is-long-enough",
+        create_schema=True,
+    )
+    participants = SQLMissionParticipantStore(database_url, create_schema=True)
+    engine = InMemoryWorkflowEngine()
+
+    def close_stores():
+        participants.close()
+        memberships.close()
+
+    api = TestClient(create_app(
+        engine=engine, identity=FakeIdentity(), membership_store=memberships,
+        mission_participant_store=participants, shutdown=close_stores,
+    ))
+    with api:
+        run_id = api.post(
+            "/v2/runs",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "member-run-one"},
+            json={"prompt": "Mission with an independent reviewer"},
+        ).json()["run_id"]
+        invitation = api.post(
+            "/v2/invitations",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "reviewer-invite"},
+            json={"roles": ["reviewer"]},
+        ).json()
+        assert api.post(
+            "/v2/invitations/claim",
+            headers={"Authorization": "Bearer reviewer-a"},
+            json={"token": invitation["claim_token"]},
+        ).status_code == 200
+
+        assert api.post(
+            f"/v2/runs/{run_id}/participants",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "grant-reviewer"},
+            json={"subject_id": "reviewer-a", "participation_role": "reviewer"},
+        ).status_code == 201
+        assert api.post(
+            f"/v2/runs/{run_id}/participants",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "forge-builder"},
+            json={"subject_id": "reviewer-a", "participation_role": "builder"},
+        ).status_code == 409
+        assert api.post(
+            f"/v2/runs/{run_id}/participants",
+            headers={"Authorization": "Bearer org-a", "Idempotency-Key": "unknown-client"},
+            json={"subject_id": "not-a-member", "participation_role": "client"},
+        ).status_code == 409
 
 
 def test_first_mission_readiness_is_honest_role_aware_and_resumable(tmp_path):
@@ -745,6 +890,49 @@ def test_notification_inbox_accepts_role_audiences_without_leaking_between_roles
         assert builder.json()["items"] == []
         assert viewer.json()["items"] == []
     finally:
+        notifications.close()
+
+
+def test_scoped_role_notifications_are_visible_only_to_assigned_mission_participants(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'api-scoped-role-attention.sqlite3'}"
+    notifications = SQLNotificationStore(database_url, create_schema=True)
+    participants = SQLMissionParticipantStore(database_url, create_schema=True)
+    try:
+        participants.grant_participant(
+            tenant_id="org-a", mission_id="run-visible", subject_id="reviewer-a",
+            participation_role="reviewer", actor_id="manager-a",
+            idempotency_key="grant-visible-reviewer",
+        )
+        for mission_id in ("run-visible", "run-hidden"):
+            notifications.publish_notification(Notification(
+                notification_id=f"review-{mission_id}", tenant_id="org-a",
+                run_id=mission_id,
+                category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+                recipient_ids=("role:reviewer",), subject="Review release evidence",
+                body="Independent review is required", source_id=f"gate-{mission_id}",
+                created_at="2026-09-17T12:00:00+00:00",
+                payload={"lifecycle_run_id": mission_id, "severity": "warning"},
+            ))
+        api = TestClient(create_app(
+            engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+            notification_store=notifications, mission_participant_store=participants,
+        ))
+
+        inbox = api.get(
+            "/v2/notifications", headers={"Authorization": "Bearer reviewer-a"},
+        )
+        hidden = api.get(
+            "/v2/notifications/review-run-hidden",
+            headers={"Authorization": "Bearer reviewer-a"},
+        )
+
+        assert inbox.status_code == 200
+        assert [item["notification_id"] for item in inbox.json()["items"]] == [
+            "review-run-visible"
+        ]
+        assert hidden.status_code == 404
+    finally:
+        participants.close()
         notifications.close()
 
 
@@ -1109,13 +1297,13 @@ def test_standing_company_agents_are_managed_by_tenant_authority_and_survive_run
         directory.close()
 
 
-def test_artifact_upload_download_and_metadata_are_tenant_scoped():
+def test_artifact_upload_download_and_metadata_are_tenant_and_mission_scoped(tmp_path):
     class FakeArtifacts:
         def __init__(self):
             self.values = {}
 
         def put(self, *, organization_id, content, media_type, idempotency_key):
-            artifact_id = f"artifact-{organization_id}"
+            artifact_id = f"artifact-{hashlib.sha256(content).hexdigest()}"
             self.values[(organization_id, artifact_id)] = (
                 content,
                 {"artifact_id": artifact_id, "tenant_id": organization_id,
@@ -1131,10 +1319,39 @@ def test_artifact_upload_download_and_metadata_are_tenant_scoped():
             found = self.values.get((organization_id, artifact_id))
             return None if found is None else found[1]
 
+    class EvidenceMissionControl:
+        def __init__(self):
+            self.artifact_ref = None
+
+        def create_mission(self, mission):
+            return True
+
+        def grant_authority(self, authority):
+            return True
+
+        def control_view(self, tenant_id, mission_id):
+            return {
+                "evidence": [] if self.artifact_ref is None else [{
+                    "evidence_id": "evidence-customer-source",
+                    "artifact_ref": self.artifact_ref,
+                    "erased": False,
+                }],
+            }
+
     store = FakeArtifacts()
+    mission_control = EvidenceMissionControl()
+    participants = SQLMissionParticipantStore(
+        f"sqlite:///{tmp_path / 'artifact-participants.sqlite3'}", create_schema=True,
+    )
     api = TestClient(create_app(
         engine=InMemoryWorkflowEngine(), identity=FakeIdentity(), artifact_store=store,
+        mission_control=mission_control, mission_participant_store=participants,
     ))
+    run_id = api.post(
+        "/v2/runs",
+        headers={"Authorization": "Bearer org-a", "Idempotency-Key": "artifact-mission"},
+        json={"prompt": "Review the customer source evidence"},
+    ).json()["run_id"]
     uploaded = api.post(
         "/v2/artifacts",
         headers={"Authorization": "Bearer org-a", "Idempotency-Key": "artifact-request-1"},
@@ -1146,6 +1363,12 @@ def test_artifact_upload_download_and_metadata_are_tenant_scoped():
 
     assert uploaded.status_code == 201
     artifact_id = uploaded.json()["artifact_id"]
+    mission_control.artifact_ref = artifact_id
+    participants.grant_participant(
+        tenant_id="org-a", mission_id=run_id, subject_id="reviewer-a",
+        participation_role="reviewer", actor_id="human-a",
+        idempotency_key="assign-artifact-reviewer",
+    )
     downloaded = api.get(
         f"/v2/artifacts/{artifact_id}/content", headers={"Authorization": "Bearer org-a"},
     )
@@ -1184,6 +1407,29 @@ def test_artifact_upload_download_and_metadata_are_tenant_scoped():
         },
     )
     assert reviewer_upload.status_code == 403
+    assert api.get(
+        f"/v2/artifacts/{artifact_id}/content",
+        headers={"Authorization": "Bearer client-a"},
+    ).status_code == 403
+    assert api.get(
+        f"/v2/artifacts/{artifact_id}/content",
+        headers={"Authorization": "Bearer viewer-a"},
+    ).status_code == 403
+    assert api.get(
+        f"/v2/artifacts/{artifact_id}/content",
+        headers={"Authorization": "Bearer reviewer-a"},
+    ).status_code == 403
+    scoped = api.get(
+        f"/v2/runs/{run_id}/artifacts/{artifact_id}/content",
+        headers={"Authorization": "Bearer reviewer-a"},
+    )
+    assert scoped.status_code == 200
+    assert scoped.content == b"customer source"
+    assert api.get(
+        f"/v2/runs/{run_id}/artifacts/{builder_upload.json()['artifact_id']}/content",
+        headers={"Authorization": "Bearer reviewer-a"},
+    ).status_code == 404
+    participants.close()
 
 
 def test_artifact_upload_rejects_invalid_base64():
@@ -1338,9 +1584,13 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
     directory = SQLCompanyDirectory(
         f"sqlite:///{tmp_path / 'mission-company.sqlite3'}", create_schema=True,
     )
+    participants = SQLMissionParticipantStore(
+        f"sqlite:///{tmp_path / 'mission-participant-projection.sqlite3'}",
+        create_schema=True,
+    )
     api = TestClient(create_app(
         engine=lifecycle, identity=FakeIdentity(), graph_engine=MissionGraphs(),
-        company_directory=directory,
+        company_directory=directory, mission_participant_store=participants,
     ))
     created = api.post(
         "/v2/runs",
@@ -1350,6 +1600,16 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
         },
         json={"prompt": "Build a product"},
     ).json()
+    for subject_id, participation_role, assignment_key in (
+        ("viewer-a", "viewer", "assign-viewer-projection"),
+        ("client-a", "client", "assign-client-projection"),
+        ("reviewer-a", "reviewer", "assign-reviewer-projection"),
+    ):
+        participants.grant_participant(
+            tenant_id="org-a", mission_id=created["run_id"],
+            subject_id=subject_id, participation_role=participation_role,
+            actor_id="human-a", idempotency_key=assignment_key,
+        )
 
     response = api.get(
         f"/v2/runs/{created['run_id']}/mission",
@@ -1408,6 +1668,55 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
     )
     assert viewer_management.status_code == 200
     assert "execution_timeline" not in viewer_management.json()
+    assert set(viewer_management.json()) <= {"health", "progress", "projection"}
+    client_mission = api.get(
+        f"/v2/runs/{created['run_id']}/mission",
+        headers={"Authorization": "Bearer client-a"},
+    )
+    assert client_mission.status_code == 200
+    assert client_mission.json()["projection"] == "stakeholder"
+    assert client_mission.json()["planning"] is None
+    assert client_mission.json()["execution"] is None
+    assert client_mission.json()["program"] is None
+    assert client_mission.json()["deliverables"][0]["public_url"].startswith("https://")
+    client_lifecycle = api.get(
+        f"/v2/runs/{created['run_id']}",
+        headers={"Authorization": "Bearer client-a"},
+    ).json()
+    assert client_lifecycle["projection"] == "stakeholder"
+    assert set(client_lifecycle) == {
+        "run_id", "title", "objective", "phase", "status", "version", "projection",
+    }
+    assert api.get(
+        f"/v2/runs/{created['run_id']}/activity",
+        headers={"Authorization": "Bearer client-a"},
+    ).status_code == 403
+    client_management = api.get(
+        f"/v2/runs/{created['run_id']}/management",
+        headers={"Authorization": "Bearer client-a"},
+    ).json()
+    assert set(client_management) <= {"health", "progress", "projection"}
+    reviewer_mission = api.get(
+        f"/v2/runs/{created['run_id']}/mission",
+        headers={"Authorization": "Bearer reviewer-a"},
+    ).json()
+    assert reviewer_mission["projection"] == "review"
+    assert reviewer_mission["planning"] is None
+    assert reviewer_mission["execution"] is None
+    reviewer_lifecycle = api.get(
+        f"/v2/runs/{created['run_id']}",
+        headers={"Authorization": "Bearer reviewer-a"},
+    ).json()
+    assert reviewer_lifecycle["projection"] == "review"
+    assert "last_event_id" not in reviewer_lifecycle
+    assert "wait" not in reviewer_lifecycle
+    reviewer_management = api.get(
+        f"/v2/runs/{created['run_id']}/management",
+        headers={"Authorization": "Bearer reviewer-a"},
+    ).json()
+    assert "work_items" in reviewer_management
+    assert "hiring_requests" not in reviewer_management
+    assert "execution_timeline" not in reviewer_management
     assert management.json()["subprograms"][0]["run_id"] == subprogram_run_id
     proposal = management.json()["hiring_requests"][0]
     assert proposal["status"] == "pending"
@@ -1437,6 +1746,7 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
         headers={"Authorization": "Bearer org-b"},
     )
     assert hidden.status_code == 404
+    participants.close()
     directory.close()
 
 

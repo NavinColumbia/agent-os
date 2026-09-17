@@ -27,8 +27,8 @@ Human membership roles are:
 | builder | assigned implementation | execute work, report hazards, request scoped effects, publish artifacts |
 | reviewer | independent verification | read work/evidence, report hazards, answer action-bound decisions |
 | billing | subscription and cost administration | billing changes and usage visibility, no execution authority |
-| client | external stakeholder | mission/release visibility, review, and explicitly addressed decisions |
-| viewer | internal read-only observer | directory, mission, release, and explicitly addressed decisions |
+| client | external stakeholder | assigned-mission milestones, review, and explicitly addressed decisions |
+| viewer | internal read-only observer | directory, assigned-mission status, and explicitly addressed decisions |
 
 Runtime `agent` and `system` roles are service identities and cannot be invited as human memberships.
 
@@ -54,8 +54,9 @@ Runtime `agent` and `system` roles are service identities and cannot be invited 
 - Adding a role or changing authority is reviewable in one bounded policy and its matrix tests.
 - The browser can adapt landing views and controls without reconstructing security logic.
 - Existing owner/operator behavior is retained except where it contradicted the published capabilities.
-- The next authorization increment is resource-scoped mission participation, so a reviewer/client can be
-  limited to named missions rather than relying only on tenant membership.
+- Resource-scoped mission participation is implemented by
+  [ADR-006](ADR-006-mission-scoped-participation.md). Tenant role grants a capability; an active assignment is
+  additionally required for builder, reviewer, client, and viewer access to a specific mission.
 
 ## Acceptance
 
@@ -66,3 +67,5 @@ Runtime `agent` and `system` roles are service identities and cannot be invited 
 - Viewer cannot publish claims/evidence or start low-level graph execution.
 - Capability-gated browser controls never advertise forbidden membership, model, staffing, integration, or
   billing actions.
+- Unassigned builders, reviewers, clients, and viewers cannot enumerate or retrieve a mission, its attention,
+  artifacts, or internal execution projection.

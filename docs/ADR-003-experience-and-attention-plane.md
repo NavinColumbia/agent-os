@@ -56,6 +56,8 @@ output, and traces are advanced diagnostic views.
     membership, billing, or policy administration. Runtime agents remain service identities, not human members.
 11. Role-addressed attention is resolved server-side from authenticated memberships. A client cannot nominate
     a role to widen its own inbox, and matching both a subject and role never duplicates the same item.
+12. Builder, reviewer, client, and viewer attention is also mission-scoped under
+    [ADR-006](ADR-006-mission-scoped-participation.md); role membership alone cannot reveal an unrelated mission.
 
 ## API direction
 
@@ -95,6 +97,8 @@ decision-response truth defined here.
   authority. Audit reasons identify the shared workspace rather than claiming every actor is the CEO.
 - Human persona authorization now follows the centralized capability policy in
   [ADR-005](ADR-005-capability-policy-and-human-roles.md); persona names remain presentation presets.
+- Human participation, stakeholder-safe projections, and exact-subject mission notification routing follow
+  [ADR-006](ADR-006-mission-scoped-participation.md).
 
 ## Acceptance
 

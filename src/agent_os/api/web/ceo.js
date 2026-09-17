@@ -60,6 +60,22 @@ async function api(path, options = {}) {
   return payload;
 }
 
+async function downloadMissionArtifact(runId, artifactId) {
+  const headers = new Headers({Authorization: `Bearer ${state.token}`});
+  if (state.organization) headers.set("X-Agent-OS-Organization", state.organization);
+  const path = `/v2/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}/content`;
+  const response = await fetch(path, {headers, cache: "no-store"});
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.detail || `Evidence download failed (${response.status})`);
+  }
+  const objectUrl = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = objectUrl; link.download = artifactId; link.hidden = true;
+  document.body.append(link); link.click(); link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
 function setLiveStatus(message) {
   const node = byId("live-status");
   if (node) node.textContent = message;
@@ -310,11 +326,13 @@ function applyRoleExperience() {
   }[persona] || "USER";
   document.querySelectorAll(".requires-mission-create").forEach((node) => node.classList.toggle("hidden", !can("mission.create")));
   document.querySelectorAll(".requires-company-read").forEach((node) => node.classList.toggle("hidden", !can("company.read")));
+  document.querySelectorAll(".requires-release-read").forEach((node) => node.classList.toggle("hidden", !can("release.read")));
   document.querySelectorAll(".requires-integration-manage").forEach((node) => node.classList.toggle("hidden", !can("integration.manage")));
   const billingAvailable = state.config?.billing_mode === "stripe";
   document.querySelectorAll(".requires-billing-manage").forEach((node) => node.classList.toggle("hidden", !can("billing.manage") || !billingAvailable));
   if (
     (!can("company.read") && state.view === "company")
+    || (!can("release.read") && state.view === "previews")
     || (!can("integration.manage") && state.view === "integrations")
     || ((!can("billing.manage") || !billingAvailable) && state.view === "billing")
   ) {
@@ -356,7 +374,12 @@ async function loadMissions() {
   const list = byId("missions-list");
   list.replaceChildren();
   if (!items.length) {
-    list.append(el("div", "empty", "No missions yet. Give your company its first objective above."));
+    list.append(el(
+      "div", "empty",
+      can("mission.create")
+        ? "No missions yet. Give your company its first objective above."
+        : "No missions are assigned to you yet.",
+    ));
     return;
   }
   for (const item of items) {
@@ -1410,11 +1433,14 @@ async function loadMissionDetail(item, silent = false) {
   const content = byId("drawer-content");
   if (!silent) content.replaceChildren(el("div", "empty", "Reading durable mission state…"));
   try {
-    const [run, missionFetch, managementFetch, company] = await Promise.all([
+    const [run, missionFetch, managementFetch, company, participantsFetch] = await Promise.all([
       api(`/v2/runs/${encodeURIComponent(item.run_id)}`),
       api(`/v2/runs/${encodeURIComponent(item.run_id)}/mission`).catch((error) => ({__error: error.message})),
       api(`/v2/runs/${encodeURIComponent(item.run_id)}/management`).catch((error) => ({__error: error.message})),
-      api("/v2/company/organization"),
+      can("company.read") ? api("/v2/company/organization") : Promise.resolve({teams: [], agents: []}),
+      can("mission.steer")
+        ? api(`/v2/runs/${encodeURIComponent(item.run_id)}/participants`).catch((error) => ({__error: error.message}))
+        : Promise.resolve(null),
     ]);
     if (!state.selectedRun || state.selectedRun.run_id !== item.run_id) return;
     const missionResult = missionFetch?.__error ? null : missionFetch;
@@ -1455,6 +1481,62 @@ async function loadMissionDetail(item, silent = false) {
       unavailable.setAttribute("role", "status");
       unavailable.textContent = `${name} is temporarily unavailable: ${result.__error}. Durable mission state is unchanged.`;
       content.append(unavailable);
+    }
+
+    if (participantsFetch && !participantsFetch.__error) {
+      const collaboration = detailSection("Mission collaborators");
+      collaboration.append(el(
+        "p", "program-rationale",
+        "Give a teammate access only to this mission. Their organization role must match the mission role.",
+      ));
+      for (const participant of participantsFetch.items || []) {
+        const row = el("div", "work-row");
+        row.append(
+          el("span", `health ${participant.active ? "healthy" : "failed"}`, participant.active ? "Active" : "Revoked"),
+          el("p", "", participant.subject_id),
+          el("small", "", `${label(participant.participation_role)} · revision ${participant.version}`),
+        );
+        if (participant.active) {
+          const revoke = el("button", "danger", "Remove access"); revoke.type = "button";
+          revoke.addEventListener("click", async () => {
+            if (!window.confirm(`Remove ${participant.subject_id} from this mission?`)) return;
+            try {
+              await api(`/v2/runs/${encodeURIComponent(item.run_id)}/participants/${encodeURIComponent(participant.subject_id)}`, {
+                method: "DELETE",
+                headers: {"Idempotency-Key": `participant-revoke-${crypto.randomUUID()}`},
+                body: JSON.stringify({reason: "Mission access removed in the Agent OS workspace"}),
+              });
+              setFlash("Mission access removed."); await loadMissionDetail(item);
+            } catch (error) { setFlash(error.message, "error"); }
+          });
+          row.append(revoke);
+        }
+        collaboration.append(row);
+      }
+      const assign = el("div", "access-form");
+      const subject = field("Teammate identity subject", "Mission teammate identity", 255);
+      const role = document.createElement("select");
+      role.setAttribute("aria-label", "Mission participation role");
+      for (const value of ["builder", "reviewer", "client", "viewer"]) {
+        const option = el("option", "", label(value)); option.value = value; role.append(option);
+      }
+      const grant = el("button", "primary", "Add to mission"); grant.type = "button";
+      grant.addEventListener("click", async () => {
+        if (!subject.value.trim()) return setFlash("Enter the teammate identity first.", "error");
+        grant.disabled = true;
+        try {
+          await api(`/v2/runs/${encodeURIComponent(item.run_id)}/participants`, {
+            method: "POST",
+            headers: {"Idempotency-Key": `participant-grant-${crypto.randomUUID()}`},
+            body: JSON.stringify({
+              subject_id: subject.value.trim(), participation_role: role.value,
+            }),
+          });
+          setFlash("Mission access granted."); await loadMissionDetail(item);
+        } catch (error) { setFlash(error.message, "error"); }
+        finally { grant.disabled = false; }
+      });
+      assign.append(subject, role, grant); collaboration.append(assign); content.append(collaboration);
     }
 
     const program = managementResult?.program || missionResult?.program;
@@ -1576,6 +1658,16 @@ async function loadMissionDetail(item, silent = false) {
               el("summary", "", `${label(evidence.kind)} · ${evidence.media_type || "artifact"}`),
               el("small", "", `Observed ${evidence.observed_at || "unknown"} · SHA-256 ${shortId(evidence.sha256)}`),
             );
+            if (can("artifact.read") && String(evidence.artifact_ref || "").startsWith("artifact-")) {
+              const download = el("button", "quiet", "Download evidence"); download.type = "button";
+              download.addEventListener("click", async () => {
+                download.disabled = true;
+                try { await downloadMissionArtifact(item.run_id, evidence.artifact_ref); }
+                catch (error) { setFlash(error.message, "error"); }
+                finally { download.disabled = false; }
+              });
+              detail.append(download);
+            }
             row.append(detail);
           }
           review.append(row);
@@ -1757,6 +1849,10 @@ function selectView(name) {
   if (name === "company" && !can("company.read")) {
     name = "missions";
     setFlash("Your role does not include company-directory access.", "error");
+  }
+  if (name === "previews" && !can("release.read")) {
+    name = "missions";
+    setFlash("Released deliverables for your role are shown inside each mission.", "error");
   }
   if (name === "billing" && (!can("billing.manage") || state.config?.billing_mode !== "stripe")) {
     setFlash("Billing is not available in this deployment.", "error"); name = "missions";

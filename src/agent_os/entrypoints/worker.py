@@ -62,6 +62,7 @@ from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_mission_control import SQLMissionControl
+from agent_os.infrastructure.sql_mission_participants import SQLMissionParticipantStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_ready_tenants import SQLReadyTenantSource
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
@@ -428,6 +429,11 @@ def run_worker(
             create_schema=settings.server.create_schema,
         )
         resources.callback(mission_control.close)
+        mission_participants = SQLMissionParticipantStore(
+            settings.server.application_database_url,
+            create_schema=settings.server.create_schema,
+        )
+        resources.callback(mission_participants.close)
         artifact_store = build_artifact_store(
             settings.server.application_database_url,
             backend=settings.server.artifact_backend,
@@ -473,7 +479,9 @@ def run_worker(
                 builder_image=settings.app_builder_image,
                 maximum_instances=settings.app_max_instances,
             )
-        notification_effects = NotificationEffectHandlers(notification_store)
+        notification_effects = NotificationEffectHandlers(
+            notification_store, mission_participants=mission_participants,
+        )
         artifact_tools = ArtifactToolNodeHandlers(artifact_store)
         named_tool_handlers = dict(artifact_tools.named_handlers())
         named_tool_handlers.update(

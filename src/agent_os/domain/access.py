@@ -18,11 +18,9 @@ HUMAN_MEMBERSHIP_ROLES = frozenset({
 })
 
 BASE_CAPABILITIES = frozenset({
-    "artifact.read",
     "mission.read",
     "notification.read",
     "notification.respond",
-    "release.read",
 })
 
 ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
@@ -39,7 +37,8 @@ ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
     "manager": frozenset({
         "artifact.publish", "artifact.read", "authority.manage", "company.read",
         "decision.redrive", "effect.request", "effect.settle", "hazard.report",
-        "mission.cancel", "mission.create", "mission.steer", "release.manage",
+        "mission.cancel", "mission.create", "mission.read.all", "mission.steer",
+        "release.manage", "release.read",
         "review.read", "usage.read", "work.assign", "work.execute", "work.read",
         "workflow.manage", "workforce.manage",
     }),
@@ -47,9 +46,9 @@ ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
         "artifact.publish", "artifact.read", "authority.manage", "company.read",
         "decision.redrive", "effect.request", "effect.settle", "evidence.erase",
         "hazard.report", "integration.manage", "membership.read", "mission.cancel",
-        "mission.create", "mission.steer", "model.read", "notification.read.all",
+        "mission.create", "mission.read.all", "mission.steer", "model.read", "notification.read.all",
         "operations.read",
-        "operations.recover", "release.manage", "review.read", "usage.read",
+        "operations.recover", "release.manage", "release.read", "review.read", "usage.read",
         "work.assign", "work.execute", "work.read", "workflow.manage",
         "workforce.manage",
     }),

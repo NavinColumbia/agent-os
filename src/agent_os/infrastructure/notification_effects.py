@@ -7,7 +7,7 @@ import hashlib
 from typing import Callable, Mapping, Any
 
 from agent_os.application.lifecycle import CommandEnvelope
-from agent_os.application.ports import NotificationStore
+from agent_os.application.ports import MissionParticipantStore, NotificationStore
 from agent_os.domain.lifecycle import CommandKind
 from agent_os.domain.notifications import Notification, NotificationCategory
 from agent_os.domain.workflow_runtime import WorkflowAction, WorkflowActionKind
@@ -25,10 +25,51 @@ class NotificationEffectHandlers:
         self,
         store: NotificationStore,
         *,
+        mission_participants: MissionParticipantStore | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
+        self._mission_participants = mission_participants
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _mission_recipients(
+        self,
+        tenant_id: str,
+        run_id: str,
+        recipients: tuple[str, ...],
+        payload: Mapping[str, Any],
+    ) -> tuple[tuple[str, ...], Mapping[str, Any]]:
+        scoped_roles = {"builder", "reviewer", "client", "viewer"}
+        requested_roles = {
+            recipient.removeprefix("role:")
+            for recipient in recipients
+            if recipient.startswith("role:")
+            and recipient.removeprefix("role:") in scoped_roles
+        }
+        if self._mission_participants is None or not requested_roles:
+            return recipients, payload
+        mission_id = str(payload.get("lifecycle_run_id") or run_id).strip()
+        participants = self._mission_participants.list_participants(tenant_id, mission_id)
+        expanded = [
+            recipient for recipient in recipients
+            if recipient.removeprefix("role:") not in requested_roles
+        ]
+        matched = [
+            str(participant["subject_id"])
+            for participant in participants
+            if participant.get("active")
+            and participant.get("participation_role") in requested_roles
+        ]
+        governed_payload = dict(payload)
+        if not matched:
+            expanded.extend(("role:manager", "human:ceo"))
+            governed_payload["participant_routing_fallback"] = sorted(requested_roles)
+        else:
+            expanded.extend(matched[:120])
+            if len(matched) > 120:
+                expanded.extend(("role:manager", "human:ceo"))
+                governed_payload["participant_routing_truncated"] = len(matched) - 120
+        return tuple(dict.fromkeys(expanded)), governed_payload
 
     def _publish(
         self,
@@ -43,6 +84,9 @@ class NotificationEffectHandlers:
         correlation_id: str | None,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        recipients, payload = self._mission_recipients(
+            tenant_id, run_id, recipients, payload,
+        )
         notification = Notification(
             notification_id=_id(source_id, category),
             tenant_id=tenant_id,

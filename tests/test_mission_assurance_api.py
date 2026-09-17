@@ -8,6 +8,7 @@ from agent_os.application.assurance import AssuranceKernel
 from agent_os.infrastructure.authzen_policy import baseline_effect_policy
 from agent_os.infrastructure.memory import InMemoryWorkflowEngine
 from agent_os.infrastructure.sql_mission_control import SQLMissionControl
+from agent_os.infrastructure.sql_mission_participants import SQLMissionParticipantStore
 
 
 class Identity:
@@ -16,6 +17,8 @@ class Identity:
             return {"sub": "human:ceo", "org": "tenant-a", "roles": ["owner"]}
         if authorization == "Bearer other":
             return {"sub": "human:other", "org": "tenant-b", "roles": ["owner"]}
+        if authorization == "Bearer client":
+            return {"sub": "client-a", "org": "tenant-a", "roles": ["client"]}
         raise ValueError("authentication required")
 
 
@@ -25,9 +28,16 @@ def test_http_mission_control_routes_effect_through_assurance_and_budget(tmp_pat
         assurance_kernel=AssuranceKernel(baseline_effect_policy()),
         create_schema=True,
     )
+    participants = SQLMissionParticipantStore(
+        f"sqlite:///{tmp_path / 'mission-api-participants.sqlite3'}", create_schema=True,
+    )
+    def close_stores():
+        participants.close()
+        store.close()
+
     api = TestClient(create_app(
         engine=InMemoryWorkflowEngine(), identity=Identity(), mission_control=store,
-        shutdown=store.close,
+        mission_participant_store=participants, shutdown=close_stores,
     ))
     headers = {"Authorization": "Bearer owner"}
     now = datetime.now(timezone.utc)
@@ -70,10 +80,27 @@ def test_http_mission_control_routes_effect_through_assurance_and_budget(tmp_pat
         assert admitted.status_code == 202
         assert admitted.json()["status"] == "admitted"
 
+        participants.grant_participant(
+            tenant_id="tenant-a", mission_id="mission-api", subject_id="client-a",
+            participation_role="client", actor_id="human:ceo",
+            idempotency_key="assign-client-mission-api",
+        )
+
         view = api.get("/v2/missions/mission-api/control", headers=headers)
         assert view.status_code == 200
         assert view.json()["budget"]["reserved_cents"] == 250
         assert view.json()["effects"][0]["decision"]["disposition"] == "allowed"
+        client_view = api.get(
+            "/v2/missions/mission-api/control",
+            headers={"Authorization": "Bearer client"},
+        )
+        assert client_view.status_code == 200
+        assert client_view.json()["projection"] == "stakeholder"
+        assert client_view.json()["mission"]["objective"] == "Publish a verified preview"
+        assert "budget" not in client_view.json()
+        assert "authorities" not in client_view.json()
+        assert "effects" not in client_view.json()
+        assert client_view.json()["evidence"] == []
         assert api.get(
             "/v2/missions/mission-api/control",
             headers={"Authorization": "Bearer other"},

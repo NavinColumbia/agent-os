@@ -45,6 +45,7 @@ from agent_os.application.ports import (
     GraphWorkflowEngine,
     GraphRunInspector,
     MembershipStore,
+    MissionParticipantStore,
     MissionControlStore,
     NotificationStore,
     OrganizationLedger,
@@ -472,6 +473,19 @@ class MembershipRevokeRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2_000)
 
 
+class MissionParticipantGrantRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_id: str = Field(min_length=1, max_length=255)
+    participation_role: str = Field(pattern=r"^(builder|reviewer|client|viewer)$")
+
+
+class MissionParticipantRevokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2_000)
+
+
 class TenantModelSettingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -706,6 +720,86 @@ def _principal_can(principal: Principal, capability: str) -> bool:
     return roles_have_capability(principal.roles, capability)
 
 
+def _mission_projection_for(principal: Principal) -> str:
+    """Choose data detail from authority, never from the presentation persona."""
+
+    if _principal_can(principal, "mission.read.all") or _principal_can(
+        principal, "work.execute",
+    ):
+        return "internal"
+    if _principal_can(principal, "work.read") and _principal_can(
+        principal, "review.read",
+    ):
+        return "review"
+    return "stakeholder"
+
+
+def _project_lifecycle_for_authority(
+    raw: Mapping[str, Any], projection: str,
+) -> Mapping[str, Any]:
+    if projection == "internal":
+        return raw
+    admitted = {
+        key: raw[key]
+        for key in (
+            "run_id", "title", "objective", "objective_preview", "phase", "status", "version",
+        )
+        if key in raw
+    }
+    if projection == "review":
+        admitted.update({
+            key: raw[key]
+            for key in ("artifact_revision", "verification_cycle")
+            if key in raw
+        })
+    admitted["projection"] = projection
+    return admitted
+
+
+def _project_assurance_for_authority(
+    raw: Mapping[str, Any] | None, projection: str,
+) -> Mapping[str, Any] | None:
+    if raw is None or projection == "internal":
+        return raw
+    mission = raw.get("mission") if isinstance(raw.get("mission"), Mapping) else {}
+    mission_summary = {
+        key: mission[key]
+        for key in (
+            "mission_id", "objective", "success_measures", "risk_tier", "revision",
+            "human_involvement_mode",
+        )
+        if key in mission
+    }
+    claims = tuple(
+        {
+            key: claim[key]
+            for key in (
+                ("claim_id", "statement", "status", "evidence_ids")
+                if projection == "review" else ("claim_id", "statement", "status")
+            )
+            if key in claim
+        }
+        for claim in raw.get("claims", ())
+        if isinstance(claim, Mapping)
+    )
+    if projection == "stakeholder":
+        return {
+            "mission": mission_summary,
+            "claims": claims,
+            "evidence": (),
+            "hazards": (),
+            "projection": "stakeholder",
+        }
+    return {
+        "mission": mission_summary,
+        "mission_revisions": raw.get("mission_revisions", ()),
+        "claims": claims,
+        "evidence": raw.get("evidence", ()),
+        "hazards": raw.get("hazards", ()),
+        "projection": projection,
+    }
+
+
 def _notification_attention(category: str, payload: Mapping[str, Any]) -> Mapping[str, str]:
     disposition = str(payload.get("attention_disposition") or "")
     severity = str(payload.get("severity") or payload.get("risk") or "").lower()
@@ -786,6 +880,7 @@ def create_app(
     company_directory: CompanyDirectory | None = None,
     connector_registry: ConnectorRegistry | None = None,
     membership_store: MembershipStore | None = None,
+    mission_participant_store: MissionParticipantStore | None = None,
     tenant_model_store: TenantModelStore | None = None,
     usage_meter: UsageMeter | None = None,
     mission_control: MissionControlStore | None = None,
@@ -944,6 +1039,23 @@ def create_app(
             raise HTTPException(status_code=403, detail="active organization membership is required")
         return Principal(principal.subject_id, organization_id, roles)
 
+    def mission_visible_to(principal: Principal, mission_id: str) -> bool:
+        if (
+            mission_participant_store is None
+            or _principal_can(principal, "mission.read.all")
+            or bool(principal.roles & {"agent", "system"})
+        ):
+            return True
+        return mission_participant_store.can_access(
+            principal.organization_id, mission_id, principal.subject_id,
+        )
+
+    def require_mission_access(principal: Principal, mission_id: str) -> None:
+        if not mission_visible_to(principal, mission_id):
+            # A mission outside the subject's explicit scope is intentionally
+            # indistinguishable from a nonexistent or cross-tenant mission.
+            raise HTTPException(status_code=404, detail="run not found")
+
     @app.exception_handler(TransitionRejected)
     def transition_rejected(_: Request, exc: TransitionRejected) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
@@ -1099,6 +1211,94 @@ def create_app(
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             if result is None:
                 raise HTTPException(status_code=404, detail="membership does not exist")
+            return result
+
+    if mission_participant_store is not None:
+        @app.get("/v2/runs/{run_id}/participants")
+        def list_mission_participants(
+            run_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "mission.steer"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="mission participant inventory requires steering authority",
+                )
+            if engine.get_run(principal.organization_id, run_id) is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            return {"items": list(mission_participant_store.list_participants(
+                principal.organization_id, run_id,
+            ))}
+
+        @app.post("/v2/runs/{run_id}/participants", status_code=201)
+        def grant_mission_participant(
+            run_id: str,
+            body: MissionParticipantGrantRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "mission.steer"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="mission participant grants require steering authority",
+                )
+            if engine.get_run(principal.organization_id, run_id) is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            if membership_store is not None:
+                roles = membership_store.roles_for(
+                    principal.organization_id, body.subject_id,
+                )
+                if roles is None or body.participation_role not in roles:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "participant must first hold an active matching organization role"
+                        ),
+                    )
+            try:
+                return mission_participant_store.grant_participant(
+                    tenant_id=principal.organization_id,
+                    mission_id=run_id,
+                    subject_id=body.subject_id,
+                    participation_role=body.participation_role,
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.delete("/v2/runs/{run_id}/participants/{subject_id}")
+        def revoke_mission_participant(
+            run_id: str,
+            subject_id: str,
+            body: MissionParticipantRevokeRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "mission.steer"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="mission participant revocation requires steering authority",
+                )
+            if engine.get_run(principal.organization_id, run_id) is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            try:
+                result = mission_participant_store.revoke_participant(
+                    tenant_id=principal.organization_id,
+                    mission_id=run_id,
+                    subject_id=subject_id,
+                    actor_id=principal.subject_id,
+                    reason=body.reason,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(status_code=404, detail="mission participant not found")
             return result
 
     if tenant_model_store is not None:
@@ -1503,10 +1703,13 @@ def create_app(
             mission_id: str,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
+            require_mission_access(principal, mission_id)
             view = mission_control.control_view(principal.organization_id, mission_id)
             if view is None:
                 raise HTTPException(status_code=404, detail="mission not found")
-            return view
+            return _project_assurance_for_authority(
+                view, _mission_projection_for(principal),
+            ) or {}
 
         @app.put("/v2/missions/{mission_id}")
         def revise_mission_contract(
@@ -1516,6 +1719,7 @@ def create_app(
         ) -> Mapping[str, Any]:
             if not _principal_can(principal, "mission.steer"):
                 raise HTTPException(status_code=403, detail="mission revision requires steering authority")
+            require_mission_access(principal, mission_id)
             current = mission_control.get_mission(principal.organization_id, mission_id)
             if current is None:
                 raise HTTPException(status_code=404, detail="mission not found")
@@ -1568,6 +1772,7 @@ def create_app(
         ) -> Mapping[str, Any]:
             if not _principal_can(principal, "artifact.publish"):
                 raise HTTPException(status_code=403, detail="evidence publication requires artifact authority")
+            require_mission_access(principal, mission_id)
             try:
                 created = mission_control.add_evidence(
                     principal.organization_id,
@@ -1594,6 +1799,7 @@ def create_app(
         ) -> Mapping[str, Any]:
             if not _principal_can(principal, "artifact.publish"):
                 raise HTTPException(status_code=403, detail="claim publication requires artifact authority")
+            require_mission_access(principal, mission_id)
             try:
                 created = mission_control.add_claim(
                     principal.organization_id,
@@ -1623,6 +1829,7 @@ def create_app(
         ) -> Mapping[str, Any]:
             if not _principal_can(principal, "evidence.erase"):
                 raise HTTPException(status_code=403, detail="evidence erasure requires evidence authority")
+            require_mission_access(principal, mission_id)
             try:
                 return mission_control.tombstone_evidence(
                     tenant_id=principal.organization_id, mission_id=mission_id,
@@ -1642,6 +1849,7 @@ def create_app(
         ) -> Mapping[str, Any]:
             if not _principal_can(principal, "hazard.report"):
                 raise HTTPException(status_code=403, detail="hazard registration requires mission authority")
+            require_mission_access(principal, mission_id)
             try:
                 created = mission_control.add_hazard(
                     principal.organization_id,
@@ -1669,6 +1877,7 @@ def create_app(
         ) -> Mapping[str, Any]:
             if not _principal_can(principal, "authority.manage"):
                 raise HTTPException(status_code=403, detail="authority delegation requires mission authority")
+            require_mission_access(principal, mission_id)
             mission = mission_control.get_mission(principal.organization_id, mission_id)
             if mission is None:
                 raise HTTPException(status_code=404, detail="mission not found")
@@ -1701,6 +1910,7 @@ def create_app(
         ) -> Mapping[str, Any]:
             if not _principal_can(principal, "effect.request"):
                 raise HTTPException(status_code=403, detail="effect requests require execution authority")
+            require_mission_access(principal, mission_id)
             if body.actor_id != principal.subject_id and not _principal_can(
                 principal, "authority.manage",
             ):
@@ -1732,6 +1942,7 @@ def create_app(
         ) -> Mapping[str, Any]:
             if not _principal_can(principal, "authority.manage"):
                 raise HTTPException(status_code=403, detail="authority revocation requires mission authority")
+            require_mission_access(principal, mission_id)
             try:
                 return mission_control.revoke_authority(
                     tenant_id=principal.organization_id, mission_id=mission_id,
@@ -1751,6 +1962,7 @@ def create_app(
         ) -> Mapping[str, Any]:
             if not _principal_can(principal, "effect.settle"):
                 raise HTTPException(status_code=403, detail="effect settlement requires mission authority")
+            require_mission_access(principal, mission_id)
             try:
                 return mission_control.settle_effect(
                     tenant_id=principal.organization_id, mission_id=mission_id,
@@ -1819,20 +2031,39 @@ def create_app(
         principal: Annotated[Principal, Depends(current_principal)],
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
     ) -> Mapping[str, Any]:
+        if (
+            mission_participant_store is not None
+            and not _principal_can(principal, "mission.read.all")
+            and not principal.roles & {"agent", "system"}
+        ):
+            visible_ids = mission_participant_store.mission_ids_for_subject(
+                principal.organization_id, principal.subject_id, limit=1_000,
+            )
+            states = tuple(
+                state
+                for run_id in visible_ids
+                if (state := engine.get_run(principal.organization_id, run_id)) is not None
+            )[:limit]
+        else:
+            states = engine.list_runs(principal.organization_id, limit=limit)
+        mission_projection = _mission_projection_for(principal)
         return {
-            "items": [{
-                "run_id": state_value.run_id,
-                "title": state_value.title,
-                "objective_preview": None if state_value.objective is None else (
-                    state_value.objective[:280]
-                    + ("…" if len(state_value.objective) > 280 else "")
-                ),
-                "phase": state_value.phase.value,
-                "status": state_value.status.value,
-                "version": state_value.version,
-                "verification_cycle": state_value.verification_cycle,
-                "artifact_revision": state_value.artifact_revision,
-            } for state_value in engine.list_runs(principal.organization_id, limit=limit)]
+            "items": [
+                _project_lifecycle_for_authority({
+                    "run_id": state_value.run_id,
+                    "title": state_value.title,
+                    "objective_preview": None if state_value.objective is None else (
+                        state_value.objective[:280]
+                        + ("…" if len(state_value.objective) > 280 else "")
+                    ),
+                    "phase": state_value.phase.value,
+                    "status": state_value.status.value,
+                    "version": state_value.version,
+                    "verification_cycle": state_value.verification_cycle,
+                    "artifact_revision": state_value.artifact_revision,
+                }, mission_projection)
+                for state_value in states
+            ]
         }
 
     @app.get("/v2/runs/{run_id}")
@@ -1845,7 +2076,10 @@ def create_app(
             # A different tenant's run is intentionally indistinguishable from
             # a nonexistent run.
             raise HTTPException(status_code=404, detail="run not found")
-        return state_value.to_dict()
+        require_mission_access(principal, run_id)
+        return _project_lifecycle_for_authority(
+            state_value.to_dict(), _mission_projection_for(principal),
+        )
 
     @app.get("/v2/runs/{run_id}/activity")
     def get_run_activity(
@@ -1858,6 +2092,11 @@ def create_app(
         # is indistinguishable from a nonexistent run.
         if engine.get_run(principal.organization_id, run_id) is None:
             raise HTTPException(status_code=404, detail="run not found")
+        require_mission_access(principal, run_id)
+        if not _principal_can(principal, "work.read"):
+            raise HTTPException(
+                status_code=403, detail="mission activity requires work visibility",
+            )
         if not isinstance(engine, OrganizationLedger):
             return {"items": [], "next_version": after_version}
         items = engine.load_organization_events(
@@ -1916,6 +2155,19 @@ def create_app(
             recipients = {str(item) for item in raw.get("recipient_ids", ())}
             if not recipients or "system" in principal.roles:
                 return True
+            scoped_role_recipients = recipients & {
+                "role:builder", "role:reviewer", "role:client", "role:viewer",
+            }
+            if mission_participant_store is not None and scoped_role_recipients:
+                payload = raw.get("payload")
+                payload = payload if isinstance(payload, Mapping) else {}
+                mission_id = str(
+                    payload.get("lifecycle_run_id") or raw.get("run_id") or ""
+                ).strip()
+                if not mission_id or not mission_participant_store.can_access(
+                    principal.organization_id, mission_id, principal.subject_id,
+                ):
+                    return False
             admitted = {
                 principal.subject_id,
                 *(f"role:{role}" for role in principal.roles),
@@ -2030,9 +2282,10 @@ def create_app(
                     return None
                 admitted = {
                     principal.subject_id,
-                    "tenant:members",
                     *(f"role:{role}" for role in principal.roles),
                 }
+                if _principal_can(principal, "company.read"):
+                    admitted.add("tenant:members")
                 if "agent" in principal.roles:
                     admitted.add(f"agent:{principal.subject_id}")
                 return tuple(sorted(admitted))
@@ -2348,8 +2601,14 @@ def create_app(
                     device_name=body.device_name,
                     audience_ids=tuple(sorted({
                         principal.subject_id,
-                        "tenant:members",
-                        *(f"role:{role}" for role in principal.roles),
+                        *(
+                            f"role:{role}" for role in principal.roles
+                            if role not in {"builder", "reviewer", "client", "viewer"}
+                        ),
+                        *(
+                            {"tenant:members"}
+                            if _principal_can(principal, "company.read") else set()
+                        ),
                         *(
                             {"human:ceo", "role:executive"}
                             if "owner" in principal.roles else set()
@@ -2880,11 +3139,71 @@ def create_app(
             return result
 
     if artifact_store is not None:
+        def artifact_attached_to_mission(
+            tenant_id: str, mission_id: str, artifact_id: str,
+        ) -> bool:
+            if mission_control is not None:
+                assurance = mission_control.control_view(tenant_id, mission_id)
+                if assurance is not None:
+                    for evidence in assurance.get("evidence", ()):
+                        if not isinstance(evidence, Mapping) or evidence.get("erased"):
+                            continue
+                        if artifact_id in {
+                            str(evidence.get("artifact_ref") or ""),
+                            str(evidence.get("evidence_id") or ""),
+                        }:
+                            return True
+            if graph_engine is None:
+                return False
+            pending = [mission_planning_run_id(mission_id)]
+            visited: set[str] = set()
+            while pending and len(visited) < 100:
+                graph_run_id = pending.pop(0)
+                if graph_run_id in visited:
+                    continue
+                visited.add(graph_run_id)
+                state = graph_engine.get_graph_run(tenant_id, graph_run_id)
+                if state is None:
+                    continue
+                for token in state.tokens:
+                    if artifact_id in token.evidence_ids:
+                        return True
+                    output = token.output if isinstance(token.output, Mapping) else {}
+                    if artifact_id in {
+                        str(output.get("artifact_id") or ""),
+                        str(output.get("receipt_artifact_id") or ""),
+                    }:
+                        return True
+                    child_run_id = str(output.get("child_run_id") or "").strip()
+                    if child_run_id and child_run_id not in visited:
+                        pending.append(child_run_id)
+            return False
+
+        def artifact_content_response(
+            principal: Principal, artifact_id: str,
+        ) -> Response:
+            record = artifact_store.describe(principal.organization_id, artifact_id)
+            content = artifact_store.get(principal.organization_id, artifact_id)
+            if record is None or content is None:
+                raise HTTPException(status_code=404, detail="artifact not found")
+            return Response(
+                content=content,
+                media_type=str(record["media_type"]),
+                headers={
+                    "ETag": f'"{record["digest"]}"',
+                    "Content-Disposition": f'attachment; filename="{record["artifact_id"]}"',
+                    "Content-Security-Policy": "sandbox; default-src 'none'",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+
         @app.get("/v2/deployments")
         def list_deployments(
             principal: Annotated[Principal, Depends(current_principal)],
             limit: Annotated[int, Query(ge=1, le=500)] = 100,
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "release.read"):
+                raise HTTPException(status_code=403, detail="release inventory requires release authority")
             items: list[dict[str, Any]] = []
             for record in artifact_store.list_artifacts(
                 principal.organization_id,
@@ -2957,11 +3276,48 @@ def create_app(
                 raise HTTPException(status_code=500, detail="artifact publication was not readable")
             return record
 
+        @app.get("/v2/runs/{run_id}/artifacts/{artifact_id}")
+        def describe_mission_artifact(
+            run_id: str,
+            artifact_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "artifact.read"):
+                raise HTTPException(status_code=403, detail="artifact access requires evidence authority")
+            require_mission_access(principal, run_id)
+            if not artifact_attached_to_mission(
+                principal.organization_id, run_id, artifact_id,
+            ):
+                raise HTTPException(status_code=404, detail="artifact not found")
+            record = artifact_store.describe(principal.organization_id, artifact_id)
+            if record is None:
+                raise HTTPException(status_code=404, detail="artifact not found")
+            return record
+
+        @app.get("/v2/runs/{run_id}/artifacts/{artifact_id}/content")
+        def download_mission_artifact(
+            run_id: str,
+            artifact_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Response:
+            if not _principal_can(principal, "artifact.read"):
+                raise HTTPException(status_code=403, detail="artifact access requires evidence authority")
+            require_mission_access(principal, run_id)
+            if not artifact_attached_to_mission(
+                principal.organization_id, run_id, artifact_id,
+            ):
+                raise HTTPException(status_code=404, detail="artifact not found")
+            return artifact_content_response(principal, artifact_id)
+
         @app.get("/v2/artifacts/{artifact_id}")
         def describe_artifact(
             artifact_id: str,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "artifact.read") or not _principal_can(
+                principal, "mission.read.all",
+            ):
+                raise HTTPException(status_code=403, detail="global artifact access requires portfolio authority")
             record = artifact_store.describe(principal.organization_id, artifact_id)
             if record is None:
                 raise HTTPException(status_code=404, detail="artifact not found")
@@ -2972,20 +3328,11 @@ def create_app(
             artifact_id: str,
             principal: Annotated[Principal, Depends(current_principal)],
         ) -> Response:
-            record = artifact_store.describe(principal.organization_id, artifact_id)
-            content = artifact_store.get(principal.organization_id, artifact_id)
-            if record is None or content is None:
-                raise HTTPException(status_code=404, detail="artifact not found")
-            return Response(
-                content=content,
-                media_type=str(record["media_type"]),
-                headers={
-                    "ETag": f'"{record["digest"]}"',
-                    "Content-Disposition": f'attachment; filename="{record["artifact_id"]}"',
-                    "Content-Security-Policy": "sandbox; default-src 'none'",
-                    "X-Content-Type-Options": "nosniff",
-                },
-            )
+            if not _principal_can(principal, "artifact.read") or not _principal_can(
+                principal, "mission.read.all",
+            ):
+                raise HTTPException(status_code=403, detail="global artifact access requires portfolio authority")
+            return artifact_content_response(principal, artifact_id)
 
     if graph_engine is not None:
         @app.get("/v2/runs/{run_id}/management")
@@ -2997,6 +3344,7 @@ def create_app(
             lifecycle = engine.get_run(principal.organization_id, run_id)
             if lifecycle is None:
                 raise HTTPException(status_code=404, detail="run not found")
+            require_mission_access(principal, run_id)
             planning_run_id = mission_planning_run_id(run_id)
             planning = graph_engine.get_graph_run(principal.organization_id, planning_run_id)
             if planning is None:
@@ -3081,11 +3429,30 @@ def create_app(
             )
             projection["subprograms"] = subprograms
             projection["subprograms_truncated"] = truncated
-            projection["assurance"] = (
+            mission_projection = _mission_projection_for(principal)
+            assurance = (
                 None if mission_control is None else mission_control.control_view(
                     principal.organization_id, run_id,
                 )
             )
+            projection["assurance"] = _project_assurance_for_authority(
+                assurance, mission_projection,
+            )
+            if mission_projection == "stakeholder":
+                return {
+                    key: projection[key]
+                    for key in ("health", "progress")
+                    if key in projection
+                } | {"projection": "stakeholder"}
+            if mission_projection == "review":
+                admitted = {
+                    "health", "progress", "readiness", "program", "work_items", "risks",
+                    "next_actions", "management_signals", "subprograms",
+                    "subprograms_truncated", "assurance",
+                }
+                return {
+                    key: value for key, value in projection.items() if key in admitted
+                } | {"projection": "review"}
             return projection
 
         if company_directory is not None:
@@ -3145,6 +3512,7 @@ def create_app(
             lifecycle = engine.get_run(principal.organization_id, run_id)
             if lifecycle is None:
                 raise HTTPException(status_code=404, detail="run not found")
+            require_mission_access(principal, run_id)
             planning_run_id = mission_planning_run_id(run_id)
             planning = graph_engine.get_graph_run(
                 principal.organization_id, planning_run_id,
@@ -3213,8 +3581,11 @@ def create_app(
             subprograms, truncated = _project_mission_subprograms(
                 graph_engine, principal.organization_id, execution_run_id,
             )
-            return {
-                "lifecycle": lifecycle.to_dict(),
+            mission_projection = _mission_projection_for(principal)
+            projected = {
+                "lifecycle": _project_lifecycle_for_authority(
+                    lifecycle.to_dict(), mission_projection,
+                ),
                 "planning_run_id": planning_run_id,
                 "planning": None if planning is None else planning.to_dict(),
                 "execution_run_id": execution_run_id,
@@ -3223,12 +3594,28 @@ def create_app(
                 "deliverables": deliverables,
                 "subprograms": subprograms,
                 "subprograms_truncated": truncated,
-                "assurance": (
+                "assurance": _project_assurance_for_authority(
                     None if mission_control is None else mission_control.control_view(
                         principal.organization_id, run_id,
-                    )
+                    ),
+                    mission_projection,
                 ),
             }
+            if mission_projection in {"review", "stakeholder"}:
+                projected.update({
+                    "planning_run_id": None,
+                    "planning": None,
+                    "execution_run_id": None,
+                    "execution": None,
+                    "projection": mission_projection,
+                })
+            if mission_projection == "stakeholder":
+                projected.update({
+                    "program": None,
+                    "subprograms": [],
+                    "subprograms_truncated": False,
+                })
+            return projected
 
         @app.post("/v2/workflows", status_code=201)
         def register_workflow(

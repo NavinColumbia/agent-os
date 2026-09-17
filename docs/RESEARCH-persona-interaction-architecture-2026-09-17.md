@@ -248,6 +248,15 @@ without artifact or runtime mutation authority. Personal inbox queries resolve b
 role audiences on the server, so teams can route a review to `role:reviewer` without leaking it to builders or
 viewers and without duplicating an item addressed to both the person and role.
 
+Mission participation now supplies the missing resource boundary for builders, reviewers, clients, and viewers.
+A tenant role describes allowable behavior, while a separately audited grant identifies the exact mission. The
+portfolio, direct mission APIs, assurance and management projections, artifacts, releases, experience feed, and
+legacy role-addressed inbox records all enforce that boundary. Client/viewer projections show outcomes,
+progress, milestones, and approved deliverables without internal communications, staffing, effect/authority
+ledgers, raw execution identifiers, or arbitrary artifacts. New role-addressed mission notifications are
+expanded into exact participant subjects before publication; an empty audience escalates to accountable
+management instead of silently broadcasting or dropping the question.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

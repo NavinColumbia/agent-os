@@ -427,6 +427,43 @@ class MembershipStore(Protocol):
 
 
 @runtime_checkable
+class MissionParticipantStore(Protocol):
+    """Subject-bound access assignments for one tenant mission."""
+
+    def can_access(self, tenant_id: str, mission_id: str, subject_id: str) -> bool: ...
+
+    def mission_ids_for_subject(
+        self, tenant_id: str, subject_id: str, *, limit: int = 1_000,
+    ) -> tuple[str, ...]: ...
+
+    def list_participants(
+        self, tenant_id: str, mission_id: str,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def grant_participant(
+        self,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        subject_id: str,
+        participation_role: str,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def revoke_participant(
+        self,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        subject_id: str,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
+
+
+@runtime_checkable
 class TenantModelStore(Protocol):
     """Tenant-owned model choice with an optional opaque credential reference."""
 

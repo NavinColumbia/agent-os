@@ -33,6 +33,7 @@ from agent_os.infrastructure.pydantic_agents import (
     default_model_name,
     model_usage_record,
 )
+from agent_os.infrastructure.mission_programs import HumanDecisionBrief
 
 
 class GraphNodeDisposition(str, Enum):
@@ -619,6 +620,45 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             if response is not None:
                 if not isinstance(response, Mapping):
                     raise FatalCommandError("durable human response must be an object")
+                raw_brief = node.configuration.get("decision_brief")
+                if raw_brief is not None:
+                    try:
+                        brief = HumanDecisionBrief.model_validate(raw_brief)
+                    except (TypeError, ValueError) as exc:
+                        raise FatalCommandError(
+                            f"human node decision_brief is invalid: {exc}"
+                        ) from exc
+                    allowed_actions = (
+                        {"respond"}
+                        if brief.kind in {"input", "choice"}
+                        else {"approve"}
+                    )
+                    if brief.kind == "approval" and node.configuration.get(
+                        "rejection_condition"
+                    ) is not None:
+                        allowed_actions.add("decline")
+                        if brief.allow_request_changes:
+                            allowed_actions.add("request_changes")
+                    response_action = response.get("action")
+                    if response_action is None:
+                        response_action = (
+                            "approve" if response.get("approved") is True
+                            else "decline" if response.get("approved") is False
+                            else "respond"
+                        )
+                    if (
+                        not isinstance(response_action, str)
+                        or response_action not in allowed_actions
+                    ):
+                        raise FatalCommandError(
+                            "human response action is not valid for the decision brief"
+                        )
+                    if response_action in {"respond", "decline", "request_changes"} and not str(
+                        response.get("answer") or ""
+                    ).strip():
+                        raise FatalCommandError("human response action requires durable context")
+                    if response_action == "respond" and "approved" in response:
+                        raise FatalCommandError("human response intent is inconsistent")
                 conditions = [edge.condition for edge in definition.outgoing(node.node_id)
                               if edge.condition != "always"]
                 configured_condition = node.configuration.get("response_condition")
@@ -654,15 +694,50 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
             recipients = node.configuration.get("recipient_ids", ["human:ceo"])
             if not isinstance(recipients, (list, tuple)) or not recipients:
                 raise FatalCommandError("human node requires configured recipient_ids")
+            raw_brief = node.configuration.get("decision_brief")
+            decision_context: dict[str, Any] | None = None
+            if raw_brief is not None:
+                try:
+                    brief = HumanDecisionBrief.model_validate(raw_brief)
+                except (TypeError, ValueError) as exc:
+                    raise FatalCommandError(
+                        f"human node decision_brief is invalid: {exc}"
+                    ) from exc
+                allowed_actions = (
+                    ["respond"]
+                    if brief.kind in {"input", "choice"}
+                    else ["approve"]
+                )
+                if brief.kind == "approval" and node.configuration.get(
+                    "rejection_condition"
+                ) is not None:
+                    allowed_actions.append("decline")
+                    if brief.allow_request_changes:
+                        allowed_actions.append("request_changes")
+                decision_context = {
+                    **brief.model_dump(mode="json", exclude_none=True),
+                    "requesting_role": brief.requesting_role or node.owner_role or "mission-team",
+                    "allowed_actions": allowed_actions,
+                    "evidence_ids": list(dict.fromkeys(
+                        evidence_id
+                        for prior in state.tokens
+                        if prior.token_id != token.token_id
+                        and prior.status is TokenStatus.SUCCEEDED
+                        for evidence_id in prior.evidence_ids
+                    ))[-16:],
+                }
             correlation = str(node.configuration.get("correlation_id") or (
                 "graph-question-" + hashlib.sha256(action.action_id.encode()).hexdigest()
             ))
-            return {
+            result = {
                 "disposition": "wait",
                 "recipient_ids": [str(item) for item in recipients],
                 "correlation_id": correlation,
                 "reason": node.purpose,
             }
+            if decision_context is not None:
+                result["decision_context"] = decision_context
+            return result
         if node.kind is NodeKind.TERMINAL:
             evidence = tuple(dict.fromkeys(
                 evidence_id

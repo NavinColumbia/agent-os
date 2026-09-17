@@ -27,6 +27,9 @@ The first records are:
 - mission-level collaboration mode and interruption budget surfaced at intake;
 - a durable, idempotent decision-response intent and recovery worker bound to an exact notification,
   workflow wait, actor, and deterministic graph event.
+- a bounded decision brief carried from the admitted workflow into the attention projection: requester,
+  recommendation, alternatives, consequences, reversibility, safe default, material cost/deadline, and the
+  exact response actions the workflow can safely accept.
 
 The next compatible records are structured `AttentionItem`, `RecipientReceipt`, `NotificationSubscription`,
 and immutable `DeliveryPlan`. Structured decision responses already hide workflow correlation/version mechanics
@@ -46,6 +49,8 @@ output, and traces are advanced diagnostic views.
 7. Tenant-facing roles, platform-operator roles, and runtime service identities remain distinct.
 8. The first scale path remains PostgreSQL, durable outboxes, stateless APIs/workers, bounded projections, and
    tenant home cells. Kafka, active-active writes, and a language rewrite require measured evidence.
+9. Free text never implies approval. Approve, decline, request-changes, and respond are separate intents;
+   admission and execution both reject an action the decision brief does not permit.
 
 ## API direction
 
@@ -85,5 +90,6 @@ decision-response truth defined here.
 - Personal dismissal removes an item from open attention without deleting the ledger record.
 - A background update never destroys a typed response or configuration draft.
 - Every interrupt explains its urgency/routing rationale.
+- Every newly planned human wait supplies a bounded decision brief, and only semantically valid actions render.
 - CEO, builder, reviewer, operator, and administrator land on useful authorized projections of the same mission.
 - Keyboard and screen-reader users can complete intake, decision, review, and recovery.

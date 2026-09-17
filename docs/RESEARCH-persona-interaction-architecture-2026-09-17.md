@@ -229,6 +229,12 @@ standing organization, hard spend guard, model policy, human-decision routing, o
 first mission. It deliberately labels an inherited platform model `verify_on_first_use`: API health cannot
 observe worker-only provider credentials, so the first metered turn—not a green setup badge—is the proof.
 
+Newly planned human waits now carry a validated, bounded decision brief through durable graph state into the
+personal inbox. The card shows requester, recommendation, alternatives, consequences, reversibility, safe
+default, material cost/deadline, and only the actions the workflow declares valid. API admission and graph
+execution enforce the same action set, so a free-text response cannot silently become an approval and “request
+changes” appears only when the rejection route is explicitly designed to accept it.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

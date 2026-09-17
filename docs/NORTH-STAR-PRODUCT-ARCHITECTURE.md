@@ -464,7 +464,8 @@ Raise the availability target only when architecture, vendors, staffing, and an 
   [ADR-004](ADR-004-live-experience-and-mobile-attention.md); AG-UI is a version-pinned public adapter rather
   than the internal workflow or approval schema.
 - One PydanticAI agent family and one V2 lifecycle on the selected bootstrap workflow adapter.
-- Consolidated prerequisite packet and one durable human approval/wait.
+- Consolidated prerequisite packet and one durable human approval/wait with an action-bound decision brief:
+  requester, recommendation, alternatives, consequences, reversibility, safe default, cost/deadline, and evidence.
 - Isolated build/QA sandbox, revision-bound evidence, signed artifact, Cloud Run deployment, health check,
   stable URL, and rollback.
 - CEO workspace showing truthful progress, communications, cost, evidence, and next decision.

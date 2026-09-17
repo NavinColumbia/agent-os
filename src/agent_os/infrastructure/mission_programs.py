@@ -7,12 +7,55 @@ deterministic admission boundary in front of the durable workflow runtime.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Collection, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 MISSION_PROGRAM_FORMAT = "agent-os.mission-program.v1"
+
+
+class HumanDecisionBrief(BaseModel):
+    """Bounded context a person needs before responding to a workflow wait."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["input", "approval", "choice"]
+    request: str = Field(min_length=1, max_length=4_000)
+    requesting_role: str | None = Field(default=None, min_length=1, max_length=256)
+    recommendation: str | None = Field(default=None, max_length=4_000)
+    alternatives: list[str] = Field(default_factory=list, max_length=8)
+    consequences: list[str] = Field(min_length=1, max_length=8)
+    reversibility: Literal[
+        "reversible", "partially_reversible", "irreversible", "unknown",
+    ] = "unknown"
+    safe_default: str = Field(min_length=1, max_length=4_000)
+    allow_request_changes: bool = False
+    estimated_cost_cents: int | None = Field(
+        default=None, ge=0, le=100_000_000_000,
+    )
+    deadline_at: str | None = Field(default=None, max_length=64)
+
+    @field_validator("alternatives", "consequences")
+    @classmethod
+    def bounded_nonempty_items(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() or len(value) > 2_000 for value in values):
+            raise ValueError("decision brief list items must contain 1 to 2000 characters")
+        return values
+
+    @field_validator("deadline_at")
+    @classmethod
+    def deadline_is_zoned_rfc3339(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("decision deadline must be RFC 3339") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("decision deadline must include a timezone")
+        return value
 
 
 class PlannedNode(BaseModel):

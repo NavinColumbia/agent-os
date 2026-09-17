@@ -1908,6 +1908,97 @@ def create_app(
                 admitted.add(f"agent:{principal.subject_id}")
             return bool(recipients & admitted)
 
+        def notification_decision_context(
+            raw: Mapping[str, Any],
+        ) -> Mapping[str, Any] | None:
+            payload = raw.get("payload")
+            if not isinstance(payload, Mapping):
+                return None
+            context = payload.get("decision_context")
+            if not isinstance(context, Mapping):
+                return None
+            kind = str(context.get("kind") or "")
+            request = str(context.get("request") or "").strip()
+            safe_default = str(context.get("safe_default") or "").strip()
+            consequences = context.get("consequences")
+            alternatives = context.get("alternatives", [])
+            evidence_ids = context.get("evidence_ids", [])
+            raw_actions = context.get("allowed_actions")
+            requesting_role = context.get("requesting_role")
+            recommendation = context.get("recommendation")
+            reversibility = context.get("reversibility", "unknown")
+            deadline_at = context.get("deadline_at")
+            estimated_cost_cents = context.get("estimated_cost_cents")
+            deadline_valid = True
+            if isinstance(deadline_at, str):
+                try:
+                    deadline_valid = datetime.fromisoformat(
+                        deadline_at.replace("Z", "+00:00")
+                    ).tzinfo is not None
+                except ValueError:
+                    deadline_valid = False
+            allowed_action_values = {"approve", "decline", "request_changes", "respond"}
+            if (
+                kind not in {"input", "approval", "choice"}
+                or not request
+                or len(request) > 4_000
+                or not safe_default
+                or len(safe_default) > 4_000
+                or not isinstance(consequences, list)
+                or not 1 <= len(consequences) <= 8
+                or any(
+                    not isinstance(value, str) or not value.strip() or len(value) > 2_000
+                    for value in consequences
+                )
+                or not isinstance(alternatives, list)
+                or len(alternatives) > 8
+                or any(
+                    not isinstance(value, str) or not value.strip() or len(value) > 2_000
+                    for value in alternatives
+                )
+                or not isinstance(evidence_ids, list)
+                or len(evidence_ids) > 16
+                or any(not isinstance(value, str) or not value.strip() for value in evidence_ids)
+                or (
+                    requesting_role is not None
+                    and (not isinstance(requesting_role, str) or len(requesting_role) > 256)
+                )
+                or (
+                    recommendation is not None
+                    and (not isinstance(recommendation, str) or len(recommendation) > 4_000)
+                )
+                or reversibility not in {
+                    "reversible", "partially_reversible", "irreversible", "unknown",
+                }
+                or (deadline_at is not None and not isinstance(deadline_at, str))
+                or not deadline_valid
+                or (
+                    estimated_cost_cents is not None
+                    and (
+                        isinstance(estimated_cost_cents, bool)
+                        or not isinstance(estimated_cost_cents, int)
+                        or not 0 <= estimated_cost_cents <= 100_000_000_000
+                    )
+                )
+                or not isinstance(raw_actions, list)
+                or not raw_actions
+                or any(
+                    not isinstance(value, str) or value not in allowed_action_values
+                    for value in raw_actions
+                )
+            ):
+                return None
+            projected = {
+                key: context[key]
+                for key in (
+                    "kind", "request", "requesting_role", "recommendation", "alternatives",
+                    "consequences", "reversibility", "safe_default", "estimated_cost_cents",
+                    "deadline_at", "allowed_actions", "evidence_ids",
+                )
+                if key in context
+            }
+            return projected
+
         experience_lister = getattr(
             notification_store, "list_experience_events", None,
         )
@@ -2343,6 +2434,44 @@ def create_app(
                     or raw.get("category") != "human_action_required"
                 ):
                     raise HTTPException(status_code=404, detail="decision not found")
+                decision_context = notification_decision_context(raw)
+                raw_payload = raw.get("payload")
+                if (
+                    isinstance(raw_payload, Mapping)
+                    and "decision_context" in raw_payload
+                    and decision_context is None
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="decision context is invalid and requires operator recovery",
+                    )
+                if decision_context is not None:
+                    response_action = body.response.get("action")
+                    if response_action is None:
+                        approved = body.response.get("approved")
+                        response_action = (
+                            "approve" if approved is True
+                            else "decline" if approved is False
+                            else "respond"
+                        )
+                    allowed_actions = set(decision_context["allowed_actions"])
+                    if not isinstance(response_action, str) or response_action not in allowed_actions:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="this response action is not valid for the decision",
+                        )
+                    if response_action == "approve" and body.response.get("approved") is not True:
+                        raise HTTPException(status_code=409, detail="approval intent is inconsistent")
+                    if response_action in {"decline", "request_changes"} and body.response.get(
+                        "approved"
+                    ) is not False:
+                        raise HTTPException(status_code=409, detail="rejection intent is inconsistent")
+                    if response_action in {"respond", "decline", "request_changes"} and not str(
+                        body.response.get("answer") or ""
+                    ).strip():
+                        raise HTTPException(status_code=409, detail="this response requires context")
+                    if response_action == "respond" and "approved" in body.response:
+                        raise HTTPException(status_code=409, detail="response intent is inconsistent")
                 run_id = str(raw.get("run_id") or "")
                 correlation_id = str(raw.get("correlation_id") or "")
                 existing = existing_reader(
@@ -2472,6 +2601,15 @@ def create_app(
             for raw in items:
                 item = dict(raw)
                 if item.get("category") == "human_action_required":
+                    decision_context = notification_decision_context(item)
+                    if decision_context is not None:
+                        item["decision_context"] = decision_context
+                    elif isinstance(item.get("payload"), Mapping) and (
+                        "decision_context" in item["payload"]
+                    ):
+                        item["decision_context_error"] = (
+                            "Decision context failed validation; an operator must recover this request."
+                        )
                     run_key = str(item.get("run_id") or "")
                     correlation = str(item.get("correlation_id") or "")
                     if graph_engine is not None and run_key and correlation:
@@ -2491,6 +2629,8 @@ def create_app(
                     else:
                         item["actionable"] = False
                 else:
+                    item["actionable"] = False
+                if item.get("decision_context_error"):
                     item["actionable"] = False
                 decision = decisions.get(str(item.get("notification_id") or ""))
                 if decision is not None:

@@ -75,7 +75,20 @@ def publish_decision(store: SQLNotificationStore) -> None:
         source_id="release-waited-action",
         created_at="2026-09-17T12:00:00+00:00",
         correlation_id="release-approval",
-        payload={"risk": "production"},
+        payload={
+            "risk": "production",
+            "decision_context": {
+                "kind": "approval",
+                "request": "Approve the production release?",
+                "requesting_role": "release-manager",
+                "recommendation": "Approve after reviewing retained evidence.",
+                "alternatives": ["Keep the current release live"],
+                "consequences": ["The verified revision becomes public."],
+                "reversibility": "reversible",
+                "safe_default": "Keep the current release live.",
+                "allowed_actions": ["approve", "decline", "request_changes"],
+            },
+        },
     ))
 
 
@@ -100,6 +113,10 @@ def test_structured_decision_is_durable_authorized_and_applied_once(tmp_path: Pa
             "/v2/notifications", headers={"Authorization": "Bearer owner"},
         ).json()["items"][0]
         assert before["actionable"] is True
+        assert before["decision_context"]["requesting_role"] == "release-manager"
+        assert before["decision_context"]["allowed_actions"] == [
+            "approve", "decline", "request_changes",
+        ]
 
         raw_bypass = api.post(
             "/v2/graph-runs/release-run/events",
@@ -123,6 +140,19 @@ def test_structured_decision_is_durable_authorized_and_applied_once(tmp_path: Pa
             json={"response": {"approved": True}},
         )
         assert forbidden.status_code == 404
+
+        unsafe_reply = api.post(
+            "/v2/decisions/notice-release/responses",
+            headers={**headers, "Idempotency-Key": "release-unsafe-reply"},
+            json={"response": {"action": "respond", "answer": "Looks good"}},
+        )
+        assert unsafe_reply.status_code == 409
+        missing_change = api.post(
+            "/v2/decisions/notice-release/responses",
+            headers={**headers, "Idempotency-Key": "release-empty-change"},
+            json={"response": {"action": "request_changes", "approved": False}},
+        )
+        assert missing_change.status_code == 409
 
         accepted = api.post(
             "/v2/decisions/notice-release/responses",

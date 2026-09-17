@@ -187,6 +187,11 @@ class DurableGraphActionExecutor(GraphActionExecutor):
                 "correlation_id": correlation_id,
                 "reason": reason,
             })
+            decision_context = result.get("decision_context")
+            if decision_context is not None:
+                if not isinstance(decision_context, Mapping):
+                    raise FatalCommandError("graph wait decision context must be an object")
+                payload["decision_context"] = dict(decision_context)
             kind = WorkflowEventKind.NODE_WAITED
         elif disposition == "wait_child":
             child_run_id = str(result.get("child_run_id") or "")

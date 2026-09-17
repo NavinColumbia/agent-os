@@ -84,6 +84,53 @@ def test_graph_action_executor_advances_token_and_replay_does_not_repeat_node_ru
     assert state.ready()[0].node_id == "done"
 
 
+def test_graph_wait_preserves_bounded_decision_context_in_durable_notification_action(tmp_path):
+    store = SQLGraphWorkflowEngine(
+        f"sqlite:///{tmp_path / 'decision-context.sqlite3'}", create_schema=True,
+    )
+    definition = WorkflowDefinition(
+        "decision", "tenant-a", "Decision", 1, "approve",
+        (
+            WorkflowNode("approve", NodeKind.HUMAN, "Approve the release"),
+            WorkflowNode("done", NodeKind.TERMINAL, "Done"),
+        ),
+        (WorkflowEdge("approve", "done"),),
+        "agent:architect",
+    )
+    store.register_workflow(definition)
+    try:
+        store.start_graph_run(
+            "tenant-a", "decision", 1, run_id="decision-run", request_id="decision-start",
+        )
+        lease = store.claim_graph_action(
+            "tenant-a", worker_id="worker-a", lease_seconds=30,
+        )
+        assert lease is not None
+        context = {
+            "kind": "approval", "request": "Approve?",
+            "consequences": ["The release becomes public."],
+            "safe_default": "Do not release.", "reversibility": "reversible",
+            "allowed_actions": ["approve", "decline"], "evidence_ids": ["evidence-one"],
+        }
+        result = DurableGraphActionExecutor(
+            engine=store,
+            node_runtime=SequenceNodeRuntime({
+                "disposition": "wait", "recipient_ids": ["human:ceo"],
+                "correlation_id": "release-decision", "reason": "Approve the release",
+                "decision_context": context,
+            }),
+        ).execute(lease.envelope)
+        assert result["token_status"] == "waiting"
+        notification = store.claim_graph_action(
+            "tenant-a", worker_id="worker-a", lease_seconds=30,
+        )
+        assert notification is not None
+        assert notification.envelope["action"]["kind"] == "notify_human"
+        assert notification.envelope["action"]["payload"]["decision_context"] == context
+    finally:
+        store.close()
+
+
 def test_graph_action_worker_retries_transient_runtime_failure_from_running_token(engine):
     started = start(engine, "run-retry")
     runtime = SequenceNodeRuntime(ConnectionError("provider unavailable"), completion())

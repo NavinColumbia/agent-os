@@ -236,6 +236,8 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert "Execution diagnostics" in script.text
     assert "Execution timeline" in script.text
     assert "Retry recorded response" in script.text
+    assert "Request changes" in script.text
+    assert "Safe default" in script.text
     assert "Load older updates" in script.text
     assert "decisionDrafts" in script.text
     assert "/v2/events/stream" in script.text

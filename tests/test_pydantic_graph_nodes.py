@@ -216,6 +216,16 @@ def test_human_rejection_selects_only_an_explicit_rejection_path():
                 configuration={
                     "response_condition": "approved",
                     "rejection_condition": "rejected",
+                    "decision_brief": {
+                        "kind": "approval",
+                        "request": "Approve the production release?",
+                        "recommendation": "Approve after reviewing the evidence packet.",
+                        "alternatives": ["Keep the current release live"],
+                        "consequences": ["The new revision becomes public."],
+                        "reversibility": "reversible",
+                        "safe_default": "Keep the current release live.",
+                        "allow_request_changes": True,
+                    },
                 },
             ),
             WorkflowNode("ship", NodeKind.TERMINAL, "Ship"),
@@ -230,20 +240,36 @@ def test_human_rejection_selects_only_an_explicit_rejection_path():
     started = start_workflow(definition, run_id="run-reject")
     action = started.actions[0]
     running = begin_node(started.state, action.token_id, expected_version=0).state
+    runtime = PydanticGraphNodeRuntime(TestModel())
+    prompt = runtime.execute_node(
+        tenant_id="tenant-a", run_id="run-reject", definition=definition,
+        state=running, action=action, idempotency_key=action.action_id,
+    )
+    assert prompt["decision_context"]["allowed_actions"] == [
+        "approve", "decline", "request_changes",
+    ]
+    assert prompt["decision_context"]["recommendation"].startswith("Approve")
+    assert prompt["decision_context"]["evidence_ids"] == []
     waiting = wait_node(
         running, action.token_id, expected_version=1,
         correlation_id="decision", reason="Approve release", recipient_ids=("human:ceo",),
+        decision_context=prompt["decision_context"],
+    )
+    assert waiting.actions[0].payload["decision_context"]["safe_default"] == (
+        "Keep the current release live."
     )
     resumed = resume_wait(
         waiting.state, expected_version=2,
-        correlation_id="decision", response={"approved": False},
+        correlation_id="decision", response={
+            "action": "decline", "approved": False, "answer": "Keep the current release.",
+        },
     )
     resumed_action = resumed.actions[0]
     resumed_running = begin_node(
         resumed.state, resumed_action.token_id, expected_version=3,
     ).state
 
-    result = PydanticGraphNodeRuntime(TestModel()).execute_node(
+    result = runtime.execute_node(
         tenant_id="tenant-a", run_id="run-reject", definition=definition,
         state=resumed_running, action=resumed_action,
         idempotency_key=resumed_action.action_id,

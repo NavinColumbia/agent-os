@@ -372,6 +372,7 @@ def wait_node(
     correlation_id: str,
     reason: str,
     recipient_ids: tuple[str, ...],
+    decision_context: Mapping[str, Any] | None = None,
 ) -> WorkflowMutation:
     _ensure_mutable(state, expected_version)
     token = state.token(token_id)
@@ -379,6 +380,20 @@ def wait_node(
         raise WorkflowTransitionRejected("only a running workflow token can wait")
     if not correlation_id.strip() or not reason.strip() or not recipient_ids:
         raise WorkflowTransitionRejected("a human wait requires correlation, reason, and recipients")
+    normalized_context: dict[str, Any] | None = None
+    if decision_context is not None:
+        try:
+            encoded_context = json.dumps(
+                decision_context, allow_nan=False, ensure_ascii=False,
+                separators=(",", ":"), sort_keys=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise WorkflowTransitionRejected(
+                "human decision context must contain JSON-compatible primitives"
+            ) from exc
+        if len(encoded_context) > 16_000:
+            raise WorkflowTransitionRejected("human decision context exceeds 16000 characters")
+        normalized_context = dict(decision_context)
     updated = replace(
         token,
         status=TokenStatus.WAITING,
@@ -390,11 +405,17 @@ def wait_node(
         TokenStatus.READY, TokenStatus.RUNNING,
     } for t in tokens) else WorkflowRunStatus.ACTIVE
     version = state.version + 1
-    action = _action(state.run_id, version, 0, WorkflowActionKind.NOTIFY_HUMAN, updated, {
+    action_payload: dict[str, Any] = {
         "correlation_id": correlation_id,
         "reason": reason,
         "recipient_ids": list(recipient_ids),
-    })
+    }
+    if normalized_context is not None:
+        action_payload["decision_context"] = normalized_context
+    action = _action(
+        state.run_id, version, 0, WorkflowActionKind.NOTIFY_HUMAN, updated,
+        action_payload,
+    )
     return WorkflowMutation(replace(state, version=version, status=status, tokens=tokens), (action,))
 
 
@@ -911,6 +932,9 @@ def evolve_workflow(
             output=output,
         )
     if event.kind is WorkflowEventKind.NODE_WAITED:
+        decision_context = payload.get("decision_context")
+        if decision_context is not None and not isinstance(decision_context, Mapping):
+            raise WorkflowTransitionRejected("human decision context must be an object")
         return wait_node(
             state,
             str(payload.get("token_id") or ""),
@@ -918,6 +942,7 @@ def evolve_workflow(
             correlation_id=str(payload.get("correlation_id") or ""),
             reason=str(payload.get("reason") or ""),
             recipient_ids=tuple(str(item) for item in payload.get("recipient_ids", ())),
+            decision_context=decision_context,
         )
     if event.kind is WorkflowEventKind.CHILD_WAITED:
         program = payload.get("child_program")

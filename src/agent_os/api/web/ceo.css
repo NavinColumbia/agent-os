@@ -148,6 +148,15 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .notice-context { margin-top: .65rem; color: var(--muted); font-size: .62rem; }
 .notice-context span + span::before { content: "·"; margin-right: .45rem; }
 .notice-why { margin: .7rem 0 0; color: #cbd1ce; font-size: .7rem; line-height: 1.5; }
+.decision-brief { margin-top: .8rem; padding: .8rem; border: 1px solid var(--line); border-radius: 10px; background: rgba(0,0,0,.13); }
+.decision-brief h4 { margin: 0; font-size: .8rem; line-height: 1.45; }
+.decision-facts { display: flex; flex-wrap: wrap; gap: .35rem .75rem; margin-top: .45rem; color: var(--muted); font-size: .62rem; }
+.decision-recommendation, .decision-default { margin: .65rem 0 0; font-size: .7rem; line-height: 1.5; }
+.decision-recommendation { color: var(--lime); }
+.decision-default { color: var(--amber); }
+.decision-list { margin-top: .65rem; font-size: .68rem; }
+.decision-list strong { font-size: .65rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.decision-list ul { margin: .3rem 0 0; padding-left: 1.2rem; line-height: 1.45; }
 .notice-utility { margin-top: .7rem; padding-top: .65rem; border-top: 1px solid var(--line); }
 .inbox-filters { margin: 0 0 .8rem; }
 .inbox-filters .active { color: var(--lime); border-color: rgba(198,255,69,.35); }
@@ -155,7 +164,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .preference-panel h4 { margin: 0; }
 .preference-panel > .muted { margin: .35rem 0 0; font-size: .72rem; line-height: 1.5; }
 .preference-actions { justify-content: flex-end; margin-top: .8rem; }
-.human-actions { display: grid; grid-template-columns: minmax(160px,1fr) auto auto auto; gap: .45rem; margin-top: .8rem; }
+.human-actions { display: grid; grid-template-columns: minmax(160px,1fr) repeat(4,auto); gap: .45rem; margin-top: .8rem; }
 .human-actions input, .human-actions button { min-width: 0; padding: .52rem .65rem; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--text); font-size: .68rem; }
 .human-actions button { cursor: pointer; }
 .human-actions button:nth-of-type(1) { color: var(--lime); }

@@ -30,6 +30,7 @@ from agent_os.domain.workflow_runtime import (
 )
 from agent_os.infrastructure.graph_output_refs import resolve_prior_output
 from agent_os.infrastructure.mission_programs import (
+    HumanDecisionBrief,
     MissionProgramPlan,
     MissionWorkflowPlan,
     validate_program_graph,
@@ -169,11 +170,16 @@ def mission_bootstrap_definition(
             "human": {
                 "allowed_keys_only": [
                     "max_iterations", "recipient_ids", "response_condition",
-                    "rejection_condition", "correlation_id",
+                    "rejection_condition", "correlation_id", "decision_brief",
                 ],
                 "notes": (
                     "recipient_ids must contain 1..32 nonempty recipients. response_condition and "
-                    "optional rejection_condition must name distinct outgoing edge conditions."
+                    "optional rejection_condition must name distinct outgoing edge conditions. "
+                    "decision_brief must tell the person the request, recommendation when one exists, "
+                    "requesting role, alternatives, consequences, reversibility, safe default, material cost, "
+                    "and deadline. "
+                    "Use kind=input for a question, approval for approve/reject, or choice for options. "
+                    "Set allow_request_changes only when the rejection branch actually returns work for revision."
                 ),
             },
             "terminal": {"allowed_keys_only": ["max_iterations"]},
@@ -405,6 +411,7 @@ def materialize_mission_workflow(
     supersedes_version: int | None = None,
 ) -> WorkflowDefinition:
     tools = _mission_tools(allowed_tools)
+    program: MissionProgramPlan | None = None
     try:
         if raw.get("format") is not None:
             program = MissionProgramPlan.model_validate(raw)
@@ -418,6 +425,11 @@ def materialize_mission_workflow(
     except (TypeError, ValueError) as exc:
         raise FatalCommandError(f"mission workflow proposal is invalid: {exc}") from exc
 
+    clarification_by_node = {} if program is None else {
+        clarification.human_node_id: clarification
+        for clarification in program.clarifications
+        if clarification.status == "open" and clarification.human_node_id
+    }
     nodes: list[WorkflowNode] = []
     tool_sources: list[tuple[str, str]] = []
     production_approvals: list[tuple[str, str]] = []
@@ -453,7 +465,7 @@ def materialize_mission_workflow(
         elif kind is NodeKind.HUMAN:
             unexpected = set(configuration) - {
                 "max_iterations", "recipient_ids", "response_condition", "rejection_condition",
-                "correlation_id",
+                "correlation_id", "decision_brief",
             }
             if unexpected:
                 raise FatalCommandError(
@@ -467,6 +479,42 @@ def materialize_mission_workflow(
             ):
                 raise FatalCommandError("planned human node requires 1..32 recipient IDs")
             configuration["recipient_ids"] = list(dict.fromkeys(recipients))
+            raw_brief = configuration.get("decision_brief")
+            clarification = clarification_by_node.get(proposed.node_id)
+            if raw_brief is None:
+                inferred_kind = (
+                    "input" if clarification is not None
+                    else "approval" if configuration.get("response_condition") is not None
+                    else "input"
+                )
+                raw_brief = {
+                    "kind": inferred_kind,
+                    "request": (
+                        clarification.question if clarification is not None else proposed.purpose
+                    ),
+                    "requesting_role": (
+                        proposed.owner_role
+                        or (program.replanning.owner_role_id if program is not None else None)
+                        or "mission-team"
+                    ),
+                    "consequences": [
+                        clarification.why_material if clarification is not None
+                        else "Dependent work remains paused until this input is resolved."
+                    ],
+                    "reversibility": "unknown",
+                    "safe_default": (
+                        clarification.default_assumption
+                        if clarification is not None and clarification.default_assumption
+                        else "Keep dependent work paused while independent work continues."
+                    ),
+                }
+            try:
+                brief = HumanDecisionBrief.model_validate(raw_brief)
+            except (TypeError, ValueError) as exc:
+                raise FatalCommandError(f"planned human decision_brief is invalid: {exc}") from exc
+            configuration["decision_brief"] = brief.model_dump(
+                mode="json", exclude_none=True,
+            )
             response_condition = configuration.get("response_condition")
             if response_condition is not None:
                 if not isinstance(response_condition, str) or not response_condition:

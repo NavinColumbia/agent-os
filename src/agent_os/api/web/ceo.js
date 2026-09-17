@@ -647,6 +647,46 @@ function renderInbox() {
       context,
       el("p", "notice-why", `Why you are seeing this: ${item.presentation?.rationale || "It is part of the mission record."}`),
     );
+    const brief = item.decision_context;
+    if (item.category === "human_action_required" && brief) {
+      const decision = el("section", "decision-brief");
+      decision.append(el("h4", "", brief.request));
+      const facts = el("div", "decision-facts");
+      facts.append(
+        el("span", "", `Requested by ${label(brief.requesting_role || "mission team")}`),
+        el("span", "", `Reversibility: ${label(brief.reversibility || "unknown")}`),
+      );
+      if (brief.deadline_at) {
+        facts.append(el("span", "", `Due ${new Date(brief.deadline_at).toLocaleString()}`));
+      }
+      if (Number.isFinite(brief.estimated_cost_cents)) {
+        facts.append(el("span", "", `Estimated cost $${(brief.estimated_cost_cents / 100).toFixed(2)}`));
+      }
+      if (brief.evidence_ids?.length) {
+        facts.append(el("span", "", `${brief.evidence_ids.length} supporting evidence item(s)`));
+      }
+      decision.append(facts);
+      if (brief.recommendation) {
+        decision.append(el("p", "decision-recommendation", `Recommendation: ${brief.recommendation}`));
+      }
+      for (const [title, values] of [
+        ["Alternatives", brief.alternatives], ["Consequences", brief.consequences],
+      ]) {
+        if (!values?.length) continue;
+        const group = el("div", "decision-list");
+        group.append(el("strong", "", title));
+        const list = document.createElement("ul");
+        for (const value of values) list.append(el("li", "", value));
+        group.append(list); decision.append(group);
+      }
+      decision.append(el("p", "decision-default", `Safe default: ${brief.safe_default}`));
+      node.append(decision);
+    }
+    if (item.decision_context_error) {
+      const contextError = el("p", "projection-warning", item.decision_context_error);
+      contextError.setAttribute("role", "alert");
+      node.append(contextError);
+    }
     if (item.category === "human_action_required" && item.actionable && item.correlation_id) {
       const actions = el("div", "human-actions");
       const answer = document.createElement("input");
@@ -654,24 +694,47 @@ function renderInbox() {
       answer.setAttribute("aria-label", "Decision context");
       answer.value = state.decisionDrafts[item.notification_id] || "";
       answer.addEventListener("input", () => { state.decisionDrafts[item.notification_id] = answer.value; });
-      const approve = el("button", "", "Approve");
-      const decline = el("button", "", "Decline");
-      const reply = el("button", "quiet", "Reply");
-      approve.type = decline.type = reply.type = "button";
-      approve.addEventListener("click", () => resolveHumanRequest(item, {
-        approved: true, answer: answer.value.trim() || "Approved in the CEO workspace",
-      }, actions));
-      decline.addEventListener("click", () => resolveHumanRequest(item, {
-        approved: false, answer: answer.value.trim() || "Declined in the CEO workspace",
-      }, actions));
-      reply.addEventListener("click", () => {
-        const value = answer.value.trim();
-        if (!value) return setFlash("Enter a response first.", "error");
-        resolveHumanRequest(item, {answer: value}, actions);
-      });
-      actions.append(answer, approve, decline, reply);
+      const allowed = new Set(brief?.allowed_actions || ["approve", "decline", "respond"]);
+      const controls = [];
+      if (allowed.has("approve")) {
+        const approve = el("button", "", "Approve"); approve.type = "button";
+        approve.addEventListener("click", () => resolveHumanRequest(item, {
+          action: "approve", approved: true,
+          answer: answer.value.trim() || "Approved in the CEO workspace",
+        }, actions));
+        controls.push(approve);
+      }
+      if (allowed.has("decline")) {
+        const decline = el("button", "", "Decline"); decline.type = "button";
+        decline.addEventListener("click", () => resolveHumanRequest(item, {
+          action: "decline", approved: false,
+          answer: answer.value.trim() || "Declined in the CEO workspace",
+        }, actions));
+        controls.push(decline);
+      }
+      if (allowed.has("request_changes")) {
+        const changes = el("button", "quiet", "Request changes"); changes.type = "button";
+        changes.addEventListener("click", () => {
+          const value = answer.value.trim();
+          if (!value) return setFlash("Describe the required changes first.", "error");
+          resolveHumanRequest(item, {
+            action: "request_changes", approved: false, answer: value,
+          }, actions);
+        });
+        controls.push(changes);
+      }
+      if (allowed.has("respond")) {
+        const reply = el("button", "quiet", "Send response"); reply.type = "button";
+        reply.addEventListener("click", () => {
+          const value = answer.value.trim();
+          if (!value) return setFlash("Enter a response first.", "error");
+          resolveHumanRequest(item, {action: "respond", answer: value}, actions);
+        });
+        controls.push(reply);
+      }
+      actions.append(answer, ...controls);
       node.append(actions);
-    } else if (item.category === "human_action_required") {
+    } else if (item.category === "human_action_required" && !item.decision_context_error) {
       const decisionStatus = item.decision_response?.status;
       const decisionMessage = decisionStatus === "pending" || decisionStatus === "executing"
         ? "Your response is durably queued and will resume this work."

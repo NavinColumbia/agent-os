@@ -181,6 +181,17 @@ def test_complete_program_contract_materializes_without_any_provider_key():
     assert program.clarifications[0].blocking_workstream_ids == ["implementation"]
     assert program.replanning.material_change_requires_new_revision is True
     assert definition.entry_node_id == "triage"
+    clarification = next(node for node in definition.nodes if node.node_id == "clarify-risk")
+    assert clarification.configuration["decision_brief"] == {
+        "kind": "input",
+        "request": "What maximum paper portfolio drawdown should the verifier enforce?",
+        "requesting_role": "mission-manager",
+        "alternatives": [],
+        "consequences": ["The answer changes risk acceptance but not market research."],
+        "reversibility": "unknown",
+        "safe_default": "Keep dependent work paused while independent work continues.",
+        "allow_request_changes": False,
+    }
 
 
 def test_scoped_human_question_does_not_stop_independent_work():
@@ -219,6 +230,12 @@ def test_scoped_human_question_does_not_stop_independent_work():
          "must reference a human node"),
         (lambda plan: plan["clarifications"][0].update({"requested_from": ["human:cfo"]}),
          "omits a requested recipient"),
+        (lambda plan: plan["workflow"]["nodes"][2]["configuration"].update({
+            "decision_brief": {
+                "kind": "approval", "request": "Approve", "consequences": [],
+                "safe_default": "Do not proceed",
+            },
+        }), "decision_brief is invalid"),
         (lambda plan: plan["success_measures"].append({
             "measure_id": "uncovered", "description": "An uncovered success claim",
         }), "success measures without verification"),

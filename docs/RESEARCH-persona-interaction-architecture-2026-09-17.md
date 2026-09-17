@@ -210,6 +210,11 @@ offset. The workspace can page backward without duplicates, keeps decision draft
 and applies every cursor inside the authenticated tenant and recipient projection. The live SSE/cursor event
 plane remains P1; this pagination contract is its durable historical half, not a claim that live push exists.
 
+First use now has a server-derived, resumable readiness projection covering identity, durable admission,
+standing organization, hard spend guard, model policy, human-decision routing, optional connectors, and the
+first mission. It deliberately labels an inherited platform model `verify_on_first_use`: API health cannot
+observe worker-only provider credentials, so the first metered turn—not a green setup badge—is the proof.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

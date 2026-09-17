@@ -195,9 +195,11 @@ function stat(name, value, tone = "") {
 }
 
 async function loadMissions() {
-  const [payload, usage] = await Promise.all([
+  const [payload, usage, readiness] = await Promise.all([
     api("/v2/runs?limit=100"), api("/v2/usage/summary").catch(() => null),
+    api("/v2/readiness").catch(() => null),
   ]);
+  renderReadiness(readiness);
   const items = payload.items || [];
   const counts = {
     active: items.filter((item) => item.status === "active").length,
@@ -229,6 +231,52 @@ async function loadMissions() {
     button.append(copy, el("span", "phase", label(item.phase)), el("span", `health ${item.status}`, label(item.status)));
     button.addEventListener("click", () => openMission(item));
     list.append(button);
+  }
+}
+
+function renderReadiness(readiness) {
+  const panel = byId("readiness-panel");
+  if (!readiness?.show_onboarding) {
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.remove("hidden");
+  const blocked = readiness.overall === "blocked";
+  const verificationPending = readiness.overall === "verification_pending";
+  const status = byId("readiness-status");
+  status.className = `health ${blocked ? "failed" : (verificationPending ? "degraded" : "healthy")}`;
+  status.textContent = blocked
+    ? "Setup blocked" : (verificationPending ? "Verification pending" : "Ready to start");
+  byId("readiness-summary").textContent = blocked
+    ? "Resolve the required items below before asking the company to execute."
+    : (verificationPending
+      ? "The mission is accepted, but a successful metered provider turn has not yet proved model access."
+      : "Required local controls are ready. Worker-only provider access will be verified by the first metered agent turn.");
+  const content = byId("readiness-steps");
+  content.replaceChildren();
+  for (const step of readiness.steps || []) {
+    const row = el("article", "readiness-step");
+    const copy = el("div");
+    copy.append(
+      el("strong", "", step.title),
+      el("small", "", step.detail),
+    );
+    const badge = el(
+      "span",
+      `health ${step.status === "blocked" ? "failed" : (step.status === "complete" ? "healthy" : "degraded")}`,
+      label(step.status),
+    );
+    row.append(copy, badge);
+    if (step.action_view && (step.status !== "complete" || step.id === "model_runtime")) {
+      const action = el("button", "quiet", step.id === "first_mission" ? "Describe mission" : "Review");
+      action.type = "button";
+      action.addEventListener("click", () => {
+        selectView(step.action_view);
+        if (step.id === "first_mission") byId("directive").focus();
+      });
+      row.append(action);
+    }
+    content.append(row);
   }
 }
 

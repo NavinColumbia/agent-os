@@ -21,6 +21,7 @@ from agent_os.api.auth import Authenticator, Principal
 from agent_os.application.billing import BillingService
 from agent_os.application.mission import mission_planning_run_id
 from agent_os.application.mission_control import project_mission_control
+from agent_os.application.readiness import project_tenant_readiness
 from agent_os.application.runtime_effects import build_runtime_authority
 from agent_os.application.ports import (
     ArtifactStore,
@@ -896,6 +897,24 @@ def create_app(
         principal: Annotated[Principal, Depends(current_principal)],
     ) -> Mapping[str, Any]:
         return _principal_experience(principal)
+
+    @app.get("/v2/readiness")
+    def get_tenant_readiness(
+        principal: Annotated[Principal, Depends(current_principal)],
+    ) -> Mapping[str, Any]:
+        experience = _principal_experience(principal)
+        return project_tenant_readiness(
+            tenant_id=principal.organization_id,
+            subject_id=principal.subject_id,
+            capabilities=experience["capabilities"],
+            engine=engine,
+            company_directory=company_directory,
+            connector_registry=connector_registry,
+            notification_store=notification_store,
+            tenant_model_store=tenant_model_store,
+            usage_meter=usage_meter,
+            billing_enabled=billing_service is not None,
+        )
 
     if membership_store is not None:
         @app.get("/v2/organizations")

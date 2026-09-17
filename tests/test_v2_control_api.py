@@ -218,6 +218,7 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert page.status_code == 200
     assert "CEO Workspace" in page.text
     assert "Maximum external spend" in page.text
+    assert "Ready your company" in page.text
     assert 'id="mobile-more-toggle"' in page.text
     assert 'data-mobile-view="company"' in page.text
     assert "unsafe-inline" not in page.headers["content-security-policy"]
@@ -259,6 +260,123 @@ def test_session_capabilities_and_mission_creation_are_role_consistent():
         json={"prompt": "Viewer must not launch this"},
     )
     assert forbidden.status_code == 403
+
+
+def test_first_mission_readiness_is_honest_role_aware_and_resumable(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'first-mission-readiness.sqlite3'}"
+    company = SQLCompanyDirectory(database_url, create_schema=True)
+    connectors = SQLConnectorRegistry(database_url, create_schema=True)
+    notifications = SQLNotificationStore(database_url, create_schema=True)
+    models = SQLTenantModelStore(database_url, create_schema=True)
+    usage = SQLUsageMeter(database_url, monthly_budget_cents=2_000, create_schema=True)
+    engine = InMemoryWorkflowEngine()
+    api = TestClient(create_app(
+        engine=engine, identity=FakeIdentity(), company_directory=company,
+        connector_registry=connectors, notification_store=notifications,
+        tenant_model_store=models, usage_meter=usage,
+    ))
+    try:
+        initial = api.get(
+            "/v2/readiness", headers={"Authorization": "Bearer org-a"},
+        )
+        assert initial.status_code == 200
+        assert initial.json()["overall"] == "ready_for_first_mission"
+        assert initial.json()["can_start_mission"] is True
+        assert initial.json()["show_onboarding"] is True
+        assert initial.json()["blockers"] == []
+        steps = {item["id"]: item for item in initial.json()["steps"]}
+        assert steps["control_plane"]["status"] == "complete"
+        assert steps["organization"]["status"] == "complete"
+        assert steps["spend_guard"]["status"] == "complete"
+        assert steps["model_runtime"]["status"] == "verify_on_first_use"
+        assert "does not pretend" in steps["model_runtime"]["detail"]
+        assert steps["integrations"]["status"] == "optional"
+
+        viewer = api.get(
+            "/v2/readiness", headers={"Authorization": "Bearer viewer-a"},
+        ).json()
+        assert viewer["can_start_mission"] is False
+        assert viewer["show_onboarding"] is False
+
+        configured = api.put(
+            "/v2/settings/model",
+            headers={
+                "Authorization": "Bearer org-a",
+                "Idempotency-Key": "readiness-model-setting",
+            },
+            json={
+                "provider": "openai", "model_name": "gpt-5.6",
+                "credential_ref": "private-model-key",
+            },
+        )
+        assert configured.status_code == 200
+        with_model = api.get(
+            "/v2/readiness", headers={"Authorization": "Bearer org-a"},
+        ).json()
+        model_step = next(
+            item for item in with_model["steps"] if item["id"] == "model_runtime"
+        )
+        assert model_step["status"] == "verify_on_first_use"
+        assert "private-model-key" not in str(with_model)
+
+        launched = api.post(
+            "/v2/runs",
+            headers={
+                "Authorization": "Bearer org-a",
+                "Idempotency-Key": "readiness-first-mission",
+            },
+            json={"prompt": "Prove onboarding can resume from durable truth"},
+        )
+        assert launched.status_code == 202
+        pending = api.get(
+            "/v2/readiness", headers={"Authorization": "Bearer org-a"},
+        ).json()
+        assert pending["overall"] == "verification_pending"
+        assert pending["show_onboarding"] is True
+
+        usage.reserve_model_turn(
+            tenant_id="org-a", source_id="readiness-model-proof", run_id="proof-run",
+            category="mission_planning", model="openai:gpt-5.6",
+            maximum_cost_cents=25,
+        )
+        usage.settle_model_turn(
+            tenant_id="org-a", source_id="readiness-model-proof",
+            usage={
+                "requests": 1, "tool_calls": 0, "input_tokens": 10,
+                "output_tokens": 5, "total_tokens": 15,
+                "provider_cost_usd_micros": 10_000,
+            },
+        )
+        active = api.get(
+            "/v2/readiness", headers={"Authorization": "Bearer org-a"},
+        ).json()
+        assert active["overall"] == "active"
+        assert active["show_onboarding"] is False
+        assert next(
+            item for item in active["steps"] if item["id"] == "model_runtime"
+        )["status"] == "complete"
+        assert next(
+            item for item in active["steps"] if item["id"] == "first_mission"
+        )["status"] == "complete"
+    finally:
+        usage.close()
+        models.close()
+        notifications.close()
+        connectors.close()
+        company.close()
+
+
+def test_readiness_fails_closed_when_required_production_adapters_are_absent():
+    response = client().get(
+        "/v2/readiness", headers={"Authorization": "Bearer org-a"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["overall"] == "blocked"
+    assert response.json()["can_start_mission"] is False
+    assert set(response.json()["blockers"]) == {
+        "organization", "spend_guard", "model_runtime", "attention",
+    }
 
 
 def test_ceo_workspace_publishes_only_validated_public_oidc_pkce_configuration():

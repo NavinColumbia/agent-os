@@ -67,6 +67,16 @@ The conclusions converged across current primary product guidance, empirical res
   observability, horizontal scale, graceful degradation, recovery tests, and learning. The system should keep
   its durable modular-monolith/cell path rather than add distributed-system machinery without measured need.
   [Google Cloud reliability pillar](https://docs.cloud.google.com/architecture/framework/reliability)
+- AG-UI's current event model separates lifecycle, activity, subagent, state snapshot/delta, and custom events;
+  its state guidance uses a fresh snapshot to recover divergence. The protocol is valuable at the public edge,
+  while still-evolving/draft event areas make it the wrong internal database schema.
+  [AG-UI events](https://github.com/ag-ui-protocol/ag-ui/blob/main/docs/concepts/events.mdx),
+  [AG-UI state](https://github.com/ag-ui-protocol/ag-ui/blob/main/docs/concepts/state.mdx)
+- The HTML living standard defines SSE reconnect and `Last-Event-ID`; the W3C Push API instead defines
+  service-worker-scoped subscriptions and push-service endpoints/key material. Foreground live updates and
+  background mobile attention therefore need separate adapters and receipts.
+  [WHATWG SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html),
+  [W3C Push API](https://www.w3.org/TR/push-api/)
 
 ## Persona defaults
 

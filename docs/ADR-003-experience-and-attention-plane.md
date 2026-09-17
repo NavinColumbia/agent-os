@@ -56,10 +56,14 @@ PUT /v2/notifications/{notification_id}/state
 POST /v2/decisions/{decision_id}/responses
 POST /v2/decisions/{decision_id}/redrive             # owner/operator recovery
 
-GET /v2/inbox?status=open&cursor=...             # next increment
-GET /v2/events?cursor=...                        # next increment, SSE
+GET /v2/inbox?status=open&cursor=...             # implemented seek pagination
+GET /v2/events?cursor=...                        # ADR-004 durable catch-up
 POST /v2/me/push-subscriptions                   # after VAPID provisioning
 ```
+
+Live transport, recovery cursors, AG-UI compatibility, and background mobile delivery are governed by
+[ADR-004](ADR-004-live-experience-and-mobile-attention.md). They deliberately remain separate from the
+decision-response truth defined here.
 
 ## Consequences
 

@@ -460,7 +460,9 @@ Raise the availability target only when architecture, vendors, staffing, and an 
 
 ### Gate 2 — one real vertical
 
-- FastAPI/OIDC create-company and directive endpoints plus AG-UI event streaming.
+- FastAPI/OIDC create-company and directive endpoints plus the durable live-experience transport in
+  [ADR-004](ADR-004-live-experience-and-mobile-attention.md); AG-UI is a version-pinned public adapter rather
+  than the internal workflow or approval schema.
 - One PydanticAI agent family and one V2 lifecycle on the selected bootstrap workflow adapter.
 - Consolidated prerequisite packet and one durable human approval/wait.
 - Isolated build/QA sandbox, revision-bound evidence, signed artifact, Cloud Run deployment, health check,

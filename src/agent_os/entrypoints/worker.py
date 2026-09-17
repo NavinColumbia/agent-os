@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
 from agent_os.application.command_worker import DurableCommandWorker, RetryPolicy
+from agent_os.application.decision_response_worker import DurableDecisionResponseWorker
 from agent_os.application.graph_action_worker import DurableGraphActionWorker
 from agent_os.application.management_monitor import DurableManagementMonitor
 from agent_os.application.assurance import AssuranceKernel
@@ -665,11 +666,19 @@ def run_worker(
             lease_seconds=settings.lease_seconds,
             retry_policy=RetryPolicy(max_attempts=settings.retry_max_attempts),
         )
+        decision_worker = DurableDecisionResponseWorker(
+            store=notification_store,
+            graph=graph_engine,
+            worker_id=settings.worker_id,
+            lease_seconds=settings.lease_seconds,
+            retry_policy=RetryPolicy(max_attempts=settings.retry_max_attempts),
+        )
         tenant_worker = TenantWorkMultiplexer(
             lifecycle_worker=worker,
             graph_worker=graph_worker,
             management_worker=management_worker,
             notification_worker=notification_worker,
+            decision_worker=decision_worker,
         )
         loop_options: dict[str, Any] = {"organization_ids": settings.organization_ids}
         if not settings.organization_ids:

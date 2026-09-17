@@ -477,7 +477,13 @@ function renderInbox() {
       actions.append(answer, approve, decline, reply);
       node.append(actions);
     } else if (item.category === "human_action_required") {
-      node.append(el("small", "", "Resolved or no longer actionable"));
+      const decisionStatus = item.decision_response?.status;
+      const decisionMessage = decisionStatus === "pending" || decisionStatus === "executing"
+        ? "Your response is durably queued and will resume this work."
+        : (decisionStatus === "failed"
+          ? "The response could not be applied. Operator attention is required; your intent remains recorded."
+          : "Resolved or no longer actionable");
+      node.append(el("small", "", decisionMessage));
     }
     const utility = el("div", "notice-utility");
     if (item.run_id) {
@@ -514,21 +520,13 @@ async function updateNotificationState(item, status, snoozedUntil, control) {
 async function resolveHumanRequest(item, response, actions) {
   for (const control of actions.querySelectorAll("button,input")) control.disabled = true;
   try {
-    const run = await api(`/v2/graph-runs/${encodeURIComponent(item.run_id)}`);
-    await api(`/v2/graph-runs/${encodeURIComponent(item.run_id)}/events`, {
-      method: "POST",
-      body: JSON.stringify({
-        event_id: `human-response-${crypto.randomUUID()}`,
-        kind: "wait_resumed",
-        expected_version: run.version,
-        payload: {correlation_id: item.correlation_id, response},
-      }),
+    const accepted = await api(`/v2/decisions/${encodeURIComponent(item.notification_id)}/responses`, {
+      method: "POST", headers: {"Idempotency-Key": `decision-${crypto.randomUUID()}`},
+      body: JSON.stringify({response}),
     });
-    setFlash("Your response was recorded and the team can continue.");
-    await api(`/v2/notifications/${encodeURIComponent(item.notification_id)}/state`, {
-      method: "PUT", headers: {"Idempotency-Key": `notice-resolved-${crypto.randomUUID()}`},
-      body: JSON.stringify({status: "dismissed", snoozed_until: null}),
-    }).catch(() => null);
+    setFlash(accepted.status === "applied"
+      ? "Your response was applied and the team can continue."
+      : "Your response is durably queued. The team will resume from the exact decision point.");
     await loadInbox();
   } catch (error) {
     for (const control of actions.querySelectorAll("button,input")) control.disabled = false;

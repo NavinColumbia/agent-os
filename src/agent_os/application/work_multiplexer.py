@@ -17,11 +17,13 @@ class TenantWorkMultiplexer:
         graph_worker: DurableGraphActionWorker,
         management_worker: TenantWorker | None = None,
         notification_worker: TenantWorker | None = None,
+        decision_worker: TenantWorker | None = None,
     ) -> None:
         self._lifecycle = lifecycle_worker
         self._graph = graph_worker
         self._management = management_worker
         self._notification = notification_worker
+        self._decision = decision_worker
         self._next_queue: dict[str, int] = {}
 
     @staticmethod
@@ -40,6 +42,8 @@ class TenantWorkMultiplexer:
             queues.append(lambda: self._management.run_one(tenant_id))
         if self._notification is not None:
             queues.append(lambda: self._notification.run_one(tenant_id))
+        if self._decision is not None:
+            queues.append(lambda: self._decision.run_one(tenant_id))
         start = self._next_queue.get(tenant_id, 0) % len(queues)
         self._next_queue[tenant_id] = (start + 1) % len(queues)
         for offset in range(len(queues)):

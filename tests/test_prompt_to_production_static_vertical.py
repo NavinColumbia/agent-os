@@ -13,6 +13,7 @@ from pydantic_ai.models.test import TestModel
 from agent_os.api.app import create_app
 from agent_os.api.auth import HMACTokenIdentity
 from agent_os.application.command_worker import CommandRunStatus, DurableCommandWorker
+from agent_os.application.decision_response_worker import DurableDecisionResponseWorker
 from agent_os.application.graph_action_worker import DurableGraphActionWorker
 from agent_os.domain.lifecycle import CommandKind, LifecycleStatus
 from agent_os.domain.workflow_runtime import WorkflowRunStatus
@@ -447,19 +448,24 @@ def test_one_ceo_prompt_reaches_human_approved_fetchable_production_static_app(
             if item["category"] == "human_action_required" and item["actionable"]
         )
         approved = api.post(
-            f"/v2/graph-runs/{child_run_id}/events",
-            headers={"Authorization": f"Bearer {owner_token}"},
-            json={
-                "event_id": "ceo-production-approval",
-                "kind": "wait_resumed",
-                "expected_version": child.version,
-                "payload": {
-                    "correlation_id": request["correlation_id"],
-                    "response": {"approved": True, "answer": "Publish this verified revision"},
-                },
+            f"/v2/decisions/{request['notification_id']}/responses",
+            headers={
+                "Authorization": f"Bearer {owner_token}",
+                "Idempotency-Key": "ceo-production-approval",
             },
+            json={"response": {
+                "approved": True,
+                "answer": "Publish this verified revision",
+            }},
         )
         assert approved.status_code == 202
+        decision_worker = DurableDecisionResponseWorker(
+            store=notifications,
+            graph=graph,
+            worker_id="production-static-decisions",
+            lease_seconds=3,
+        )
+        assert decision_worker.run_one("tenant-a").status is CommandRunStatus.SUCCEEDED
         drain(mission_worker)
 
         completed = graph.get_graph_run("tenant-a", child_run_id)

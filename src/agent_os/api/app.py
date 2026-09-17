@@ -329,6 +329,12 @@ class NotificationPreferencesRequest(BaseModel):
     digest_interval_minutes: int = Field(default=60)
 
 
+class DecisionResponseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    response: dict[str, Any] = Field(min_length=1, max_length=32)
+
+
 class InvitationCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1824,6 +1830,83 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+        if graph_engine is not None:
+            @app.post("/v2/decisions/{notification_id}/responses", status_code=202)
+            def submit_decision_response(
+                notification_id: str,
+                body: DecisionResponseRequest,
+                principal: Annotated[Principal, Depends(current_principal)],
+                idempotency_key: Annotated[
+                    str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+                ],
+            ) -> Mapping[str, Any]:
+                reader = getattr(notification_store, "get_notification", None)
+                existing_reader = getattr(notification_store, "get_decision_response", None)
+                writer = getattr(notification_store, "admit_decision_response", None)
+                if reader is None or existing_reader is None or writer is None:
+                    raise HTTPException(status_code=503, detail="structured decisions are unavailable")
+                raw = reader(principal.organization_id, notification_id)
+                if (
+                    raw is None
+                    or not notification_visible_to(raw, principal)
+                    or raw.get("category") != "human_action_required"
+                ):
+                    raise HTTPException(status_code=404, detail="decision not found")
+                run_id = str(raw.get("run_id") or "")
+                correlation_id = str(raw.get("correlation_id") or "")
+                existing = existing_reader(
+                    principal.organization_id, notification_id=notification_id,
+                )
+                if existing is None:
+                    state_value = graph_engine.get_graph_run(
+                        principal.organization_id, run_id,
+                    )
+                    waiting = [] if state_value is None else [
+                        token for token in state_value.tokens
+                        if token.status is TokenStatus.WAITING
+                        and token.wait_correlation_id == correlation_id
+                    ]
+                    if len(waiting) != 1:
+                        raise HTTPException(
+                            status_code=409, detail="decision is no longer actionable",
+                        )
+                    expected_version = state_value.version
+                else:
+                    expected_version = int(existing["expected_version"])
+                try:
+                    admitted = writer(
+                        tenant_id=principal.organization_id,
+                        notification_id=notification_id,
+                        run_id=run_id,
+                        correlation_id=correlation_id,
+                        response=body.response,
+                        expected_version=expected_version,
+                        actor_id=principal.subject_id,
+                        idempotency_key=idempotency_key,
+                    )
+                except LookupError as exc:
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if admitted["status"] == "failed":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="the recorded response requires operator recovery",
+                    )
+                if admitted["status"] == "superseded":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="the recorded decision was superseded by another resolution",
+                    )
+                return {
+                    "response_id": admitted["response_id"],
+                    "notification_id": admitted["notification_id"],
+                    "status": admitted["status"],
+                    "actor_id": admitted["actor_id"],
+                    "accepted": admitted["status"] in {"pending", "executing", "applied"},
+                    "duplicate": admitted["duplicate"],
+                }
+
         @app.get("/v2/notifications")
         def list_notifications(
             principal: Annotated[Principal, Depends(current_principal)],
@@ -1842,6 +1925,11 @@ def create_app(
             states = {} if state_reader is None else state_reader(
                 principal.organization_id,
                 subject_id=principal.subject_id,
+                notification_ids=tuple(str(item.get("notification_id") or "") for item in items),
+            )
+            decision_reader = getattr(notification_store, "list_decision_responses", None)
+            decisions = {} if decision_reader is None else decision_reader(
+                principal.organization_id,
                 notification_ids=tuple(str(item.get("notification_id") or "") for item in items),
             )
             preference_reader = getattr(notification_store, "get_notification_preferences", None)
@@ -1883,6 +1971,18 @@ def create_app(
                         item["actionable"] = False
                 else:
                     item["actionable"] = False
+                decision = decisions.get(str(item.get("notification_id") or ""))
+                if decision is not None:
+                    item["decision_response"] = {
+                        "response_id": decision["response_id"],
+                        "status": decision["status"],
+                        "actor_id": decision["actor_id"],
+                        "attempts": decision["attempts"],
+                        "last_error": decision["last_error"],
+                        "completed_at": decision["completed_at"],
+                    }
+                    if decision["status"] in {"pending", "executing", "applied", "superseded", "failed"}:
+                        item["actionable"] = False
                 item_state = dict(states.get(str(item.get("notification_id") or ""), {
                     "status": "unread", "snoozed_until": None, "version": 0,
                 }))
@@ -2462,6 +2562,17 @@ def create_app(
             if body.kind is WorkflowEventKind.RUN_CANCELLED and not owner_authority:
                 raise HTTPException(status_code=403, detail="graph cancellation requires owner authority")
             if body.kind is WorkflowEventKind.WAIT_RESUMED:
+                if (
+                    notification_store is not None
+                    and getattr(notification_store, "admit_decision_response", None) is not None
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "human responses must use the structured decision endpoint "
+                            "so intent remains recoverable"
+                        ),
+                    )
                 correlation_id = body.payload.get("correlation_id")
                 response = body.payload.get("response")
                 if (

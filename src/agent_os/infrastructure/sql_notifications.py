@@ -32,7 +32,11 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError
 
-from agent_os.application.ports import NotificationDeliveryLease, NotificationStore
+from agent_os.application.ports import (
+    DecisionResponseLease,
+    NotificationDeliveryLease,
+    NotificationStore,
+)
 from agent_os.domain.notifications import (
     Notification,
     NotificationCategory,
@@ -123,6 +127,45 @@ notification_preferences = Table(
     Column("idempotency_key", String(200), nullable=False),
     Column("updated_by", String(256), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+decision_responses = Table(
+    "aos_v2_decision_responses",
+    notification_metadata,
+    Column("tenant_id", String(128), primary_key=True),
+    Column("response_id", String(96), primary_key=True),
+    Column("notification_id", String(128), nullable=False),
+    Column("run_id", String(256), nullable=False),
+    Column("correlation_id", String(256), nullable=False),
+    Column("event_id", String(256), nullable=False),
+    Column("response", JSON, nullable=False),
+    Column("expected_version", Integer, nullable=False),
+    Column("actor_id", String(256), nullable=False),
+    Column("idempotency_key", String(200), nullable=False),
+    Column("fingerprint", String(64), nullable=False),
+    Column("status", String(32), nullable=False),
+    Column("attempts", Integer, nullable=False),
+    Column("available_at", DateTime(timezone=True), nullable=False),
+    Column("lease_owner", String(256), nullable=True),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=True),
+    Column("last_error", JSON, nullable=True),
+    Column("result", JSON, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("completed_at", DateTime(timezone=True), nullable=True),
+    UniqueConstraint("tenant_id", "notification_id"),
+    UniqueConstraint("tenant_id", "idempotency_key"),
+    ForeignKeyConstraint(
+        ["tenant_id", "notification_id"],
+        ["aos_v2_notifications.tenant_id", "aos_v2_notifications.notification_id"],
+        ondelete="CASCADE",
+    ),
+)
+
+Index(
+    "aos_v2_decision_responses_ready_idx",
+    decision_responses.c.tenant_id,
+    decision_responses.c.status,
+    decision_responses.c.available_at,
 )
 
 notification_routes = Table(
@@ -622,6 +665,380 @@ class SQLNotificationStore(NotificationStore):
             "updated_at": now.isoformat(),
             "duplicate": False,
         }
+
+    @staticmethod
+    def _decision_record(
+        row: Mapping[str, Any], *, duplicate: bool = False,
+    ) -> Mapping[str, Any]:
+        return {
+            "response_id": row["response_id"],
+            "notification_id": row["notification_id"],
+            "run_id": row["run_id"],
+            "correlation_id": row["correlation_id"],
+            "response": dict(row["response"]),
+            "expected_version": int(row["expected_version"]),
+            "actor_id": row["actor_id"],
+            "status": row["status"],
+            "attempts": int(row["attempts"]),
+            "last_error": row["last_error"],
+            "result": row["result"],
+            "created_at": row["created_at"].isoformat(),
+            "completed_at": (
+                None if row["completed_at"] is None else row["completed_at"].isoformat()
+            ),
+            "duplicate": duplicate,
+        }
+
+    @staticmethod
+    def _decision_ids(tenant_id: str, notification_id: str) -> tuple[str, str]:
+        material = f"agent-os:decision-response:v1:{tenant_id}:{notification_id}"
+        digest = hashlib.sha256(material.encode()).hexdigest()
+        return f"decision-{digest}", f"decision-event-{digest}"
+
+    def admit_decision_response(
+        self,
+        *,
+        tenant_id: str,
+        notification_id: str,
+        run_id: str,
+        correlation_id: str,
+        response: Mapping[str, Any],
+        expected_version: int,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]:
+        actor_id = actor_id.strip()
+        idempotency_key = idempotency_key.strip()
+        if (
+            not tenant_id.strip() or not notification_id.strip() or not run_id.strip()
+            or not correlation_id.strip() or not actor_id
+            or not 8 <= len(idempotency_key) <= 200 or expected_version < 0
+        ):
+            raise ValueError("decision response identity and version are invalid")
+        if not 1 <= len(response) <= 32 or any(
+            not isinstance(key, str) or not 1 <= len(key) <= 128 for key in response
+        ):
+            raise ValueError("decision response must contain 1..32 bounded fields")
+        try:
+            encoded_response = json.dumps(
+                response, allow_nan=False, ensure_ascii=False,
+                separators=(",", ":"), sort_keys=True,
+            ).encode()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("decision response must contain JSON-compatible primitives") from exc
+        if len(encoded_response) > 64 * 1024:
+            raise ValueError("decision response exceeds 64 KiB")
+        semantic = {
+            "tenant_id": tenant_id,
+            "notification_id": notification_id,
+            "run_id": run_id,
+            "correlation_id": correlation_id,
+            "response": dict(response),
+            "actor_id": actor_id,
+        }
+        fingerprint = hashlib.sha256(json.dumps(
+            semantic, allow_nan=False, ensure_ascii=False,
+            separators=(",", ":"), sort_keys=True,
+        ).encode()).hexdigest()
+        response_id, event_id = self._decision_ids(tenant_id, notification_id)
+        now = self._clock()
+        values = {
+            "tenant_id": tenant_id,
+            "response_id": response_id,
+            "notification_id": notification_id,
+            "run_id": run_id,
+            "correlation_id": correlation_id,
+            "event_id": event_id,
+            "response": dict(response),
+            "expected_version": expected_version,
+            "actor_id": actor_id,
+            "idempotency_key": idempotency_key,
+            "fingerprint": fingerprint,
+            "status": "pending",
+            "attempts": 0,
+            "available_at": now,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "last_error": None,
+            "result": None,
+            "created_at": now,
+            "completed_at": None,
+        }
+        prior_filter = and_(
+            decision_responses.c.tenant_id == tenant_id,
+            or_(
+                decision_responses.c.notification_id == notification_id,
+                decision_responses.c.idempotency_key == idempotency_key,
+            ),
+        )
+        try:
+            with self._tenant_connection(tenant_id) as connection:
+                notification = connection.execute(select(
+                    notifications.c.run_id,
+                    notifications.c.category,
+                    notifications.c.correlation_id,
+                ).where(and_(
+                    notifications.c.tenant_id == tenant_id,
+                    notifications.c.notification_id == notification_id,
+                ))).mappings().one_or_none()
+                if notification is None:
+                    raise LookupError("notification not found")
+                if (
+                    notification["category"] != NotificationCategory.HUMAN_ACTION_REQUIRED.value
+                    or notification["run_id"] != run_id
+                    or notification["correlation_id"] != correlation_id
+                ):
+                    raise ValueError("notification is not the requested human decision")
+                priors = connection.execute(
+                    select(decision_responses).where(prior_filter).limit(2).with_for_update()
+                ).mappings().all()
+                if len(priors) > 1:
+                    raise ValueError("decision notification and idempotency key conflict")
+                prior = None if not priors else priors[0]
+                if prior is not None:
+                    if prior["fingerprint"] != fingerprint:
+                        raise ValueError("human decision was already answered differently")
+                    return self._decision_record(prior, duplicate=True)
+                connection.execute(insert(decision_responses).values(**values))
+        except IntegrityError as exc:
+            with self._tenant_connection(tenant_id) as connection:
+                priors = connection.execute(
+                    select(decision_responses).where(prior_filter).limit(2)
+                ).mappings().all()
+            prior = priors[0] if len(priors) == 1 else None
+            if prior is None or prior["fingerprint"] != fingerprint:
+                raise ValueError("human decision response conflicted") from exc
+            return self._decision_record(prior, duplicate=True)
+        return self._decision_record(values)
+
+    def get_decision_response(
+        self, tenant_id: str, *, notification_id: str,
+    ) -> Mapping[str, Any] | None:
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                decision_responses.c.notification_id == notification_id,
+            ))).mappings().one_or_none()
+        return None if row is None else self._decision_record(row)
+
+    def list_decision_responses(
+        self, tenant_id: str, *, notification_ids: tuple[str, ...],
+    ) -> Mapping[str, Mapping[str, Any]]:
+        bounded = tuple(dict.fromkeys(notification_ids))
+        if len(bounded) > 500:
+            raise ValueError("decision response lookup exceeds 500 items")
+        if not bounded:
+            return {}
+        with self._tenant_connection(tenant_id) as connection:
+            rows = connection.execute(select(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                decision_responses.c.notification_id.in_(bounded),
+            ))).mappings().all()
+        return {
+            str(row["notification_id"]): self._decision_record(row)
+            for row in rows
+        }
+
+    @staticmethod
+    def _eligible_decision_response(now: datetime):
+        return or_(
+            and_(
+                decision_responses.c.status == "pending",
+                decision_responses.c.available_at <= now,
+            ),
+            and_(
+                decision_responses.c.status == "executing",
+                decision_responses.c.lease_expires_at < now,
+            ),
+        )
+
+    def claim_decision_response(
+        self,
+        tenant_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> DecisionResponseLease | None:
+        if not worker_id.strip() or lease_seconds < 3:
+            raise ValueError("decision worker and lease of at least three seconds are required")
+        now = self._clock()
+        expires = now + timedelta(seconds=lease_seconds)
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                self._eligible_decision_response(now),
+            )).order_by(
+                decision_responses.c.available_at,
+                decision_responses.c.response_id,
+            ).limit(1).with_for_update(skip_locked=True)).mappings().one_or_none()
+            if row is None:
+                return None
+            changed = connection.execute(update(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                decision_responses.c.response_id == row["response_id"],
+                self._eligible_decision_response(now),
+            )).values(
+                status="executing",
+                attempts=int(row["attempts"]) + 1,
+                lease_owner=worker_id,
+                lease_expires_at=expires,
+            )).rowcount
+            if changed != 1:
+                return None
+        return DecisionResponseLease(
+            tenant_id=tenant_id,
+            response_id=str(row["response_id"]),
+            notification_id=str(row["notification_id"]),
+            run_id=str(row["run_id"]),
+            correlation_id=str(row["correlation_id"]),
+            event_id=str(row["event_id"]),
+            response=dict(row["response"]),
+            expected_version=int(row["expected_version"]),
+            actor_id=str(row["actor_id"]),
+            worker_id=worker_id,
+            attempt=int(row["attempts"]) + 1,
+            lease_expires_at=expires.isoformat(),
+        )
+
+    def rebase_decision_response(
+        self,
+        tenant_id: str,
+        response_id: str,
+        *,
+        worker_id: str,
+        expected_version: int,
+        error: Mapping[str, Any],
+    ) -> bool:
+        if expected_version < 0:
+            raise ValueError("decision response version is invalid")
+        json.dumps(error, allow_nan=False)
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                decision_responses.c.response_id == response_id,
+                decision_responses.c.status == "executing",
+                decision_responses.c.lease_owner == worker_id,
+            )).values(
+                status="pending",
+                expected_version=expected_version,
+                available_at=self._clock(),
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=dict(error),
+            )).rowcount
+        return changed == 1
+
+    def complete_decision_response(
+        self,
+        tenant_id: str,
+        response_id: str,
+        *,
+        worker_id: str,
+        outcome: str,
+        result: Mapping[str, Any],
+    ) -> bool:
+        if outcome not in {"applied", "superseded"}:
+            raise ValueError("decision response outcome is invalid")
+        json.dumps(result, allow_nan=False)
+        now = self._clock()
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                decision_responses.c.response_id == response_id,
+                decision_responses.c.status == "executing",
+                decision_responses.c.lease_owner == worker_id,
+            )).with_for_update()).mappings().one_or_none()
+            if row is None:
+                return False
+            connection.execute(update(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                decision_responses.c.response_id == response_id,
+            )).values(
+                status=outcome,
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=None,
+                result=dict(result),
+                completed_at=now,
+            ))
+            state_key = and_(
+                notification_states.c.tenant_id == tenant_id,
+                notification_states.c.subject_id == row["actor_id"],
+                notification_states.c.notification_id == row["notification_id"],
+            )
+            prior_state = connection.execute(
+                select(notification_states).where(state_key).with_for_update()
+            ).mappings().one_or_none()
+            state_fingerprint = hashlib.sha256(
+                b'{"snoozed_until":null,"status":"resolved"}'
+            ).hexdigest()
+            state_values = {
+                "tenant_id": tenant_id,
+                "subject_id": row["actor_id"],
+                "notification_id": row["notification_id"],
+                "status": "resolved",
+                "snoozed_until": None,
+                "version": 1 if prior_state is None else int(prior_state["version"]) + 1,
+                "fingerprint": state_fingerprint,
+                "idempotency_key": f"resolve-{response_id}",
+                "updated_by": row["actor_id"],
+                "updated_at": now,
+            }
+            if prior_state is None:
+                connection.execute(insert(notification_states).values(**state_values))
+            else:
+                connection.execute(update(notification_states).where(state_key).values(**state_values))
+        return True
+
+    def retry_decision_response(
+        self,
+        tenant_id: str,
+        response_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+        delay_seconds: int,
+    ) -> bool:
+        if not 0 <= delay_seconds <= 86_400:
+            raise ValueError("decision retry delay must be between 0 and 86400")
+        json.dumps(error, allow_nan=False)
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                decision_responses.c.response_id == response_id,
+                decision_responses.c.status == "executing",
+                decision_responses.c.lease_owner == worker_id,
+            )).values(
+                status="pending",
+                available_at=self._clock() + timedelta(seconds=delay_seconds),
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=dict(error),
+            )).rowcount
+        return changed == 1
+
+    def fail_decision_response(
+        self,
+        tenant_id: str,
+        response_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+    ) -> bool:
+        json.dumps(error, allow_nan=False)
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                decision_responses.c.response_id == response_id,
+                decision_responses.c.status == "executing",
+                decision_responses.c.lease_owner == worker_id,
+            )).values(
+                status="failed",
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=dict(error),
+            )).rowcount
+        return changed == 1
 
     def register_notification_route(
         self,

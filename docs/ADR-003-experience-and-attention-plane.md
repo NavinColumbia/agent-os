@@ -24,11 +24,13 @@ The first records are:
 - per-person notification preference;
 - per-person notification state layered over immutable notification truth;
 - an authenticated session/capability projection;
-- mission-level collaboration mode and interruption budget surfaced at intake.
+- mission-level collaboration mode and interruption budget surfaced at intake;
+- a durable, idempotent decision-response intent and recovery worker bound to an exact notification,
+  workflow wait, actor, and deterministic graph event.
 
 The next compatible records are structured `AttentionItem`, `RecipientReceipt`, `NotificationSubscription`,
-and immutable `DeliveryPlan`. Structured decision responses will hide workflow correlation/version mechanics
-from clients.
+and immutable `DeliveryPlan`. Structured decision responses already hide workflow correlation/version mechanics
+from clients; the raw graph event route refuses to bypass that durable boundary when this capability is present.
 
 UI defaults to outcome, owner, decision, progress, evidence, and next action. Agent graph, prompts, raw model
 output, and traces are advanced diagnostic views.
@@ -51,9 +53,9 @@ output, and traces are advanced diagnostic views.
 GET /v2/me
 GET/PUT /v2/notification-preferences
 PUT /v2/notifications/{notification_id}/state
+POST /v2/decisions/{decision_id}/responses
 
 GET /v2/inbox?status=open&cursor=...             # next increment
-POST /v2/decisions/{decision_id}/responses       # next increment
 GET /v2/events?cursor=...                        # next increment, SSE
 POST /v2/me/push-subscriptions                   # after VAPID provisioning
 ```
@@ -62,6 +64,7 @@ POST /v2/me/push-subscriptions                   # after VAPID provisioning
 
 - Existing mission/runtime/assurance ports remain stable.
 - Mutable attention projections require RLS-protected tables and idempotent updates.
+- Human responses add a small durable queue so a process crash cannot lose accepted intent or apply it twice.
 - External delivery routes must evolve from tenant-wide category matching to recipient/audience-aware policy.
 - Read models and cursor pagination become necessary before very large mission histories.
 - Persona UX can evolve independently without forking workflow semantics.

@@ -190,6 +190,15 @@ authorization, and one person may hold several personas.
 - reusable versioned organization/workflow templates;
 - native mobile only if measured PWA limitations justify it.
 
+## Implemented baseline — 2026-09-17
+
+The first P0 slice now includes a role/capability projection, non-destructive ambient refresh, personal
+notification state and preferences, recipient-aware/redacted external routes, mission collaboration controls,
+linked claim/evidence rendering, core keyboard/dialog/mobile improvements, and an installable shell. Human
+responses enter through a structured endpoint backed by durable intent, deterministic graph-event identity,
+lease recovery, conflict rejection, and immutable notification truth. Remaining priorities above are retained
+as product requirements rather than represented as already complete.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

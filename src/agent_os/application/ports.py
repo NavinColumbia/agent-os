@@ -96,6 +96,24 @@ class NotificationDeliveryLease:
     lease_expires_at: str
 
 
+@dataclass(frozen=True)
+class DecisionResponseLease:
+    """Crash-recoverable intent to resume one exact human wait."""
+
+    tenant_id: str
+    response_id: str
+    notification_id: str
+    run_id: str
+    correlation_id: str
+    event_id: str
+    response: Mapping[str, Any]
+    expected_version: int
+    actor_id: str
+    worker_id: str
+    attempt: int
+    lease_expires_at: str
+
+
 @runtime_checkable
 class WorkflowEngine(Protocol):
     """Durable lifecycle execution used by the control API."""
@@ -604,6 +622,74 @@ class NotificationStore(Protocol):
         actor_id: str,
         idempotency_key: str,
     ) -> Mapping[str, Any]: ...
+
+    def admit_decision_response(
+        self,
+        *,
+        tenant_id: str,
+        notification_id: str,
+        run_id: str,
+        correlation_id: str,
+        response: Mapping[str, Any],
+        expected_version: int,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def get_decision_response(
+        self, tenant_id: str, *, notification_id: str,
+    ) -> Mapping[str, Any] | None: ...
+
+    def list_decision_responses(
+        self, tenant_id: str, *, notification_ids: tuple[str, ...],
+    ) -> Mapping[str, Mapping[str, Any]]: ...
+
+    def claim_decision_response(
+        self,
+        tenant_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> DecisionResponseLease | None: ...
+
+    def rebase_decision_response(
+        self,
+        tenant_id: str,
+        response_id: str,
+        *,
+        worker_id: str,
+        expected_version: int,
+        error: Mapping[str, Any],
+    ) -> bool: ...
+
+    def complete_decision_response(
+        self,
+        tenant_id: str,
+        response_id: str,
+        *,
+        worker_id: str,
+        outcome: str,
+        result: Mapping[str, Any],
+    ) -> bool: ...
+
+    def retry_decision_response(
+        self,
+        tenant_id: str,
+        response_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+        delay_seconds: int,
+    ) -> bool: ...
+
+    def fail_decision_response(
+        self,
+        tenant_id: str,
+        response_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+    ) -> bool: ...
 
     def register_notification_route(
         self,

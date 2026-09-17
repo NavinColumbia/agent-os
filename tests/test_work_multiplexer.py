@@ -101,3 +101,23 @@ def test_multiplexer_gives_external_delivery_a_fair_turn():
         "lifecycle", "graph", "management", "management",
     ]
     assert delivery.calls == 1
+
+
+def test_multiplexer_gives_durable_human_decisions_a_fair_turn():
+    lifecycle = LifecycleWorker([CommandRunStatus.SUCCEEDED])
+    graph = GraphWorker([CommandRunStatus.SUCCEEDED])
+    management = ManagementWorker([CommandRunStatus.SUCCEEDED])
+    delivery = ManagementWorker([CommandRunStatus.SUCCEEDED])
+    decisions = ManagementWorker([CommandRunStatus.SUCCEEDED])
+    worker = TenantWorkMultiplexer(  # type: ignore[arg-type]
+        lifecycle_worker=lifecycle,
+        graph_worker=graph,
+        management_worker=management,
+        notification_worker=delivery,
+        decision_worker=decisions,
+    )
+
+    assert [worker.run_one("tenant-a").command_id for _ in range(5)] == [
+        "lifecycle", "graph", "management", "management", "management",
+    ]
+    assert decisions.calls == 1

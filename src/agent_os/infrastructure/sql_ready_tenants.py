@@ -32,6 +32,11 @@ WITH ready_tenants AS (
     FROM aos_v2_notification_deliveries
     WHERE (status = 'pending' AND available_at <= :now)
        OR (status = 'executing' AND lease_expires_at < :now)
+    UNION
+    SELECT tenant_id
+    FROM aos_v2_decision_responses
+    WHERE (status = 'pending' AND available_at <= :now)
+       OR (status = 'executing' AND lease_expires_at < :now)
 )
 SELECT tenant_id
 FROM ready_tenants

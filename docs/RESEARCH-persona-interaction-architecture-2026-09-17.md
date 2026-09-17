@@ -264,6 +264,18 @@ are immutable and idempotent, ambient refresh retains an unfinished draft, and q
 audience notifications without copying confidential text into push or webhook payloads. Conversation remains
 non-authoritative: only the structured decision boundary can approve an effect or resume a governed wait.
 
+Human accountability is now distinct from agent delegation as specified in
+[ADR-008](ADR-008-human-accountability-and-agent-delegation.md). Responsible builder and independent reviewer
+duties coexist, bind to a fingerprinted work revision, and use expected-version compare-and-swap. The assignee
+must accept before becoming the projected accountable human; immutable command receipts make delayed retries
+safe and preserve every actor/reason/revision. **My Work** queries active mission scope before limiting results,
+groups summaries by mission, and does not run the full management/event projection for every card. It
+distinguishes supersession, work revision change, not-yet-materialized state, reconciliation conflict, and
+temporary unavailability. Builder assurance no longer exposes mission-wide evidence; accepted responsible work
+authorizes only evidence attached to that work. Production packaging now includes participation, conversation,
+and accountability migrations, with a real PostgreSQL RLS test. The same hardening also removed an
+executive-only directory request from non-executive sign-in.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

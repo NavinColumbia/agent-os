@@ -193,6 +193,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .detail-grid small, .detail-grid strong { display: block; }
 .detail-grid small { color: var(--muted); font-size: .6rem; }
 .detail-grid strong { margin-top: .25rem; font-size: .78rem; }
+.detail-grid strong { overflow-wrap: anywhere; }
 .progress-track { height: 7px; margin: .9rem 0 .4rem; border-radius: 99px; background: #0b0e10; overflow: hidden; }
 .progress-track span { display: block; height: 100%; background: var(--lime); border-radius: inherit; }
 .program-rationale { color: #cbd1ce; font-size: .75rem; line-height: 1.55; }
@@ -231,7 +232,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
   .sidebar { position: fixed; top: auto; bottom: 0; width: 100%; height: calc(64px + env(safe-area-inset-bottom)); padding: .55rem .55rem calc(.55rem + env(safe-area-inset-bottom)); border: 0; border-top: 1px solid var(--line); flex-direction: row; }
   .brand, .sidebar-bottom { display: none; }
   .mobile-only { display: flex; }
-  nav > [data-view="company"], nav > [data-view="integrations"], nav > [data-view="billing"] { display: none; }
+  nav > [data-view="company"], nav > [data-view="integrations"], nav > [data-view="previews"], nav > [data-view="billing"] { display: none; }
   nav { width: 100%; display: flex; gap: .2rem; margin: 0; overflow-x: auto; scrollbar-width: none; }
   .nav-item { flex: 1 0 68px; min-height: 44px; justify-content: center; padding: .6rem .25rem; font-size: .67rem; }
   .nav-item > span { width: auto; }
@@ -249,10 +250,13 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
   .model-form { grid-template-columns: 1fr; }
   .integration-form { grid-template-columns: 1fr; }
   .preference-grid { grid-template-columns: 1fr; }
+  .detail-grid { grid-template-columns: 1fr 1fr; }
+  #work-content .proposal-actions button, #work-content .quiet { min-height: 44px; }
   .human-actions input { grid-column: 1 / -1; }
   .human-actions button, .notice-utility button, .top-actions button { min-height: 44px; }
   .top-actions { gap: .35rem; }
   #last-refresh, .avatar { display: none; }
   .auth-card { padding: 2rem; }
 }
+@media (max-width: 420px) { .detail-grid { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; } }

@@ -265,40 +265,45 @@ class SQLMissionParticipantStore(MissionParticipantStore):
             mission_participants.c.mission_id == mission_id,
             mission_participants.c.subject_id == subject_id,
         )
-        with self._connection(tenant_id) as connection:
-            prior = connection.execute(
-                select(mission_participants).where(key).with_for_update(),
-            ).mappings().one_or_none()
-            if prior is None:
-                return None
-            if not prior["active"]:
-                if prior["revocation_key"] != idempotency_key:
-                    raise ValueError("mission participant was already revoked by another decision")
-                return self._record(prior, duplicate=True)
-            now = _utc(self._clock())
-            version = int(prior["version"]) + 1
-            connection.execute(update(mission_participants).where(key).values(
-                active=False,
-                version=version,
-                revoked_by=actor_id,
-                revoked_at=now,
-                revoked_reason=reason,
-                revocation_key=idempotency_key,
-            ))
-            self._experience_events.append(
-                connection,
-                tenant_id=tenant_id,
-                source_key=experience_source_key(
-                    "mission.participant.revoked", mission_id, subject_id, str(version),
-                ),
-                resource_type="mission_participant",
-                resource_id=_resource_id(mission_id, subject_id),
-                projection_revision=version,
-                kind="mission.participant.revoked",
-                audience_ids=(subject_id, "role:manager"),
-                safe_summary="Mission access was revoked from a participant.",
-                occurred_at=now,
-            )
+        try:
+            with self._connection(tenant_id) as connection:
+                prior = connection.execute(
+                    select(mission_participants).where(key).with_for_update(),
+                ).mappings().one_or_none()
+                if prior is None:
+                    return None
+                if not prior["active"]:
+                    if prior["revocation_key"] != idempotency_key:
+                        raise ValueError("mission participant was already revoked by another decision")
+                    return self._record(prior, duplicate=True)
+                now = _utc(self._clock())
+                version = int(prior["version"]) + 1
+                connection.execute(update(mission_participants).where(key).values(
+                    active=False,
+                    version=version,
+                    revoked_by=actor_id,
+                    revoked_at=now,
+                    revoked_reason=reason,
+                    revocation_key=idempotency_key,
+                ))
+                self._experience_events.append(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key(
+                        "mission.participant.revoked", mission_id, subject_id, str(version),
+                    ),
+                    resource_type="mission_participant",
+                    resource_id=_resource_id(mission_id, subject_id),
+                    projection_revision=version,
+                    kind="mission.participant.revoked",
+                    audience_ids=(subject_id, "role:manager"),
+                    safe_summary="Mission access was revoked from a participant.",
+                    occurred_at=now,
+                )
+        except IntegrityError as exc:
+            raise ValueError(
+                "mission participant still owns active work or changed concurrently"
+            ) from exc
         result = dict(prior)
         result.update({
             "active": False,

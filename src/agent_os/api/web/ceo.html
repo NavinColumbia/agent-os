@@ -40,6 +40,7 @@
       </a>
       <nav aria-label="Workspace">
         <button class="nav-item active" data-view="missions" type="button"><span>◫</span>Missions</button>
+        <button class="nav-item requires-work-read" data-view="work" type="button"><span>✓</span>My Work</button>
         <button class="nav-item requires-company-read" data-view="company" type="button"><span>⌘</span>Company</button>
         <button class="nav-item" data-view="inbox" type="button"><span>◇</span>Inbox <b id="inbox-count" class="count hidden">0</b></button>
         <button class="nav-item requires-integration-manage" data-view="integrations" type="button"><span>⌁</span>Integrations</button>
@@ -47,9 +48,10 @@
         <button class="nav-item requires-billing-manage" data-view="billing" type="button"><span>◎</span>Billing</button>
         <button id="mobile-more-toggle" class="nav-item mobile-only" type="button" aria-expanded="false" aria-controls="mobile-more-menu"><span>•••</span>More</button>
       </nav>
-      <div id="mobile-more-menu" class="mobile-more-menu hidden" role="menu" aria-label="More workspace destinations">
+      <div id="mobile-more-menu" class="mobile-more-menu hidden" aria-label="More workspace destinations">
         <button class="requires-company-read" type="button" data-mobile-view="company">Company</button>
         <button class="requires-integration-manage" type="button" data-mobile-view="integrations">Integrations</button>
+        <button class="requires-release-read" type="button" data-mobile-view="previews">Releases</button>
         <button class="requires-billing-manage" type="button" data-mobile-view="billing">Billing</button>
         <button id="mobile-disconnect" type="button">Disconnect</button>
       </div>
@@ -124,6 +126,12 @@
         <div id="mission-stats" class="stats" aria-label="Mission summary"></div>
         <div class="section-heading"><div><p class="eyebrow">PORTFOLIO</p><h3>Recent missions</h3></div></div>
         <div id="missions-list" class="mission-list"><div class="empty">Loading missions…</div></div>
+      </section>
+
+      <section id="work-view" class="view hidden">
+        <div class="section-heading"><div><p class="eyebrow">ACCOUNTABILITY</p><h3>My assigned work</h3></div></div>
+        <p class="muted">Accept or decline explicit responsibility. You become the accountable human only after acceptance; the executing AI delegate remains separately visible.</p>
+        <div id="work-content" class="stack" aria-live="polite"><div class="empty">Loading assigned work…</div></div>
       </section>
 
       <section id="company-view" class="view hidden">

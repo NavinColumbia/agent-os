@@ -25,6 +25,7 @@ from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
 from agent_os.infrastructure.sql_mission_conversations import SQLMissionConversationStore
 from agent_os.infrastructure.sql_mission_participants import SQLMissionParticipantStore
+from agent_os.infrastructure.sql_mission_work_assignments import SQLMissionWorkAssignmentStore
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
@@ -349,6 +350,13 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert 'detailSection("Mission conversation")' in script.text
     assert "missionMessageDrafts" in script.text
     assert "/messages?limit=100" in script.text
+    assert 'data-view="work"' in page.text
+    assert "loadMyWork" in script.text
+    assert "Accept ${label(item.duty)} responsibility" in script.text
+    assert "assignments/${duty}" in script.text
+    assert "expected_version" in script.text
+    assert "aria-current" in script.text
+    assert 'if (can("company.read")) await api("/v2/company/organization")' in script.text
     assert "CEO workspace" not in script.text
     assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
     assert api.get("/v2/runs").status_code == 401
@@ -557,6 +565,32 @@ def test_mission_grant_requires_an_active_matching_organization_role(tmp_path):
             headers={"Authorization": "Bearer org-a", "Idempotency-Key": "unknown-client"},
             json={"subject_id": "not-a-member", "participation_role": "client"},
         ).status_code == 409
+        membership_revoke = api.request(
+            "DELETE", "/v2/memberships/reviewer-a",
+            headers={
+                "Authorization": "Bearer org-a",
+                "Idempotency-Key": "revoke-reviewer-membership-too-early",
+            },
+            json={"reason": "Reviewer leaves the company"},
+        )
+        assert membership_revoke.status_code == 409
+        assert "revoke active mission participation" in membership_revoke.json()["detail"]
+        assert api.request(
+            "DELETE", f"/v2/runs/{run_id}/participants/reviewer-a",
+            headers={
+                "Authorization": "Bearer org-a",
+                "Idempotency-Key": "revoke-reviewer-mission-first",
+            },
+            json={"reason": "Review engagement ended"},
+        ).status_code == 200
+        assert api.request(
+            "DELETE", "/v2/memberships/reviewer-a",
+            headers={
+                "Authorization": "Bearer org-a",
+                "Idempotency-Key": "revoke-reviewer-membership-after-mission",
+            },
+            json={"reason": "Reviewer leaves the company"},
+        ).status_code == 200
 
 
 def test_mission_conversation_is_multiway_private_and_routes_safe_questions(tmp_path):
@@ -1714,7 +1748,11 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
                     "created_at": "2026-09-17T12:00:01+00:00",
                     "completed_at": None, "last_error": None,
                 }],
-            }
+                }
+
+    class FailingAssignmentNotifications:
+        def publish_notification(self, notification):
+            raise RuntimeError("notification transport unavailable")
 
     directory = SQLCompanyDirectory(
         f"sqlite:///{tmp_path / 'mission-company.sqlite3'}", create_schema=True,
@@ -1723,9 +1761,15 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
         f"sqlite:///{tmp_path / 'mission-participant-projection.sqlite3'}",
         create_schema=True,
     )
+    assignments = SQLMissionWorkAssignmentStore(
+        f"sqlite:///{tmp_path / 'mission-work-assignment-projection.sqlite3'}",
+        create_schema=True,
+    )
     api = TestClient(create_app(
         engine=lifecycle, identity=FakeIdentity(), graph_engine=MissionGraphs(),
         company_directory=directory, mission_participant_store=participants,
+        mission_work_assignment_store=assignments,
+        notification_store=FailingAssignmentNotifications(),
     ))
     created = api.post(
         "/v2/runs",
@@ -1739,6 +1783,7 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
         ("viewer-a", "viewer", "assign-viewer-projection"),
         ("client-a", "client", "assign-client-projection"),
         ("reviewer-a", "reviewer", "assign-reviewer-projection"),
+        ("builder-a", "builder", "assign-builder-projection"),
     ):
         participants.grant_participant(
             tenant_id="org-a", mission_id=created["run_id"],
@@ -1797,6 +1842,97 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
     }]
     assert "must-not-project" not in str(management.json())
     assert "private-worker-host" not in str(management.json())
+    assigned_work = api.post(
+        f"/v2/runs/{created['run_id']}/work/work-token/assignments/responsible",
+        headers={
+            "Authorization": "Bearer manager-a",
+            "Idempotency-Key": "assign-human-builder-work",
+        },
+        json={
+            "subject_id": "builder-a", "expected_version": 0,
+            "reason": "Own the product implementation outcome",
+        },
+    )
+    assert assigned_work.status_code == 201
+    assert assigned_work.json()["status"] == "pending"
+    assert assigned_work.json()["notification_status"] == "experience_feed_only"
+    awaiting_acceptance = api.get(
+        f"/v2/runs/{created['run_id']}/management",
+        headers={"Authorization": "Bearer manager-a"},
+    ).json()["work_items"][0]
+    assert awaiting_acceptance["accountable_owner_id"] != "builder-a"
+    assert awaiting_acceptance["human_assignment"]["assignment_status"] == "pending"
+    my_work = api.get(
+        "/v2/me/work", headers={"Authorization": "Bearer builder-a"},
+    )
+    assert my_work.status_code == 200
+    assert my_work.json()["items"][0]["work"]["objective"] == "Build the product"
+    assert my_work.json()["items"][0]["projection_status"] == "current"
+    accepted_work = api.post(
+        f"/v2/runs/{created['run_id']}/work/work-token/assignments/responsible/response",
+        headers={
+            "Authorization": "Bearer builder-a",
+            "Idempotency-Key": "builder-accepts-responsibility",
+        },
+        json={"action": "accept", "expected_version": 1, "reason": ""},
+    )
+    assert accepted_work.status_code == 200
+    assert accepted_work.json()["status"] == "accepted"
+    accountable = api.get(
+        f"/v2/runs/{created['run_id']}/management",
+        headers={"Authorization": "Bearer manager-a"},
+    ).json()["work_items"][0]
+    assert accountable["accountable_owner_id"] == "builder-a"
+    assert accountable["delegate_id"] == "agent:engineer"
+    assert accountable["human_assignment"]["participation_role"] == "builder"
+    reviewer_assignment = api.post(
+        f"/v2/runs/{created['run_id']}/work/work-token/assignments/reviewer",
+        headers={
+            "Authorization": "Bearer manager-a",
+            "Idempotency-Key": "assign-independent-reviewer",
+        },
+        json={
+            "subject_id": "reviewer-a", "expected_version": 0,
+            "reason": "Provide independent acceptance evidence",
+        },
+    )
+    assert reviewer_assignment.status_code == 201
+    assert api.get(
+        "/v2/me/work", headers={"Authorization": "Bearer reviewer-a"},
+    ).json()["items"][0]["duty"] == "reviewer"
+    builder_mission = api.get(
+        f"/v2/runs/{created['run_id']}/mission",
+        headers={"Authorization": "Bearer builder-a"},
+    ).json()
+    assert builder_mission["projection"] == "builder"
+    assert builder_mission["planning"] is None
+    assert builder_mission["execution"] is None
+    builder_management = api.get(
+        f"/v2/runs/{created['run_id']}/management",
+        headers={"Authorization": "Bearer builder-a"},
+    ).json()
+    assert builder_management["projection"] == "builder"
+    assert "execution_timeline" not in builder_management
+    assert "hiring_requests" not in builder_management
+    assert "communications" not in builder_management
+    assert api.get(
+        f"/v2/runs/{created['run_id']}/work-assignments",
+        headers={"Authorization": "Bearer builder-a"},
+    ).status_code == 403
+    assert api.post(
+        f"/v2/runs/{created['run_id']}/work/work-token/assignments/responsible",
+        headers={
+            "Authorization": "Bearer manager-a",
+            "Idempotency-Key": "client-cannot-own-work",
+        },
+        json={
+            "subject_id": "client-a", "expected_version": 2,
+            "reason": "Invalid client assignment probe",
+        },
+    ).status_code == 409
+    assert api.get(
+        "/v2/me/work", headers={"Authorization": "Bearer client-a"},
+    ).status_code == 403
     viewer_management = api.get(
         f"/v2/runs/{created['run_id']}/management",
         headers={"Authorization": "Bearer viewer-a"},
@@ -1852,6 +1988,65 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
     assert "work_items" in reviewer_management
     assert "hiring_requests" not in reviewer_management
     assert "execution_timeline" not in reviewer_management
+    blocked_revoke = api.request(
+        "DELETE",
+        f"/v2/runs/{created['run_id']}/participants/builder-a",
+        headers={
+            "Authorization": "Bearer manager-a",
+            "Idempotency-Key": "revoke-builder-blocked-by-work",
+        },
+        json={"reason": "Builder left the mission"},
+    )
+    assert blocked_revoke.status_code == 409
+    assert "active work responsibilities" in blocked_revoke.json()["detail"]
+    removed = api.request(
+        "DELETE",
+        f"/v2/runs/{created['run_id']}/work/work-token/assignments/responsible",
+        headers={
+            "Authorization": "Bearer manager-a",
+            "Idempotency-Key": "remove-stale-builder-assignment",
+        },
+        json={
+            "reason": "Builder no longer participates in this mission",
+            "expected_version": 2,
+        },
+    )
+    assert removed.status_code == 200
+    assert removed.json()["active"] is False
+    duplicate_remove = api.request(
+        "DELETE",
+        f"/v2/runs/{created['run_id']}/work/work-token/assignments/responsible",
+        headers={
+            "Authorization": "Bearer manager-a",
+            "Idempotency-Key": "remove-stale-builder-assignment",
+        },
+        json={
+            "reason": "Builder no longer participates in this mission",
+            "expected_version": 2,
+        },
+    )
+    assert duplicate_remove.status_code == 200
+    assert duplicate_remove.json()["duplicate"] is True
+    revoked_participant = api.request(
+        "DELETE",
+        f"/v2/runs/{created['run_id']}/participants/builder-a",
+        headers={
+            "Authorization": "Bearer manager-a",
+            "Idempotency-Key": "revoke-builder-after-work-removal",
+        },
+        json={"reason": "Builder left the mission"},
+    )
+    assert revoked_participant.status_code == 200
+    assert api.get(
+        "/v2/me/work", headers={"Authorization": "Bearer builder-a"},
+    ).json()["items"] == []
+    assignment_history = api.get(
+        f"/v2/runs/{created['run_id']}/work-assignments?include_history=true",
+        headers={"Authorization": "Bearer manager-a"},
+    ).json()["history"]
+    assert [item["event_kind"] for item in assignment_history if item["duty"] == "responsible"] == [
+        "revoked", "accepted", "assigned",
+    ]
     assert management.json()["subprograms"][0]["run_id"] == subprogram_run_id
     proposal = management.json()["hiring_requests"][0]
     assert proposal["status"] == "pending"
@@ -1881,6 +2076,18 @@ def test_mission_status_links_authenticated_lifecycle_planning_and_execution(tmp
         headers={"Authorization": "Bearer org-b"},
     )
     assert hidden.status_code == 404
+    assert api.post(
+        f"/v2/runs/{created['run_id']}/work/work-token/assignments/responsible",
+        headers={
+            "Authorization": "Bearer org-b",
+            "Idempotency-Key": "foreign-work-assignment",
+        },
+        json={
+            "subject_id": "builder-a", "expected_version": 0,
+            "reason": "Foreign tenant assignment probe",
+        },
+    ).status_code == 404
+    assignments.close()
     participants.close()
     directory.close()
 

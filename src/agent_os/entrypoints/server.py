@@ -22,6 +22,7 @@ from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
 from agent_os.infrastructure.sql_mission_conversations import SQLMissionConversationStore
 from agent_os.infrastructure.sql_mission_participants import SQLMissionParticipantStore
+from agent_os.infrastructure.sql_mission_work_assignments import SQLMissionWorkAssignmentStore
 from agent_os.infrastructure.sql_mission_control import SQLMissionControl
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
@@ -393,6 +394,11 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(mission_conversation_store.close)
+        mission_work_assignment_store = SQLMissionWorkAssignmentStore(
+            settings.application_database_url,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(mission_work_assignment_store.close)
         tenant_model_store = SQLTenantModelStore(
             settings.application_database_url,
             create_schema=settings.create_schema,
@@ -477,6 +483,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             membership_store=membership_store,
             mission_participant_store=mission_participant_store,
             mission_conversation_store=mission_conversation_store,
+            mission_work_assignment_store=mission_work_assignment_store,
             tenant_model_store=tenant_model_store,
             usage_meter=usage_meter,
             mission_control=mission_control,
@@ -498,6 +505,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.membership_store = membership_store
     app.state.mission_participant_store = mission_participant_store
     app.state.mission_conversation_store = mission_conversation_store
+    app.state.mission_work_assignment_store = mission_work_assignment_store
     app.state.tenant_model_store = tenant_model_store
     app.state.usage_meter = usage_meter
     app.state.mission_control = mission_control

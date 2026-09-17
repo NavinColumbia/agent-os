@@ -47,6 +47,7 @@ from agent_os.application.ports import (
     MembershipStore,
     MissionConversationStore,
     MissionParticipantStore,
+    MissionWorkAssignmentStore,
     MissionControlStore,
     NotificationStore,
     OrganizationLedger,
@@ -498,6 +499,29 @@ class MissionMessageRequest(BaseModel):
     reply_to_message_id: str | None = Field(default=None, min_length=1, max_length=96)
 
 
+class MissionWorkAssignmentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_id: str = Field(min_length=1, max_length=255)
+    expected_version: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=2_000)
+
+
+class MissionWorkAssignmentResponseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: str = Field(pattern=r"^(accept|decline)$")
+    expected_version: int = Field(ge=1)
+    reason: str = Field(default="", max_length=2_000)
+
+
+class MissionWorkUnassignmentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2_000)
+    expected_version: int = Field(ge=1)
+
+
 class TenantModelSettingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -735,10 +759,10 @@ def _principal_can(principal: Principal, capability: str) -> bool:
 def _mission_projection_for(principal: Principal) -> str:
     """Choose data detail from authority, never from the presentation persona."""
 
-    if _principal_can(principal, "mission.read.all") or _principal_can(
-        principal, "work.execute",
-    ):
+    if _principal_can(principal, "mission.read.all"):
         return "internal"
+    if _principal_can(principal, "work.execute"):
+        return "builder"
     if _principal_can(principal, "work.read") and _principal_can(
         principal, "review.read",
     ):
@@ -758,7 +782,7 @@ def _project_lifecycle_for_authority(
         )
         if key in raw
     }
-    if projection == "review":
+    if projection in {"builder", "review"}:
         admitted.update({
             key: raw[key]
             for key in ("artifact_revision", "verification_cycle")
@@ -802,11 +826,34 @@ def _project_assurance_for_authority(
             "hazards": (),
             "projection": "stakeholder",
         }
+    if projection == "builder":
+        return {
+            "mission": mission_summary,
+            "mission_revisions": raw.get("mission_revisions", ()),
+            "claims": claims,
+            # Work-item evidence is projected through the assigned work contract. Until
+            # evidence carries an immutable work scope, do not expose mission-wide refs.
+            "evidence": (),
+            "hazards": raw.get("hazards", ()),
+            "projection": "builder",
+        }
+    review_evidence = tuple(
+        {
+            key: evidence[key]
+            for key in (
+                "evidence_id", "kind", "artifact_ref", "sha256", "produced_by",
+                "observed_at", "recorded_at", "media_type",
+            )
+            if key in evidence
+        }
+        for evidence in raw.get("evidence", ())
+        if isinstance(evidence, Mapping)
+    )
     return {
         "mission": mission_summary,
         "mission_revisions": raw.get("mission_revisions", ()),
         "claims": claims,
-        "evidence": raw.get("evidence", ()),
+        "evidence": review_evidence,
         "hazards": raw.get("hazards", ()),
         "projection": projection,
     }
@@ -894,6 +941,7 @@ def create_app(
     membership_store: MembershipStore | None = None,
     mission_participant_store: MissionParticipantStore | None = None,
     mission_conversation_store: MissionConversationStore | None = None,
+    mission_work_assignment_store: MissionWorkAssignmentStore | None = None,
     tenant_model_store: TenantModelStore | None = None,
     usage_meter: UsageMeter | None = None,
     mission_control: MissionControlStore | None = None,
@@ -1212,6 +1260,18 @@ def create_app(
                     status_code=403,
                     detail="only an owner can revoke owner or administrator authority",
                 )
+            if mission_participant_store is not None:
+                scoped_missions = mission_participant_store.mission_ids_for_subject(
+                    principal.organization_id, subject_id, limit=1_000,
+                )
+                if scoped_missions:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "revoke active mission participation before organization membership; "
+                            f"affected missions: {', '.join(scoped_missions[:10])}"
+                        ),
+                    )
             try:
                 result = membership_store.revoke_member(
                     tenant_id=principal.organization_id,
@@ -1299,6 +1359,25 @@ def create_app(
                 )
             if engine.get_run(principal.organization_id, run_id) is None:
                 raise HTTPException(status_code=404, detail="run not found")
+            if mission_work_assignment_store is not None:
+                active_work = [
+                    item for item in mission_work_assignment_store.list_for_mission(
+                        principal.organization_id, run_id,
+                    )
+                    if item.get("active") and item.get("subject_id") == subject_id
+                ]
+                if active_work:
+                    duties = ", ".join(
+                        f"{item['work_id']}:{item['duty']}@v{item['version']}"
+                        for item in active_work[:20]
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "remove or reassign active work responsibilities before revoking "
+                            f"mission access: {duties}"
+                        ),
+                    )
             try:
                 result = mission_participant_store.revoke_participant(
                     tenant_id=principal.organization_id,
@@ -3320,6 +3399,37 @@ def create_app(
                         pending.append(child_run_id)
             return False
 
+        def builder_may_read_mission_artifact(
+            principal: Principal, mission_id: str, artifact_id: str,
+        ) -> bool:
+            if _mission_projection_for(principal) != "builder":
+                return True
+            if mission_work_assignment_store is None or graph_engine is None:
+                return False
+            try:
+                _, management = current_work_summary(mission_id, principal)
+            except HTTPException:
+                return False
+            responsibilities = {
+                str(item["work_id"]): item
+                for item in mission_work_assignment_store.list_for_subject(
+                    principal.organization_id,
+                    principal.subject_id,
+                    mission_ids=(mission_id,),
+                    limit=500,
+                )
+                if item.get("duty") == "responsible" and item.get("status") == "accepted"
+            }
+            for work_item in management.get("work_items", ()):
+                responsibility = responsibilities.get(str(work_item.get("work_id") or ""))
+                if (
+                    responsibility is not None
+                    and responsibility.get("work_fingerprint") == work_item.get("work_fingerprint")
+                    and artifact_id in set(work_item.get("evidence_ids") or ())
+                ):
+                    return True
+            return False
+
         def artifact_content_response(
             principal: Principal, artifact_id: str,
         ) -> Response:
@@ -3430,6 +3540,8 @@ def create_app(
                 principal.organization_id, run_id, artifact_id,
             ):
                 raise HTTPException(status_code=404, detail="artifact not found")
+            if not builder_may_read_mission_artifact(principal, run_id, artifact_id):
+                raise HTTPException(status_code=404, detail="artifact not found")
             record = artifact_store.describe(principal.organization_id, artifact_id)
             if record is None:
                 raise HTTPException(status_code=404, detail="artifact not found")
@@ -3447,6 +3559,8 @@ def create_app(
             if not artifact_attached_to_mission(
                 principal.organization_id, run_id, artifact_id,
             ):
+                raise HTTPException(status_code=404, detail="artifact not found")
+            if not builder_may_read_mission_artifact(principal, run_id, artifact_id):
                 raise HTTPException(status_code=404, detail="artifact not found")
             return artifact_content_response(principal, artifact_id)
 
@@ -3476,6 +3590,59 @@ def create_app(
             return artifact_content_response(principal, artifact_id)
 
     if graph_engine is not None:
+        def current_work_summary(
+            run_id: str, principal: Principal,
+        ) -> tuple[Any, Mapping[str, Any]]:
+            """Bounded work-card projection without assurance or 10k-event management scans."""
+
+            lifecycle = engine.get_run(principal.organization_id, run_id)
+            if lifecycle is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            require_mission_access(principal, run_id)
+            planning = graph_engine.get_graph_run(
+                principal.organization_id, mission_planning_run_id(run_id),
+            )
+            if planning is None:
+                raise HTTPException(status_code=404, detail="mission planning has not started")
+            child_run_ids = {
+                str(token.output["child_run_id"])
+                for token in planning.tokens
+                if token.output.get("child_run_id")
+            }
+            if len(child_run_ids) > 1:
+                raise HTTPException(status_code=409, detail="mission has conflicting execution runs")
+            execution_run_id = next(iter(child_run_ids), None)
+            execution = None if execution_run_id is None else graph_engine.get_graph_run(
+                principal.organization_id, execution_run_id,
+            )
+            selected = execution or planning
+            definition = graph_engine.get_workflow_definition(
+                principal.organization_id, selected.workflow_id, selected.workflow_version,
+            )
+            if definition is None:
+                raise HTTPException(status_code=503, detail="mission workflow definition is unavailable")
+            projection = dict(project_mission_control(
+                lifecycle_run_id=run_id,
+                planning_state=planning,
+                execution_state=execution,
+                definition=definition,
+                observation=None,
+                organization_events=(),
+                company_events=(),
+                slow_after_seconds=300,
+            ))
+            for work_item in projection.get("work_items", ()):
+                work_item["delegate_id"] = work_item.get("owner_id")
+                work_item["work_fingerprint"] = hashlib.sha256(json.dumps({
+                    "execution_run_id": selected.run_id,
+                    "workflow_id": selected.workflow_id,
+                    "workflow_version": selected.workflow_version,
+                    "work_id": work_item.get("work_id"),
+                    "objective": work_item.get("objective"),
+                    "delegate_id": work_item.get("owner_id"),
+                }, allow_nan=False, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+            return lifecycle, projection
+
         @app.get("/v2/runs/{run_id}/management")
         def get_mission_management(
             run_id: str,
@@ -3576,6 +3743,81 @@ def create_app(
                     principal.organization_id, run_id,
                 )
             )
+            for work_item in projection.get("work_items", ()):
+                work_item["work_fingerprint"] = hashlib.sha256(json.dumps({
+                    "execution_run_id": selected.run_id,
+                    "workflow_id": selected.workflow_id,
+                    "workflow_version": selected.workflow_version,
+                    "work_id": work_item.get("work_id"),
+                    "objective": work_item.get("objective"),
+                    "delegate_id": work_item.get("owner_id"),
+                }, allow_nan=False, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+            if mission_work_assignment_store is not None:
+                active_participant_roles = {
+                    (str(item["subject_id"]), str(item["participation_role"]))
+                    for item in (
+                        mission_participant_store.list_participants(
+                            principal.organization_id, run_id,
+                        )
+                        if mission_participant_store is not None else ()
+                    )
+                    if item.get("active")
+                }
+                assignments = {
+                    (str(item["work_id"]), str(item["duty"])): item
+                    for item in mission_work_assignment_store.list_for_mission(
+                        principal.organization_id, run_id,
+                    )
+                }
+                mission_record = (
+                    assurance.get("mission") if isinstance(assurance, Mapping) else None
+                )
+                default_accountable_owner = (
+                    str(mission_record.get("accountable_owner_id"))
+                    if isinstance(mission_record, Mapping)
+                    and mission_record.get("accountable_owner_id")
+                    else "role:manager"
+                )
+                for work_item in projection.get("work_items", ()):
+                    work_id = str(work_item.get("work_id") or "")
+                    current_fingerprint = str(work_item["work_fingerprint"])
+                    projected_assignments: dict[str, Mapping[str, Any] | None] = {}
+                    for duty in ("responsible", "reviewer"):
+                        assignment = assignments.get((work_id, duty))
+                        if assignment is None:
+                            projected_assignments[duty] = None
+                            continue
+                        eligible = (
+                            str(assignment["subject_id"]),
+                            str(assignment["participation_role"]),
+                        ) in active_participant_roles
+                        current_revision = assignment["work_fingerprint"] == current_fingerprint
+                        status_value = str(assignment["status"])
+                        if assignment.get("active") and not eligible:
+                            status_value = "participant_inactive"
+                        elif assignment.get("active") and not current_revision:
+                            status_value = "work_revision_changed"
+                        projected_assignments[duty] = {
+                            **dict(assignment),
+                            "eligible": eligible,
+                            "current_work_revision": current_revision,
+                            "assignment_status": status_value,
+                        }
+                    responsible = projected_assignments["responsible"]
+                    accepted_responsible = bool(
+                        responsible is not None
+                        and responsible.get("active")
+                        and responsible.get("eligible")
+                        and responsible.get("current_work_revision")
+                        and responsible.get("status") == "accepted"
+                    )
+                    work_item["delegate_id"] = work_item.get("owner_id")
+                    work_item["accountable_owner_id"] = (
+                        default_accountable_owner
+                        if not accepted_responsible else responsible["subject_id"]
+                    )
+                    work_item["human_assignment"] = responsible
+                    work_item["review_assignment"] = projected_assignments["reviewer"]
             projection["assurance"] = _project_assurance_for_authority(
                 assurance, mission_projection,
             )
@@ -3585,7 +3827,7 @@ def create_app(
                     for key in ("health", "progress")
                     if key in projection
                 } | {"projection": "stakeholder"}
-            if mission_projection == "review":
+            if mission_projection in {"builder", "review"}:
                 admitted = {
                     "health", "progress", "readiness", "program", "work_items", "risks",
                     "next_actions", "management_signals", "subprograms",
@@ -3593,8 +3835,334 @@ def create_app(
                 }
                 return {
                     key: value for key, value in projection.items() if key in admitted
-                } | {"projection": "review"}
+                } | {"projection": mission_projection}
             return projection
+
+        if (
+            mission_work_assignment_store is not None
+            and mission_participant_store is not None
+        ):
+            @app.get("/v2/me/work")
+            def list_my_work(
+                principal: Annotated[Principal, Depends(current_principal)],
+                limit: Annotated[int, Query(ge=1, le=200)] = 100,
+            ) -> Mapping[str, Any]:
+                if not _principal_can(principal, "work.read"):
+                    raise HTTPException(status_code=403, detail="assigned work requires work visibility")
+                visible_mission_ids = mission_participant_store.mission_ids_for_subject(
+                    principal.organization_id, principal.subject_id, limit=1_000,
+                )
+                assignments = mission_work_assignment_store.list_for_subject(
+                    principal.organization_id,
+                    principal.subject_id,
+                    mission_ids=visible_mission_ids,
+                    limit=limit,
+                )
+                items: list[Mapping[str, Any]] = []
+                by_mission: dict[str, list[Mapping[str, Any]]] = {}
+                for assignment in assignments:
+                    by_mission.setdefault(str(assignment["mission_id"]), []).append(assignment)
+                for mission_id, mission_assignments in by_mission.items():
+                    projection_status = "current"
+                    projection_retryable = False
+                    try:
+                        lifecycle, management = current_work_summary(mission_id, principal)
+                    except HTTPException as exc:
+                        lifecycle = engine.get_run(principal.organization_id, mission_id)
+                        if lifecycle is None:
+                            continue
+                        if exc.status_code == 404:
+                            projection_status = "not_materialized"
+                            projection_retryable = True
+                        elif exc.status_code == 409:
+                            projection_status = "projection_conflict"
+                            projection_retryable = True
+                        elif exc.status_code == 503:
+                            projection_status = "temporarily_unavailable"
+                            projection_retryable = True
+                        else:
+                            raise
+                        management = {}
+                    work_by_id = {
+                        str(item.get("work_id")): item
+                        for item in management.get("work_items", ())
+                    }
+                    for assignment in mission_assignments:
+                        work_item = work_by_id.get(str(assignment["work_id"]))
+                        item_status = projection_status
+                        if projection_status == "current" and work_item is None:
+                            item_status = "superseded"
+                        elif (
+                            projection_status == "current"
+                            and work_item.get("work_fingerprint")
+                            != assignment.get("work_fingerprint")
+                        ):
+                            item_status = "work_revision_changed"
+                        items.append({
+                            **dict(assignment),
+                            "mission_title": lifecycle.title,
+                            "mission_objective": lifecycle.objective,
+                            "phase": lifecycle.phase.value,
+                            "work": work_item,
+                            "projection_status": item_status,
+                            "projection_retryable": projection_retryable,
+                        })
+                return {"items": items}
+
+            @app.get("/v2/runs/{run_id}/work-assignments")
+            def list_mission_work_assignments(
+                run_id: str,
+                principal: Annotated[Principal, Depends(current_principal)],
+                include_history: Annotated[bool, Query()] = False,
+            ) -> Mapping[str, Any]:
+                if not _principal_can(principal, "work.assign"):
+                    raise HTTPException(
+                        status_code=403, detail="work assignment inventory requires manager authority",
+                    )
+                require_mission_access(principal, run_id)
+                result: dict[str, Any] = {
+                    "items": list(mission_work_assignment_store.list_for_mission(
+                        principal.organization_id, run_id,
+                    )),
+                }
+                if include_history:
+                    result["history"] = list(mission_work_assignment_store.list_history(
+                        principal.organization_id, run_id,
+                    ))
+                return result
+
+            def publish_work_assignment_notification(
+                *,
+                tenant_id: str,
+                run_id: str,
+                work_id: str,
+                duty: str,
+                result: Mapping[str, Any],
+                recipient_ids: tuple[str, ...],
+                subject: str,
+                body: str,
+                category: NotificationCategory,
+            ) -> str:
+                if notification_store is None:
+                    return "experience_feed_only"
+                source_id = (
+                    f"mission-work-{result['status']}:{run_id}:{work_id}:"
+                    f"{duty}:v{result['version']}"
+                )
+                try:
+                    notification_store.publish_notification(Notification(
+                        notification_id="notification-" + hashlib.sha256(
+                            source_id.encode(),
+                        ).hexdigest(),
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        category=category,
+                        recipient_ids=recipient_ids,
+                        subject=subject,
+                        body=body,
+                        source_id=source_id,
+                        created_at=str(
+                            result.get("responded_at") or result.get("revoked_at")
+                            or result["assigned_at"]
+                        ),
+                        payload={
+                            "lifecycle_run_id": run_id,
+                            "work_id": work_id,
+                            "duty": duty,
+                            "severity": "info",
+                        },
+                    ))
+                except Exception:  # noqa: BLE001 - mutation is already durable and SSE-audienced
+                    return "experience_feed_only"
+                return "published"
+
+            @app.post(
+                "/v2/runs/{run_id}/work/{work_id}/assignments/{duty}", status_code=201,
+            )
+            def assign_mission_work(
+                run_id: str,
+                work_id: str,
+                duty: str,
+                body: MissionWorkAssignmentRequest,
+                principal: Annotated[Principal, Depends(current_principal)],
+                idempotency_key: Annotated[
+                    str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+                ],
+            ) -> Mapping[str, Any]:
+                if not _principal_can(principal, "work.assign"):
+                    raise HTTPException(status_code=403, detail="work assignment requires manager authority")
+                if duty not in {"responsible", "reviewer"}:
+                    raise HTTPException(status_code=404, detail="mission work duty not found")
+                require_mission_access(principal, run_id)
+                _, management = current_work_summary(run_id, principal)
+                work_item = next((
+                    item for item in management.get("work_items", ())
+                    if item.get("work_id") == work_id
+                ), None)
+                if work_item is None:
+                    raise HTTPException(status_code=404, detail="mission work item not found")
+                if str(work_item.get("status")) in {"succeeded", "cancelled"}:
+                    raise HTTPException(status_code=409, detail="terminal mission work cannot be assigned")
+                required_role = "builder" if duty == "responsible" else "reviewer"
+                participant = next((
+                    item for item in mission_participant_store.list_participants(
+                        principal.organization_id, run_id,
+                    )
+                    if item.get("active")
+                    and item.get("subject_id") == body.subject_id
+                    and item.get("participation_role") == required_role
+                ), None)
+                if participant is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"work {duty} must be an active mission {required_role}",
+                    )
+                if membership_store is not None:
+                    roles = membership_store.roles_for(
+                        principal.organization_id, body.subject_id,
+                    )
+                    if roles is None or required_role not in roles:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="work assignee no longer has a matching organization role",
+                        )
+                try:
+                    result = mission_work_assignment_store.assign_work(
+                        tenant_id=principal.organization_id,
+                        mission_id=run_id,
+                        work_id=work_id,
+                        duty=duty,
+                        work_fingerprint=str(work_item["work_fingerprint"]),
+                        subject_id=body.subject_id,
+                        participation_role=required_role,
+                        assigned_by=principal.subject_id,
+                        reason=body.reason,
+                        expected_version=body.expected_version,
+                        idempotency_key=idempotency_key,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                notification_status = publish_work_assignment_notification(
+                    tenant_id=principal.organization_id,
+                    run_id=run_id,
+                    work_id=work_id,
+                    duty=duty,
+                    result=result,
+                    recipient_ids=(body.subject_id,),
+                    subject=f"Mission work {duty} response requested",
+                    body="Open My Work to accept or decline this responsibility.",
+                    category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+                )
+                return {**dict(result), "notification_status": notification_status}
+
+            @app.post("/v2/runs/{run_id}/work/{work_id}/assignments/{duty}/response")
+            def respond_to_mission_work_assignment(
+                run_id: str,
+                work_id: str,
+                duty: str,
+                body: MissionWorkAssignmentResponseRequest,
+                principal: Annotated[Principal, Depends(current_principal)],
+                idempotency_key: Annotated[
+                    str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+                ],
+            ) -> Mapping[str, Any]:
+                if duty not in {"responsible", "reviewer"}:
+                    raise HTTPException(status_code=404, detail="mission work duty not found")
+                if not _principal_can(principal, "work.read"):
+                    raise HTTPException(status_code=403, detail="work response requires work visibility")
+                require_mission_access(principal, run_id)
+                _, management = current_work_summary(run_id, principal)
+                work_item = next((
+                    item for item in management.get("work_items", ())
+                    if item.get("work_id") == work_id
+                ), None)
+                current_assignment = next((
+                    value for value in mission_work_assignment_store.list_for_mission(
+                        principal.organization_id, run_id,
+                    )
+                    if value.get("work_id") == work_id and value.get("duty") == duty
+                ), None)
+                if (
+                    current_assignment is None
+                    or current_assignment.get("subject_id") != principal.subject_id
+                    or work_item is None
+                    or current_assignment.get("work_fingerprint")
+                    != work_item.get("work_fingerprint")
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="mission work assignment is absent or belongs to an older work revision",
+                    )
+                try:
+                    result = mission_work_assignment_store.respond_to_assignment(
+                        tenant_id=principal.organization_id,
+                        mission_id=run_id,
+                        work_id=work_id,
+                        duty=duty,
+                        subject_id=principal.subject_id,
+                        response=body.action,
+                        reason=body.reason,
+                        expected_version=body.expected_version,
+                        idempotency_key=idempotency_key,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                notification_status = publish_work_assignment_notification(
+                    tenant_id=principal.organization_id,
+                    run_id=run_id,
+                    work_id=work_id,
+                    duty=duty,
+                    result=result,
+                    recipient_ids=("role:manager",),
+                    subject=f"Mission work {duty} assignment {result['status']}",
+                    body="Open the mission work plan to review the responsibility decision.",
+                    category=NotificationCategory.MANAGEMENT_ATTENTION,
+                )
+                return {**dict(result), "notification_status": notification_status}
+
+            @app.delete("/v2/runs/{run_id}/work/{work_id}/assignments/{duty}")
+            def unassign_mission_work(
+                run_id: str,
+                work_id: str,
+                duty: str,
+                body: MissionWorkUnassignmentRequest,
+                principal: Annotated[Principal, Depends(current_principal)],
+                idempotency_key: Annotated[
+                    str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+                ],
+            ) -> Mapping[str, Any]:
+                if not _principal_can(principal, "work.assign"):
+                    raise HTTPException(status_code=403, detail="work unassignment requires manager authority")
+                if duty not in {"responsible", "reviewer"}:
+                    raise HTTPException(status_code=404, detail="mission work duty not found")
+                require_mission_access(principal, run_id)
+                try:
+                    result = mission_work_assignment_store.revoke_assignment(
+                        tenant_id=principal.organization_id,
+                        mission_id=run_id,
+                        work_id=work_id,
+                        duty=duty,
+                        revoked_by=principal.subject_id,
+                        reason=body.reason,
+                        expected_version=body.expected_version,
+                        idempotency_key=idempotency_key,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if result is None:
+                    raise HTTPException(status_code=404, detail="mission work assignment not found")
+                notification_status = publish_work_assignment_notification(
+                    tenant_id=principal.organization_id,
+                    run_id=run_id,
+                    work_id=work_id,
+                    duty=duty,
+                    result=result,
+                    recipient_ids=(str(result["subject_id"]),),
+                    subject=f"Mission work {duty} assignment removed",
+                    body="Open My Work or the mission conversation for current responsibility context.",
+                    category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+                )
+                return {**dict(result), "notification_status": notification_status}
 
         if company_directory is not None:
             @app.post("/v2/runs/{run_id}/management/proposals/{proposal_id}/hiring-decision")
@@ -3742,7 +4310,7 @@ def create_app(
                     mission_projection,
                 ),
             }
-            if mission_projection in {"review", "stakeholder"}:
+            if mission_projection in {"builder", "review", "stakeholder"}:
                 projected.update({
                     "planning_run_id": None,
                     "planning": None,

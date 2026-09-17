@@ -141,6 +141,9 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "104-decision-response-redrive-v2.sql" in compose
     assert "105-experience-events-v2.sql" in compose
     assert "106-web-push-subscriptions-v2.sql" in compose
+    assert "99zzzzzz-mission-participants-v2.sql" in compose
+    assert "99zzzzzzz-mission-conversations-v2.sql" in compose
+    assert "107-mission-work-accountability-v2.sql" in compose
     migration_image = (ROOT / "deploy" / "Dockerfile.migrations-v2").read_text()
     assert "99zzzzz-notification-delivery-v2.sql" in migration_image
     assert "100-mission-assurance-kernel-v2.sql" in migration_image
@@ -150,6 +153,17 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "104-decision-response-redrive-v2.sql" in migration_image
     assert "105-experience-events-v2.sql" in migration_image
     assert "106-web-push-subscriptions-v2.sql" in migration_image
+    assert "99zzzzzz-mission-participants-v2.sql" in migration_image
+    assert "99zzzzzzz-mission-conversations-v2.sql" in migration_image
+    assert "107-mission-work-accountability-v2.sql" in migration_image
+    required_v2_migrations = [
+        path.name for path in (ROOT / "postgres" / "initdb").glob("*.sql")
+        if int(path.name.split("-", 1)[0].rstrip("z")) >= 86
+    ]
+    assert required_v2_migrations
+    for migration_name in required_v2_migrations:
+        assert migration_name in compose, f"compose omits {migration_name}"
+        assert migration_name in migration_image, f"migration image omits {migration_name}"
     assert '127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080' in compose
     assert "GEMINI_API_KEY" in compose
     assert "AOS_V2_DATABASE_RUNTIME_PASSWORD" in compose

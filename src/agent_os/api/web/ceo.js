@@ -234,15 +234,15 @@ async function connect(token) {
   state.eventCursor = null;
   try {
     await loadOrganizations();
-    await api("/v2/company/organization");
+    if (can("company.read")) await api("/v2/company/organization");
     byId("auth-gate").classList.add("hidden");
     byId("workspace").classList.remove("hidden");
     const requestedRoute = routeFromHash();
-    const persona = state.session?.persona;
-    const roleDefault = ["operator", "reviewer"].includes(persona)
-      ? "inbox"
-      : (persona === "administrator" ? "company" : (persona === "billing" ? "billing" : "missions"));
-    await selectView(requestedRoute.view || roleDefault);
+    const roleDefault = personaDefaultView();
+    await selectView(
+      requestedRoute.view && viewAllowed(requestedRoute.view)
+        ? requestedRoute.view : roleDefault,
+    );
     if (requestedRoute.pushDeliveryId) await openPushDelivery(requestedRoute.pushDeliveryId);
     else if (requestedRoute.runId) await openMissionDeepLink(requestedRoute.runId);
     const billingNotice = sessionStorage.getItem("aos.billing.notice");
@@ -256,7 +256,7 @@ async function connect(token) {
     startLiveEvents();
     state.timer = window.setInterval(() => {
       if (!document.hidden && state.token) refreshAmbient();
-    }, 10000);
+    }, 60000);
   } catch (error) {
     state.token = "";
     byId("auth-status").textContent = error.message;
@@ -283,6 +283,7 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   state.pushSubscriptionId = null;
   state.missionMessageDrafts = {};
   closeDrawer({updateRoute: false});
+  history.replaceState({}, document.title, "/app");
   byId("workspace").classList.add("hidden");
   byId("auth-gate").classList.remove("hidden");
   byId("token-input").value = "";
@@ -313,6 +314,25 @@ function can(capability) {
   return Boolean(state.session && (state.session.capabilities || []).includes(capability));
 }
 
+function personaDefaultView() {
+  const persona = state.session?.persona;
+  if (["operator", "reviewer"].includes(persona)) return "inbox";
+  if (persona === "builder") return "work";
+  if (persona === "administrator") return "company";
+  if (persona === "billing" && state.config?.billing_mode === "stripe") return "billing";
+  return "missions";
+}
+
+function viewAllowed(name) {
+  if (!["missions", "work", "company", "inbox", "integrations", "previews", "billing"].includes(name)) return false;
+  if (name === "work") return can("work.read");
+  if (name === "company") return can("company.read");
+  if (name === "integrations") return can("integration.manage");
+  if (name === "previews") return can("release.read");
+  if (name === "billing") return can("billing.manage") && state.config?.billing_mode === "stripe";
+  return true;
+}
+
 function applyRoleExperience() {
   const persona = state.session?.persona || "viewer";
   const labels = {
@@ -327,19 +347,12 @@ function applyRoleExperience() {
     viewer: "VIEW",
   }[persona] || "USER";
   document.querySelectorAll(".requires-mission-create").forEach((node) => node.classList.toggle("hidden", !can("mission.create")));
+  document.querySelectorAll(".requires-work-read").forEach((node) => node.classList.toggle("hidden", !can("work.read")));
   document.querySelectorAll(".requires-company-read").forEach((node) => node.classList.toggle("hidden", !can("company.read")));
   document.querySelectorAll(".requires-release-read").forEach((node) => node.classList.toggle("hidden", !can("release.read")));
   document.querySelectorAll(".requires-integration-manage").forEach((node) => node.classList.toggle("hidden", !can("integration.manage")));
   const billingAvailable = state.config?.billing_mode === "stripe";
   document.querySelectorAll(".requires-billing-manage").forEach((node) => node.classList.toggle("hidden", !can("billing.manage") || !billingAvailable));
-  if (
-    (!can("company.read") && state.view === "company")
-    || (!can("release.read") && state.view === "previews")
-    || (!can("integration.manage") && state.view === "integrations")
-    || ((!can("billing.manage") || !billingAvailable) && state.view === "billing")
-  ) {
-    selectView("missions");
-  }
 }
 
 function userIsEditing() {
@@ -395,6 +408,98 @@ async function loadMissions() {
     button.append(copy, el("span", "phase", label(item.phase)), el("span", `health ${item.status}`, label(item.status)));
     button.addEventListener("click", () => openMission(item));
     list.append(button);
+  }
+}
+
+async function loadMyWork() {
+  const content = byId("work-content");
+  try {
+    const payload = await api("/v2/me/work?limit=100");
+    const items = payload.items || [];
+    content.replaceChildren();
+    if (!items.length) {
+      content.append(el("div", "empty", "No open work is assigned to you. Assigned mission access remains available under Missions."));
+      return;
+    }
+    for (const item of items) {
+      const work = item.work || {};
+      const card = el("article", "panel notice-card");
+      card.append(
+        el("p", "eyebrow", `${label(item.duty)} · ${label(item.status)}`),
+        el("h4", "", work.objective || `Work details unavailable · ${shortId(item.work_id)}`),
+        el("p", "muted", item.mission_title || item.mission_objective || shortId(item.mission_id)),
+      );
+      if (item.projection_status !== "current") {
+        const explanations = {
+          superseded: "This work item is no longer in the current mission plan. A manager must close or replace the assignment.",
+          work_revision_changed: "The work contract changed after assignment. Do not act until a manager reconfirms it.",
+          temporarily_unavailable: "Current work state is temporarily unavailable. Your assignment remains durable; retry shortly.",
+          projection_conflict: "The work view is reconciling concurrent changes. Retry before acting.",
+          not_materialized: "The mission has not materialized this work yet. Your assignment remains pending.",
+        };
+        card.append(el("p", "projection-warning", explanations[item.projection_status] || "Current work details are unavailable."));
+      }
+      const facts = el("div", "detail-grid");
+      for (const [name, value] of [
+        ["Responsibility", label(item.status)],
+        ["Work status", label(work.status || item.projection_status)],
+        ["Health", label(work.health || "unavailable")],
+        ["AI delegate", label(work.delegate_id || work.owner_id || "not assigned")],
+        ["Evidence", `${(work.evidence_ids || []).length} retained item(s)`],
+        ["Waiting for", label(work.wait_reason || "nothing")],
+      ]) {
+        const fact = el("div"); fact.append(el("small", "", name), el("strong", "", value)); facts.append(fact);
+      }
+      const actions = el("div", "proposal-actions");
+      if (item.status === "pending" && item.projection_status === "current") {
+        const respond = async (action, reason = "") => {
+          await api(`/v2/runs/${encodeURIComponent(item.mission_id)}/work/${encodeURIComponent(item.work_id)}/assignments/${encodeURIComponent(item.duty)}/response`, {
+            method: "POST",
+            headers: {"Idempotency-Key": `work-response-${crypto.randomUUID()}`},
+            body: JSON.stringify({action, expected_version: item.version, reason}),
+          });
+          setFlash(action === "accept" ? "Responsibility accepted." : "Responsibility declined and returned to management.");
+          await loadMyWork();
+        };
+        const accept = el("button", "primary", `Accept ${label(item.duty)} responsibility`); accept.type = "button";
+        accept.addEventListener("click", async () => {
+          accept.disabled = true;
+          try { await respond("accept"); } catch (error) { setFlash(error.message, "error"); }
+          finally { accept.disabled = false; }
+        });
+        const decline = el("button", "danger", `Decline ${label(item.duty)} responsibility`); decline.type = "button";
+        decline.addEventListener("click", async () => {
+          const reason = window.prompt("Why can you not take this responsibility? This returns it to mission management.", "");
+          if (reason == null || !reason.trim()) return;
+          decline.disabled = true;
+          try { await respond("decline", reason.trim()); } catch (error) { setFlash(error.message, "error"); }
+          finally { decline.disabled = false; }
+        });
+        actions.append(accept, decline);
+      }
+      const open = el("button", "quiet", `Open mission: ${item.mission_title || shortId(item.mission_id)}`); open.type = "button";
+      open.addEventListener("click", async () => {
+        await selectView("missions");
+        await openMission({
+          run_id: item.mission_id,
+          title: item.mission_title || "Assigned mission",
+          objective_preview: item.mission_objective || "",
+        });
+      });
+      actions.append(open);
+      if (item.projection_retryable) {
+        const retry = el("button", "quiet", "Retry work status"); retry.type = "button";
+        retry.addEventListener("click", () => loadMyWork()); actions.append(retry);
+      }
+      card.append(facts, actions); content.append(card);
+    }
+  } catch (error) {
+    content.replaceChildren();
+    const failed = el("div", "empty", `Assigned work could not be loaded: ${error.message}`);
+    const retry = el("button", "quiet", "Retry assigned work"); retry.type = "button";
+    retry.addEventListener("click", () => loadMyWork());
+    content.append(failed, retry);
+    throw error;
   }
 }
 
@@ -1358,6 +1463,7 @@ async function loadBilling() {
 async function refreshView(silent = false) {
   try {
     if (state.view === "missions") await loadMissions();
+    if (state.view === "work") await loadMyWork();
     if (state.view === "company") await loadCompany();
     if (state.view === "inbox") await loadInbox({refresh: true});
     if (state.view === "integrations") await loadIntegrations();
@@ -1375,6 +1481,7 @@ async function refreshAmbient() {
   if (userIsEditing()) return;
   try {
     if (state.view === "missions") await loadMissions();
+    if (state.view === "work") await loadMyWork();
     if (state.view === "inbox") await loadInbox({refresh: true});
     if (state.view === "previews") await loadPreviews();
     byId("last-refresh").textContent = `Updated ${new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
@@ -1399,6 +1506,8 @@ async function openMission(item, {updateRoute = true} = {}) {
   byId("drawer-title").textContent = item.title || "Mission";
   byId("mission-drawer").classList.add("open");
   byId("mission-drawer").setAttribute("aria-hidden", "false");
+  document.querySelector(".sidebar").inert = true;
+  byId("workspace-main").inert = true;
   byId("mission-drawer").focus();
   await loadMissionDetail(item);
 }
@@ -1424,10 +1533,16 @@ function closeDrawer({updateRoute = true} = {}) {
   state.selectedRun = null;
   byId("mission-drawer").classList.remove("open");
   byId("mission-drawer").setAttribute("aria-hidden", "true");
+  document.querySelector(".sidebar").inert = false;
+  byId("workspace-main").inert = false;
   if (updateRoute && state.token) {
     history.replaceState({}, document.title, workspaceRoute(state.view));
   }
-  if (state.drawerReturnFocus?.isConnected) state.drawerReturnFocus.focus();
+  if (
+    state.drawerReturnFocus?.isConnected
+    && !state.drawerReturnFocus.closest(".view.hidden")
+  ) state.drawerReturnFocus.focus();
+  else if (state.token) byId("workspace-main").focus();
   state.drawerReturnFocus = null;
 }
 
@@ -1802,8 +1917,74 @@ async function loadMissionDetail(item, silent = false) {
         row.append(
           el("span", `health ${itemValue.health}`, label(itemValue.health)),
           el("p", "", itemValue.objective),
-          el("small", "", `${itemValue.owner_id || "system"} · ${label(itemValue.status)} · iteration ${itemValue.iteration} · node attempt ${itemValue.attempt} · ${queueAttempts}`),
+          el("small", "", `Accountable: ${itemValue.accountable_owner_id || "role:manager"} · AI delegate: ${itemValue.delegate_id || itemValue.owner_id || "system"} · ${label(itemValue.status)} · iteration ${itemValue.iteration} · node attempt ${itemValue.attempt} · ${queueAttempts}`),
         );
+        if (can("work.assign") && participantsFetch && !participantsFetch.__error) {
+          for (const [duty, field, role] of [
+            ["responsible", "human_assignment", "builder"],
+            ["reviewer", "review_assignment", "reviewer"],
+          ]) {
+            const assignment = itemValue[field];
+            const actions = el("div", "proposal-actions");
+            if (assignment) {
+              row.append(el("small", "", `${label(duty)}: ${assignment.subject_id} · ${label(assignment.assignment_status || assignment.status)} · revision ${assignment.version}`));
+              if (assignment.active && ["participant_inactive", "work_revision_changed"].includes(assignment.assignment_status)) {
+                row.append(el("p", "status-line warning", `${label(duty)} responsibility is not effective because access or the work contract changed. Mission management remains accountable until it is replaced.`));
+              }
+              if (assignment.active) {
+                const remove = el("button", "danger", `Remove ${duty} assignment`); remove.type = "button";
+                remove.addEventListener("click", async () => {
+                  if (!window.confirm(`Remove ${assignment.subject_id} as ${duty} for this work item?`)) return;
+                  remove.disabled = true;
+                  try {
+                    await api(`/v2/runs/${encodeURIComponent(item.run_id)}/work/${encodeURIComponent(itemValue.work_id)}/assignments/${duty}`, {
+                      method: "DELETE",
+                      headers: {"Idempotency-Key": `work-unassign-${crypto.randomUUID()}`},
+                      body: JSON.stringify({reason: `${label(duty)} responsibility removed by mission management`, expected_version: assignment.version}),
+                    });
+                    setFlash(`${label(duty)} assignment removed and the participant was notified.`); await loadMissionDetail(item);
+                  } catch (error) { setFlash(error.message, "error"); }
+                  finally { remove.disabled = false; }
+                });
+                actions.append(remove);
+              }
+            }
+            const eligible = (participantsFetch.items || []).filter((participant) =>
+              participant.active
+              && participant.participation_role === role
+              && (!assignment?.active || participant.subject_id !== assignment.subject_id));
+            if (eligible.length) {
+              const assignee = document.createElement("select");
+              assignee.setAttribute("aria-label", `${label(duty)} human for ${itemValue.objective}`);
+              for (const participant of eligible) {
+                const option = el("option", "", `${participant.subject_id} · ${label(participant.participation_role)}`);
+                option.value = participant.subject_id; assignee.append(option);
+              }
+              const assign = el("button", "", assignment ? `Replace ${duty}` : `Assign ${duty}`); assign.type = "button";
+              assign.addEventListener("click", async () => {
+                assign.disabled = true;
+                try {
+                  await api(`/v2/runs/${encodeURIComponent(item.run_id)}/work/${encodeURIComponent(itemValue.work_id)}/assignments/${duty}`, {
+                    method: "POST",
+                    headers: {"Idempotency-Key": `work-assign-${crypto.randomUUID()}`},
+                    body: JSON.stringify({
+                      subject_id: assignee.value,
+                      expected_version: assignment?.version || 0,
+                      reason: assignment
+                        ? `${label(duty)} responsibility atomically reassigned by mission management`
+                        : `${label(duty)} responsibility assigned by mission management`,
+                    }),
+                  });
+                  setFlash(`${label(duty)} responsibility requested; accountability changes only after acceptance.`);
+                  await loadMissionDetail(item);
+                } catch (error) { setFlash(error.message, "error"); }
+                finally { assign.disabled = false; }
+              });
+              actions.append(assignee, assign);
+            }
+            if (actions.childElementCount) row.append(actions);
+          }
+        }
         const diagnostics = el("details", "work-diagnostics");
         diagnostics.append(el("summary", "", "Execution diagnostics"));
         const facts = el("dl", "diagnostic-grid");
@@ -1924,20 +2105,9 @@ async function cancelMission(item, version) {
 }
 
 function selectView(name) {
-  if (!["missions", "company", "inbox", "integrations", "previews", "billing"].includes(name)) name = "missions";
-  if (name === "integrations" && !can("integration.manage")) {
-    setFlash("Your role cannot manage integrations.", "error"); name = "missions";
-  }
-  if (name === "company" && !can("company.read")) {
-    name = "missions";
-    setFlash("Your role does not include company-directory access.", "error");
-  }
-  if (name === "previews" && !can("release.read")) {
-    name = "missions";
-    setFlash("Released deliverables for your role are shown inside each mission.", "error");
-  }
-  if (name === "billing" && (!can("billing.manage") || state.config?.billing_mode !== "stripe")) {
-    setFlash("Billing is not available in this deployment.", "error"); name = "missions";
+  if (!viewAllowed(name)) {
+    setFlash("That workspace is not available for your current role.", "error");
+    name = personaDefaultView();
   }
   state.view = name;
   if (name !== "inbox") {
@@ -1946,11 +2116,20 @@ function selectView(name) {
   }
   byId("mobile-more-menu").classList.add("hidden");
   byId("mobile-more-toggle").setAttribute("aria-expanded", "false");
-  document.querySelectorAll(".nav-item").forEach((node) => node.classList.toggle("active", node.dataset.view === name));
-  byId("mobile-more-toggle").classList.toggle("active", ["company", "integrations", "billing"].includes(name));
+  document.querySelectorAll(".nav-item[data-view]").forEach((node) => {
+    const active = node.dataset.view === name;
+    node.classList.toggle("active", active);
+    if (active) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current");
+  });
+  document.querySelectorAll("[data-mobile-view]").forEach((node) => {
+    if (node.dataset.mobileView === name) node.setAttribute("aria-current", "page");
+    else node.removeAttribute("aria-current");
+  });
+  byId("mobile-more-toggle").classList.toggle("active", ["company", "integrations", "previews", "billing"].includes(name));
   document.querySelectorAll(".view").forEach((node) => node.classList.add("hidden"));
   byId(`${name}-view`).classList.remove("hidden");
-  byId("view-title").textContent = { missions: "Missions", company: "Company", inbox: "Inbox", integrations: "Integrations", previews: "Releases", billing: "Billing" }[name];
+  byId("view-title").textContent = { missions: "Missions", work: "My Work", company: "Company", inbox: "Inbox", integrations: "Integrations", previews: "Releases", billing: "Billing" }[name];
+  byId("workspace-main").focus({preventScroll: true});
   history.replaceState({}, document.title, workspaceRoute(name));
   closeDrawer({updateRoute: false}); return refreshView();
 }
@@ -2005,7 +2184,7 @@ byId("organization-select").addEventListener("change", async (event) => {
   state.session = await api("/v2/me");
   applyRoleExperience();
   setFlash("Organization changed.");
-  await refreshView();
+  await selectView(personaDefaultView());
   await refreshInboxBadge();
   reconcileBackgroundPush().catch((error) => setPushStatus(error.message));
   startLiveEvents();
@@ -2134,6 +2313,9 @@ document.addEventListener("keydown", (event) => {
     .filter((node) => !node.disabled && !node.classList.contains("hidden"));
   if (!focusable.length) return;
   const first = focusable[0]; const last = focusable[focusable.length - 1];
+  if (!focusable.includes(document.activeElement)) {
+    event.preventDefault(); (event.shiftKey ? last : first).focus(); return;
+  }
   if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
   if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
 });

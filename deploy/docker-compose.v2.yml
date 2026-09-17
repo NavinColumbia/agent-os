@@ -74,6 +74,8 @@ services:
       - ../postgres/initdb/99zzz-memberships-v2.sql:/migrations/99zzz-memberships-v2.sql:ro
       - ../postgres/initdb/99zzzz-tenant-models-v2.sql:/migrations/99zzzz-tenant-models-v2.sql:ro
       - ../postgres/initdb/99zzzzz-notification-delivery-v2.sql:/migrations/99zzzzz-notification-delivery-v2.sql:ro
+      - ../postgres/initdb/99zzzzzz-mission-participants-v2.sql:/migrations/99zzzzzz-mission-participants-v2.sql:ro
+      - ../postgres/initdb/99zzzzzzz-mission-conversations-v2.sql:/migrations/99zzzzzzz-mission-conversations-v2.sql:ro
       - ../postgres/initdb/100-mission-assurance-kernel-v2.sql:/migrations/100-mission-assurance-kernel-v2.sql:ro
       - ../postgres/initdb/101-mission-revision-history-v2.sql:/migrations/101-mission-revision-history-v2.sql:ro
       - ../postgres/initdb/102-personal-attention-state-v2.sql:/migrations/102-personal-attention-state-v2.sql:ro
@@ -81,6 +83,7 @@ services:
       - ../postgres/initdb/104-decision-response-redrive-v2.sql:/migrations/104-decision-response-redrive-v2.sql:ro
       - ../postgres/initdb/105-experience-events-v2.sql:/migrations/105-experience-events-v2.sql:ro
       - ../postgres/initdb/106-web-push-subscriptions-v2.sql:/migrations/106-web-push-subscriptions-v2.sql:ro
+      - ../postgres/initdb/107-mission-work-accountability-v2.sql:/migrations/107-mission-work-accountability-v2.sql:ro
     command:
       - sh
       - -ec
@@ -104,6 +107,8 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/99zzz-memberships-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/99zzzz-tenant-models-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/99zzzzz-notification-delivery-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/99zzzzzz-mission-participants-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/99zzzzzzz-mission-conversations-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/100-mission-assurance-kernel-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/101-mission-revision-history-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/102-personal-attention-state-v2.sql
@@ -111,6 +116,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/104-decision-response-redrive-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/105-experience-events-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/106-web-push-subscriptions-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/107-mission-work-accountability-v2.sql
         psql -v ON_ERROR_STOP=1 \
           -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
         SELECT format(

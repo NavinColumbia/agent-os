@@ -493,6 +493,71 @@ class MissionConversationStore(Protocol):
 
 
 @runtime_checkable
+class MissionWorkAssignmentStore(Protocol):
+    """Human accountability assignments over durable mission work items."""
+
+    def list_for_mission(
+        self, tenant_id: str, mission_id: str,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def list_for_subject(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        *,
+        mission_ids: tuple[str, ...],
+        limit: int = 200,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def list_history(
+        self, tenant_id: str, mission_id: str, *, limit: int = 500,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def assign_work(
+        self,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        work_id: str,
+        duty: str,
+        work_fingerprint: str,
+        subject_id: str,
+        participation_role: str,
+        assigned_by: str,
+        reason: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def respond_to_assignment(
+        self,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        work_id: str,
+        duty: str,
+        subject_id: str,
+        response: str,
+        reason: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def revoke_assignment(
+        self,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        work_id: str,
+        duty: str,
+        revoked_by: str,
+        reason: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
+
+
+@runtime_checkable
 class TenantModelStore(Protocol):
     """Tenant-owned model choice with an optional opaque credential reference."""
 

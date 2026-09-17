@@ -407,33 +407,40 @@ class SQLMembershipStore(MembershipStore):
             memberships.c.tenant_id == tenant_id,
             memberships.c.subject_id == subject_id,
         )
-        with self._connection(tenant_id=tenant_id) as connection:
-            row = connection.execute(select(memberships).where(key).with_for_update()).mappings().one_or_none()
-            if row is None:
-                return None
-            if not row["active"]:
-                if row["revocation_key"] != idempotency_key:
-                    raise ValueError("membership was already revoked by another decision")
-                return {"subject_id": subject_id, "active": False, "duplicate": True}
-            now = _utc(self._clock())
-            connection.execute(update(memberships).where(key).values(
-                active=False, updated_at=now, revoked_by=actor_id, revoked_at=now,
-                revoked_reason=reason, revocation_key=idempotency_key,
-            ))
-            self._experience_events.append(
-                connection,
-                tenant_id=tenant_id,
-                source_key=experience_source_key(
-                    "membership.revoked", subject_id, idempotency_key,
-                ),
-                resource_type="membership",
-                resource_id=subject_id,
-                projection_revision=2,
-                kind="membership.revoked",
-                audience_ids=("tenant:members", subject_id),
-                safe_summary="Organization membership was revoked.",
-                occurred_at=now,
-            )
+        try:
+            with self._connection(tenant_id=tenant_id) as connection:
+                row = connection.execute(
+                    select(memberships).where(key).with_for_update(),
+                ).mappings().one_or_none()
+                if row is None:
+                    return None
+                if not row["active"]:
+                    if row["revocation_key"] != idempotency_key:
+                        raise ValueError("membership was already revoked by another decision")
+                    return {"subject_id": subject_id, "active": False, "duplicate": True}
+                now = _utc(self._clock())
+                connection.execute(update(memberships).where(key).values(
+                    active=False, updated_at=now, revoked_by=actor_id, revoked_at=now,
+                    revoked_reason=reason, revocation_key=idempotency_key,
+                ))
+                self._experience_events.append(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key(
+                        "membership.revoked", subject_id, idempotency_key,
+                    ),
+                    resource_type="membership",
+                    resource_id=subject_id,
+                    projection_revision=2,
+                    kind="membership.revoked",
+                    audience_ids=("tenant:members", subject_id),
+                    safe_summary="Organization membership was revoked.",
+                    occurred_at=now,
+                )
+        except IntegrityError as exc:
+            raise ValueError(
+                "membership still has active mission participation or changed concurrently"
+            ) from exc
         return {
             "subject_id": subject_id,
             "active": False,

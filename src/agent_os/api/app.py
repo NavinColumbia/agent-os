@@ -45,6 +45,7 @@ from agent_os.application.ports import (
     GraphWorkflowEngine,
     GraphRunInspector,
     MembershipStore,
+    MissionConversationStore,
     MissionParticipantStore,
     MissionControlStore,
     NotificationStore,
@@ -75,6 +76,8 @@ from agent_os.domain.mission_model import (
     SafeMode,
 )
 from agent_os.domain.notifications import (
+    Notification,
+    NotificationCategory,
     NotificationPreferenceMode,
     NotificationPreferences,
 )
@@ -486,6 +489,15 @@ class MissionParticipantRevokeRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2_000)
 
 
+class MissionMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel: str = Field(pattern=r"^(shared|internal)$")
+    kind: str = Field(pattern=r"^(comment|question|update)$")
+    body: str = Field(min_length=1, max_length=8_000)
+    reply_to_message_id: str | None = Field(default=None, min_length=1, max_length=96)
+
+
 class TenantModelSettingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -881,6 +893,7 @@ def create_app(
     connector_registry: ConnectorRegistry | None = None,
     membership_store: MembershipStore | None = None,
     mission_participant_store: MissionParticipantStore | None = None,
+    mission_conversation_store: MissionConversationStore | None = None,
     tenant_model_store: TenantModelStore | None = None,
     usage_meter: UsageMeter | None = None,
     mission_control: MissionControlStore | None = None,
@@ -1299,6 +1312,134 @@ def create_app(
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             if result is None:
                 raise HTTPException(status_code=404, detail="mission participant not found")
+            return result
+
+    if mission_conversation_store is not None:
+        def can_read_internal_mission_messages(principal: Principal) -> bool:
+            return _principal_can(principal, "work.read") or _principal_can(
+                principal, "mission.read.all",
+            )
+
+        def mission_message_audiences(
+            principal: Principal, run_id: str, channel: str,
+        ) -> tuple[str, ...]:
+            audiences = [principal.subject_id, "role:manager", "human:ceo"]
+            if mission_participant_store is not None:
+                participants = mission_participant_store.list_participants(
+                    principal.organization_id, run_id,
+                )
+                audiences.extend(
+                    str(item["subject_id"])
+                    for item in participants
+                    if item.get("active")
+                    and (
+                        channel == "shared"
+                        or item.get("participation_role") not in {"client", "viewer"}
+                    )
+                )
+            return tuple(dict.fromkeys(audiences))[:128]
+
+        @app.get("/v2/runs/{run_id}/messages")
+        def list_mission_messages(
+            run_id: str,
+            principal: Annotated[Principal, Depends(current_principal)],
+            limit: Annotated[int, Query(ge=1, le=200)] = 100,
+        ) -> Mapping[str, Any]:
+            if engine.get_run(principal.organization_id, run_id) is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            require_mission_access(principal, run_id)
+            include_internal = can_read_internal_mission_messages(principal)
+            return {
+                "items": list(mission_conversation_store.list_messages(
+                    principal.organization_id,
+                    run_id,
+                    include_internal=include_internal,
+                    limit=limit,
+                )),
+                "channels": ["shared", *(["internal"] if include_internal else [])],
+            }
+
+        @app.post("/v2/runs/{run_id}/messages", status_code=201)
+        def append_mission_message(
+            run_id: str,
+            body: MissionMessageRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if engine.get_run(principal.organization_id, run_id) is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            require_mission_access(principal, run_id)
+            include_internal = can_read_internal_mission_messages(principal)
+            if body.channel == "internal" and not include_internal:
+                raise HTTPException(
+                    status_code=403,
+                    detail="internal mission communication requires company visibility",
+                )
+            if body.kind == "update" and not _principal_can(principal, "work.read"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="mission status updates require work visibility",
+                )
+            if body.reply_to_message_id is not None:
+                visible_messages = mission_conversation_store.list_messages(
+                    principal.organization_id,
+                    run_id,
+                    include_internal=include_internal,
+                    limit=500,
+                )
+                if body.reply_to_message_id not in {
+                    str(item.get("message_id")) for item in visible_messages
+                }:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="mission message reply target is not visible",
+                    )
+            audiences = mission_message_audiences(principal, run_id, body.channel)
+            try:
+                result = mission_conversation_store.append_message(
+                    tenant_id=principal.organization_id,
+                    mission_id=run_id,
+                    sender_id=principal.subject_id,
+                    sender_persona=persona_for_roles(principal.roles),
+                    channel=body.channel,
+                    kind=body.kind,
+                    body=body.body,
+                    reply_to_message_id=body.reply_to_message_id,
+                    audience_ids=audiences,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if body.kind == "question" and notification_store is not None:
+                recipients = tuple(value for value in audiences if not (
+                    value == principal.subject_id
+                    or (value == "human:ceo" and "owner" in principal.roles)
+                    or (value == "role:manager" and "manager" in principal.roles)
+                ))
+                if recipients:
+                    source_id = f"mission-question:{result['message_id']}"
+                    notification_id = "notification-" + hashlib.sha256(
+                        source_id.encode(),
+                    ).hexdigest()
+                    notification_store.publish_notification(Notification(
+                        notification_id=notification_id,
+                        tenant_id=principal.organization_id,
+                        run_id=run_id,
+                        category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+                        recipient_ids=recipients,
+                        subject="A mission question needs a response",
+                        body="Open the authorized mission conversation to read and answer it.",
+                        source_id=source_id,
+                        created_at=str(result["created_at"]),
+                        payload={
+                            "lifecycle_run_id": run_id,
+                            "message_id": result["message_id"],
+                            "channel": body.channel,
+                            "severity": "warning",
+                        },
+                    ))
             return result
 
     if tenant_model_store is not None:

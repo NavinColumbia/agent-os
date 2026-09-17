@@ -257,6 +257,13 @@ ledgers, raw execution identifiers, or arbitrary artifacts. New role-addressed m
 expanded into exact participant subjects before publication; an empty audience escalates to accountable
 management instead of silently broadcasting or dropping the question.
 
+The mission workspace now also has a durable two-way conversation rather than relying on start-once intake and
+approval prompts. Assigned clients can ask questions or clarify requirements on a shared channel; builders,
+reviewers, and managers additionally have an internal delivery channel and may publish status updates. Messages
+are immutable and idempotent, ambient refresh retains an unfinished draft, and questions create generic exact-
+audience notifications without copying confidential text into push or webhook payloads. Conversation remains
+non-authoritative: only the structured decision boundary can approve an effect or resume a governed wait.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

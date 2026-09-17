@@ -58,6 +58,8 @@ output, and traces are advanced diagnostic views.
     a role to widen its own inbox, and matching both a subject and role never duplicates the same item.
 12. Builder, reviewer, client, and viewer attention is also mission-scoped under
     [ADR-006](ADR-006-mission-scoped-participation.md); role membership alone cannot reveal an unrelated mission.
+13. Ordinary multiway communication follows [ADR-007](ADR-007-mission-conversation.md) and never substitutes
+    conversational language for an action-bound approval or authority grant.
 
 ## API direction
 
@@ -99,6 +101,8 @@ decision-response truth defined here.
   [ADR-005](ADR-005-capability-policy-and-human-roles.md); persona names remain presentation presets.
 - Human participation, stakeholder-safe projections, and exact-subject mission notification routing follow
   [ADR-006](ADR-006-mission-scoped-participation.md).
+- Shared/internal mission conversation and privacy-minimized question routing follow
+  [ADR-007](ADR-007-mission-conversation.md).
 
 ## Acceptance
 

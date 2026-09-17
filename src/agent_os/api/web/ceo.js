@@ -7,6 +7,7 @@ const state = {
   eventCursor: null, eventAbort: null, eventRefreshTimer: null,
   pushSubscriptionId: null,
   focusedNotificationId: null, focusInboxItemPending: false,
+  missionMessageDrafts: {},
 };
 const byId = (id) => document.getElementById(id);
 const el = (tag, className, text) => {
@@ -280,6 +281,7 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   state.browserAlertBaseline = null;
   state.eventCursor = null;
   state.pushSubscriptionId = null;
+  state.missionMessageDrafts = {};
   closeDrawer({updateRoute: false});
   byId("workspace").classList.add("hidden");
   byId("auth-gate").classList.remove("hidden");
@@ -1433,7 +1435,7 @@ async function loadMissionDetail(item, silent = false) {
   const content = byId("drawer-content");
   if (!silent) content.replaceChildren(el("div", "empty", "Reading durable mission state…"));
   try {
-    const [run, missionFetch, managementFetch, company, participantsFetch] = await Promise.all([
+    const [run, missionFetch, managementFetch, company, participantsFetch, messagesFetch] = await Promise.all([
       api(`/v2/runs/${encodeURIComponent(item.run_id)}`),
       api(`/v2/runs/${encodeURIComponent(item.run_id)}/mission`).catch((error) => ({__error: error.message})),
       api(`/v2/runs/${encodeURIComponent(item.run_id)}/management`).catch((error) => ({__error: error.message})),
@@ -1441,6 +1443,7 @@ async function loadMissionDetail(item, silent = false) {
       can("mission.steer")
         ? api(`/v2/runs/${encodeURIComponent(item.run_id)}/participants`).catch((error) => ({__error: error.message}))
         : Promise.resolve(null),
+      api(`/v2/runs/${encodeURIComponent(item.run_id)}/messages?limit=100`).catch((error) => ({__error: error.message})),
     ]);
     if (!state.selectedRun || state.selectedRun.run_id !== item.run_id) return;
     const missionResult = missionFetch?.__error ? null : missionFetch;
@@ -1480,6 +1483,85 @@ async function loadMissionDetail(item, silent = false) {
       const unavailable = el("div", "projection-warning");
       unavailable.setAttribute("role", "status");
       unavailable.textContent = `${name} is temporarily unavailable: ${result.__error}. Durable mission state is unchanged.`;
+      content.append(unavailable);
+    }
+
+    if (messagesFetch && !messagesFetch.__error) {
+      const conversation = detailSection("Mission conversation");
+      conversation.append(el(
+        "p", "program-rationale",
+        "Ask, clarify, or update the mission here. Shared messages are visible to every assigned participant; internal messages stay with the delivery team.",
+      ));
+      const messages = messagesFetch.items || [];
+      if (!messages.length) conversation.append(el("p", "muted", "No mission messages yet."));
+      for (const message of messages) {
+        const row = el("div", "work-row conversation-message");
+        row.append(
+          el("span", `phase message-${message.kind}`, label(message.kind)),
+          el("p", "", message.body),
+          el(
+            "small", "",
+            `${label(message.sender_persona)} · ${message.sender_id} · ${label(message.channel)} · ${new Date(message.created_at).toLocaleString()}`,
+          ),
+        );
+        conversation.append(row);
+      }
+      const draft = state.missionMessageDrafts[item.run_id] || {
+        body: "", kind: "comment", channel: "shared",
+      };
+      const composer = el("div", "access-form conversation-composer");
+      const kind = document.createElement("select");
+      kind.setAttribute("aria-label", "Message kind");
+      const permittedKinds = can("work.read") ? ["comment", "question", "update"] : ["comment", "question"];
+      if (!permittedKinds.includes(draft.kind)) draft.kind = "comment";
+      for (const value of permittedKinds) {
+        const option = el("option", "", label(value)); option.value = value;
+        option.selected = draft.kind === value; kind.append(option);
+      }
+      const channel = document.createElement("select");
+      channel.setAttribute("aria-label", "Message audience");
+      const channels = messagesFetch.channels || ["shared"];
+      if (!channels.includes(draft.channel)) draft.channel = "shared";
+      for (const value of channels) {
+        const option = el("option", "", value === "shared" ? "Shared with participants" : "Internal delivery team");
+        option.value = value; option.selected = draft.channel === value; channel.append(option);
+      }
+      const messageBody = document.createElement("textarea");
+      messageBody.rows = 3; messageBody.maxLength = 8000;
+      messageBody.setAttribute("aria-label", "Mission message");
+      messageBody.placeholder = "Ask a question, clarify a requirement, or share an update…";
+      messageBody.value = draft.body;
+      const retainDraft = () => {
+        state.missionMessageDrafts[item.run_id] = {
+          body: messageBody.value, kind: kind.value, channel: channel.value,
+        };
+      };
+      messageBody.addEventListener("input", retainDraft);
+      kind.addEventListener("change", retainDraft); channel.addEventListener("change", retainDraft);
+      const send = el("button", "primary", "Send message"); send.type = "button";
+      send.addEventListener("click", async () => {
+        if (!messageBody.value.trim()) return setFlash("Write a mission message first.", "error");
+        send.disabled = true;
+        try {
+          await api(`/v2/runs/${encodeURIComponent(item.run_id)}/messages`, {
+            method: "POST",
+            headers: {"Idempotency-Key": `mission-message-${crypto.randomUUID()}`},
+            body: JSON.stringify({
+              body: messageBody.value.trim(), kind: kind.value, channel: channel.value,
+            }),
+          });
+          delete state.missionMessageDrafts[item.run_id];
+          setFlash(kind.value === "question" ? "Question sent to the mission team." : "Mission message posted.");
+          await loadMissionDetail(item);
+        } catch (error) { setFlash(error.message, "error"); }
+        finally { send.disabled = false; }
+      });
+      composer.append(kind, channel, messageBody, send); conversation.append(composer);
+      content.append(conversation);
+    } else if (messagesFetch?.__error) {
+      const unavailable = el("div", "projection-warning");
+      unavailable.setAttribute("role", "status");
+      unavailable.textContent = `Mission conversation is temporarily unavailable: ${messagesFetch.__error}.`;
       content.append(unavailable);
     }
 

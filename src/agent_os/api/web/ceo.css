@@ -121,6 +121,9 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .access-panel { padding-bottom: 1.2rem; border-bottom: 1px solid var(--line); }
 .access-form { display: grid; grid-template-columns: minmax(180px,1fr) auto; gap: .55rem; margin: .65rem 0; }
 .access-form select { padding: .65rem; }
+.conversation-composer { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.conversation-composer textarea { grid-column: 1 / -1; }
+.conversation-composer button { justify-self: end; }
 .model-form { display: grid; grid-template-columns: 130px minmax(180px,1fr) minmax(180px,1fr) auto; gap: .55rem; margin-top: .8rem; }
 .model-form select { padding: .65rem; }
 .integration-card { padding: 1.2rem; }

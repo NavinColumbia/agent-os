@@ -23,6 +23,7 @@ from agent_os.infrastructure.sql_company_directory import SQLCompanyDirectory
 from agent_os.infrastructure.sql_artifacts import SQLArtifactStore
 from agent_os.infrastructure.sql_connectors import SQLConnectorRegistry
 from agent_os.infrastructure.sql_memberships import SQLMembershipStore
+from agent_os.infrastructure.sql_mission_conversations import SQLMissionConversationStore
 from agent_os.infrastructure.sql_mission_participants import SQLMissionParticipantStore
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
@@ -345,6 +346,9 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert 'can("mission.steer")' in script.text
     assert 'detailSection("Mission collaborators")' in script.text
     assert 'participation_role: role.value' in script.text
+    assert 'detailSection("Mission conversation")' in script.text
+    assert "missionMessageDrafts" in script.text
+    assert "/messages?limit=100" in script.text
     assert "CEO workspace" not in script.text
     assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
     assert api.get("/v2/runs").status_code == 401
@@ -553,6 +557,137 @@ def test_mission_grant_requires_an_active_matching_organization_role(tmp_path):
             headers={"Authorization": "Bearer org-a", "Idempotency-Key": "unknown-client"},
             json={"subject_id": "not-a-member", "participation_role": "client"},
         ).status_code == 409
+
+
+def test_mission_conversation_is_multiway_private_and_routes_safe_questions(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'api-mission-conversation.sqlite3'}"
+    participants = SQLMissionParticipantStore(database_url, create_schema=True)
+    conversations = SQLMissionConversationStore(database_url, create_schema=True)
+    notifications = SQLNotificationStore(database_url, create_schema=True)
+    engine = InMemoryWorkflowEngine()
+
+    def close_stores():
+        notifications.close()
+        conversations.close()
+        participants.close()
+
+    api = TestClient(create_app(
+        engine=engine,
+        identity=FakeIdentity(),
+        mission_participant_store=participants,
+        mission_conversation_store=conversations,
+        notification_store=notifications,
+        shutdown=close_stores,
+    ))
+    with api:
+        run_id = api.post(
+            "/v2/runs",
+            headers={
+                "Authorization": "Bearer manager-a",
+                "Idempotency-Key": "conversation-mission-one",
+            },
+            json={"prompt": "Build a mission with client collaboration"},
+        ).json()["run_id"]
+        for subject_id, role, key in (
+            ("client-a", "client", "conversation-client-grant"),
+            ("reviewer-a", "reviewer", "conversation-reviewer-grant"),
+        ):
+            participants.grant_participant(
+                tenant_id="org-a", mission_id=run_id, subject_id=subject_id,
+                participation_role=role, actor_id="manager-a", idempotency_key=key,
+            )
+
+        internal = api.post(
+            f"/v2/runs/{run_id}/messages",
+            headers={
+                "Authorization": "Bearer manager-a",
+                "Idempotency-Key": "conversation-internal-update",
+            },
+            json={
+                "channel": "internal", "kind": "update",
+                "body": "Security review is still in progress.",
+            },
+        )
+        assert internal.status_code == 201
+        client_before = api.get(
+            f"/v2/runs/{run_id}/messages",
+            headers={"Authorization": "Bearer client-a"},
+        ).json()
+        assert client_before == {"items": [], "channels": ["shared"]}
+        assert api.post(
+            f"/v2/runs/{run_id}/messages",
+            headers={
+                "Authorization": "Bearer client-a",
+                "Idempotency-Key": "client-internal-forbidden",
+            },
+            json={
+                "channel": "internal", "kind": "comment", "body": "Must not enter",
+            },
+        ).status_code == 403
+        assert api.post(
+            f"/v2/runs/{run_id}/messages",
+            headers={
+                "Authorization": "Bearer client-a",
+                "Idempotency-Key": "client-hidden-reply-forbidden",
+            },
+            json={
+                "channel": "shared", "kind": "comment", "body": "Hidden reply",
+                "reply_to_message_id": internal.json()["message_id"],
+            },
+        ).status_code == 409
+        assert api.post(
+            f"/v2/runs/{run_id}/messages",
+            headers={
+                "Authorization": "Bearer client-a",
+                "Idempotency-Key": "client-update-forbidden",
+            },
+            json={
+                "channel": "shared", "kind": "update", "body": "False status update",
+            },
+        ).status_code == 403
+
+        question_headers = {
+            "Authorization": "Bearer client-a",
+            "Idempotency-Key": "client-shared-question",
+        }
+        question_body = {
+            "channel": "shared", "kind": "question",
+            "body": "Does the confidential launch include our acquisition target?",
+        }
+        question = api.post(
+            f"/v2/runs/{run_id}/messages", headers=question_headers, json=question_body,
+        )
+        duplicate = api.post(
+            f"/v2/runs/{run_id}/messages", headers=question_headers, json=question_body,
+        )
+        assert question.status_code == duplicate.status_code == 201
+        assert duplicate.json()["duplicate"] is True
+
+        client_after = api.get(
+            f"/v2/runs/{run_id}/messages",
+            headers={"Authorization": "Bearer client-a"},
+        ).json()
+        assert [item["kind"] for item in client_after["items"]] == ["question"]
+        reviewer = api.get(
+            f"/v2/runs/{run_id}/messages",
+            headers={"Authorization": "Bearer reviewer-a"},
+        ).json()
+        assert [item["kind"] for item in reviewer["items"]] == ["update", "question"]
+        assert set(reviewer["channels"]) == {"shared", "internal"}
+        assert api.get(
+            f"/v2/runs/{run_id}/messages",
+            headers={"Authorization": "Bearer viewer-a"},
+        ).status_code == 404
+
+        owner_inbox = api.get(
+            "/v2/notifications", headers={"Authorization": "Bearer org-a"},
+        ).json()["items"]
+        question_notice = next(
+            item for item in owner_inbox
+            if item["payload"].get("message_id") == question.json()["message_id"]
+        )
+        assert question_notice["subject"] == "A mission question needs a response"
+        assert "acquisition" not in str(question_notice).lower()
 
 
 def test_first_mission_readiness_is_honest_role_aware_and_resumable(tmp_path):

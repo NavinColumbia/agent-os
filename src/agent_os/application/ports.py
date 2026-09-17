@@ -464,6 +464,35 @@ class MissionParticipantStore(Protocol):
 
 
 @runtime_checkable
+class MissionConversationStore(Protocol):
+    """Immutable, mission-scoped human and agent communication."""
+
+    def list_messages(
+        self,
+        tenant_id: str,
+        mission_id: str,
+        *,
+        include_internal: bool,
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def append_message(
+        self,
+        *,
+        tenant_id: str,
+        mission_id: str,
+        sender_id: str,
+        sender_persona: str,
+        channel: str,
+        kind: str,
+        body: str,
+        reply_to_message_id: str | None,
+        audience_ids: tuple[str, ...],
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class TenantModelStore(Protocol):
     """Tenant-owned model choice with an optional opaque credential reference."""
 

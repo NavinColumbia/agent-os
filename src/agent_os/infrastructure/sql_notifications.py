@@ -34,6 +34,7 @@ from sqlalchemy.exc import IntegrityError
 
 from agent_os.application.ports import (
     DecisionResponseLease,
+    ExperienceEventPage,
     NotificationDeliveryLease,
     NotificationStore,
 )
@@ -44,6 +45,10 @@ from agent_os.domain.notifications import (
     notification_fingerprint,
 )
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
+from agent_os.infrastructure.sql_experience_events import (
+    SQLExperienceEventLog,
+    experience_source_key,
+)
 
 
 notification_metadata = MetaData()
@@ -272,8 +277,10 @@ class SQLNotificationStore(NotificationStore):
             raise ValueError("database_url is required")
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._experience_events = SQLExperienceEventLog(self._tenant_connection)
         if create_schema:
             notification_metadata.create_all(self._engine)
+            self._experience_events.create_schema(self._engine)
 
     @staticmethod
     def _route_definition(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -360,6 +367,50 @@ class SQLNotificationStore(NotificationStore):
                 )
             yield connection
 
+    def _append_experience_event(
+        self,
+        connection,
+        *,
+        tenant_id: str,
+        source_key: str,
+        resource_type: str,
+        resource_id: str,
+        projection_revision: int,
+        kind: str,
+        audience_ids: tuple[str, ...],
+        safe_summary: str,
+        occurred_at: datetime,
+        trace_id: str | None = None,
+    ) -> int:
+        return self._experience_events.append(
+            connection,
+            tenant_id=tenant_id,
+            source_key=source_key,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            projection_revision=projection_revision,
+            kind=kind,
+            audience_ids=audience_ids,
+            safe_summary=safe_summary,
+            occurred_at=occurred_at,
+            trace_id=trace_id,
+        )
+
+    def list_experience_events(
+        self,
+        tenant_id: str,
+        *,
+        after_sequence: int = 0,
+        audience_ids: tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> ExperienceEventPage:
+        return self._experience_events.list(
+            tenant_id,
+            after_sequence=after_sequence,
+            audience_ids=audience_ids,
+            limit=limit,
+        )
+
     def publish_notification(self, notification: Notification) -> bool:
         raw = notification.to_dict()
         fingerprint = notification_fingerprint(notification)
@@ -444,6 +495,20 @@ class SQLNotificationStore(NotificationStore):
                         "available_at": created_at,
                         "created_at": created_at,
                     } for row in eligible_routes])
+                self._append_experience_event(
+                    connection,
+                    tenant_id=notification.tenant_id,
+                    source_key=experience_source_key(
+                        "notification:published", notification.notification_id,
+                    ),
+                    resource_type="notification",
+                    resource_id=notification.notification_id,
+                    projection_revision=1,
+                    kind="notification.published",
+                    audience_ids=notification.recipient_ids,
+                    safe_summary="A new attention item is available.",
+                    occurred_at=created_at,
+                )
         except IntegrityError as exc:
             # Another replica can win the same deterministic insert after our
             # initial read. Re-read after rollback and accept only byte-for-byte
@@ -626,6 +691,20 @@ class SQLNotificationStore(NotificationStore):
                 connection.execute(insert(notification_states).values(**values))
             else:
                 connection.execute(update(notification_states).where(key).values(**values))
+            self._append_experience_event(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key(
+                    "notification:state", subject_id, notification_id, idempotency_key,
+                ),
+                resource_type="notification_state",
+                resource_id=notification_id,
+                projection_revision=version,
+                kind="notification.state.changed",
+                audience_ids=(subject_id,),
+                safe_summary="Your attention-item state changed.",
+                occurred_at=now,
+            )
         return self._state_record(values)
 
     def get_notification_preferences(
@@ -700,6 +779,20 @@ class SQLNotificationStore(NotificationStore):
                 connection.execute(insert(notification_preferences).values(**values))
             else:
                 connection.execute(update(notification_preferences).where(key).values(**values))
+            self._append_experience_event(
+                connection,
+                tenant_id=preferences.tenant_id,
+                source_key=experience_source_key(
+                    "notification:preferences", preferences.subject_id, idempotency_key,
+                ),
+                resource_type="notification_preferences",
+                resource_id=preferences.subject_id,
+                projection_revision=version,
+                kind="notification.preferences.changed",
+                audience_ids=(preferences.subject_id,),
+                safe_summary="Your attention preferences changed.",
+                occurred_at=now,
+            )
         return {
             **record,
             "version": version,
@@ -848,6 +941,18 @@ class SQLNotificationStore(NotificationStore):
                         raise ValueError("human decision was already answered differently")
                     return self._decision_record(prior, duplicate=True)
                 connection.execute(insert(decision_responses).values(**values))
+                self._append_experience_event(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key("decision:admitted", response_id),
+                    resource_type="decision_response",
+                    resource_id=notification_id,
+                    projection_revision=1,
+                    kind="decision.response.admitted",
+                    audience_ids=(actor_id,),
+                    safe_summary="Your decision response was safely recorded.",
+                    occurred_at=now,
+                )
         except IntegrityError as exc:
             with self._tenant_connection(tenant_id) as connection:
                 priors = connection.execute(
@@ -1037,6 +1142,20 @@ class SQLNotificationStore(NotificationStore):
                 connection.execute(insert(notification_states).values(**state_values))
             else:
                 connection.execute(update(notification_states).where(state_key).values(**state_values))
+            self._append_experience_event(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key(
+                    "decision:completed", response_id, outcome,
+                ),
+                resource_type="decision_response",
+                resource_id=str(row["notification_id"]),
+                projection_revision=int(row["redrive_count"]) + 2,
+                kind=f"decision.response.{outcome}",
+                audience_ids=(str(row["actor_id"]),),
+                safe_summary="Your decision response finished processing.",
+                occurred_at=now,
+            )
         return True
 
     def retry_decision_response(

@@ -115,6 +115,24 @@ class DecisionResponseLease:
     lease_expires_at: str
 
 
+@dataclass(frozen=True)
+class ExperienceEventPage:
+    """One bounded, tenant-scoped page from the user-visible event log.
+
+    ``cursor_sequence`` is the safe high-water mark a client may acknowledge.
+    When ``reset_required`` is true, the requested cursor predates retained
+    history and the client must reload authoritative REST projections before
+    resuming at that high-water mark.
+    """
+
+    events: tuple[Mapping[str, Any], ...]
+    cursor_sequence: int
+    minimum_sequence: int
+    latest_sequence: int
+    has_more: bool = False
+    reset_required: bool = False
+
+
 @runtime_checkable
 class WorkflowEngine(Protocol):
     """Durable lifecycle execution used by the control API."""
@@ -571,6 +589,20 @@ class GraphNodeRuntime(Protocol):
         action: WorkflowAction,
         idempotency_key: str,
     ) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class ExperienceEventStore(Protocol):
+    """Durable user-visible invalidations and safe activity summaries."""
+
+    def list_experience_events(
+        self,
+        tenant_id: str,
+        *,
+        after_sequence: int = 0,
+        audience_ids: tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> ExperienceEventPage: ...
 
 
 @runtime_checkable

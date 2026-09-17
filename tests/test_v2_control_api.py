@@ -679,6 +679,63 @@ def test_personal_notification_preferences_state_and_attention_projection(tmp_pa
         notifications.close()
 
 
+def test_experience_event_catchup_cursor_is_tenant_bound_and_advances_hidden_events(tmp_path):
+    notifications = SQLNotificationStore(
+        f"sqlite:///{tmp_path / 'api-experience-events.sqlite3'}", create_schema=True,
+    )
+    notifications.publish_notification(Notification(
+        notification_id="event-notification", tenant_id="org-a", run_id="run-one",
+        category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+        recipient_ids=("human:ceo",), subject="Approve",
+        body="Sensitive decision detail", source_id="approval-source",
+        created_at="2026-09-17T12:00:00+00:00", correlation_id="decision-one",
+    ))
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+        notification_store=notifications,
+    ))
+    try:
+        owner_headers = {"Authorization": "Bearer org-a"}
+        initial = api.get("/v2/events", headers=owner_headers)
+        assert initial.status_code == 200
+        assert [item["kind"] for item in initial.json()["items"]] == [
+            "notification.published",
+        ]
+        assert initial.json()["reset_required"] is False
+        cursor = initial.json()["cursor"]
+        assert "org-a" not in cursor
+        assert "event-notification" not in cursor
+
+        hidden = api.get(
+            "/v2/events", headers={"Authorization": "Bearer viewer-a"},
+        )
+        assert hidden.status_code == 200
+        assert hidden.json()["items"] == []
+        assert hidden.json()["cursor"] == cursor
+
+        assert api.get(
+            f"/v2/events?cursor={cursor}",
+            headers={"Authorization": "Bearer org-b"},
+        ).status_code == 400
+
+        changed = api.put(
+            "/v2/notifications/event-notification/state",
+            headers={**owner_headers, "Idempotency-Key": "read-experience-event"},
+            json={"status": "read"},
+        )
+        assert changed.status_code == 200
+        catchup = api.get(
+            f"/v2/events?cursor={cursor}", headers=owner_headers,
+        )
+        assert catchup.status_code == 200
+        assert [item["kind"] for item in catchup.json()["items"]] == [
+            "notification.state.changed",
+        ]
+    finally:
+        api.close()
+        notifications.close()
+
+
 def test_usage_api_is_tenant_scoped_and_event_detail_requires_owner(tmp_path):
     meter = SQLUsageMeter(
         f"sqlite:///{tmp_path / 'api-usage.sqlite3'}", monthly_budget_cents=250,

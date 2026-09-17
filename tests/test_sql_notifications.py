@@ -136,6 +136,119 @@ def test_notification_cursor_is_stable_across_equal_timestamps_and_tenant_scoped
         )
 
 
+def test_experience_events_are_monotonic_audience_scoped_and_replay_safe(store):
+    first_notification = notification()
+    second_notification = notification(
+        notification_id="notification-2",
+        recipient_ids=("operator:on-call",),
+        source_id="action-2",
+    )
+    assert store.publish_notification(first_notification) is True
+    assert store.publish_notification(second_notification) is True
+    assert store.publish_notification(first_notification) is False
+
+    first = store.list_experience_events("tenant-a", limit=1)
+    assert [item["tenant_sequence"] for item in first.events] == [1]
+    assert first.cursor_sequence == 1
+    assert first.latest_sequence == 2
+    assert first.has_more is True
+
+    second = store.list_experience_events(
+        "tenant-a", after_sequence=first.cursor_sequence, limit=1,
+    )
+    assert [item["tenant_sequence"] for item in second.events] == [2]
+    assert second.cursor_sequence == 2
+    assert second.has_more is False
+
+    personal = store.list_experience_events(
+        "tenant-a", audience_ids=("human:ceo",),
+    )
+    assert [item["resource_id"] for item in personal.events] == ["notification-1"]
+    # Hidden events do not strand a recipient on an old cursor.
+    assert personal.cursor_sequence == 2
+    assert "Approve the release" not in personal.events[0]["safe_summary"]
+    hidden = store.list_experience_events(
+        "tenant-a", audience_ids=("someone-else",),
+    )
+    assert hidden.events == ()
+    assert hidden.cursor_sequence == 2
+
+    store.publish_notification(notification(
+        notification_id="notification-b", tenant_id="tenant-b", source_id="action-b",
+    ))
+    other = store.list_experience_events("tenant-b")
+    assert [item["tenant_sequence"] for item in other.events] == [1]
+    with pytest.raises(ValueError, match="ahead"):
+        store.list_experience_events("tenant-b", after_sequence=2)
+
+
+def test_experience_retention_floor_requires_authoritative_snapshot_reset(store):
+    store.publish_notification(notification())
+    store.publish_notification(notification(
+        notification_id="notification-2", source_id="action-2",
+    ))
+    with store._engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE aos_v2_experience_streams "
+            "SET retained_from_sequence = 2 WHERE tenant_id = ?",
+            ("tenant-a",),
+        )
+
+    expired = store.list_experience_events("tenant-a", after_sequence=0)
+    assert expired.reset_required is True
+    assert expired.events == ()
+    assert expired.minimum_sequence == 2
+    assert expired.cursor_sequence == 2
+    resumed = store.list_experience_events("tenant-a", after_sequence=1)
+    assert resumed.reset_required is False
+    assert [item["tenant_sequence"] for item in resumed.events] == [2]
+
+
+def test_notification_and_experience_event_share_one_transaction(store, monkeypatch):
+    def fail_event_append(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("simulated event-log failure")
+
+    monkeypatch.setattr(store, "_append_experience_event", fail_event_append)
+    with pytest.raises(RuntimeError, match="event-log failure"):
+        store.publish_notification(notification())
+    assert store.list_notifications("tenant-a") == ()
+
+
+def test_attention_mutations_append_exactly_one_transactional_experience_event(store):
+    store.publish_notification(notification())
+    state = store.set_notification_state(
+        tenant_id="tenant-a", subject_id="human:ceo", notification_id="notification-1",
+        status="read", snoozed_until=None, actor_id="human:ceo",
+        idempotency_key="read-notification-once",
+    )
+    replay = store.set_notification_state(
+        tenant_id="tenant-a", subject_id="human:ceo", notification_id="notification-1",
+        status="read", snoozed_until=None, actor_id="human:ceo",
+        idempotency_key="read-notification-once",
+    )
+    preferences = NotificationPreferences(
+        tenant_id="tenant-a", subject_id="human:ceo",
+        mode=NotificationPreferenceMode.FOCUSED,
+    )
+    store.set_notification_preferences(
+        preferences, actor_id="human:ceo", idempotency_key="preferences-once",
+    )
+    store.set_notification_preferences(
+        preferences, actor_id="human:ceo", idempotency_key="preferences-once",
+    )
+
+    assert state["duplicate"] is False
+    assert replay["duplicate"] is True
+    page = store.list_experience_events("tenant-a")
+    assert [item["kind"] for item in page.events] == [
+        "notification.published",
+        "notification.state.changed",
+        "notification.preferences.changed",
+    ]
+    assert [item["tenant_sequence"] for item in page.events] == [1, 2, 3]
+
+
 def test_personal_state_is_idempotent_and_never_mutates_notification_truth(store):
     store.publish_notification(notification())
 
@@ -211,3 +324,20 @@ def test_personal_attention_migration_is_tenant_fenced_and_non_destructive():
     assert "GRANT SELECT, INSERT, UPDATE" in migration
     assert "GRANT DELETE" not in migration
     assert "REFERENCES public.aos_v2_notifications" in migration
+
+
+def test_experience_event_migration_is_tenant_fenced_append_only_and_audience_indexed():
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "postgres/initdb/105-experience-events-v2.sql"
+    ).read_text()
+
+    assert migration.count("ENABLE ROW LEVEL SECURITY") == 3
+    assert migration.count("FORCE ROW LEVEL SECURITY") == 3
+    assert migration.count("current_setting('app.tenant_id', true)") == 6
+    assert "retained_from_sequence" in migration
+    assert "UNIQUE (tenant_id, source_key)" in migration
+    assert "aos_v2_experience_event_audiences_lookup_idx" in migration
+    assert "GRANT SELECT, INSERT ON TABLE public.aos_v2_experience_events" in migration
+    assert "GRANT UPDATE ON TABLE public.aos_v2_experience_events" not in migration
+    assert "GRANT DELETE" not in migration

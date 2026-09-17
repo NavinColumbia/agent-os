@@ -107,6 +107,41 @@ def _decode_notification_cursor(value: str) -> tuple[datetime, str]:
     return created_at, notification_id
 
 
+def _encode_experience_cursor(tenant_id: str, sequence: int) -> str:
+    if not tenant_id.strip() or sequence < 0:
+        raise ValueError("experience cursor is invalid")
+    raw = json.dumps(
+        {"v": 1, "tenant_id": tenant_id, "sequence": sequence},
+        separators=(",", ":"), sort_keys=True,
+    ).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_experience_cursor(value: str, tenant_id: str) -> int:
+    if not 1 <= len(value) <= 1_024 or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("experience cursor is invalid")
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        payload = json.loads(decoded)
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("v") != 1
+            or payload.get("tenant_id") != tenant_id
+            or not isinstance(payload.get("sequence"), int)
+            or isinstance(payload.get("sequence"), bool)
+        ):
+            raise ValueError
+        sequence = int(payload["sequence"])
+    except (
+        ValueError, TypeError, KeyError, UnicodeDecodeError,
+        json.JSONDecodeError, binascii.Error,
+    ) as exc:
+        raise ValueError("experience cursor is invalid for this organization") from exc
+    if sequence < 0:
+        raise ValueError("experience cursor is invalid")
+    return sequence
+
+
 def _project_mission_subprograms(
     graph_engine: GraphWorkflowEngine,
     tenant_id: str,
@@ -1818,6 +1853,59 @@ def create_app(
             if "agent" in principal.roles:
                 admitted.add(f"agent:{principal.subject_id}")
             return bool(recipients & admitted)
+
+        experience_lister = getattr(
+            notification_store, "list_experience_events", None,
+        )
+        if experience_lister is not None:
+            @app.get("/v2/events")
+            def list_experience_events(
+                principal: Annotated[Principal, Depends(current_principal)],
+                limit: Annotated[int, Query(ge=1, le=500)] = 100,
+                cursor: Annotated[str | None, Query(max_length=1_024)] = None,
+            ) -> Mapping[str, Any]:
+                try:
+                    after_sequence = (
+                        0 if cursor is None else _decode_experience_cursor(
+                            cursor, principal.organization_id,
+                        )
+                    )
+                    privileged = bool(
+                        principal.roles & {"owner", "operator", "system"}
+                    )
+                    audience_ids = None
+                    if not privileged:
+                        admitted = {
+                            principal.subject_id,
+                            "tenant:members",
+                            *(f"role:{role}" for role in principal.roles),
+                        }
+                        if "agent" in principal.roles:
+                            admitted.add(f"agent:{principal.subject_id}")
+                        audience_ids = tuple(sorted(admitted))
+                    page = experience_lister(
+                        principal.organization_id,
+                        after_sequence=after_sequence,
+                        audience_ids=audience_ids,
+                        limit=limit,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                return {
+                    "items": list(page.events),
+                    "cursor": _encode_experience_cursor(
+                        principal.organization_id, page.cursor_sequence,
+                    ),
+                    "minimum_cursor": _encode_experience_cursor(
+                        principal.organization_id,
+                        max(0, page.minimum_sequence - 1),
+                    ),
+                    "latest_cursor": _encode_experience_cursor(
+                        principal.organization_id, page.latest_sequence,
+                    ),
+                    "has_more": page.has_more,
+                    "reset_required": page.reset_required,
+                }
 
         @app.get("/v2/notification-preferences")
         def get_notification_preferences(

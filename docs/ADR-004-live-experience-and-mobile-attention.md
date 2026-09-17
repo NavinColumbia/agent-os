@@ -1,6 +1,6 @@
 # ADR-004: Live Experience Transport and Mobile Attention
 
-- **Status:** accepted architecture; implementation staged
+- **Status:** accepted; durable catch-up foundation implemented, streaming and push staged
 - **Date:** 2026-09-17
 - **Owners:** experience, runtime assurance, platform operations
 
@@ -74,6 +74,19 @@ reset response rather than silent loss.
 4. pinned AG-UI compatibility tests at the public adapter boundary;
 5. push-subscription metadata/secret boundary, service-worker handlers, governed delivery worker, and live-device
    receipts after VAPID provisioning.
+
+## Current implementation
+
+Migration 105 and `SQLExperienceEventLog` now provide the tenant-monotonic stream, forced-RLS audience rows,
+retention floor, idempotent source keys, and bounded catch-up API. Notification publication, personal attention
+state/preferences, and structured decision admission/completion append safe events in the same database
+transaction as their source mutation. Cursor tokens are bound to the selected organization; an expired cursor
+returns an explicit snapshot-reset requirement. The migration is included in both local Compose and the
+production migration image.
+
+Mission/workflow mutations, foreground SSE, the pinned AG-UI adapter, and provisioned Web Push remain staged.
+Until those producers are transactionally connected, `/v2/events` is an attention/decision catch-up stream—not
+a claim that every product transition is live.
 
 ## Acceptance
 

@@ -221,7 +221,8 @@ async function connect(token) {
     byId("auth-gate").classList.add("hidden");
     byId("workspace").classList.remove("hidden");
     const requestedRoute = routeFromHash();
-    const roleDefault = state.session?.persona === "operator" ? "inbox" : "missions";
+    const roleDefault = ["operator", "reviewer"].includes(state.session?.persona)
+      ? "inbox" : "missions";
     await selectView(requestedRoute.view || roleDefault);
     if (requestedRoute.pushDeliveryId) await openPushDelivery(requestedRoute.pushDeliveryId);
     else if (requestedRoute.runId) await openMissionDeepLink(requestedRoute.runId);
@@ -294,9 +295,14 @@ function can(capability) {
 
 function applyRoleExperience() {
   const persona = state.session?.persona || "viewer";
-  const labels = { executive: "Executive", operator: "Operations", builder: "Builder", viewer: "Viewer" };
+  const labels = {
+    executive: "Executive", operator: "Operations", builder: "Builder",
+    reviewer: "Reviewer", viewer: "Viewer",
+  };
   byId("workspace-role-label").textContent = `${labels[persona] || "Member"} workspace`;
-  byId("identity-avatar").textContent = { executive: "CEO", operator: "OPS", builder: "BUILD", viewer: "VIEW" }[persona] || "USER";
+  byId("identity-avatar").textContent = {
+    executive: "CEO", operator: "OPS", builder: "BUILD", reviewer: "REVIEW", viewer: "VIEW",
+  }[persona] || "USER";
   document.querySelectorAll(".requires-mission-create").forEach((node) => node.classList.toggle("hidden", !can("mission.create")));
   document.querySelectorAll(".requires-integration-manage").forEach((node) => node.classList.toggle("hidden", !can("integration.manage")));
   const billingAvailable = state.config?.billing_mode === "stripe";
@@ -510,7 +516,7 @@ function accessPanel(memberships) {
   }
   const invite = el("div", "access-form");
   const role = document.createElement("select");
-  for (const value of ["viewer", "operator", "owner"]) {
+  for (const value of ["viewer", "builder", "reviewer", "operator", "owner"]) {
     const option = el("option", "", value); option.value = value; role.append(option);
   }
   role.setAttribute("aria-label", "Invitation role");

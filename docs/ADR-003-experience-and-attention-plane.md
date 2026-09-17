@@ -51,6 +51,11 @@ output, and traces are advanced diagnostic views.
    tenant home cells. Kafka, active-active writes, and a language rewrite require measured evidence.
 9. Free text never implies approval. Approve, decline, request-changes, and respond are separate intents;
    admission and execution both reject an action the decision brief does not permit.
+10. Human delivery roles are least-privilege memberships: builders may execute assigned work and publish
+    artifacts; reviewers may inspect work and answer review decisions; neither inherits mission, integration,
+    membership, billing, or policy administration. Runtime agents remain service identities, not human members.
+11. Role-addressed attention is resolved server-side from authenticated memberships. A client cannot nominate
+    a role to widen its own inbox, and matching both a subject and role never duplicates the same item.
 
 ## API direction
 
@@ -83,6 +88,8 @@ decision-response truth defined here.
 - External delivery routes must evolve from tenant-wide category matching to recipient/audience-aware policy.
 - Read models and cursor pagination become necessary before very large mission histories.
 - Persona UX can evolve independently without forking workflow semantics.
+- Human builder and reviewer memberships are first-class: reviewers default to their decision queue, builders
+  can publish evidence, and both receive only the bounded capabilities returned by the authenticated session.
 
 ## Acceptance
 

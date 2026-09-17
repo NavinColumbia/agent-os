@@ -750,6 +750,7 @@ class SQLNotificationStore(NotificationStore):
         *,
         run_id: str | None = None,
         recipient_id: str | None = None,
+        recipient_ids: tuple[str, ...] | None = None,
         before: tuple[datetime, str] | None = None,
         limit: int = 100,
     ) -> tuple[Mapping[str, Any], ...]:
@@ -763,20 +764,26 @@ class SQLNotificationStore(NotificationStore):
                 or "\0" in before_notification_id
             ):
                 raise ValueError("notification cursor is invalid")
+        if recipient_id is not None and recipient_ids is not None:
+            raise ValueError("use one notification recipient filter")
+        audience_ids = (
+            (recipient_id,) if recipient_id is not None
+            else tuple(dict.fromkeys(recipient_ids or ()))
+        )
+        if len(audience_ids) > 64 or any(
+            not value.strip() or len(value) > 256 for value in audience_ids
+        ):
+            raise ValueError("notification recipient filter is invalid")
         with self._tenant_connection(tenant_id) as connection:
             criteria = [notifications.c.tenant_id == tenant_id]
             if run_id is not None:
                 criteria.append(notifications.c.run_id == run_id)
-            source = notifications
-            if recipient_id is not None:
-                source = notifications.join(notification_recipients, and_(
+            if audience_ids:
+                criteria.append(select(notification_recipients.c.notification_id).where(and_(
                     notification_recipients.c.tenant_id == notifications.c.tenant_id,
                     notification_recipients.c.notification_id == notifications.c.notification_id,
-                ))
-                criteria.extend((
-                    notification_recipients.c.tenant_id == tenant_id,
-                    notification_recipients.c.recipient_id == recipient_id,
-                ))
+                    notification_recipients.c.recipient_id.in_(audience_ids),
+                )).exists())
             if before is not None:
                 criteria.append(or_(
                     notifications.c.created_at < before_created_at,
@@ -785,7 +792,7 @@ class SQLNotificationStore(NotificationStore):
                         notifications.c.notification_id < before_notification_id,
                     ),
                 ))
-            rows = connection.execute(select(notifications.c.record).select_from(source).where(and_(
+            rows = connection.execute(select(notifications.c.record).where(and_(
                 *criteria,
             )).order_by(
                 notifications.c.created_at.desc(),

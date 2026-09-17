@@ -241,6 +241,13 @@ foreign and nonexistent mission indistinguishable. Opening, closing, reloading, 
 retain the familiar drawer interaction while producing a link a teammate can use inside the same authorized
 company.
 
+The role model now includes least-privilege human `builder` and `reviewer` memberships rather than representing
+those personas only as UI labels. Builders receive assigned-work execution and artifact-publication capability,
+without mission or administration authority. Reviewers receive review-read and decision-response capability,
+without artifact or runtime mutation authority. Personal inbox queries resolve both subject and authenticated
+role audiences on the server, so teams can route a review to `role:reviewer` without leaking it to builders or
+viewers and without duplicating an item addressed to both the person and role.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

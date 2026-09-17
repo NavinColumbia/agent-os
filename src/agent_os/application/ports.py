@@ -632,6 +632,7 @@ class NotificationStore(Protocol):
         *,
         run_id: str | None = None,
         recipient_id: str | None = None,
+        recipient_ids: tuple[str, ...] | None = None,
         before: tuple[datetime, str] | None = None,
         limit: int = 100,
     ) -> tuple[Mapping[str, Any], ...]: ...

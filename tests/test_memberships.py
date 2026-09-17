@@ -151,6 +151,24 @@ def test_membership_authority_validates_roles_and_prevents_self_revocation(tmp_p
         memberships.close()
 
 
+@pytest.mark.parametrize("role", ["builder", "reviewer"])
+def test_membership_supports_least_privilege_delivery_roles(tmp_path: Path, role: str):
+    memberships = store(tmp_path)
+    try:
+        invitation = memberships.create_invitation(
+            tenant_id="org-a", roles=(role,), actor_id="owner-a",
+            expires_in_seconds=3600, idempotency_key=f"invite-{role}",
+        )
+        claimed = memberships.claim_invitation(
+            token=invitation["claim_token"], subject_id=f"{role}-a",
+        )
+
+        assert claimed["roles"] == [role]
+        assert memberships.roles_for("org-a", f"{role}-a") == frozenset({role})
+    finally:
+        memberships.close()
+
+
 def test_membership_migration_forces_tenant_and_subject_scoped_rls():
     migration = (
         Path(__file__).resolve().parents[1]

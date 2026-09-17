@@ -38,7 +38,7 @@ from agent_os.infrastructure.sql_experience_events import (
 
 
 membership_metadata = MetaData()
-_MEMBER_ROLES = frozenset({"owner", "operator", "viewer"})
+_MEMBER_ROLES = frozenset({"owner", "operator", "builder", "reviewer", "viewer"})
 
 
 memberships = Table(
@@ -134,7 +134,9 @@ class SQLMembershipStore(MembershipStore):
     def _roles(raw: tuple[str, ...] | list[str]) -> tuple[str, ...]:
         roles = tuple(sorted(set(str(item).strip() for item in raw if str(item).strip())))
         if not roles or set(roles) - _MEMBER_ROLES:
-            raise ValueError("membership roles must be owner, operator, or viewer")
+            raise ValueError(
+                "membership roles must be owner, operator, builder, reviewer, or viewer"
+            )
         return roles
 
     def _invitation_id(self, tenant_id: str, idempotency_key: str) -> str:

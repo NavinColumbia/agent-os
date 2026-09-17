@@ -38,6 +38,10 @@ class FakeIdentity:
             return {"sub": "agent-a", "org": "org-a", "roles": ["agent"]}
         if authorization == "Bearer operator-a":
             return {"sub": "operator-a", "org": "org-a", "roles": ["operator"]}
+        if authorization == "Bearer builder-a":
+            return {"sub": "builder-a", "org": "org-a", "roles": ["builder"]}
+        if authorization == "Bearer reviewer-a":
+            return {"sub": "reviewer-a", "org": "org-a", "roles": ["reviewer"]}
         if authorization == "Bearer viewer-a":
             return {"sub": "viewer-a", "org": "org-a", "roles": ["viewer"]}
         if authorization == "Bearer guest-b":
@@ -267,11 +271,22 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
 def test_session_capabilities_and_mission_creation_are_role_consistent():
     api = client()
     owner = api.get("/v2/me", headers={"Authorization": "Bearer org-a"}).json()
+    builder = api.get("/v2/me", headers={"Authorization": "Bearer builder-a"}).json()
+    reviewer = api.get("/v2/me", headers={"Authorization": "Bearer reviewer-a"}).json()
     viewer = api.get("/v2/me", headers={"Authorization": "Bearer viewer-a"}).json()
 
     assert owner["persona"] == "executive"
     assert "mission.create" in owner["capabilities"]
     assert "decision.redrive" in owner["capabilities"]
+    assert builder["persona"] == "builder"
+    assert {"work.execute", "artifact.publish", "notification.respond"} <= set(
+        builder["capabilities"]
+    )
+    assert "mission.create" not in builder["capabilities"]
+    assert reviewer["persona"] == "reviewer"
+    assert {"review.read", "notification.respond"} <= set(reviewer["capabilities"])
+    assert "artifact.publish" not in reviewer["capabilities"]
+    assert "mission.create" not in reviewer["capabilities"]
     assert viewer["persona"] == "viewer"
     assert "mission.create" not in viewer["capabilities"]
     forbidden = api.post(
@@ -560,8 +575,11 @@ def test_notification_inbox_uses_authenticated_tenant_and_role_scope():
         def __init__(self):
             self.calls = []
 
-        def list_notifications(self, tenant_id, *, run_id=None, recipient_id=None, limit=100):
-            self.calls.append((tenant_id, run_id, recipient_id, limit))
+        def list_notifications(
+            self, tenant_id, *, run_id=None, recipient_id=None,
+            recipient_ids=None, limit=100,
+        ):
+            self.calls.append((tenant_id, run_id, recipient_id, recipient_ids, limit))
             return ({"notification_id": f"notice-{tenant_id}"},)
 
     store = FakeNotifications()
@@ -574,8 +592,47 @@ def test_notification_inbox_uses_authenticated_tenant_and_role_scope():
 
     assert owner.status_code == 200
     assert owner.json()["items"][0]["notification_id"] == "notice-org-a"
-    assert store.calls[0] == ("org-a", "run-1", None, 26)
-    assert store.calls[1] == ("org-a", None, "agent-a", 101)
+    assert store.calls[0] == ("org-a", "run-1", None, None, 26)
+    assert store.calls[1] == (
+        "org-a", None, None, ("agent-a", "agent:agent-a", "role:agent"), 101,
+    )
+
+
+def test_notification_inbox_accepts_role_audiences_without_leaking_between_roles(tmp_path):
+    notifications = SQLNotificationStore(
+        f"sqlite:///{tmp_path / 'api-role-attention.sqlite3'}", create_schema=True,
+    )
+    try:
+        notifications.publish_notification(Notification(
+            notification_id="review-required", tenant_id="org-a", run_id="run-review",
+            category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+            recipient_ids=("role:reviewer",), subject="Review release evidence",
+            body="Independent review is required", source_id="review-gate",
+            created_at="2026-09-17T12:00:00+00:00",
+            payload={"severity": "warning"},
+        ))
+        api = TestClient(create_app(
+            engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+            notification_store=notifications,
+        ))
+
+        reviewer = api.get(
+            "/v2/notifications", headers={"Authorization": "Bearer reviewer-a"},
+        )
+        builder = api.get(
+            "/v2/notifications", headers={"Authorization": "Bearer builder-a"},
+        )
+        viewer = api.get(
+            "/v2/notifications", headers={"Authorization": "Bearer viewer-a"},
+        )
+
+        assert [item["notification_id"] for item in reviewer.json()["items"]] == [
+            "review-required"
+        ]
+        assert builder.json()["items"] == []
+        assert viewer.json()["items"] == []
+    finally:
+        notifications.close()
 
 
 def test_notification_inbox_cursor_is_opaque_stable_and_tenant_fenced(tmp_path):
@@ -996,6 +1053,24 @@ def test_artifact_upload_download_and_metadata_are_tenant_scoped():
         },
     )
     assert forbidden.status_code == 403
+    builder_upload = api.post(
+        "/v2/artifacts",
+        headers={"Authorization": "Bearer builder-a", "Idempotency-Key": "artifact-builder"},
+        json={
+            "content_base64": base64.b64encode(b"builder evidence").decode(),
+            "media_type": "text/plain",
+        },
+    )
+    assert builder_upload.status_code == 201
+    reviewer_upload = api.post(
+        "/v2/artifacts",
+        headers={"Authorization": "Bearer reviewer-a", "Idempotency-Key": "artifact-reviewer"},
+        json={
+            "content_base64": base64.b64encode(b"must remain read only").decode(),
+            "media_type": "text/plain",
+        },
+    )
+    assert reviewer_upload.status_code == 403
 
 
 def test_artifact_upload_rejects_invalid_base64():

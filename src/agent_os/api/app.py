@@ -690,13 +690,16 @@ def _principal_experience(principal: Principal) -> Mapping[str, Any]:
     roles = set(principal.roles)
     owner = bool(roles & {"owner", "system"})
     operator = bool(roles & {"operator"})
-    agent = bool(roles & {"agent"})
+    builder = bool(roles & {"builder", "agent"})
+    reviewer = bool(roles & {"reviewer"})
     if owner:
         persona = "executive"
     elif operator:
         persona = "operator"
-    elif agent:
+    elif builder:
         persona = "builder"
+    elif reviewer:
+        persona = "reviewer"
     else:
         persona = "viewer"
     capabilities = {
@@ -715,8 +718,12 @@ def _principal_experience(principal: Principal) -> Mapping[str, Any]:
             "membership.manage", "model.manage", "billing.manage",
             "authority.manage", "policy.manage",
         })
-    if agent:
-        capabilities.update({"work.read", "work.execute", "notification.respond"})
+    if builder:
+        capabilities.update({
+            "work.read", "work.execute", "artifact.publish", "notification.respond",
+        })
+    if reviewer:
+        capabilities.update({"work.read", "review.read", "notification.respond"})
     return {
         "subject_id": principal.subject_id,
         "organization_id": principal.organization_id,
@@ -1899,7 +1906,10 @@ def create_app(
             recipients = {str(item) for item in raw.get("recipient_ids", ())}
             if not recipients or "system" in principal.roles:
                 return True
-            admitted = {principal.subject_id}
+            admitted = {
+                principal.subject_id,
+                *(f"role:{role}" for role in principal.roles),
+            }
             if "owner" in principal.roles:
                 admitted.update({"human:ceo", "role:owner", "role:executive"})
             if "operator" in principal.roles:
@@ -2700,7 +2710,14 @@ def create_app(
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             list_args = {
                 "run_id": run_id,
-                "recipient_id": None if privileged else principal.subject_id,
+                "recipient_ids": None if privileged else tuple(sorted({
+                    principal.subject_id,
+                    *(f"role:{role}" for role in principal.roles),
+                    *(
+                        {f"agent:{principal.subject_id}"}
+                        if "agent" in principal.roles else set()
+                    ),
+                })),
                 "limit": limit + 1,
             }
             if before is not None:
@@ -2908,7 +2925,7 @@ def create_app(
                 str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
             ],
         ) -> Mapping[str, Any]:
-            if not (principal.roles & {"owner", "operator", "agent", "system"}):
+            if not (principal.roles & {"owner", "operator", "builder", "agent", "system"}):
                 raise HTTPException(status_code=403, detail="artifact publication requires write authority")
             try:
                 content = base64.b64decode(body.content_base64, validate=True)

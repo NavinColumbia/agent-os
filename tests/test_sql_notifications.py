@@ -88,6 +88,22 @@ def test_notification_inbox_is_tenant_run_and_recipient_scoped(store):
     ]
 
 
+def test_notification_inbox_supports_role_and_subject_audiences_without_duplicates(store):
+    store.publish_notification(notification(
+        recipient_ids=("reviewer-a", "role:reviewer"),
+    ))
+
+    records = store.list_notifications(
+        "tenant-a", recipient_ids=("reviewer-a", "role:reviewer"),
+    )
+
+    assert [item["notification_id"] for item in records] == ["notification-1"]
+    with pytest.raises(ValueError, match="one notification recipient filter"):
+        store.list_notifications(
+            "tenant-a", recipient_id="reviewer-a", recipient_ids=("role:reviewer",),
+        )
+
+
 def test_recipient_inbox_is_not_hidden_by_other_recipients_high_volume(store):
     target = notification(
         notification_id="notification-target",

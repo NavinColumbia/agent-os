@@ -192,6 +192,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .diagnostic-grid dd { margin: 0; color: #d8ddda; overflow-wrap: anywhere; }
 .timeline-row p { margin-bottom: .2rem; }
 .timeline-error { color: #ffadad !important; overflow-wrap: anywhere; }
+.inbox-load-older { justify-self: center; margin-top: .6rem; }
 .good-note { display: block; margin-top: .75rem; color: var(--lime); font-size: .68rem; }
 .work-row { padding: .8rem 0; border-top: 1px solid var(--line); }
 .work-row:first-of-type { border-top: 0; }

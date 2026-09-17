@@ -465,10 +465,19 @@ class SQLNotificationStore(NotificationStore):
         *,
         run_id: str | None = None,
         recipient_id: str | None = None,
+        before: tuple[datetime, str] | None = None,
         limit: int = 100,
     ) -> tuple[Mapping[str, Any], ...]:
-        if not 1 <= limit <= 500:
-            raise ValueError("notification limit must be 1..500")
+        if not 1 <= limit <= 501:
+            raise ValueError("notification limit must be 1..501")
+        if before is not None:
+            before_created_at, before_notification_id = before
+            if (
+                before_created_at.tzinfo is None
+                or not 1 <= len(before_notification_id) <= 128
+                or "\0" in before_notification_id
+            ):
+                raise ValueError("notification cursor is invalid")
         with self._tenant_connection(tenant_id) as connection:
             criteria = [notifications.c.tenant_id == tenant_id]
             if run_id is not None:
@@ -482,6 +491,14 @@ class SQLNotificationStore(NotificationStore):
                 criteria.extend((
                     notification_recipients.c.tenant_id == tenant_id,
                     notification_recipients.c.recipient_id == recipient_id,
+                ))
+            if before is not None:
+                criteria.append(or_(
+                    notifications.c.created_at < before_created_at,
+                    and_(
+                        notifications.c.created_at == before_created_at,
+                        notifications.c.notification_id < before_notification_id,
+                    ),
                 ))
             rows = connection.execute(select(notifications.c.record).select_from(source).where(and_(
                 *criteria,

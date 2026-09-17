@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,34 @@ def test_recipient_inbox_is_not_hidden_by_other_recipients_high_volume(store):
     records = store.list_notifications("tenant-a", recipient_id="human:ceo", limit=1)
 
     assert [item["notification_id"] for item in records] == ["notification-target"]
+
+
+def test_notification_cursor_is_stable_across_equal_timestamps_and_tenant_scoped(store):
+    timestamp = "2026-09-08T15:00:00+00:00"
+    for position in range(1, 4):
+        store.publish_notification(notification(
+            notification_id=f"notification-{position}",
+            source_id=f"action-{position}", created_at=timestamp,
+        ))
+
+    first = store.list_notifications("tenant-a", limit=2)
+    assert [item["notification_id"] for item in first] == [
+        "notification-3", "notification-2",
+    ]
+    second = store.list_notifications(
+        "tenant-a",
+        before=(datetime(2026, 9, 8, 15, tzinfo=timezone.utc), "notification-2"),
+        limit=2,
+    )
+    assert [item["notification_id"] for item in second] == ["notification-1"]
+    assert store.list_notifications(
+        "tenant-b",
+        before=(datetime(2026, 9, 8, 15, tzinfo=timezone.utc), "notification-2"),
+    ) == ()
+    with pytest.raises(ValueError, match="cursor"):
+        store.list_notifications(
+            "tenant-a", before=(datetime(2026, 9, 8, 15), "notification-2"),
+        )
 
 
 def test_personal_state_is_idempotent_and_never_mutates_notification_truth(store):

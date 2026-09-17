@@ -8,6 +8,7 @@ suite rather than changing product semantics.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from agent_os.domain.lifecycle import Event, LifecycleState
@@ -584,6 +585,7 @@ class NotificationStore(Protocol):
         *,
         run_id: str | None = None,
         recipient_id: str | None = None,
+        before: tuple[datetime, str] | None = None,
         limit: int = 100,
     ) -> tuple[Mapping[str, Any], ...]: ...
 

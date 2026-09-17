@@ -3,7 +3,7 @@
 const state = {
   token: "", organization: "", config: null, view: "missions", selectedRun: null,
   timer: null, session: null, inboxFilter: "open", inboxItems: [], notificationPreferences: null,
-  browserAlertBaseline: null, drawerReturnFocus: null,
+  inboxCursor: null, decisionDrafts: {}, browserAlertBaseline: null, drawerReturnFocus: null,
 };
 const byId = (id) => document.getElementById(id);
 const el = (tag, className, text) => {
@@ -134,6 +134,8 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   state.timer = null;
   state.session = null;
   state.inboxItems = [];
+  state.inboxCursor = null;
+  state.decisionDrafts = {};
   state.notificationPreferences = null;
   state.browserAlertBaseline = null;
   closeDrawer();
@@ -387,9 +389,28 @@ function accessPanel(memberships) {
   return block;
 }
 
-async function loadInbox() {
-  const payload = await api("/v2/notifications?limit=100");
-  state.inboxItems = payload.items || [];
+async function loadInbox({ append = false, refresh = false } = {}) {
+  const priorItems = state.inboxItems;
+  const priorCursor = state.inboxCursor;
+  const preserveHistory = refresh && priorItems.length > 100;
+  const query = new URLSearchParams({limit: "100"});
+  if (append && state.inboxCursor) query.set("cursor", state.inboxCursor);
+  const payload = await api(`/v2/notifications?${query}`);
+  if (append || preserveHistory) {
+    const source = preserveHistory ? [...(payload.items || []), ...priorItems] : priorItems;
+    const byNotification = new Map(state.inboxItems.map((item) => [item.notification_id, item]));
+    if (preserveHistory) byNotification.clear();
+    for (const item of source) {
+      if (!byNotification.has(item.notification_id)) byNotification.set(item.notification_id, item);
+    }
+    if (!preserveHistory) {
+      for (const item of payload.items || []) byNotification.set(item.notification_id, item);
+    }
+    state.inboxItems = [...byNotification.values()];
+  } else {
+    state.inboxItems = payload.items || [];
+  }
+  state.inboxCursor = preserveHistory ? priorCursor : (payload.next_cursor || null);
   state.notificationPreferences = payload.preferences || state.notificationPreferences;
   updateInboxBadge(state.inboxItems);
   hydrateInboxPreferences(state.notificationPreferences);
@@ -433,7 +454,7 @@ function renderInbox() {
   const content = byId("inbox-content");
   content.replaceChildren();
   const items = state.inboxItems.filter(inboxItemVisible);
-  if (!items.length) return content.append(el("div", "empty", "Nothing needs your attention."));
+  if (!items.length) content.append(el("div", "empty", "Nothing needs your attention."));
   for (const item of items) {
     const itemState = item.user_state?.status || "unread";
     const attention = item.presentation?.level || "active";
@@ -462,6 +483,8 @@ function renderInbox() {
       const answer = document.createElement("input");
       answer.type = "text"; answer.maxLength = 2000; answer.placeholder = "Optional decision context";
       answer.setAttribute("aria-label", "Decision context");
+      answer.value = state.decisionDrafts[item.notification_id] || "";
+      answer.addEventListener("input", () => { state.decisionDrafts[item.notification_id] = answer.value; });
       const approve = el("button", "", "Approve");
       const decline = el("button", "", "Decline");
       const reply = el("button", "quiet", "Reply");
@@ -511,6 +534,16 @@ function renderInbox() {
     utility.append(mark, snooze, dismiss); node.append(utility);
     content.append(node);
   }
+  if (state.inboxCursor) {
+    const older = el("button", "quiet inbox-load-older", "Load older updates");
+    older.type = "button";
+    older.addEventListener("click", async () => {
+      older.disabled = true;
+      try { await loadInbox({append: true}); }
+      catch (error) { older.disabled = false; setFlash(error.message, "error"); }
+    });
+    content.append(older);
+  }
 }
 
 async function updateNotificationState(item, status, snoozedUntil, control) {
@@ -520,7 +553,7 @@ async function updateNotificationState(item, status, snoozedUntil, control) {
       method: "PUT", headers: {"Idempotency-Key": `notice-state-${crypto.randomUUID()}`},
       body: JSON.stringify({status, snoozed_until: snoozedUntil}),
     });
-    await loadInbox();
+    await loadInbox({refresh: true});
   } catch (error) {
     control.disabled = false; setFlash(error.message, "error");
   }
@@ -536,7 +569,8 @@ async function resolveHumanRequest(item, response, actions) {
     setFlash(accepted.status === "applied"
       ? "Your response was applied and the team can continue."
       : "Your response is durably queued. The team will resume from the exact decision point.");
-    await loadInbox();
+    delete state.decisionDrafts[item.notification_id];
+    await loadInbox({refresh: true});
   } catch (error) {
     for (const control of actions.querySelectorAll("button,input")) control.disabled = false;
     setFlash(error.message, "error");
@@ -550,7 +584,7 @@ async function redriveHumanRequest(item, control) {
       method: "POST", headers: {"Idempotency-Key": `decision-redrive-${crypto.randomUUID()}`},
     });
     setFlash("The recorded response is queued for another bounded recovery cycle.");
-    await loadInbox();
+    await loadInbox({refresh: true});
   } catch (error) {
     control.disabled = false;
     setFlash(error.message, "error");
@@ -864,7 +898,7 @@ async function refreshView(silent = false) {
   try {
     if (state.view === "missions") await loadMissions();
     if (state.view === "company") await loadCompany();
-    if (state.view === "inbox") await loadInbox();
+    if (state.view === "inbox") await loadInbox({refresh: true});
     if (state.view === "integrations") await loadIntegrations();
     if (state.view === "previews") await loadPreviews();
     if (state.view === "billing") await loadBilling();
@@ -880,7 +914,7 @@ async function refreshAmbient() {
   if (userIsEditing()) return;
   try {
     if (state.view === "missions") await loadMissions();
-    if (state.view === "inbox") await loadInbox();
+    if (state.view === "inbox") await loadInbox({refresh: true});
     if (state.view === "previews") await loadPreviews();
     byId("last-refresh").textContent = `Updated ${new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
     if (state.selectedRun) await loadMissionDetail(state.selectedRun, true);
@@ -1297,6 +1331,8 @@ byId("refresh").addEventListener("click", () => refreshView());
 byId("organization-select").addEventListener("change", async (event) => {
   state.organization = event.target.value;
   state.browserAlertBaseline = null;
+  state.inboxCursor = null;
+  state.decisionDrafts = {};
   sessionStorage.setItem("aos.organization", state.organization);
   closeDrawer();
   state.session = await api("/v2/me");
@@ -1366,7 +1402,7 @@ byId("save-inbox-preferences").addEventListener("click", async (event) => {
         digest_interval_minutes: Number(byId("digest-interval").value),
       }),
     });
-    setFlash("Notification preferences saved."); await loadInbox();
+    setFlash("Notification preferences saved."); await loadInbox({refresh: true});
   } catch (error) { setFlash(error.message, "error"); }
   finally { button.disabled = false; }
 });

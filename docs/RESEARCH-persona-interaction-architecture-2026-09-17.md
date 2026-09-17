@@ -205,6 +205,11 @@ to owners/operators. A failed human response can be redriven explicitly without 
 their decision: the immutable intent and event identity remain fixed, a new bounded retry cycle starts, and
 lifetime attempts plus the redriving actor remain auditable.
 
+The attention feed now uses a stable opaque `(created_at, notification_id)` cursor rather than an unbounded
+offset. The workspace can page backward without duplicates, keeps decision drafts across refresh/page renders,
+and applies every cursor inside the authenticated tenant and recipient projection. The live SSE/cursor event
+plane remains P1; this pagination contract is its durable historical half, not a claim that live push exists.
+
 ## Satisfaction and evolution loop
 
 “Everyone satisfied” is not a one-time engineering state and cannot be established by synthetic personas alone.

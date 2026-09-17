@@ -235,6 +235,8 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert "Execution diagnostics" in script.text
     assert "Execution timeline" in script.text
     assert "Retry recorded response" in script.text
+    assert "Load older updates" in script.text
+    assert "decisionDrafts" in script.text
     assert "#view=" in script.text
     assert 'querySelectorAll(".nav-item[data-view]")' in script.text
     assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
@@ -434,8 +436,60 @@ def test_notification_inbox_uses_authenticated_tenant_and_role_scope():
 
     assert owner.status_code == 200
     assert owner.json()["items"][0]["notification_id"] == "notice-org-a"
-    assert store.calls[0] == ("org-a", "run-1", None, 25)
-    assert store.calls[1] == ("org-a", None, "agent-a", 100)
+    assert store.calls[0] == ("org-a", "run-1", None, 26)
+    assert store.calls[1] == ("org-a", None, "agent-a", 101)
+
+
+def test_notification_inbox_cursor_is_opaque_stable_and_tenant_fenced(tmp_path):
+    notifications = SQLNotificationStore(
+        f"sqlite:///{tmp_path / 'api-cursor-attention.sqlite3'}", create_schema=True,
+    )
+    try:
+        for position in range(3):
+            notifications.publish_notification(Notification(
+                notification_id=f"notice-page-{position}", tenant_id="org-a",
+                run_id=f"run-{position}",
+                category=NotificationCategory.MANAGEMENT_ATTENTION,
+                recipient_ids=("human:ceo",), subject=f"Update {position}",
+                body="Bounded attention update", source_id=f"source-{position}",
+                created_at=f"2026-09-17T12:00:0{position}+00:00",
+                payload={"severity": "warning"},
+            ))
+        api = TestClient(create_app(
+            engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+            notification_store=notifications,
+        ))
+
+        first = api.get(
+            "/v2/notifications?limit=2", headers={"Authorization": "Bearer org-a"},
+        )
+        assert first.status_code == 200
+        assert [item["notification_id"] for item in first.json()["items"]] == [
+            "notice-page-2", "notice-page-1",
+        ]
+        cursor = first.json()["next_cursor"]
+        assert cursor and "notice-page" not in cursor
+        second = api.get(
+            f"/v2/notifications?limit=2&cursor={cursor}",
+            headers={"Authorization": "Bearer org-a"},
+        )
+        assert second.status_code == 200
+        assert [item["notification_id"] for item in second.json()["items"]] == [
+            "notice-page-0",
+        ]
+        assert second.json()["next_cursor"] is None
+        other_tenant = api.get(
+            f"/v2/notifications?limit=2&cursor={cursor}",
+            headers={"Authorization": "Bearer org-b"},
+        )
+        assert other_tenant.status_code == 200
+        assert other_tenant.json()["items"] == []
+        assert api.get(
+            "/v2/notifications?cursor=not-a-real-cursor",
+            headers={"Authorization": "Bearer org-a"},
+        ).status_code == 400
+    finally:
+        notifications.close()
 
 
 def test_personal_notification_preferences_state_and_attention_projection(tmp_path):

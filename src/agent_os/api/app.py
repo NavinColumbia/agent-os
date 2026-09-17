@@ -68,6 +68,44 @@ from agent_os.domain.workflow_runtime import (
 _MAX_MISSION_SUBPROGRAMS = 256
 
 
+def _encode_notification_cursor(item: Mapping[str, Any]) -> str:
+    created_at = str(item.get("created_at") or "")
+    notification_id = str(item.get("notification_id") or "")
+    parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or not 1 <= len(notification_id) <= 128:
+        raise ValueError("notification cannot form a stable cursor")
+    raw = json.dumps(
+        {"v": 1, "created_at": parsed.isoformat(), "notification_id": notification_id},
+        separators=(",", ":"), sort_keys=True,
+    ).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_notification_cursor(value: str) -> tuple[datetime, str]:
+    if not 1 <= len(value) <= 1_024 or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("notification cursor is invalid")
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        payload = json.loads(decoded)
+        if not isinstance(payload, Mapping) or payload.get("v") != 1:
+            raise ValueError
+        created_at = datetime.fromisoformat(
+            str(payload.get("created_at") or "").replace("Z", "+00:00")
+        )
+        notification_id = str(payload.get("notification_id") or "")
+    except (
+        ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError, binascii.Error,
+    ) as exc:
+        raise ValueError("notification cursor is invalid") from exc
+    if (
+        created_at.tzinfo is None
+        or not 1 <= len(notification_id) <= 128
+        or "\0" in notification_id
+    ):
+        raise ValueError("notification cursor is invalid")
+    return created_at, notification_id
+
+
 def _project_mission_subprograms(
     graph_engine: GraphWorkflowEngine,
     tenant_id: str,
@@ -1951,15 +1989,36 @@ def create_app(
             principal: Annotated[Principal, Depends(current_principal)],
             run_id: Annotated[str | None, Query(max_length=256)] = None,
             limit: Annotated[int, Query(ge=1, le=500)] = 100,
+            cursor: Annotated[str | None, Query(max_length=1_024)] = None,
         ) -> Mapping[str, Any]:
             privileged = bool(principal.roles & {"owner", "operator", "system"})
-            items = notification_store.list_notifications(
-                principal.organization_id,
-                run_id=run_id,
-                recipient_id=None if privileged else principal.subject_id,
-                limit=limit,
+            try:
+                before = None if cursor is None else _decode_notification_cursor(cursor)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            list_args = {
+                "run_id": run_id,
+                "recipient_id": None if privileged else principal.subject_id,
+                "limit": limit + 1,
+            }
+            if before is not None:
+                list_args["before"] = before
+            raw_items = notification_store.list_notifications(
+                principal.organization_id, **list_args,
             )
-            items = tuple(item for item in items if notification_visible_to(item, principal))
+            has_more = len(raw_items) > limit
+            page_items = raw_items[:limit]
+            next_cursor = None
+            if has_more and page_items:
+                try:
+                    next_cursor = _encode_notification_cursor(page_items[-1])
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=503, detail="notification pagination is unavailable",
+                    ) from exc
+            items = tuple(
+                item for item in page_items if notification_visible_to(item, principal)
+            )
             state_reader = getattr(notification_store, "list_notification_states", None)
             states = {} if state_reader is None else state_reader(
                 principal.organization_id,
@@ -2056,7 +2115,11 @@ def create_app(
                     "preference_mode": preference_mode,
                 }
                 rendered.append(item)
-            return {"items": rendered, "preferences": preferences}
+            return {
+                "items": rendered,
+                "preferences": preferences,
+                "next_cursor": next_cursor,
+            }
 
         @app.get("/v2/notification-routes")
         def list_notification_routes(

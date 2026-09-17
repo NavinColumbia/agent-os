@@ -285,7 +285,7 @@ def signal(dedupe_key: str, subject: str, trigger: str, state: dict | None = Non
                                   manager_role,trigger,state,semantic_state,observation,state_fingerprint,
                                   progress_seq)
                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                               ON CONFLICT (tenant_id,dedupe_key) DO UPDATE SET
+                               ON CONFLICT (case_id) DO UPDATE SET
                                  product=COALESCE(EXCLUDED.product,management_cases.product),
                                  work_id=COALESCE(EXCLUDED.work_id,management_cases.work_id),
                                  subject=EXCLUDED.subject,
@@ -309,6 +309,8 @@ def signal(dedupe_key: str, subject: str, trigger: str, state: dict | None = Non
                                  updated_at=CASE
                                    WHEN management_cases.state_fingerprint <> EXCLUDED.state_fingerprint
                                    THEN now() ELSE management_cases.updated_at END
+                               WHERE management_cases.tenant_id = EXCLUDED.tenant_id
+                                 AND management_cases.dedupe_key = EXCLUDED.dedupe_key
                                RETURNING case_id,status,next_review_at,semantic_generation""",
                             (cid, dedupe_key, tenant_id, product, work_id, subject, worker,
                              manager_role, trigger, json.dumps(state, default=str),
@@ -316,6 +318,8 @@ def signal(dedupe_key: str, subject: str, trigger: str, state: dict | None = Non
                              json.dumps(observation, default=str), fp,
                              1 if progress else 0))
                 row = cur.fetchone()
+                if row is None:
+                    raise RuntimeError("management case identity collision")
                 cur.execute("""UPDATE management_cases
                                   SET last_event_generation=semantic_generation
                                 WHERE case_id=%s AND last_event_generation<semantic_generation

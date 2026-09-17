@@ -84,9 +84,15 @@ transaction as their source mutation. Cursor tokens are bound to the selected or
 returns an explicit snapshot-reset requirement. The migration is included in both local Compose and the
 production migration image.
 
-Mission/workflow mutations, foreground SSE, the pinned AG-UI adapter, and provisioned Web Push remain staged.
-Until those producers are transactionally connected, `/v2/events` is an attention/decision catch-up stream—not
-a claim that every product transition is live.
+Authenticated foreground SSE is also implemented for that stream. It accepts the opaque cursor or
+`Last-Event-ID`, uses bounded connections and heartbeat comments, emits explicit reset/cursor events, and is
+consumed through streaming `fetch` so bearer and organization headers stay in memory. The browser pauses the
+stream while hidden, reconnects with backoff, coalesces invalidations, preserves typed input, and retains the
+ten-second polling path as a degradation fallback.
+
+Mission/workflow producers, the pinned AG-UI adapter, and provisioned Web Push remain staged. Until those
+producers are transactionally connected, `/v2/events` is an attention/decision live stream—not a claim that
+every product transition is live.
 
 ## Acceptance
 

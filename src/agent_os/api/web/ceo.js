@@ -4,6 +4,7 @@ const state = {
   token: "", organization: "", config: null, view: "missions", selectedRun: null,
   timer: null, session: null, inboxFilter: "open", inboxItems: [], notificationPreferences: null,
   inboxCursor: null, decisionDrafts: {}, browserAlertBaseline: null, drawerReturnFocus: null,
+  eventCursor: null, eventAbort: null, eventRefreshTimer: null,
 };
 const byId = (id) => document.getElementById(id);
 const el = (tag, className, text) => {
@@ -39,6 +40,101 @@ async function api(path, options = {}) {
     throw new Error(detail || `Request failed (${response.status})`);
   }
   return payload;
+}
+
+function setLiveStatus(message) {
+  const node = byId("live-status");
+  if (node) node.textContent = message;
+}
+
+function stopLiveEvents() {
+  if (state.eventAbort) state.eventAbort.abort();
+  state.eventAbort = null;
+  window.clearTimeout(state.eventRefreshTimer);
+  state.eventRefreshTimer = null;
+}
+
+function scheduleLiveRefresh() {
+  if (state.eventRefreshTimer) return;
+  state.eventRefreshTimer = window.setTimeout(async () => {
+    state.eventRefreshTimer = null;
+    if (!state.token || document.hidden) return;
+    await refreshAmbient();
+  }, 200);
+}
+
+function consumeSseFrame(frame) {
+  let eventName = "message";
+  let eventId = "";
+  const data = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) eventName = line.slice(6).trim();
+    if (line.startsWith("id:")) eventId = line.slice(3).trim();
+    if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+  }
+  if (eventId) state.eventCursor = eventId;
+  if (!["experience", "cursor", "reset"].includes(eventName)) return;
+  if (data.length) {
+    try {
+      const payload = JSON.parse(data.join("\n"));
+      if (payload.cursor) state.eventCursor = payload.cursor;
+    } catch (_) {
+      return;
+    }
+  }
+  scheduleLiveRefresh();
+}
+
+async function startLiveEvents() {
+  if (!state.token || document.hidden || state.eventAbort) return;
+  const controller = new AbortController();
+  state.eventAbort = controller;
+  try {
+    while (state.token && !document.hidden && !controller.signal.aborted) {
+      const query = state.eventCursor
+        ? `?cursor=${encodeURIComponent(state.eventCursor)}` : "";
+      const headers = new Headers({
+        "Accept": "text/event-stream",
+        "Authorization": `Bearer ${state.token}`,
+      });
+      if (state.organization) headers.set("X-Agent-OS-Organization", state.organization);
+      const response = await fetch(`/v2/events/stream${query}`, {
+        headers, cache: "no-store", signal: controller.signal,
+      });
+      if (response.status === 401) {
+        disconnect("Your session expired. Connect again to continue.");
+        return;
+      }
+      if (!response.ok || !response.body) throw new Error(`Live updates unavailable (${response.status})`);
+      setLiveStatus("Live updates connected");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (!controller.signal.aborted) {
+        const {value, done} = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
+        buffer = buffer.replaceAll("\r\n", "\n");
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+          consumeSseFrame(buffer.slice(0, boundary));
+          buffer = buffer.slice(boundary + 2);
+          boundary = buffer.indexOf("\n\n");
+        }
+        if (done) break;
+      }
+      if (!controller.signal.aborted) await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    }
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      setLiveStatus("Polling fallback active");
+      window.setTimeout(() => {
+        if (state.eventAbort === controller) state.eventAbort = null;
+        startLiveEvents();
+      }, 3000);
+    }
+  } finally {
+    if (state.eventAbort === controller && controller.signal.aborted) state.eventAbort = null;
+  }
 }
 
 function randomValue(bytes = 32) {
@@ -100,6 +196,7 @@ async function connect(token) {
   state.token = token;
   state.organization = sessionStorage.getItem("aos.organization") || "";
   state.browserAlertBaseline = null;
+  state.eventCursor = null;
   try {
     await loadOrganizations();
     await api("/v2/company/organization");
@@ -116,6 +213,7 @@ async function connect(token) {
       setFlash(billingNotice === "success" ? "Subscription received. Entitlements update after Stripe confirms it." : "Billing account refreshed.");
     }
     await refreshInboxBadge();
+    startLiveEvents();
     state.timer = window.setInterval(() => {
       if (!document.hidden && state.token) refreshAmbient();
     }, 10000);
@@ -127,6 +225,7 @@ async function connect(token) {
 }
 
 function disconnect(message = "Disconnected. No credential was stored.") {
+  stopLiveEvents();
   state.token = "";
   state.organization = "";
   sessionStorage.removeItem("aos.organization");
@@ -138,6 +237,7 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   state.decisionDrafts = {};
   state.notificationPreferences = null;
   state.browserAlertBaseline = null;
+  state.eventCursor = null;
   closeDrawer();
   byId("workspace").classList.add("hidden");
   byId("auth-gate").classList.remove("hidden");
@@ -1377,16 +1477,19 @@ byId("mobile-more-toggle").addEventListener("click", () => {
 document.querySelectorAll("[data-mobile-view]").forEach((node) => node.addEventListener("click", () => selectView(node.dataset.mobileView)));
 byId("refresh").addEventListener("click", () => refreshView());
 byId("organization-select").addEventListener("change", async (event) => {
+  stopLiveEvents();
   state.organization = event.target.value;
   state.browserAlertBaseline = null;
   state.inboxCursor = null;
   state.decisionDrafts = {};
+  state.eventCursor = null;
   sessionStorage.setItem("aos.organization", state.organization);
   closeDrawer();
   state.session = await api("/v2/me");
   applyRoleExperience();
   setFlash("Organization changed.");
   await refreshView();
+  startLiveEvents();
 });
 byId("drawer-close").addEventListener("click", closeDrawer);
 byId("directive").addEventListener("input", (event) => { byId("directive-count").textContent = `${event.target.value.length.toLocaleString()} / 50,000`; });
@@ -1465,6 +1568,17 @@ window.addEventListener("hashchange", () => {
   if (!window.location.hash.startsWith("#view=")) return;
   const requested = window.location.hash.slice(6);
   if (requested && requested !== state.view) selectView(requested);
+});
+document.addEventListener("visibilitychange", () => {
+  if (!state.token) return;
+  if (document.hidden) {
+    stopLiveEvents();
+    setLiveStatus("Polling paused while hidden");
+    return;
+  }
+  setLiveStatus("Reconnecting live updates…");
+  refreshAmbient();
+  startLiveEvents();
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {

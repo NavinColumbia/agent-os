@@ -1,5 +1,6 @@
 """FastAPI control surface for the V2 product lifecycle."""
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -9,11 +10,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+import time
 from typing import Any, Annotated, Mapping
 from urllib.parse import urlparse
 
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -772,8 +780,11 @@ def create_app(
     mission_control: MissionControlStore | None = None,
     billing_service: BillingService | None = None,
     client_identity_config: Mapping[str, str] | None = None,
+    experience_stream_seconds: float = 55.0,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
+    if not 0.01 <= experience_stream_seconds <= 300:
+        raise ValueError("experience stream lifetime must be between 0.01 and 300 seconds")
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
@@ -1858,6 +1869,20 @@ def create_app(
             notification_store, "list_experience_events", None,
         )
         if experience_lister is not None:
+            def experience_audience_ids(
+                principal: Principal,
+            ) -> tuple[str, ...] | None:
+                if principal.roles & {"owner", "operator", "system"}:
+                    return None
+                admitted = {
+                    principal.subject_id,
+                    "tenant:members",
+                    *(f"role:{role}" for role in principal.roles),
+                }
+                if "agent" in principal.roles:
+                    admitted.add(f"agent:{principal.subject_id}")
+                return tuple(sorted(admitted))
+
             @app.get("/v2/events")
             def list_experience_events(
                 principal: Annotated[Principal, Depends(current_principal)],
@@ -1870,23 +1895,10 @@ def create_app(
                             cursor, principal.organization_id,
                         )
                     )
-                    privileged = bool(
-                        principal.roles & {"owner", "operator", "system"}
-                    )
-                    audience_ids = None
-                    if not privileged:
-                        admitted = {
-                            principal.subject_id,
-                            "tenant:members",
-                            *(f"role:{role}" for role in principal.roles),
-                        }
-                        if "agent" in principal.roles:
-                            admitted.add(f"agent:{principal.subject_id}")
-                        audience_ids = tuple(sorted(admitted))
                     page = experience_lister(
                         principal.organization_id,
                         after_sequence=after_sequence,
-                        audience_ids=audience_ids,
+                        audience_ids=experience_audience_ids(principal),
                         limit=limit,
                     )
                 except ValueError as exc:
@@ -1906,6 +1918,120 @@ def create_app(
                     "has_more": page.has_more,
                     "reset_required": page.reset_required,
                 }
+
+            @app.get("/v2/events/stream")
+            async def stream_experience_events(
+                request: Request,
+                principal: Annotated[Principal, Depends(current_principal)],
+                cursor: Annotated[str | None, Query(max_length=1_024)] = None,
+                last_event_id: Annotated[
+                    str | None, Header(alias="Last-Event-ID", max_length=1_024)
+                ] = None,
+            ) -> StreamingResponse:
+                if cursor is not None and last_event_id is not None and cursor != last_event_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="cursor and Last-Event-ID must identify the same position",
+                    )
+                selected_cursor = cursor or last_event_id
+                try:
+                    after_sequence = (
+                        0 if selected_cursor is None else _decode_experience_cursor(
+                            selected_cursor, principal.organization_id,
+                        )
+                    )
+                    initial_page = await run_in_threadpool(
+                        lambda: experience_lister(
+                            principal.organization_id,
+                            after_sequence=after_sequence,
+                            audience_ids=experience_audience_ids(principal),
+                            limit=100,
+                        )
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+                async def event_stream() -> AsyncIterator[str]:
+                    current_sequence = after_sequence
+                    page = initial_page
+                    deadline = time.monotonic() + experience_stream_seconds
+                    last_heartbeat = time.monotonic()
+                    yield "retry: 3000\n\n"
+                    while True:
+                        if page.reset_required:
+                            reset_cursor = _encode_experience_cursor(
+                                principal.organization_id, page.cursor_sequence,
+                            )
+                            yield (
+                                f"id: {reset_cursor}\n"
+                                "event: reset\n"
+                                f"data: {json.dumps({'reset_required': True, 'cursor': reset_cursor}, separators=(',', ':'))}\n\n"
+                            )
+                            return
+                        for item in page.events:
+                            item_sequence = int(item["tenant_sequence"])
+                            item_cursor = _encode_experience_cursor(
+                                principal.organization_id, item_sequence,
+                            )
+                            payload = json.dumps(
+                                {"cursor": item_cursor, "event": item},
+                                allow_nan=False, ensure_ascii=False,
+                                separators=(",", ":"), sort_keys=True,
+                            )
+                            yield f"id: {item_cursor}\nevent: experience\ndata: {payload}\n\n"
+                        previous_sequence = current_sequence
+                        emitted_sequence = (
+                            int(page.events[-1]["tenant_sequence"])
+                            if page.events else previous_sequence
+                        )
+                        current_sequence = page.cursor_sequence
+                        if (
+                            not page.has_more
+                            and current_sequence > emitted_sequence
+                        ):
+                            cursor_value = _encode_experience_cursor(
+                                principal.organization_id, current_sequence,
+                            )
+                            yield (
+                                f"id: {cursor_value}\n"
+                                "event: cursor\n"
+                                f"data: {json.dumps({'cursor': cursor_value}, separators=(',', ':'))}\n\n"
+                            )
+                        if await request.is_disconnected():
+                            return
+                        if time.monotonic() >= deadline:
+                            return
+                        if page.has_more:
+                            await asyncio.sleep(0)
+                        else:
+                            await asyncio.sleep(min(1.0, max(0.01, deadline - time.monotonic())))
+                            if time.monotonic() - last_heartbeat >= 15:
+                                yield ": keep-alive\n\n"
+                                last_heartbeat = time.monotonic()
+                        try:
+                            page = await run_in_threadpool(
+                                lambda: experience_lister(
+                                    principal.organization_id,
+                                    after_sequence=current_sequence,
+                                    audience_ids=experience_audience_ids(principal),
+                                    limit=100,
+                                )
+                            )
+                        except ValueError:
+                            # A retention sweep can move the floor while the
+                            # stream is open. Force the browser through its
+                            # authenticated reconnect/snapshot path.
+                            return
+
+                return StreamingResponse(
+                    event_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-store, no-transform",
+                        "X-Accel-Buffering": "no",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
 
         @app.get("/v2/notification-preferences")
         def get_notification_preferences(

@@ -238,6 +238,10 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert "Retry recorded response" in script.text
     assert "Load older updates" in script.text
     assert "decisionDrafts" in script.text
+    assert "/v2/events/stream" in script.text
+    assert "AbortController" in script.text
+    assert "EventSource" not in script.text
+    assert '"Authorization": `Bearer ${state.token}`' in script.text
     assert "#view=" in script.text
     assert 'querySelectorAll(".nav-item[data-view]")' in script.text
     assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
@@ -731,6 +735,56 @@ def test_experience_event_catchup_cursor_is_tenant_bound_and_advances_hidden_eve
         assert [item["kind"] for item in catchup.json()["items"]] == [
             "notification.state.changed",
         ]
+    finally:
+        api.close()
+        notifications.close()
+
+
+def test_experience_sse_uses_authenticated_resume_cursor_and_bounded_connection(tmp_path):
+    notifications = SQLNotificationStore(
+        f"sqlite:///{tmp_path / 'api-experience-sse.sqlite3'}", create_schema=True,
+    )
+    notifications.publish_notification(Notification(
+        notification_id="sse-notification", tenant_id="org-a", run_id="run-one",
+        category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+        recipient_ids=("human:ceo",), subject="Approve",
+        body="Sensitive decision detail", source_id="approval-source",
+        created_at="2026-09-17T12:00:00+00:00",
+    ))
+    api = TestClient(create_app(
+        engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+        notification_store=notifications, experience_stream_seconds=0.02,
+    ))
+    try:
+        with api.stream(
+            "GET", "/v2/events/stream",
+            headers={"Authorization": "Bearer org-a"},
+        ) as response:
+            body = "".join(response.iter_text())
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            assert response.headers["cache-control"] == "no-store, no-transform"
+        assert "retry: 3000" in body
+        assert "event: experience" in body
+        assert '"kind":"notification.published"' in body
+        cursor = next(
+            line.removeprefix("id: ") for line in body.splitlines()
+            if line.startswith("id: ")
+        )
+
+        resumed = api.get(
+            "/v2/events/stream",
+            headers={"Authorization": "Bearer org-a", "Last-Event-ID": cursor},
+        )
+        assert resumed.status_code == 200
+        assert "event: experience" not in resumed.text
+        assert api.get(
+            f"/v2/events/stream?cursor={cursor}",
+            headers={
+                "Authorization": "Bearer org-a",
+                "Last-Event-ID": "different-cursor",
+            },
+        ).status_code == 400
     finally:
         api.close()
         notifications.close()

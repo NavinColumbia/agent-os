@@ -52,6 +52,10 @@ from agent_os.domain.mission_model import (
     MissionSpec,
     SafeMode,
 )
+from agent_os.domain.notifications import (
+    NotificationPreferenceMode,
+    NotificationPreferences,
+)
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.domain.workflow_runtime import (
     TokenStatus,
@@ -297,12 +301,32 @@ class NotificationRouteRegistrationRequest(BaseModel):
     categories: list[str] = Field(min_length=1, max_length=16)
     payload_format: str = Field(default="agent-os", pattern=r"^(agent-os|slack)$")
     destination: str | None = Field(default=None, min_length=1, max_length=256)
+    recipient_ids: list[str] = Field(default_factory=lambda: ["human:ceo"], min_length=1, max_length=128)
+    redaction_policy: str = Field(default="summary", pattern=r"^(summary|full)$")
 
 
 class NotificationRouteDisableRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(min_length=1, max_length=2_000)
+
+
+class NotificationStateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = Field(pattern=r"^(unread|read|dismissed|snoozed)$")
+    snoozed_until: str | None = None
+
+
+class NotificationPreferencesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: NotificationPreferenceMode = NotificationPreferenceMode.BALANCED
+    browser_notifications: bool = False
+    quiet_hours_start: str | None = Field(default=None, pattern=r"^[0-2][0-9]:[0-5][0-9]$")
+    quiet_hours_end: str | None = Field(default=None, pattern=r"^[0-2][0-9]:[0-5][0-9]$")
+    timezone: str = Field(default="UTC", min_length=1, max_length=128)
+    digest_interval_minutes: int = Field(default=60)
 
 
 class InvitationCreateRequest(BaseModel):
@@ -541,6 +565,74 @@ def _response(receipt: WorkflowReceipt, run_id: str) -> MutationResponse:
     )
 
 
+def _principal_experience(principal: Principal) -> Mapping[str, Any]:
+    """Project authorization into honest navigation hints for any client."""
+
+    roles = set(principal.roles)
+    owner = bool(roles & {"owner", "system"})
+    operator = bool(roles & {"operator"})
+    agent = bool(roles & {"agent"})
+    if owner:
+        persona = "executive"
+    elif operator:
+        persona = "operator"
+    elif agent:
+        persona = "builder"
+    else:
+        persona = "viewer"
+    capabilities = {
+        "mission.read",
+        "notification.read",
+        "release.read",
+    }
+    if owner or operator:
+        capabilities.update({
+            "mission.create", "mission.cancel", "mission.steer",
+            "notification.respond", "company.read", "integration.manage",
+        })
+    if owner:
+        capabilities.update({
+            "membership.manage", "model.manage", "billing.manage",
+            "authority.manage", "policy.manage",
+        })
+    if agent:
+        capabilities.update({"work.read", "work.execute", "notification.respond"})
+    return {
+        "subject_id": principal.subject_id,
+        "organization_id": principal.organization_id,
+        "roles": sorted(principal.roles),
+        "persona": persona,
+        "capabilities": sorted(capabilities),
+    }
+
+
+def _notification_attention(category: str, payload: Mapping[str, Any]) -> Mapping[str, str]:
+    disposition = str(payload.get("attention_disposition") or "")
+    severity = str(payload.get("severity") or payload.get("risk") or "").lower()
+    if disposition == "interrupt" or severity in {"critical", "irreversible"}:
+        level = "time_sensitive"
+    elif category in {"human_action_required", "operator_attention", "run_failed"}:
+        level = "time_sensitive"
+    elif category in {"run_succeeded", "run_cancelled", "work_recovered"}:
+        level = "passive"
+    else:
+        level = "active"
+    rationale = str(
+        payload.get("attention_reason")
+        or payload.get("reason")
+        or {
+            "human_action_required": "Work is waiting for a decision only you can make.",
+            "operator_attention": "The system needs an operator to restore healthy progress.",
+            "run_failed": "A mission stopped before its acceptance contract was satisfied.",
+            "management_attention": "A manager detected material variance or stalled progress.",
+            "run_succeeded": "A mission reported a verified completion outcome.",
+            "run_cancelled": "A mission was cancelled and no further execution is expected.",
+            "work_recovered": "Previously unhealthy work resumed or recovered.",
+        }.get(category, "This update is part of the durable mission record.")
+    )
+    return {"level": level, "rationale": rationale[:2_000]}
+
+
 def _organization_view(organization) -> Mapping[str, Any]:
     return {
         "tenant_id": organization.tenant_id,
@@ -624,7 +716,8 @@ def create_app(
         "Content-Security-Policy": (
             "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
             f"connect-src 'self'{token_origin}; font-src 'self'; base-uri 'none'; "
-            "frame-ancestors 'none'; form-action 'none'; object-src 'none'"
+            "manifest-src 'self'; worker-src 'self'; frame-ancestors 'none'; "
+            "form-action 'none'; object-src 'none'"
         ),
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
@@ -660,6 +753,40 @@ def create_app(
         return FileResponse(
             _WEB_ROOT / "ceo.js", media_type="text/javascript",
             headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/assets/app-icon.svg", include_in_schema=False)
+    def app_icon() -> FileResponse:
+        return FileResponse(
+            _WEB_ROOT / "app-icon.svg", media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/app.webmanifest", include_in_schema=False)
+    def app_manifest() -> JSONResponse:
+        return JSONResponse({
+            "name": "Agent OS Workspace",
+            "short_name": "Agent OS",
+            "description": "Govern missions, decisions, evidence, and AI company operations.",
+            "start_url": "/app",
+            "scope": "/",
+            "display": "standalone",
+            "background_color": "#080b0d",
+            "theme_color": "#080b0d",
+            "icons": [{
+                "src": "/assets/app-icon.svg", "sizes": "any", "type": "image/svg+xml",
+                "purpose": "any maskable",
+            }],
+        }, headers={"Cache-Control": "public, max-age=3600"})
+
+    @app.get("/service-worker.js", include_in_schema=False)
+    def service_worker() -> FileResponse:
+        return FileResponse(
+            _WEB_ROOT / "service-worker.js", media_type="text/javascript",
+            headers={
+                "Cache-Control": "no-cache", "Service-Worker-Allowed": "/",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.get("/v2/client-config", include_in_schema=False)
@@ -718,6 +845,12 @@ def create_app(
     def ready() -> JSONResponse:
         report = dict(engine.health())
         return JSONResponse(status_code=200 if report.get("ok") else 503, content=report)
+
+    @app.get("/v2/me")
+    def get_current_experience(
+        principal: Annotated[Principal, Depends(current_principal)],
+    ) -> Mapping[str, Any]:
+        return _principal_experience(principal)
 
     if membership_store is not None:
         @app.get("/v2/organizations")
@@ -1463,6 +1596,8 @@ def create_app(
         principal: Annotated[Principal, Depends(current_principal)],
         idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)],
     ) -> MutationResponse:
+        if not (principal.roles & {"owner", "operator", "system"}):
+            raise HTTPException(status_code=403, detail="mission creation requires owner/operator authority")
         run_id = _run_id(principal.organization_id, idempotency_key)
         if mission_control is not None:
             try:
@@ -1605,6 +1740,90 @@ def create_app(
         return _response(receipt, run_id)
 
     if notification_store is not None:
+        def notification_visible_to(
+            raw: Mapping[str, Any], principal: Principal,
+        ) -> bool:
+            recipients = {str(item) for item in raw.get("recipient_ids", ())}
+            if not recipients or "system" in principal.roles:
+                return True
+            admitted = {principal.subject_id}
+            if "owner" in principal.roles:
+                admitted.update({"human:ceo", "role:owner", "role:executive"})
+            if "operator" in principal.roles:
+                admitted.update({"human:operator", "operator:on-call", "role:operator"})
+            if "agent" in principal.roles:
+                admitted.add(f"agent:{principal.subject_id}")
+            return bool(recipients & admitted)
+
+        @app.get("/v2/notification-preferences")
+        def get_notification_preferences(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            reader = getattr(notification_store, "get_notification_preferences", None)
+            if reader is None:
+                raise HTTPException(status_code=503, detail="notification preferences are unavailable")
+            return reader(principal.organization_id, subject_id=principal.subject_id)
+
+        @app.put("/v2/notification-preferences")
+        def set_notification_preferences(
+            body: NotificationPreferencesRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            writer = getattr(notification_store, "set_notification_preferences", None)
+            if writer is None:
+                raise HTTPException(status_code=503, detail="notification preferences are unavailable")
+            try:
+                preferences = NotificationPreferences(
+                    tenant_id=principal.organization_id,
+                    subject_id=principal.subject_id,
+                    mode=body.mode,
+                    browser_notifications=body.browser_notifications,
+                    quiet_hours_start=body.quiet_hours_start,
+                    quiet_hours_end=body.quiet_hours_end,
+                    timezone_name=body.timezone,
+                    digest_interval_minutes=body.digest_interval_minutes,
+                )
+                return writer(
+                    preferences, actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @app.put("/v2/notifications/{notification_id}/state")
+        def set_notification_state(
+            notification_id: str,
+            body: NotificationStateRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            reader = getattr(notification_store, "get_notification", None)
+            writer = getattr(notification_store, "set_notification_state", None)
+            if reader is None or writer is None:
+                raise HTTPException(status_code=503, detail="notification state is unavailable")
+            raw = reader(principal.organization_id, notification_id)
+            if raw is None or not notification_visible_to(raw, principal):
+                raise HTTPException(status_code=404, detail="notification not found")
+            try:
+                return writer(
+                    tenant_id=principal.organization_id,
+                    subject_id=principal.subject_id,
+                    notification_id=notification_id,
+                    status=body.status,
+                    snoozed_until=body.snoozed_until,
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except LookupError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
         @app.get("/v2/notifications")
         def list_notifications(
             principal: Annotated[Principal, Depends(current_principal)],
@@ -1618,6 +1837,27 @@ def create_app(
                 recipient_id=None if privileged else principal.subject_id,
                 limit=limit,
             )
+            items = tuple(item for item in items if notification_visible_to(item, principal))
+            state_reader = getattr(notification_store, "list_notification_states", None)
+            states = {} if state_reader is None else state_reader(
+                principal.organization_id,
+                subject_id=principal.subject_id,
+                notification_ids=tuple(str(item.get("notification_id") or "") for item in items),
+            )
+            preference_reader = getattr(notification_store, "get_notification_preferences", None)
+            preferences = (
+                NotificationPreferences(
+                    principal.organization_id, principal.subject_id,
+                ).to_dict()
+                if preference_reader is None else preference_reader(
+                    principal.organization_id, subject_id=principal.subject_id,
+                )
+            )
+            preference_mode = str(preferences.get("mode") or "balanced")
+            focused_categories = {
+                "human_action_required", "operator_attention", "run_failed",
+                "management_attention",
+            }
             graph_states: dict[str, Any] = {}
             rendered = []
             for raw in items:
@@ -1641,8 +1881,40 @@ def create_app(
                         )
                     else:
                         item["actionable"] = False
+                else:
+                    item["actionable"] = False
+                item_state = dict(states.get(str(item.get("notification_id") or ""), {
+                    "status": "unread", "snoozed_until": None, "version": 0,
+                }))
+                snoozed_until = item_state.get("snoozed_until")
+                if item_state.get("status") == "snoozed" and snoozed_until:
+                    try:
+                        if datetime.fromisoformat(str(snoozed_until).replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+                            item_state["status"] = "unread"
+                    except ValueError:
+                        item_state["status"] = "unread"
+                category = str(item.get("category") or "")
+                payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else {}
+                attention = _notification_attention(category, payload)
+                promoted = (
+                    attention["level"] == "time_sensitive"
+                    or preference_mode == "all"
+                    or category in focused_categories
+                    or (preference_mode == "balanced" and attention["level"] != "passive")
+                )
+                disposition = "interrupt" if (
+                    item["actionable"] or attention["level"] == "time_sensitive"
+                ) else ("feed" if promoted else "muted")
+                if item_state.get("status") in {"dismissed", "snoozed", "resolved"}:
+                    disposition = "hidden"
+                item["user_state"] = item_state
+                item["presentation"] = {
+                    **attention,
+                    "disposition": disposition,
+                    "preference_mode": preference_mode,
+                }
                 rendered.append(item)
-            return {"items": rendered}
+            return {"items": rendered, "preferences": preferences}
 
         @app.get("/v2/notification-routes")
         def list_notification_routes(

@@ -4,10 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#080b0d">
   <title>Agent OS — CEO Workspace</title>
   <link rel="stylesheet" href="/assets/ceo.css">
+  <link rel="manifest" href="/app.webmanifest">
 </head>
 <body>
+  <a class="skip-link" href="#workspace-main">Skip to workspace</a>
   <div class="ambient ambient-one"></div>
   <div class="ambient ambient-two"></div>
   <div id="auth-gate" class="auth-gate">
@@ -33,23 +36,30 @@
     <aside class="sidebar">
       <a class="brand" href="#missions" aria-label="Agent OS home">
         <div class="brand-mark compact" aria-hidden="true"><span></span><span></span><span></span></div>
-        <div><strong>Agent OS</strong><small>CEO workspace</small></div>
+        <div><strong>Agent OS</strong><small id="workspace-role-label">Executive workspace</small></div>
       </a>
       <nav aria-label="Workspace">
         <button class="nav-item active" data-view="missions" type="button"><span>◫</span>Missions</button>
         <button class="nav-item" data-view="company" type="button"><span>⌘</span>Company</button>
         <button class="nav-item" data-view="inbox" type="button"><span>◇</span>Inbox <b id="inbox-count" class="count hidden">0</b></button>
-        <button class="nav-item" data-view="integrations" type="button"><span>⌁</span>Integrations</button>
+        <button class="nav-item requires-integration-manage" data-view="integrations" type="button"><span>⌁</span>Integrations</button>
         <button class="nav-item" data-view="previews" type="button"><span>↗</span>Releases</button>
-        <button class="nav-item" data-view="billing" type="button"><span>◎</span>Billing</button>
+        <button class="nav-item requires-billing-manage" data-view="billing" type="button"><span>◎</span>Billing</button>
+        <button id="mobile-more-toggle" class="nav-item mobile-only" type="button" aria-expanded="false" aria-controls="mobile-more-menu"><span>•••</span>More</button>
       </nav>
+      <div id="mobile-more-menu" class="mobile-more-menu hidden" role="menu" aria-label="More workspace destinations">
+        <button type="button" data-mobile-view="company">Company</button>
+        <button class="requires-integration-manage" type="button" data-mobile-view="integrations">Integrations</button>
+        <button class="requires-billing-manage" type="button" data-mobile-view="billing">Billing</button>
+        <button id="mobile-disconnect" type="button">Disconnect</button>
+      </div>
       <div class="sidebar-bottom">
         <div class="connection"><i></i><span>Control plane connected</span></div>
         <button id="disconnect" class="quiet" type="button">Disconnect</button>
       </div>
     </aside>
 
-    <main>
+    <main id="workspace-main" tabindex="-1">
       <header class="topbar">
         <div>
           <p class="eyebrow">COMMAND CENTER</p>
@@ -62,14 +72,14 @@
           </label>
           <span id="last-refresh" class="muted small">Not refreshed</span>
           <button id="refresh" class="icon-button" type="button" aria-label="Refresh current view">↻</button>
-          <div class="avatar" aria-label="Signed in">CEO</div>
+          <div id="identity-avatar" class="avatar" aria-label="Signed in">CEO</div>
         </div>
       </header>
 
       <div id="flash" class="flash hidden" role="status" aria-live="polite"></div>
 
       <section id="missions-view" class="view">
-        <form id="directive-form" class="composer panel">
+        <form id="directive-form" class="composer panel requires-mission-create">
           <div class="composer-copy">
             <span class="pulse"></span>
             <div>
@@ -80,6 +90,22 @@
           <input id="directive-title" maxlength="200" placeholder="Mission name (optional)" aria-label="Mission name">
           <input id="directive-budget" type="number" min="0" max="1000000000" step="0.01" value="0" placeholder="Maximum external spend (USD)" aria-label="Maximum external spend in US dollars">
           <textarea id="directive" maxlength="50000" rows="4" placeholder="Build and launch…" required></textarea>
+          <details class="mission-preferences">
+            <summary>How should the team work with me?</summary>
+            <div class="preference-grid">
+              <label for="directive-human-mode">Collaboration style
+                <select id="directive-human-mode">
+                  <option value="autonomous">Handle routine choices for me</option>
+                  <option value="balanced" selected>Ask for important decisions</option>
+                  <option value="collaborative">Work closely with me</option>
+                </select>
+              </label>
+              <label for="directive-interrupt-limit">Maximum interruptions per day
+                <input id="directive-interrupt-limit" type="number" min="0" max="100" value="8">
+              </label>
+            </div>
+            <p id="human-mode-explanation" class="fineprint">Routine reversible work continues; material risk, ambiguity, or authority gaps come to you.</p>
+          </details>
           <div class="composer-actions">
             <span id="directive-count">0 / 50,000</span>
             <button class="primary" type="submit"><span>Start mission</span><b>→</b></button>
@@ -98,7 +124,43 @@
       </section>
 
       <section id="inbox-view" class="view hidden">
-        <div class="section-heading"><div><p class="eyebrow">ATTENTION</p><h3>Company inbox</h3></div></div>
+        <div class="section-heading">
+          <div><p class="eyebrow">ATTENTION</p><h3>My decision inbox</h3></div>
+          <button id="inbox-preferences-toggle" class="quiet" type="button" aria-expanded="false">Notification settings</button>
+        </div>
+        <section id="inbox-preferences" class="panel preference-panel hidden" aria-labelledby="inbox-preferences-title">
+          <h4 id="inbox-preferences-title">How Agent OS should reach me</h4>
+          <p class="muted">Critical and blocking decisions remain in the durable inbox. These settings control promotion and browser interruptions.</p>
+          <div class="preference-grid">
+            <label for="inbox-mode">Inbox focus
+              <select id="inbox-mode">
+                <option value="focused">Decisions and problems only</option>
+                <option value="balanced">Important progress and decisions</option>
+                <option value="all">All company updates</option>
+              </select>
+            </label>
+            <label class="checkbox-label" for="browser-notifications">
+              <input id="browser-notifications" type="checkbox"> Browser alerts while this workspace is available
+            </label>
+            <label for="quiet-start">Quiet hours start <input id="quiet-start" type="time"></label>
+            <label for="quiet-end">Quiet hours end <input id="quiet-end" type="time"></label>
+            <label for="notification-timezone">Timezone <input id="notification-timezone" value="UTC" maxlength="128"></label>
+            <label for="digest-interval">Preferred external digest cadence
+              <select id="digest-interval">
+                <option value="15">15 minutes</option><option value="30">30 minutes</option>
+                <option value="60">Hourly</option><option value="240">Every 4 hours</option>
+                <option value="1440">Daily</option>
+              </select>
+            </label>
+          </div>
+          <div class="preference-actions"><button id="save-inbox-preferences" class="primary" type="button">Save preferences</button></div>
+          <p class="fineprint">The in-app inbox remains immediate. Digest cadence is retained for digest-capable channels; current Slack routes deliver eligible alerts individually. For phone alerts now, connect Slack and use Slack mobile. Native background web push remains separately provisioned.</p>
+        </section>
+        <div class="inbox-filters" role="group" aria-label="Filter inbox">
+          <button class="quiet active" data-inbox-filter="open" type="button">Needs me</button>
+          <button class="quiet" data-inbox-filter="updates" type="button">Updates</button>
+          <button class="quiet" data-inbox-filter="all" type="button">All</button>
+        </div>
         <div id="inbox-content" class="stack"><div class="empty">Loading messages…</div></div>
       </section>
 
@@ -119,7 +181,7 @@
       </section>
     </main>
 
-    <aside id="mission-drawer" class="drawer" aria-label="Mission details" aria-hidden="true">
+    <aside id="mission-drawer" class="drawer" role="dialog" aria-modal="true" aria-label="Mission details" aria-hidden="true" tabindex="-1">
       <div class="drawer-head">
         <div><p class="eyebrow">MISSION CONTROL</p><h3 id="drawer-title">Mission</h3></div>
         <button id="drawer-close" class="icon-button" type="button" aria-label="Close mission details">×</button>

@@ -36,6 +36,8 @@ class FakeIdentity:
             return {"sub": "human-b", "org": "org-b", "roles": ["owner"]}
         if authorization == "Bearer agent-a":
             return {"sub": "agent-a", "org": "org-a", "roles": ["agent"]}
+        if authorization == "Bearer operator-a":
+            return {"sub": "operator-a", "org": "org-a", "roles": ["operator"]}
         if authorization == "Bearer viewer-a":
             return {"sub": "viewer-a", "org": "org-a", "roles": ["viewer"]}
         if authorization == "Bearer guest-b":
@@ -216,15 +218,40 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert page.status_code == 200
     assert "CEO Workspace" in page.text
     assert "Maximum external spend" in page.text
+    assert 'id="mobile-more-toggle"' in page.text
+    assert 'data-mobile-view="company"' in page.text
     assert "unsafe-inline" not in page.headers["content-security-policy"]
     assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
     assert api.get("/assets/ceo.css").status_code == 200
+    assert api.get("/assets/app-icon.svg").status_code == 200
+    manifest = api.get("/app.webmanifest")
+    assert manifest.status_code == 200
+    assert manifest.json()["display"] == "standalone"
+    assert api.get("/service-worker.js").status_code == 200
     script = api.get("/assets/ceo.js")
     assert script.status_code == 200
     assert "Program command" in script.text
     assert "Independent work is continuing" in script.text
+    assert 'querySelectorAll(".nav-item[data-view]")' in script.text
     assert api.get("/v2/client-config").json() == {"identity_mode": "manual"}
     assert api.get("/v2/runs").status_code == 401
+
+
+def test_session_capabilities_and_mission_creation_are_role_consistent():
+    api = client()
+    owner = api.get("/v2/me", headers={"Authorization": "Bearer org-a"}).json()
+    viewer = api.get("/v2/me", headers={"Authorization": "Bearer viewer-a"}).json()
+
+    assert owner["persona"] == "executive"
+    assert "mission.create" in owner["capabilities"]
+    assert viewer["persona"] == "viewer"
+    assert "mission.create" not in viewer["capabilities"]
+    forbidden = api.post(
+        "/v2/runs",
+        headers={"Authorization": "Bearer viewer-a", "Idempotency-Key": "viewer-mission"},
+        json={"prompt": "Viewer must not launch this"},
+    )
+    assert forbidden.status_code == 403
 
 
 def test_ceo_workspace_publishes_only_validated_public_oidc_pkce_configuration():
@@ -404,6 +431,75 @@ def test_notification_inbox_uses_authenticated_tenant_and_role_scope():
     assert owner.json()["items"][0]["notification_id"] == "notice-org-a"
     assert store.calls[0] == ("org-a", "run-1", None, 25)
     assert store.calls[1] == ("org-a", None, "agent-a", 100)
+
+
+def test_personal_notification_preferences_state_and_attention_projection(tmp_path):
+    notifications = SQLNotificationStore(
+        f"sqlite:///{tmp_path / 'api-personal-attention.sqlite3'}", create_schema=True,
+    )
+    try:
+        notifications.publish_notification(Notification(
+            notification_id="attention-one", tenant_id="org-a", run_id="run-one",
+            category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+            recipient_ids=("human:ceo",), subject="Approve the release",
+            body="A consequential release is waiting.", source_id="approval-one",
+            created_at="2026-09-17T12:00:00+00:00", correlation_id="decision-one",
+            payload={"risk": "irreversible"},
+        ))
+        notifications.publish_notification(Notification(
+            notification_id="operator-one", tenant_id="org-a", run_id="run-two",
+            category=NotificationCategory.OPERATOR_ATTENTION,
+            recipient_ids=("operator:on-call",), subject="Restore the worker",
+            body="A durable queue lease needs attention.", source_id="operator-source-one",
+            created_at="2026-09-17T12:01:00+00:00",
+        ))
+        api = TestClient(create_app(
+            engine=InMemoryWorkflowEngine(), identity=FakeIdentity(),
+            notification_store=notifications,
+        ))
+        headers = {"Authorization": "Bearer org-a"}
+        inbox = api.get("/v2/notifications", headers=headers).json()
+        assert inbox["items"][0]["subject"] == "Approve the release"
+        assert inbox["items"][0]["presentation"]["level"] == "time_sensitive"
+        assert inbox["items"][0]["user_state"]["status"] == "unread"
+        assert api.get(
+            "/v2/notifications", headers={"Authorization": "Bearer viewer-a"},
+        ).json()["items"] == []
+        operator_inbox = api.get(
+            "/v2/notifications", headers={"Authorization": "Bearer operator-a"},
+        ).json()["items"]
+        assert [item["notification_id"] for item in operator_inbox] == ["operator-one"]
+
+        preference = api.put(
+            "/v2/notification-preferences",
+            headers={**headers, "Idempotency-Key": "preferences-api-one"},
+            json={
+                "mode": "focused", "browser_notifications": True,
+                "quiet_hours_start": "22:00", "quiet_hours_end": "07:00",
+                "timezone": "America/Los_Angeles", "digest_interval_minutes": 240,
+            },
+        )
+        assert preference.status_code == 200
+        assert preference.json()["mode"] == "focused"
+        dismissed = api.put(
+            "/v2/notifications/attention-one/state",
+            headers={**headers, "Idempotency-Key": "dismiss-attention-one"},
+            json={"status": "dismissed"},
+        )
+        assert dismissed.status_code == 200
+        updated = api.get("/v2/notifications", headers=headers).json()["items"][0]
+        assert updated["user_state"]["status"] == "dismissed"
+        assert updated["presentation"]["disposition"] == "hidden"
+        assert api.put(
+            "/v2/notifications/attention-one/state",
+            headers={
+                "Authorization": "Bearer viewer-a",
+                "Idempotency-Key": "viewer-cannot-dismiss",
+            },
+            json={"status": "dismissed"},
+        ).status_code == 404
+    finally:
+        notifications.close()
 
 
 def test_usage_api_is_tenant_scoped_and_event_detail_requires_owner(tmp_path):

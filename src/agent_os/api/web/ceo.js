@@ -1,6 +1,10 @@
 "use strict";
 
-const state = { token: "", organization: "", config: null, view: "missions", selectedRun: null, timer: null };
+const state = {
+  token: "", organization: "", config: null, view: "missions", selectedRun: null,
+  timer: null, session: null, inboxFilter: "open", inboxItems: [], notificationPreferences: null,
+  browserAlertBaseline: null, drawerReturnFocus: null,
+};
 const byId = (id) => document.getElementById(id);
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -95,6 +99,7 @@ async function finishOidc() {
 async function connect(token) {
   state.token = token;
   state.organization = sessionStorage.getItem("aos.organization") || "";
+  state.browserAlertBaseline = null;
   try {
     await loadOrganizations();
     await api("/v2/company/organization");
@@ -107,8 +112,9 @@ async function connect(token) {
       selectView("billing");
       setFlash(billingNotice === "success" ? "Subscription received. Entitlements update after Stripe confirms it." : "Billing account refreshed.");
     }
+    await refreshInboxBadge();
     state.timer = window.setInterval(() => {
-      if (!document.hidden && state.token) refreshView(true);
+      if (!document.hidden && state.token) refreshAmbient();
     }, 10000);
   } catch (error) {
     state.token = "";
@@ -123,6 +129,10 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   sessionStorage.removeItem("aos.organization");
   window.clearInterval(state.timer);
   state.timer = null;
+  state.session = null;
+  state.inboxItems = [];
+  state.notificationPreferences = null;
+  state.browserAlertBaseline = null;
   closeDrawer();
   byId("workspace").classList.add("hidden");
   byId("auth-gate").classList.remove("hidden");
@@ -145,7 +155,32 @@ async function loadOrganizations(preferred = state.organization) {
     option.selected = item.organization_id === state.organization;
     picker.append(option);
   }
+  state.session = await api("/v2/me");
+  applyRoleExperience();
   return payload;
+}
+
+function can(capability) {
+  return Boolean(state.session && (state.session.capabilities || []).includes(capability));
+}
+
+function applyRoleExperience() {
+  const persona = state.session?.persona || "viewer";
+  const labels = { executive: "Executive", operator: "Operations", builder: "Builder", viewer: "Viewer" };
+  byId("workspace-role-label").textContent = `${labels[persona] || "Member"} workspace`;
+  byId("identity-avatar").textContent = { executive: "CEO", operator: "OPS", builder: "BUILD", viewer: "VIEW" }[persona] || "USER";
+  document.querySelectorAll(".requires-mission-create").forEach((node) => node.classList.toggle("hidden", !can("mission.create")));
+  document.querySelectorAll(".requires-integration-manage").forEach((node) => node.classList.toggle("hidden", !can("integration.manage")));
+  const billingAvailable = state.config?.billing_mode === "stripe";
+  document.querySelectorAll(".requires-billing-manage").forEach((node) => node.classList.toggle("hidden", !can("billing.manage") || !billingAvailable));
+  if ((!can("integration.manage") && state.view === "integrations") || ((!can("billing.manage") || !billingAvailable) && state.view === "billing")) {
+    selectView("missions");
+  }
+}
+
+function userIsEditing() {
+  const active = document.activeElement;
+  return Boolean(active && active.matches("input, textarea, select, [contenteditable='true']"));
 }
 
 function stat(name, value, tone = "") {
@@ -351,18 +386,73 @@ function accessPanel(memberships) {
 
 async function loadInbox() {
   const payload = await api("/v2/notifications?limit=100");
-  const items = payload.items || [];
+  state.inboxItems = payload.items || [];
+  state.notificationPreferences = payload.preferences || state.notificationPreferences;
+  updateInboxBadge(state.inboxItems);
+  hydrateInboxPreferences(state.notificationPreferences);
+  renderInbox();
+  deliverBrowserAlerts(state.inboxItems);
+}
+
+function updateInboxBadge(items) {
+  const unread = items.filter((item) => (
+    (item.user_state?.status || "unread") === "unread"
+    && item.presentation?.disposition === "interrupt"
+  )).length;
   const count = byId("inbox-count");
-  count.textContent = String(items.length);
-  count.classList.toggle("hidden", !items.length);
+  count.textContent = String(unread);
+  count.classList.toggle("hidden", !unread);
+  count.setAttribute("aria-label", `${unread} unread attention items`);
+}
+
+async function refreshInboxBadge() {
+  try {
+    const payload = await api("/v2/notifications?limit=100");
+    state.notificationPreferences = payload.preferences || state.notificationPreferences;
+    updateInboxBadge(payload.items || []);
+    deliverBrowserAlerts(payload.items || []);
+  } catch (error) {
+    if (state.view === "inbox") setFlash(`Inbox refresh failed: ${error.message}`, "error");
+  }
+}
+
+function inboxItemVisible(item) {
+  const itemState = item.user_state?.status || "unread";
+  if (state.inboxFilter === "all") return true;
+  if (["dismissed", "snoozed", "resolved"].includes(itemState)) return false;
+  if (state.inboxFilter === "open") {
+    return Boolean(item.actionable || item.presentation?.disposition === "interrupt");
+  }
+  return !item.actionable && item.presentation?.disposition !== "interrupt";
+}
+
+function renderInbox() {
   const content = byId("inbox-content");
   content.replaceChildren();
+  const items = state.inboxItems.filter(inboxItemVisible);
   if (!items.length) return content.append(el("div", "empty", "Nothing needs your attention."));
   for (const item of items) {
-    const node = el("article", "notice");
+    const itemState = item.user_state?.status || "unread";
+    const attention = item.presentation?.level || "active";
+    const node = el("article", `notice ${itemState} ${attention}`);
+    const heading = el("div", "notice-heading");
+    const copy = el("div");
+    copy.append(
+      el("strong", "", item.subject || item.title || label(item.kind || item.category || "Company update")),
+      el("small", "", item.body || item.message || item.reason || JSON.stringify(item.payload || {})),
+    );
+    const badge = el("span", `attention-badge ${attention}`, label(attention));
+    heading.append(copy, badge);
+    const timestamp = item.created_at ? new Date(item.created_at).toLocaleString() : "Time unavailable";
+    const context = el("div", "notice-context");
+    context.append(
+      el("span", "", label(item.category)), el("span", "", timestamp),
+      el("span", "", `Mission ${shortId(item.run_id)}`),
+    );
     node.append(
-      el("strong", "", item.title || label(item.kind || item.category || "Company update")),
-      el("small", "", item.message || item.body || item.reason || JSON.stringify(item.payload || {})),
+      heading,
+      context,
+      el("p", "notice-why", `Why you are seeing this: ${item.presentation?.rationale || "It is part of the mission record."}`),
     );
     if (item.category === "human_action_required" && item.actionable && item.correlation_id) {
       const actions = el("div", "human-actions");
@@ -389,7 +479,35 @@ async function loadInbox() {
     } else if (item.category === "human_action_required") {
       node.append(el("small", "", "Resolved or no longer actionable"));
     }
+    const utility = el("div", "notice-utility");
+    if (item.run_id) {
+      const open = el("button", "quiet", "Open mission"); open.type = "button";
+      open.addEventListener("click", () => openMission({ run_id: item.run_id, title: item.subject || "Mission" }));
+      utility.append(open);
+    }
+    const mark = el("button", "quiet", itemState === "read" ? "Mark unread" : "Mark read"); mark.type = "button";
+    mark.addEventListener("click", () => updateNotificationState(item, itemState === "read" ? "unread" : "read", null, mark));
+    const snooze = el("button", "quiet", "Snooze 1 hour"); snooze.type = "button";
+    snooze.addEventListener("click", () => updateNotificationState(
+      item, "snoozed", new Date(Date.now() + 60 * 60 * 1000).toISOString(), snooze,
+    ));
+    const dismiss = el("button", "quiet", "Dismiss"); dismiss.type = "button";
+    dismiss.addEventListener("click", () => updateNotificationState(item, "dismissed", null, dismiss));
+    utility.append(mark, snooze, dismiss); node.append(utility);
     content.append(node);
+  }
+}
+
+async function updateNotificationState(item, status, snoozedUntil, control) {
+  control.disabled = true;
+  try {
+    await api(`/v2/notifications/${encodeURIComponent(item.notification_id)}/state`, {
+      method: "PUT", headers: {"Idempotency-Key": `notice-state-${crypto.randomUUID()}`},
+      body: JSON.stringify({status, snoozed_until: snoozedUntil}),
+    });
+    await loadInbox();
+  } catch (error) {
+    control.disabled = false; setFlash(error.message, "error");
   }
 }
 
@@ -407,10 +525,60 @@ async function resolveHumanRequest(item, response, actions) {
       }),
     });
     setFlash("Your response was recorded and the team can continue.");
+    await api(`/v2/notifications/${encodeURIComponent(item.notification_id)}/state`, {
+      method: "PUT", headers: {"Idempotency-Key": `notice-resolved-${crypto.randomUUID()}`},
+      body: JSON.stringify({status: "dismissed", snoozed_until: null}),
+    }).catch(() => null);
     await loadInbox();
   } catch (error) {
     for (const control of actions.querySelectorAll("button,input")) control.disabled = false;
     setFlash(error.message, "error");
+  }
+}
+
+function hydrateInboxPreferences(preferences) {
+  if (!preferences) return;
+  byId("inbox-mode").value = preferences.mode || "balanced";
+  byId("browser-notifications").checked = Boolean(preferences.browser_notifications);
+  byId("quiet-start").value = preferences.quiet_hours_start || "";
+  byId("quiet-end").value = preferences.quiet_hours_end || "";
+  byId("notification-timezone").value = preferences.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  byId("digest-interval").value = String(preferences.digest_interval_minutes || 60);
+}
+
+function withinQuietHours(preferences) {
+  if (!preferences?.quiet_hours_start || !preferences?.quiet_hours_end) return false;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: preferences.timezone || "UTC", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).formatToParts(new Date());
+    const hour = Number(parts.find((part) => part.type === "hour").value);
+    const minute = Number(parts.find((part) => part.type === "minute").value);
+    const current = hour * 60 + minute;
+    const toMinutes = (value) => Number(value.slice(0, 2)) * 60 + Number(value.slice(3, 5));
+    const start = toMinutes(preferences.quiet_hours_start);
+    const end = toMinutes(preferences.quiet_hours_end);
+    return start < end ? current >= start && current < end : current >= start || current < end;
+  } catch (_) { return false; }
+}
+
+function deliverBrowserAlerts(items) {
+  const ids = new Set(items.map((item) => item.notification_id));
+  if (state.browserAlertBaseline === null) {
+    state.browserAlertBaseline = ids;
+    return;
+  }
+  const fresh = items.filter((item) => !state.browserAlertBaseline.has(item.notification_id));
+  state.browserAlertBaseline = ids;
+  if (!state.notificationPreferences?.browser_notifications || !window.Notification || Notification.permission !== "granted") return;
+  if (withinQuietHours(state.notificationPreferences)) return;
+  for (const item of fresh.filter((entry) => entry.presentation?.disposition === "interrupt")) {
+    const notice = new Notification(item.subject || "Agent OS needs your attention", {
+      body: "Open Agent OS to review this item securely.",
+      tag: item.notification_id,
+      icon: "/assets/app-icon.svg",
+    });
+    notice.onclick = () => { window.focus(); selectView("inbox"); notice.close(); };
   }
 }
 
@@ -527,6 +695,14 @@ async function loadIntegrations() {
     const option = el("option", "", value === "agent-os" ? "Generic Agent OS webhook" : "Slack channel message");
     option.value = value; routeFormat.append(option);
   }
+  const routeAudience = document.createElement("select"); routeAudience.setAttribute("aria-label", "Notification audience");
+  for (const [value, title] of [["human:ceo", "Executive decision makers"], ["operator:on-call", "Operations on-call"], ["*", "All notification recipients"]]) {
+    const option = el("option", "", title); option.value = value; routeAudience.append(option);
+  }
+  const routeRedaction = document.createElement("select"); routeRedaction.setAttribute("aria-label", "Notification detail policy");
+  for (const [value, title] of [["summary", "Redacted summary"], ["full", "Full notification record"]]) {
+    const option = el("option", "", title); option.value = value; routeRedaction.append(option);
+  }
   const destination = field("Slack channel (only for Slack)", "Notification destination", 256);
   const addRoute = el("button", "primary", "Activate alerts"); addRoute.type = "button";
   addRoute.disabled = !routeConnector.options.length;
@@ -541,20 +717,21 @@ async function loadIntegrations() {
           categories: ["human_action_required", "operator_attention", "run_failed", "management_attention", "work_recovered"],
           payload_format: routeFormat.value,
           destination: routeFormat.value === "slack" ? destination.value.trim() : null,
+          recipient_ids: [routeAudience.value], redaction_policy: routeRedaction.value,
         }),
       });
       setFlash("External alert route activated."); await loadIntegrations();
     } catch (error) { setFlash(error.message, "error"); }
     finally { addRoute.disabled = false; }
   });
-  routeForm.append(routeId, routeName, routeConnector, routePath, routeFormat, destination, addRoute);
+  routeForm.append(routeId, routeName, routeConnector, routePath, routeAudience, routeRedaction, routeFormat, destination, addRoute);
   routeCard.append(routeForm);
   const routeList = el("div", "people");
   for (const route of routes) {
     const item = el("div", "person");
     item.append(
       el("strong", "", route.display_name),
-      el("small", "", `${route.connector_id}${route.path} · ${route.payload_format} · ${route.active ? "active" : "disabled"}`),
+      el("small", "", `${route.connector_id}${route.path} · ${route.payload_format} · ${(route.recipient_ids || ["human:ceo"]).map(label).join(", ")} · ${route.redaction_policy || "summary"} · ${route.active ? "active" : "disabled"}`),
     );
     if (route.active) {
       const disable = el("button", "danger", "Disable"); disable.type = "button";
@@ -677,6 +854,20 @@ async function refreshView(silent = false) {
   }
 }
 
+async function refreshAmbient() {
+  await refreshInboxBadge();
+  if (userIsEditing()) return;
+  try {
+    if (state.view === "missions") await loadMissions();
+    if (state.view === "inbox") await loadInbox();
+    if (state.view === "previews") await loadPreviews();
+    byId("last-refresh").textContent = `Updated ${new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
+    if (state.selectedRun) await loadMissionDetail(state.selectedRun, true);
+  } catch (_) {
+    // Background refresh is intentionally quiet; explicit refresh reports errors.
+  }
+}
+
 function detailSection(title) {
   const section = el("section", "detail-card");
   section.append(el("h4", "", title));
@@ -684,10 +875,12 @@ function detailSection(title) {
 }
 
 async function openMission(item) {
+  state.drawerReturnFocus = document.activeElement;
   state.selectedRun = item;
   byId("drawer-title").textContent = item.title || "Mission";
   byId("mission-drawer").classList.add("open");
   byId("mission-drawer").setAttribute("aria-hidden", "false");
+  byId("mission-drawer").focus();
   await loadMissionDetail(item);
 }
 
@@ -695,19 +888,23 @@ function closeDrawer() {
   state.selectedRun = null;
   byId("mission-drawer").classList.remove("open");
   byId("mission-drawer").setAttribute("aria-hidden", "true");
+  if (state.drawerReturnFocus?.isConnected) state.drawerReturnFocus.focus();
+  state.drawerReturnFocus = null;
 }
 
 async function loadMissionDetail(item, silent = false) {
   const content = byId("drawer-content");
   if (!silent) content.replaceChildren(el("div", "empty", "Reading durable mission state…"));
   try {
-    const [run, missionResult, managementResult, company] = await Promise.all([
+    const [run, missionFetch, managementFetch, company] = await Promise.all([
       api(`/v2/runs/${encodeURIComponent(item.run_id)}`),
-      api(`/v2/runs/${encodeURIComponent(item.run_id)}/mission`).catch(() => null),
-      api(`/v2/runs/${encodeURIComponent(item.run_id)}/management`).catch(() => null),
+      api(`/v2/runs/${encodeURIComponent(item.run_id)}/mission`).catch((error) => ({__error: error.message})),
+      api(`/v2/runs/${encodeURIComponent(item.run_id)}/management`).catch((error) => ({__error: error.message})),
       api("/v2/company/organization"),
     ]);
     if (!state.selectedRun || state.selectedRun.run_id !== item.run_id) return;
+    const missionResult = missionFetch?.__error ? null : missionFetch;
+    const managementResult = managementFetch?.__error ? null : managementFetch;
     content.replaceChildren();
     const overview = detailSection("Current state");
     const grid = el("div", "detail-grid");
@@ -717,10 +914,20 @@ async function loadMissionDetail(item, silent = false) {
     overview.append(grid);
     if (managementResult) {
       const ratio = Math.round(Number(managementResult.progress?.materialized_completion_ratio || 0) * 100);
-      const track = el("div", "progress-track"); const bar = el("span"); bar.style.width = `${Math.min(100, ratio)}%`; track.append(bar);
+      const track = el("div", "progress-track");
+      track.setAttribute("role", "progressbar"); track.setAttribute("aria-valuemin", "0");
+      track.setAttribute("aria-valuemax", "100"); track.setAttribute("aria-valuenow", String(Math.min(100, ratio)));
+      const bar = el("span"); bar.style.width = `${Math.min(100, ratio)}%`; track.append(bar);
       overview.append(track, el("small", "muted", `${ratio}% of currently materialized work complete · ${label(managementResult.health)}`));
     }
     content.append(overview);
+    for (const [name, result] of [["Execution projection", missionFetch], ["Management projection", managementFetch]]) {
+      if (!result?.__error) continue;
+      const unavailable = el("div", "projection-warning");
+      unavailable.setAttribute("role", "status");
+      unavailable.textContent = `${name} is temporarily unavailable: ${result.__error}. Durable mission state is unchanged.`;
+      content.append(unavailable);
+    }
 
     const program = managementResult?.program || missionResult?.program;
     const readiness = managementResult?.readiness;
@@ -822,6 +1029,34 @@ async function loadMissionDetail(item, silent = false) {
         trust.append(row);
       }
       content.append(trust);
+
+      if ((assurance.claims || []).length || (assurance.evidence || []).length) {
+        const review = detailSection("Claims and review evidence");
+        const evidenceById = new Map((assurance.evidence || []).map((record) => [record.evidence_id, record]));
+        for (const claim of assurance.claims || []) {
+          const row = el("div", "work-row evidence-row");
+          row.append(
+            el("span", `phase claim-${claim.status}`, label(claim.status)),
+            el("p", "", claim.statement),
+            el("small", "", `Asserted by ${label(claim.asserted_by)} · ${claim.evidence_ids?.length || 0} evidence item(s)`),
+          );
+          for (const evidenceId of claim.evidence_ids || []) {
+            const evidence = evidenceById.get(evidenceId);
+            if (!evidence) continue;
+            const detail = el("details", "evidence-detail");
+            detail.append(
+              el("summary", "", `${label(evidence.kind)} · ${evidence.media_type || "artifact"}`),
+              el("small", "", `Observed ${evidence.observed_at || "unknown"} · SHA-256 ${shortId(evidence.sha256)}`),
+            );
+            row.append(detail);
+          }
+          review.append(row);
+        }
+        const unclaimed = (assurance.evidence || []).filter((record) =>
+          !(assurance.claims || []).some((claim) => (claim.evidence_ids || []).includes(record.evidence_id)));
+        if (unclaimed.length) review.append(el("small", "muted", `${unclaimed.length} retained evidence item(s) are not yet linked to a claim.`));
+        content.append(review);
+      }
     }
 
     if (managementResult?.management_signals?.length) {
@@ -832,6 +1067,26 @@ async function loadMissionDetail(item, silent = false) {
         signals.append(row);
       }
       content.append(signals);
+    }
+    const narrativeGroups = [
+      ["Next actions", managementResult?.next_actions, (entry) => entry.text || entry.action || entry.description],
+      ["Risks and escalations", managementResult?.risks, (entry) => entry.description || entry.text || entry.reason],
+      ["Decisions", managementResult?.decisions, (entry) => entry.intent || entry.decision || entry.text || entry.reason],
+      ["Team communications", managementResult?.communications, (entry) => entry.body || entry.message || entry.text],
+      ["Observations", managementResult?.observations, (entry) => entry.text || entry.observation || entry.description],
+    ];
+    for (const [title, values, describe] of narrativeGroups) {
+      if (!values?.length) continue;
+      const section = detailSection(title);
+      for (const value of values) {
+        const row = el("div", "work-row");
+        row.append(
+          el("p", "", describe(value) || "Recorded update"),
+          el("small", "", `${label(value.actor_id || value.source_node_id || value.kind || "mission team")}${value.status ? ` · ${label(value.status)}` : ""}`),
+        );
+        section.append(row);
+      }
+      content.append(section);
     }
     if (managementResult?.work_items?.length) {
       const work = detailSection("Team execution");
@@ -880,7 +1135,7 @@ async function loadMissionDetail(item, silent = false) {
       }
       content.append(deliverables);
     }
-    if (!["succeeded", "failed", "cancelled"].includes(run.status)) {
+    if (can("mission.cancel") && !["succeeded", "failed", "cancelled"].includes(run.status)) {
       const controls = detailSection("Mission controls");
       const cancel = el("button", "danger", "Cancel mission"); cancel.type = "button";
       cancel.addEventListener("click", () => cancelMission(item, run.version)); controls.append(cancel); content.append(controls);
@@ -916,8 +1171,13 @@ async function cancelMission(item, version) {
 }
 
 function selectView(name) {
+  if (name === "integrations" && !can("integration.manage")) return setFlash("Your role cannot manage integrations.", "error");
+  if (name === "billing" && (!can("billing.manage") || state.config?.billing_mode !== "stripe")) return setFlash("Billing is not available in this deployment.", "error");
   state.view = name;
+  byId("mobile-more-menu").classList.add("hidden");
+  byId("mobile-more-toggle").setAttribute("aria-expanded", "false");
   document.querySelectorAll(".nav-item").forEach((node) => node.classList.toggle("active", node.dataset.view === name));
+  byId("mobile-more-toggle").classList.toggle("active", ["company", "integrations", "billing"].includes(name));
   document.querySelectorAll(".view").forEach((node) => node.classList.add("hidden"));
   byId(`${name}-view`).classList.remove("hidden");
   byId("view-title").textContent = { missions: "Missions", company: "Company", inbox: "Inbox", integrations: "Integrations", previews: "Releases", billing: "Billing" }[name];
@@ -942,6 +1202,7 @@ async function bootstrap() {
       byId("token-form").classList.remove("hidden");
       byId("auth-status").textContent = "Connect to the local/BYOC control plane.";
     }
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js").catch(() => null);
   } catch (error) {
     byId("auth-status").textContent = error.message;
     byId("auth-status").className = "status-line error";
@@ -951,16 +1212,33 @@ async function bootstrap() {
 byId("oidc-login").addEventListener("click", beginOidc);
 byId("token-form").addEventListener("submit", (event) => { event.preventDefault(); connect(byId("token-input").value.trim()); });
 byId("disconnect").addEventListener("click", () => disconnect());
+byId("mobile-disconnect").addEventListener("click", () => disconnect());
+byId("mobile-more-toggle").addEventListener("click", () => {
+  const menu = byId("mobile-more-menu"); const opening = menu.classList.contains("hidden");
+  menu.classList.toggle("hidden", !opening);
+  byId("mobile-more-toggle").setAttribute("aria-expanded", String(opening));
+});
+document.querySelectorAll("[data-mobile-view]").forEach((node) => node.addEventListener("click", () => selectView(node.dataset.mobileView)));
 byId("refresh").addEventListener("click", () => refreshView());
 byId("organization-select").addEventListener("change", async (event) => {
   state.organization = event.target.value;
+  state.browserAlertBaseline = null;
   sessionStorage.setItem("aos.organization", state.organization);
   closeDrawer();
+  state.session = await api("/v2/me");
+  applyRoleExperience();
   setFlash("Organization changed.");
   await refreshView();
 });
 byId("drawer-close").addEventListener("click", closeDrawer);
 byId("directive").addEventListener("input", (event) => { byId("directive-count").textContent = `${event.target.value.length.toLocaleString()} / 50,000`; });
+byId("directive-human-mode").addEventListener("change", (event) => {
+  byId("human-mode-explanation").textContent = {
+    autonomous: "Routine and reversible work continues without interruption; policy, authority, and high-risk gates still hold.",
+    balanced: "Routine reversible work continues; material risk, ambiguity, or authority gaps come to you.",
+    collaborative: "The team asks for more frequent direction and keeps you close to important trade-offs.",
+  }[event.target.value];
+});
 byId("directive-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = event.submitter; button.disabled = true;
@@ -971,6 +1249,8 @@ byId("directive-form").addEventListener("submit", async (event) => {
         prompt: byId("directive").value.trim(),
         title: byId("directive-title").value.trim() || null,
         budget_limit_cents: Math.round(Number(byId("directive-budget").value || 0) * 100),
+        human_involvement_mode: byId("directive-human-mode").value,
+        daily_interrupt_limit: Number(byId("directive-interrupt-limit").value || 0),
       }),
     });
     byId("directive").value = ""; byId("directive-title").value = ""; byId("directive-budget").value = "0"; byId("directive-count").textContent = "0 / 50,000";
@@ -979,6 +1259,61 @@ byId("directive-form").addEventListener("submit", async (event) => {
   } catch (error) { setFlash(error.message, "error"); }
   finally { button.disabled = false; }
 });
-document.querySelectorAll(".nav-item").forEach((node) => node.addEventListener("click", () => selectView(node.dataset.view)));
-document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeDrawer(); });
+byId("inbox-preferences-toggle").addEventListener("click", () => {
+  const panel = byId("inbox-preferences");
+  const opening = panel.classList.contains("hidden");
+  panel.classList.toggle("hidden", !opening);
+  byId("inbox-preferences-toggle").setAttribute("aria-expanded", String(opening));
+});
+byId("save-inbox-preferences").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const quietStart = byId("quiet-start").value || null;
+  const quietEnd = byId("quiet-end").value || null;
+  if (Boolean(quietStart) !== Boolean(quietEnd)) return setFlash("Choose both quiet-hour times or clear both.", "error");
+  let browserNotifications = byId("browser-notifications").checked;
+  if (browserNotifications && window.Notification && Notification.permission === "default") {
+    browserNotifications = (await Notification.requestPermission()) === "granted";
+    byId("browser-notifications").checked = browserNotifications;
+  }
+  if (browserNotifications && (!window.Notification || Notification.permission !== "granted")) {
+    browserNotifications = false; byId("browser-notifications").checked = false;
+    setFlash("Browser alerts are blocked in this browser; the inbox remains active.", "error");
+  }
+  button.disabled = true;
+  try {
+    state.notificationPreferences = await api("/v2/notification-preferences", {
+      method: "PUT", headers: {"Idempotency-Key": `notice-preferences-${crypto.randomUUID()}`},
+      body: JSON.stringify({
+        mode: byId("inbox-mode").value,
+        browser_notifications: browserNotifications,
+        quiet_hours_start: quietStart,
+        quiet_hours_end: quietEnd,
+        timezone: byId("notification-timezone").value.trim() || "UTC",
+        digest_interval_minutes: Number(byId("digest-interval").value),
+      }),
+    });
+    setFlash("Notification preferences saved."); await loadInbox();
+  } catch (error) { setFlash(error.message, "error"); }
+  finally { button.disabled = false; }
+});
+document.querySelectorAll("[data-inbox-filter]").forEach((node) => node.addEventListener("click", () => {
+  state.inboxFilter = node.dataset.inboxFilter;
+  document.querySelectorAll("[data-inbox-filter]").forEach((item) => item.classList.toggle("active", item === node));
+  renderInbox();
+}));
+document.querySelectorAll(".nav-item[data-view]").forEach((node) => node.addEventListener("click", () => selectView(node.dataset.view)));
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeDrawer();
+    byId("mobile-more-menu").classList.add("hidden");
+    byId("mobile-more-toggle").setAttribute("aria-expanded", "false");
+  }
+  if (event.key !== "Tab" || !byId("mission-drawer").classList.contains("open")) return;
+  const focusable = Array.from(byId("mission-drawer").querySelectorAll("button, a[href], input, select, textarea, [tabindex]:not([tabindex='-1'])"))
+    .filter((node) => !node.disabled && !node.classList.contains("hidden"));
+  if (!focusable.length) return;
+  const first = focusable[0]; const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+  if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+});
 bootstrap();

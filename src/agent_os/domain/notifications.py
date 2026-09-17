@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Mapping
 
 
@@ -17,6 +18,92 @@ class NotificationCategory(str, Enum):
     RUN_CANCELLED = "run_cancelled"
     MANAGEMENT_ATTENTION = "management_attention"
     WORK_RECOVERED = "work_recovered"
+
+
+class NotificationPreferenceMode(str, Enum):
+    """How much activity a person wants promoted in their personal inbox."""
+
+    FOCUSED = "focused"
+    BALANCED = "balanced"
+    ALL = "all"
+
+
+@dataclass(frozen=True)
+class NotificationPreferences:
+    """Durable, per-person attention preferences.
+
+    The immutable notification ledger remains complete regardless of these
+    preferences.  They only control presentation and interruption, never
+    delete audit history or weaken a mandatory approval gate.
+    """
+
+    tenant_id: str
+    subject_id: str
+    mode: NotificationPreferenceMode = NotificationPreferenceMode.BALANCED
+    browser_notifications: bool = False
+    quiet_hours_start: str | None = None
+    quiet_hours_end: str | None = None
+    timezone_name: str = "UTC"
+    digest_interval_minutes: int = 60
+
+    def __post_init__(self) -> None:
+        if not self.tenant_id.strip() or not self.subject_id.strip():
+            raise ValueError("notification preference tenant and subject are required")
+        if len(self.tenant_id) > 128 or len(self.subject_id) > 256:
+            raise ValueError("notification preference identity is too long")
+        if (self.quiet_hours_start is None) != (self.quiet_hours_end is None):
+            raise ValueError("quiet hours require both a start and end")
+        for value in (self.quiet_hours_start, self.quiet_hours_end):
+            if value is None:
+                continue
+            try:
+                hour, minute = (int(part) for part in value.split(":"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("quiet hours must use HH:MM") from exc
+            if not 0 <= hour <= 23 or not 0 <= minute <= 59 or len(value) != 5:
+                raise ValueError("quiet hours must use HH:MM")
+        if (
+            self.quiet_hours_start is not None
+            and self.quiet_hours_start == self.quiet_hours_end
+        ):
+            raise ValueError("quiet hours start and end must differ")
+        try:
+            ZoneInfo(self.timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("notification timezone is unknown") from exc
+        if self.digest_interval_minutes not in {15, 30, 60, 240, 1_440}:
+            raise ValueError("digest interval must be 15, 30, 60, 240, or 1440 minutes")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tenant_id": self.tenant_id,
+            "subject_id": self.subject_id,
+            "mode": self.mode.value,
+            "browser_notifications": self.browser_notifications,
+            "quiet_hours_start": self.quiet_hours_start,
+            "quiet_hours_end": self.quiet_hours_end,
+            "timezone": self.timezone_name,
+            "digest_interval_minutes": self.digest_interval_minutes,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "NotificationPreferences":
+        return cls(
+            tenant_id=str(raw["tenant_id"]),
+            subject_id=str(raw["subject_id"]),
+            mode=NotificationPreferenceMode(str(raw.get("mode", "balanced"))),
+            browser_notifications=bool(raw.get("browser_notifications", False)),
+            quiet_hours_start=(
+                None if raw.get("quiet_hours_start") is None
+                else str(raw["quiet_hours_start"])
+            ),
+            quiet_hours_end=(
+                None if raw.get("quiet_hours_end") is None
+                else str(raw["quiet_hours_end"])
+            ),
+            timezone_name=str(raw.get("timezone", "UTC")),
+            digest_interval_minutes=int(raw.get("digest_interval_minutes", 60)),
+        )
 
 
 @dataclass(frozen=True)

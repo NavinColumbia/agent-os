@@ -66,6 +66,14 @@ class GovernedNotificationSender:
     def _body(lease: NotificationDeliveryLease) -> bytes:
         notification = dict(lease.notification)
         route = lease.route
+        if route.get("redaction_policy", "summary") == "summary":
+            notification = {
+                key: notification.get(key)
+                for key in (
+                    "notification_id", "run_id", "category", "subject", "created_at",
+                )
+            }
+            notification["body"] = "Open Agent OS to review this notification securely."
         payload_format = route.get("payload_format")
         if payload_format == "slack":
             rendered: Mapping[str, Any] = {

@@ -19,7 +19,7 @@ from agent_os.domain.mission_model import (
     Hazard,
     MissionSpec,
 )
-from agent_os.domain.notifications import Notification
+from agent_os.domain.notifications import Notification, NotificationPreferences
 from agent_os.domain.organization import Organization
 from agent_os.domain.organization_events import OrganizationEvent
 from agent_os.domain.workflow import WorkflowDefinition
@@ -568,6 +568,42 @@ class NotificationStore(Protocol):
         recipient_id: str | None = None,
         limit: int = 100,
     ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def get_notification(
+        self, tenant_id: str, notification_id: str,
+    ) -> Mapping[str, Any] | None: ...
+
+    def list_notification_states(
+        self,
+        tenant_id: str,
+        *,
+        subject_id: str,
+        notification_ids: tuple[str, ...],
+    ) -> Mapping[str, Mapping[str, Any]]: ...
+
+    def set_notification_state(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        notification_id: str,
+        status: str,
+        snoozed_until: str | None,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def get_notification_preferences(
+        self, tenant_id: str, *, subject_id: str,
+    ) -> Mapping[str, Any]: ...
+
+    def set_notification_preferences(
+        self,
+        preferences: NotificationPreferences,
+        *,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
 
     def register_notification_route(
         self,

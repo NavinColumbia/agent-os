@@ -102,6 +102,11 @@ def test_notification_publication_enqueues_only_matching_routes_and_delivers_sec
             source_id="source-no-route",
             category=NotificationCategory.RUN_SUCCEEDED,
         ))
+        notifications.publish_notification(notification(
+            notification_id="notification-wrong-audience",
+            source_id="source-wrong-audience",
+            recipient_ids=("agent:engineer",),
+        ))
         worker = DurableNotificationDeliveryWorker(
             store=notifications,
             sender=GovernedNotificationSender(registry, Secrets(), transport=transport),
@@ -119,6 +124,9 @@ def test_notification_publication_enqueues_only_matching_routes_and_delivers_sec
         assert headers["Idempotency-Key"] == report.command_id
         assert b"private-operator-token" not in body
         assert b'"event":"agent_os.notification"' in body
+        assert b"Approve the production release" not in body
+        assert b'"risk"' not in body
+        assert b"Open Agent OS to review this notification securely" in body
         assert (timeout, max_bytes) == (15, 1024)
         delivery = notifications.list_notification_deliveries("tenant-a")[0]
         assert delivery["status"] == "delivered"

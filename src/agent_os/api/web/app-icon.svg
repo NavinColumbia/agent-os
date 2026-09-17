@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Agent OS">
+  <rect width="512" height="512" rx="112" fill="#111618"/>
+  <rect x="80" y="288" width="88" height="144" rx="28" fill="#8cab36"/>
+  <rect x="212" y="192" width="88" height="240" rx="28" fill="#a9dc3e"/>
+  <rect x="344" y="80" width="88" height="352" rx="28" fill="#c6ff45"/>
+</svg>

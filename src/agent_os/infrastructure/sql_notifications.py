@@ -36,6 +36,7 @@ from agent_os.application.ports import NotificationDeliveryLease, NotificationSt
 from agent_os.domain.notifications import (
     Notification,
     NotificationCategory,
+    NotificationPreferences,
     notification_fingerprint,
 )
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
@@ -81,6 +82,47 @@ Index(
     notification_recipients.c.recipient_id,
     notification_recipients.c.created_at.desc(),
     notification_recipients.c.notification_id.desc(),
+)
+
+notification_states = Table(
+    "aos_v2_notification_states",
+    notification_metadata,
+    Column("tenant_id", String(128), primary_key=True),
+    Column("subject_id", String(256), primary_key=True),
+    Column("notification_id", String(128), primary_key=True),
+    Column("status", String(32), nullable=False),
+    Column("snoozed_until", DateTime(timezone=True), nullable=True),
+    Column("version", Integer, nullable=False),
+    Column("fingerprint", String(64), nullable=False),
+    Column("idempotency_key", String(200), nullable=False),
+    Column("updated_by", String(256), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["tenant_id", "notification_id"],
+        ["aos_v2_notifications.tenant_id", "aos_v2_notifications.notification_id"],
+        ondelete="CASCADE",
+    ),
+)
+
+Index(
+    "aos_v2_notification_states_inbox_idx",
+    notification_states.c.tenant_id,
+    notification_states.c.subject_id,
+    notification_states.c.status,
+    notification_states.c.snoozed_until,
+)
+
+notification_preferences = Table(
+    "aos_v2_notification_preferences",
+    notification_metadata,
+    Column("tenant_id", String(128), primary_key=True),
+    Column("subject_id", String(256), primary_key=True),
+    Column("record", JSON, nullable=False),
+    Column("fingerprint", String(64), nullable=False),
+    Column("version", Integer, nullable=False),
+    Column("idempotency_key", String(200), nullable=False),
+    Column("updated_by", String(256), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
 )
 
 notification_routes = Table(
@@ -176,9 +218,14 @@ class SQLNotificationStore(NotificationStore):
         destination_value = raw.get("destination")
         destination = None if destination_value is None else str(destination_value).strip()
         categories_raw = raw.get("categories", ())
+        recipients_raw = raw.get("recipient_ids", ("human:ceo",))
         if not isinstance(categories_raw, (list, tuple)):
             raise ValueError("notification route categories must be a list")
+        if not isinstance(recipients_raw, (list, tuple)):
+            raise ValueError("notification route recipients must be a list")
         categories = tuple(dict.fromkeys(str(item).strip() for item in categories_raw))
+        recipients = tuple(dict.fromkeys(str(item).strip() for item in recipients_raw))
+        redaction_policy = str(raw.get("redaction_policy") or "summary").strip()
         if not _ROUTE_ID.fullmatch(route_id) or not _ROUTE_ID.fullmatch(connector_id):
             raise ValueError("notification route and connector IDs must be lowercase slugs")
         if not 1 <= len(display_name) <= 200:
@@ -194,6 +241,13 @@ class SQLNotificationStore(NotificationStore):
             raise ValueError("notification route categories are missing or unsupported")
         if payload_format not in _DELIVERY_FORMATS:
             raise ValueError("notification route payload format is unsupported")
+        if (
+            not recipients or len(recipients) > 128
+            or any(not recipient or len(recipient) > 256 for recipient in recipients)
+        ):
+            raise ValueError("notification route recipients are missing or invalid")
+        if redaction_policy not in {"summary", "full"}:
+            raise ValueError("notification route redaction policy is unsupported")
         if destination is not None and not 1 <= len(destination) <= 256:
             raise ValueError("notification route destination is invalid")
         if payload_format == "slack" and destination is None:
@@ -206,6 +260,8 @@ class SQLNotificationStore(NotificationStore):
             "categories": list(categories),
             "payload_format": payload_format,
             "destination": destination,
+            "recipient_ids": list(recipients),
+            "redaction_policy": redaction_policy,
         }
 
     @staticmethod
@@ -281,6 +337,7 @@ class SQLNotificationStore(NotificationStore):
                 route_rows = connection.execute(select(
                     notification_routes.c.route_id,
                     notification_routes.c.categories,
+                    notification_routes.c.definition,
                 ).where(and_(
                     notification_routes.c.tenant_id == notification.tenant_id,
                     notification_routes.c.active.is_(True),
@@ -298,6 +355,13 @@ class SQLNotificationStore(NotificationStore):
                     row for row in route_rows
                     if externally_interrupting
                     and notification.category.value in row["categories"]
+                    and (
+                        "*" in row["definition"].get("recipient_ids", ())
+                        or bool(
+                            set(notification.recipient_ids)
+                            & set(row["definition"].get("recipient_ids", ("human:ceo",)))
+                        )
+                    )
                 ]
                 if eligible_routes:
                     connection.execute(insert(notification_deliveries), [{
@@ -359,6 +423,205 @@ class SQLNotificationStore(NotificationStore):
                 notifications.c.notification_id.desc(),
             ).limit(limit)).scalars().all()
         return tuple(dict(raw) for raw in rows)
+
+    def get_notification(
+        self, tenant_id: str, notification_id: str,
+    ) -> Mapping[str, Any] | None:
+        with self._tenant_connection(tenant_id) as connection:
+            raw = connection.execute(select(notifications.c.record).where(and_(
+                notifications.c.tenant_id == tenant_id,
+                notifications.c.notification_id == notification_id,
+            ))).scalar_one_or_none()
+        return None if raw is None else dict(raw)
+
+    def list_notification_states(
+        self,
+        tenant_id: str,
+        *,
+        subject_id: str,
+        notification_ids: tuple[str, ...],
+    ) -> Mapping[str, Mapping[str, Any]]:
+        """Return one person's presentation state without mutating ledger truth."""
+
+        if not subject_id.strip() or len(subject_id) > 256:
+            raise ValueError("notification state subject is required")
+        bounded_ids = tuple(dict.fromkeys(notification_ids))
+        if len(bounded_ids) > 500:
+            raise ValueError("notification state lookup exceeds 500 items")
+        if not bounded_ids:
+            return {}
+        with self._tenant_connection(tenant_id) as connection:
+            rows = connection.execute(select(notification_states).where(and_(
+                notification_states.c.tenant_id == tenant_id,
+                notification_states.c.subject_id == subject_id,
+                notification_states.c.notification_id.in_(bounded_ids),
+            ))).mappings().all()
+        return {
+            str(row["notification_id"]): self._state_record(row)
+            for row in rows
+        }
+
+    @staticmethod
+    def _state_record(
+        row: Mapping[str, Any], *, duplicate: bool = False,
+    ) -> Mapping[str, Any]:
+        return {
+            "notification_id": row["notification_id"],
+            "subject_id": row["subject_id"],
+            "status": row["status"],
+            "snoozed_until": (
+                None if row["snoozed_until"] is None
+                else row["snoozed_until"].isoformat()
+            ),
+            "version": int(row["version"]),
+            "updated_at": row["updated_at"].isoformat(),
+            "duplicate": duplicate,
+        }
+
+    def set_notification_state(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        notification_id: str,
+        status: str,
+        snoozed_until: str | None,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]:
+        subject_id = subject_id.strip()
+        actor_id = actor_id.strip()
+        idempotency_key = idempotency_key.strip()
+        if not subject_id or not actor_id or not 8 <= len(idempotency_key) <= 200:
+            raise ValueError("notification state subject, actor, and idempotency key are required")
+        if status not in {"unread", "read", "dismissed", "snoozed", "resolved"}:
+            raise ValueError("notification state is unsupported")
+        snooze_time = None if snoozed_until is None else _parse_time(snoozed_until)
+        if (status == "snoozed") != (snooze_time is not None):
+            raise ValueError("snoozed state requires an expiry and other states forbid one")
+        now = self._clock()
+        if snooze_time is not None and snooze_time <= now:
+            raise ValueError("notification snooze must end in the future")
+        semantic = {"status": status, "snoozed_until": snoozed_until}
+        fingerprint = hashlib.sha256(json.dumps(
+            semantic, separators=(",", ":"), sort_keys=True,
+        ).encode()).hexdigest()
+        key = and_(
+            notification_states.c.tenant_id == tenant_id,
+            notification_states.c.subject_id == subject_id,
+            notification_states.c.notification_id == notification_id,
+        )
+        with self._tenant_connection(tenant_id) as connection:
+            exists = connection.execute(select(notifications.c.notification_id).where(and_(
+                notifications.c.tenant_id == tenant_id,
+                notifications.c.notification_id == notification_id,
+            ))).scalar_one_or_none()
+            if exists is None:
+                raise LookupError("notification not found")
+            prior = connection.execute(
+                select(notification_states).where(key).with_for_update()
+            ).mappings().one_or_none()
+            if prior is not None and prior["idempotency_key"] == idempotency_key:
+                if prior["fingerprint"] != fingerprint:
+                    raise ValueError("notification state idempotency key was reused")
+                return self._state_record(prior, duplicate=True)
+            version = 1 if prior is None else int(prior["version"]) + 1
+            values = {
+                "tenant_id": tenant_id,
+                "subject_id": subject_id,
+                "notification_id": notification_id,
+                "status": status,
+                "snoozed_until": snooze_time,
+                "version": version,
+                "fingerprint": fingerprint,
+                "idempotency_key": idempotency_key,
+                "updated_by": actor_id,
+                "updated_at": now,
+            }
+            if prior is None:
+                connection.execute(insert(notification_states).values(**values))
+            else:
+                connection.execute(update(notification_states).where(key).values(**values))
+        return self._state_record(values)
+
+    def get_notification_preferences(
+        self, tenant_id: str, *, subject_id: str,
+    ) -> Mapping[str, Any]:
+        if not subject_id.strip() or len(subject_id) > 256:
+            raise ValueError("notification preference subject is required")
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(notification_preferences).where(and_(
+                notification_preferences.c.tenant_id == tenant_id,
+                notification_preferences.c.subject_id == subject_id,
+            ))).mappings().one_or_none()
+        if row is None:
+            return {
+                **NotificationPreferences(tenant_id, subject_id).to_dict(),
+                "version": 0,
+                "updated_at": None,
+                "duplicate": False,
+            }
+        return {
+            **dict(row["record"]),
+            "version": int(row["version"]),
+            "updated_at": row["updated_at"].isoformat(),
+            "duplicate": False,
+        }
+
+    def set_notification_preferences(
+        self,
+        preferences: NotificationPreferences,
+        *,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]:
+        actor_id = actor_id.strip()
+        idempotency_key = idempotency_key.strip()
+        if not actor_id or not 8 <= len(idempotency_key) <= 200:
+            raise ValueError("notification preference actor and idempotency key are required")
+        record = preferences.to_dict()
+        fingerprint = hashlib.sha256(json.dumps(
+            record, separators=(",", ":"), sort_keys=True,
+        ).encode()).hexdigest()
+        key = and_(
+            notification_preferences.c.tenant_id == preferences.tenant_id,
+            notification_preferences.c.subject_id == preferences.subject_id,
+        )
+        now = self._clock()
+        with self._tenant_connection(preferences.tenant_id) as connection:
+            prior = connection.execute(
+                select(notification_preferences).where(key).with_for_update()
+            ).mappings().one_or_none()
+            if prior is not None and prior["idempotency_key"] == idempotency_key:
+                if prior["fingerprint"] != fingerprint:
+                    raise ValueError("notification preference idempotency key was reused")
+                return {
+                    **dict(prior["record"]),
+                    "version": int(prior["version"]),
+                    "updated_at": prior["updated_at"].isoformat(),
+                    "duplicate": True,
+                }
+            version = 1 if prior is None else int(prior["version"]) + 1
+            values = {
+                "tenant_id": preferences.tenant_id,
+                "subject_id": preferences.subject_id,
+                "record": record,
+                "fingerprint": fingerprint,
+                "version": version,
+                "idempotency_key": idempotency_key,
+                "updated_by": actor_id,
+                "updated_at": now,
+            }
+            if prior is None:
+                connection.execute(insert(notification_preferences).values(**values))
+            else:
+                connection.execute(update(notification_preferences).where(key).values(**values))
+        return {
+            **record,
+            "version": version,
+            "updated_at": now.isoformat(),
+            "duplicate": False,
+        }
 
     def register_notification_route(
         self,

@@ -69,6 +69,19 @@ companies with tens of thousands of employees:
   proposal. Identity, tenancy, permissions, budgets, recipients, evidence, decision authority, and side-effect
   policy are verified deterministically. Hallucinated people, tools, success claims, or evidence cannot become
   company facts merely because an agent said them.
+- **One truth, many human workspaces.** CEOs, product and engineering leaders, builders, reviewers, operators,
+  administrators, clients, and integrators see role-appropriate projections over the same durable mission
+  truth. The primary interface shows outcomes, ownership, decisions, progress, evidence, and next actions;
+  agent topology, model calls, and raw traces are available through progressive disclosure rather than
+  becoming the user's task model.
+- **Attention belongs to the recipient.** Every interruption has an exact recipient, urgency, rationale,
+  deadline, action, and durable receipt. People control channels, quiet hours, digest cadence, and information
+  density. Safety-critical gates may narrowly bypass those preferences with an auditable reason; routine
+  progress never earns fake urgency. Read, snooze, dismiss, and resolve state never erase immutable history.
+- **Human input is durable work.** Live updates cannot destroy a draft, focus, selection, or scroll. A person
+  can steer now, queue a follow-up, revise requirements, request changes, delegate, pause, resume, stop, or
+  replan without restarting healthy completed work. Projection failures are shown as unavailable or stale,
+  never disguised as an empty success state.
 
 **Commercial bar:** sellable for hundreds of millions; hundreds of thousands of users, each launching
 millions of dollars of business through it.

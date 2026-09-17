@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 from pathlib import Path
+
+from py_vapid import Vapid02
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,8 +16,24 @@ preflight = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(preflight)
 
 
-def complete_values() -> dict[str, str]:
+def web_push_values() -> dict[str, str]:
+    vapid = Vapid02()
+    vapid.generate_keys()
+    private_number = vapid.private_key.private_numbers().private_value
+    numbers = vapid.public_key.public_numbers()
     return {
+        "AOS_V2_WEB_PUSH_PUBLIC_KEY": base64.urlsafe_b64encode(
+            b"\x04" + numbers.x.to_bytes(32, "big") + numbers.y.to_bytes(32, "big")
+        ).decode().rstrip("="),
+        "AOS_V2_WEB_PUSH_PRIVATE_KEY": base64.urlsafe_b64encode(
+            private_number.to_bytes(32, "big")
+        ).decode().rstrip("="),
+        "AOS_V2_WEB_PUSH_SUBJECT": "mailto:push@example.test",
+    }
+
+
+def complete_values() -> dict[str, str]:
+    values = {
         "GCP_PROJECT_ID": "agentos-control",
         "GCP_SANDBOX_PROJECT_ID": "agentos-sandbox",
         "GCP_APP_PROJECT_ID": "agentos-apps",
@@ -49,6 +68,8 @@ def complete_values() -> dict[str, str]:
         "AOS_V2_STRIPE_WEBHOOK_SECRET": "whsec_abcdefghijklmnopqrstuvwxyz",
         "AOS_V2_MODEL_PROVIDER_KEY": "sk-proj-abcdefghijklmnopqrstuvwxyz",
     }
+    values.update(web_push_values())
+    return values
 
 
 def test_launch_preflight_accepts_complete_isolated_live_configuration():
@@ -139,3 +160,30 @@ def test_launch_preflight_accepts_github_workflow_terraform_aliases():
     }
     report = preflight.evaluate(aliases, require_bootstrap_secrets=False)
     assert report["ok"] is True
+
+
+def test_launch_preflight_requires_complete_web_push_only_during_bootstrap():
+    values = complete_values()
+    assert preflight.evaluate(values, require_bootstrap_secrets=True)["ok"] is True
+
+    values.pop("AOS_V2_WEB_PUSH_PRIVATE_KEY")
+    assert preflight.evaluate(values, require_bootstrap_secrets=False)["ok"] is True
+    assert preflight.evaluate(values, require_bootstrap_secrets=True)["ok"] is False
+
+
+def test_launch_preflight_rejects_malformed_web_push_base64():
+    values = complete_values()
+    values["AOS_V2_WEB_PUSH_PUBLIC_KEY"] += "!"
+    report = preflight.evaluate(values, require_bootstrap_secrets=True)
+    failed = {item["check"] for item in report["checks"] if not item["ok"]}
+    assert "Web Push key set" in failed
+
+
+def test_launch_preflight_rejects_mismatched_web_push_pair():
+    values = complete_values()
+    values["AOS_V2_WEB_PUSH_PRIVATE_KEY"] = web_push_values()[
+        "AOS_V2_WEB_PUSH_PRIVATE_KEY"
+    ]
+    report = preflight.evaluate(values, require_bootstrap_secrets=True)
+    failed = {item["check"] for item in report["checks"] if not item["ok"]}
+    assert "Web Push key set" in failed

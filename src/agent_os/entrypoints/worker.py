@@ -68,6 +68,11 @@ from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.tenant_model_resolver import TenantModelResolver
 from agent_os.infrastructure.tool_node_router import GraphToolNodeRouter
+from agent_os.infrastructure.web_push import WebPushSubscriptionProtector
+from agent_os.infrastructure.web_push_delivery import (
+    DurableWebPushDeliveryWorker,
+    WebPushSender,
+)
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -140,6 +145,8 @@ class WorkerSettings:
     connector_secret_directory: str
     connector_secret_backend: str
     connector_secret_project_id: str
+    web_push_private_key: str
+    web_push_subject: str
 
     @classmethod
     def from_env(cls, *, organization_ids: Sequence[str] = ()) -> "WorkerSettings":
@@ -302,6 +309,15 @@ class WorkerSettings:
             raise ValueError(
                 "GCP connector secrets require AOS_V2_CONNECTOR_SECRET_PROJECT_ID"
             )
+        web_push_private_key = os.getenv("AOS_V2_WEB_PUSH_PRIVATE_KEY", "").strip()
+        web_push_subject = os.getenv("AOS_V2_WEB_PUSH_SUBJECT", "").strip()
+        web_push_values = (
+            server.web_push_public_key, web_push_private_key, web_push_subject,
+        )
+        if any(web_push_values) and not all(web_push_values):
+            raise ValueError(
+                "Web Push requires public/private VAPID keys and AOS_V2_WEB_PUSH_SUBJECT"
+            )
         worker_id = os.getenv("AOS_V2_WORKER_ID", "").strip()
         if not worker_id:
             worker_id = f"{socket.gethostname()}:{os.getpid()}"
@@ -348,6 +364,8 @@ class WorkerSettings:
             connector_secret_directory=connector_secret_directory,
             connector_secret_backend=connector_secret_backend,
             connector_secret_project_id=connector_secret_project_id,
+            web_push_private_key=web_push_private_key,
+            web_push_subject=web_push_subject,
         )
 
     def with_organizations(self, organization_ids: Sequence[str]) -> "WorkerSettings":
@@ -398,6 +416,9 @@ def run_worker(
         resources.callback(tenant_model_store.close)
         notification_store = SQLNotificationStore(
             settings.server.application_database_url,
+            push_protector=WebPushSubscriptionProtector(
+                settings.server.capability_secret,
+            ),
             create_schema=settings.server.create_schema,
         )
         resources.callback(notification_store.close)
@@ -666,6 +687,19 @@ def run_worker(
             lease_seconds=settings.lease_seconds,
             retry_policy=RetryPolicy(max_attempts=settings.retry_max_attempts),
         )
+        web_push_worker = None
+        if settings.server.web_push_public_key:
+            web_push_worker = DurableWebPushDeliveryWorker(
+                store=notification_store,
+                sender=WebPushSender(
+                    vapid_private_key=settings.web_push_private_key,
+                    vapid_public_key=settings.server.web_push_public_key,
+                    vapid_subject=settings.web_push_subject,
+                ),
+                worker_id=settings.worker_id,
+                lease_seconds=settings.lease_seconds,
+                retry_policy=RetryPolicy(max_attempts=settings.retry_max_attempts),
+            )
         decision_worker = DurableDecisionResponseWorker(
             store=notification_store,
             graph=graph_engine,
@@ -678,6 +712,7 @@ def run_worker(
             graph_worker=graph_worker,
             management_worker=management_worker,
             notification_worker=notification_worker,
+            web_push_worker=web_push_worker,
             decision_worker=decision_worker,
         )
         loop_options: dict[str, Any] = {"organization_ids": settings.organization_ids}

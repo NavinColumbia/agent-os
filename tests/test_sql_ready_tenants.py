@@ -11,6 +11,7 @@ from agent_os.infrastructure.sql_notifications import (
     decision_responses,
     notification_deliveries,
     notification_metadata,
+    web_push_deliveries,
 )
 from agent_os.infrastructure.sql_workflow_graph import (
     graph_metadata,
@@ -129,16 +130,29 @@ def test_ready_tenant_discovery_unifies_queues_excludes_future_work_and_rotates(
             "lease_expires_at": None,
             "created_at": now,
         })
+        connection.execute(insert(web_push_deliveries), {
+            "tenant_id": "tenant-h",
+            "delivery_id": "push-delivery-" + "h" * 64,
+            "notification_id": "notification-h",
+            "subscription_id": "push-" + "h" * 64,
+            "status": "pending",
+            "attempts": 0,
+            "available_at": now - timedelta(seconds=1),
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "created_at": now,
+        })
     source = SQLReadyTenantSource(database_url)
     try:
         assert source.list_ready_tenants(limit=10) == (
-            "tenant-a", "tenant-b", "tenant-e", "tenant-f", "tenant-g",
+            "tenant-a", "tenant-b", "tenant-e", "tenant-f", "tenant-g", "tenant-h",
         )
         assert source.list_ready_tenants(after_tenant_id="tenant-a", limit=1) == ("tenant-b",)
         assert source.list_ready_tenants(after_tenant_id="tenant-b", limit=1) == ("tenant-e",)
         assert source.list_ready_tenants(after_tenant_id="tenant-e", limit=1) == ("tenant-f",)
         assert source.list_ready_tenants(after_tenant_id="tenant-f", limit=1) == ("tenant-g",)
-        assert source.list_ready_tenants(after_tenant_id="tenant-g", limit=1) == ("tenant-a",)
+        assert source.list_ready_tenants(after_tenant_id="tenant-g", limit=1) == ("tenant-h",)
+        assert source.list_ready_tenants(after_tenant_id="tenant-h", limit=1) == ("tenant-a",)
     finally:
         source.close()
         engine.dispose()

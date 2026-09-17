@@ -28,6 +28,7 @@ from agent_os.infrastructure.sql_billing import SQLBillingStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.stripe_billing import StripeBillingGateway
+from agent_os.infrastructure.web_push import WebPushSubscriptionProtector
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class ServerSettings:
     stripe_api_version: str
     application_version: str
     public_base_url: str
+    web_push_public_key: str
     preview_ttl_seconds: int
     artifact_backend: str
     artifact_bucket: str
@@ -214,6 +216,7 @@ class ServerSettings:
         public_base_url = os.getenv(
             "AOS_V2_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}",
         ).rstrip("/")
+        web_push_public_key = os.getenv("AOS_V2_WEB_PUSH_PUBLIC_KEY", "").strip()
         if environment == "production" and not public_base_url.startswith("https://"):
             raise ValueError("production AOS_V2_PUBLIC_BASE_URL must use HTTPS")
         if require_billing and environment == "production" and billing_mode != "stripe":
@@ -294,6 +297,7 @@ class ServerSettings:
             stripe_api_version=stripe_api_version,
             application_version=os.getenv("AOS_V2_APPLICATION_VERSION", "v2-dev"),
             public_base_url=public_base_url,
+            web_push_public_key=web_push_public_key,
             preview_ttl_seconds=preview_ttl_seconds,
             artifact_backend=artifact_backend,
             artifact_bucket=artifact_bucket,
@@ -384,6 +388,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
         resources.callback(tenant_model_store.close)
         notification_store = SQLNotificationStore(
             settings.application_database_url,
+            push_protector=WebPushSubscriptionProtector(settings.capability_secret),
             create_schema=settings.create_schema,
         )
         resources.callback(notification_store.close)
@@ -463,6 +468,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             mission_control=mission_control,
             billing_service=billing_service,
             client_identity_config=browser_identity_config(settings),
+            web_push_public_key=settings.web_push_public_key,
             shutdown=resources.close,
         )
     except Exception:

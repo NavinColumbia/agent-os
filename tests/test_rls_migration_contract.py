@@ -230,6 +230,21 @@ def test_mission_revision_history_is_tenant_fenced_and_authority_bound():
     assert "GRANT SELECT, INSERT, UPDATE, DELETE" not in migration
 
 
+def test_web_push_subscriptions_are_encrypted_tenant_fenced_and_person_scoped():
+    migration = _migration(106)
+    assert "CREATE TABLE IF NOT EXISTS public.aos_v2_push_subscriptions" in migration
+    assert "sealed_subscription bytea NOT NULL" in migration
+    assert "endpoint text" not in migration
+    assert "p256dh text" not in migration and "auth_secret text" not in migration
+    assert "UNIQUE (tenant_id, subject_id, device_id)" in migration
+    assert "ALTER TABLE public.aos_v2_push_subscriptions FORCE ROW LEVEL SECURITY" in migration
+    assert "CREATE POLICY aos_v2_push_subscriptions_tenant_guc" in migration
+    assert "REVOKE ALL ON TABLE public.aos_v2_push_subscriptions FROM agentos_worker" in migration
+    assert "CREATE TABLE IF NOT EXISTS public.aos_v2_web_push_deliveries" in migration
+    assert "SELECT (tenant_id, status, available_at, lease_expires_at)" in migration
+    assert "CREATE POLICY aos_v2_web_push_deliveries_worker_discovery" in migration
+
+
 def test_controller_execution_scope_migration_preserves_tenant_rls_tables():
     migration = _migration(73)
     for table in ("controller_state", "controller_jobs"):

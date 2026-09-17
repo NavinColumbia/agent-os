@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
@@ -198,6 +200,68 @@ def evaluate(values: Mapping[str, str], *, require_bootstrap_secrets: bool) -> d
         "separate public HTTPS origins",
         public_ok and apps_ok and public_host != apps_host,
         "valid and separate" if public_ok and apps_ok and public_host != apps_host else "invalid or overlapping",
+    )
+
+    push_public = str(values.get("AOS_V2_WEB_PUSH_PUBLIC_KEY", "")).strip()
+    push_private = str(values.get("AOS_V2_WEB_PUSH_PRIVATE_KEY", "")).strip()
+    push_subject = str(values.get("AOS_V2_WEB_PUSH_SUBJECT", "")).strip()
+    push_values = (push_public, push_private, push_subject)
+    push_ok = not any(push_values) and not require_bootstrap_secrets
+    configured_without_local_secret = (
+        bool(push_public and push_subject and not push_private)
+        and not require_bootstrap_secrets
+    )
+    if all(push_values) or configured_without_local_secret:
+        try:
+            decoded_public = base64.b64decode(
+                push_public + "=" * (-len(push_public) % 4),
+                altchars=b"-_", validate=True,
+            )
+            decoded_private = (
+                b"provisioned-in-secret-manager"
+                if configured_without_local_secret
+                else base64.b64decode(
+                    push_private + "=" * (-len(push_private) % 4),
+                    altchars=b"-_", validate=True,
+                )
+            )
+        except (ValueError, TypeError, binascii.Error):
+            decoded_public = decoded_private = b""
+        subject_url = urlparse(push_subject)
+        subject_ok = (
+            (subject_url.scheme == "mailto" and bool(subject_url.path))
+            or (
+                subject_url.scheme == "https" and bool(subject_url.netloc)
+                and not subject_url.username and not subject_url.password
+            )
+        )
+        push_ok = (
+            len(decoded_public) == 65 and decoded_public[:1] == b"\x04"
+            and (configured_without_local_secret or len(decoded_private) == 32)
+            and subject_ok
+        )
+        if push_ok and require_bootstrap_secrets:
+            try:
+                from cryptography.hazmat.primitives.asymmetric import ec
+
+                private_key = ec.derive_private_key(
+                    int.from_bytes(decoded_private, "big"), ec.SECP256R1(),
+                )
+                numbers = private_key.public_key().public_numbers()
+                derived_public = (
+                    b"\x04"
+                    + numbers.x.to_bytes(32, "big")
+                    + numbers.y.to_bytes(32, "big")
+                )
+                push_ok = derived_public == decoded_public
+            except (ImportError, ValueError, OverflowError):
+                push_ok = False
+    add(
+        "Web Push key set",
+        push_ok,
+        "disabled" if not any(push_values) else (
+            "complete VAPID configuration" if push_ok else "must provide one valid public/private/contact set"
+        ),
     )
 
     oidc_urls = [str(values.get(key, "")) for key in (

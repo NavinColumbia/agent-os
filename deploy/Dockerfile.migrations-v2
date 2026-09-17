@@ -27,6 +27,7 @@ COPY --chmod=0444 postgres/initdb/102-personal-attention-state-v2.sql /migration
 COPY --chmod=0444 postgres/initdb/103-structured-decision-responses-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/104-decision-response-redrive-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/105-experience-events-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/106-web-push-subscriptions-v2.sql /migrations/
 COPY --chmod=0555 deploy/migrate-v2.sh /usr/local/bin/agentos-migrate-v2
 
 USER 999:999

@@ -20,6 +20,10 @@ def test_production_lock_excludes_unhashable_local_project_and_covers_direct_dep
     for requirement in pyproject["project"]["dependencies"]:
         normalized = requirement.split("[", 1)[0].split("=", 1)[0].lower().replace("_", "-")
         assert normalized in locked
+    assert {
+        "aiohttp", "aiohappyeyeballs", "aiosignal", "frozenlist",
+        "http-ece", "multidict", "propcache", "py-vapid", "yarl",
+    } <= locked
 
 
 def test_runtime_image_installs_locked_dependencies_before_local_package():
@@ -136,6 +140,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "103-structured-decision-responses-v2.sql" in compose
     assert "104-decision-response-redrive-v2.sql" in compose
     assert "105-experience-events-v2.sql" in compose
+    assert "106-web-push-subscriptions-v2.sql" in compose
     migration_image = (ROOT / "deploy" / "Dockerfile.migrations-v2").read_text()
     assert "99zzzzz-notification-delivery-v2.sql" in migration_image
     assert "100-mission-assurance-kernel-v2.sql" in migration_image
@@ -144,6 +149,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "103-structured-decision-responses-v2.sql" in migration_image
     assert "104-decision-response-redrive-v2.sql" in migration_image
     assert "105-experience-events-v2.sql" in migration_image
+    assert "106-web-push-subscriptions-v2.sql" in migration_image
     assert '127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080' in compose
     assert "GEMINI_API_KEY" in compose
     assert "AOS_V2_DATABASE_RUNTIME_PASSWORD" in compose
@@ -157,6 +163,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "AOS_V2_SANDBOX_BACKEND=disabled" in env_example
     assert "AOS_V2_PUBLIC_BASE_URL=http://localhost:8080" in env_example
     assert "AOS_V2_PREVIEW_TTL_SECONDS=604800" in env_example
+    assert "AOS_V2_WEB_PUSH_PUBLIC_KEY" in env_example
     assert "AOS_V2_CONNECTOR_SECRET_HOST_DIR=./connector-secrets" in env_example
     assert "@sha256:" in env_example
 

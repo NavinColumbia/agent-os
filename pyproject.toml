@@ -24,6 +24,7 @@ dependencies = [
   "pyjwt==2.13.0",
   "pydantic==2.13.4",
   "pydantic-ai-slim[anthropic,google,mcp,openai]==2.41.0",
+  "pywebpush==2.5.0",
   "python-dotenv==1.2.2",
   "requests==2.34.2",
   "sqlalchemy==2.0.51",

@@ -197,6 +197,14 @@ def test_worker_settings_require_explicit_model_and_production_tenants(monkeypat
     with pytest.raises(ValueError, match="AOS_V2_MODEL is required"):
         WorkerSettings.from_env()
 
+    monkeypatch.setenv("AOS_V2_MODEL", "provider:model")
+    monkeypatch.setenv("AOS_V2_WEB_PUSH_PUBLIC_KEY", "public-only")
+    monkeypatch.delenv("AOS_V2_WEB_PUSH_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("AOS_V2_WEB_PUSH_SUBJECT", raising=False)
+    with pytest.raises(ValueError, match="public/private VAPID keys"):
+        WorkerSettings.from_env()
+    monkeypatch.delenv("AOS_V2_WEB_PUSH_PUBLIC_KEY", raising=False)
+
     monkeypatch.setenv("AOS_ENVIRONMENT", "production")
     monkeypatch.setenv("AOS_V2_SYSTEM_DATABASE_URL", "postgresql://db/system")
     monkeypatch.setenv("AOS_V2_APPLICATION_DATABASE_URL", "postgresql://db/application")

@@ -121,3 +121,19 @@ def test_multiplexer_gives_durable_human_decisions_a_fair_turn():
         "lifecycle", "graph", "management", "management", "management",
     ]
     assert decisions.calls == 1
+
+
+def test_multiplexer_gives_background_push_a_fair_turn():
+    lifecycle = LifecycleWorker([CommandRunStatus.SUCCEEDED])
+    graph = GraphWorker([CommandRunStatus.SUCCEEDED])
+    push = ManagementWorker([CommandRunStatus.SUCCEEDED])
+    worker = TenantWorkMultiplexer(  # type: ignore[arg-type]
+        lifecycle_worker=lifecycle,
+        graph_worker=graph,
+        web_push_worker=push,
+    )
+
+    assert [worker.run_one("tenant-a").command_id for _ in range(3)] == [
+        "lifecycle", "graph", "management",
+    ]
+    assert push.calls == 1

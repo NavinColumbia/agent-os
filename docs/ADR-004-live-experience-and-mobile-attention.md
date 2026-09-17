@@ -1,6 +1,6 @@
 # ADR-004: Live Experience Transport and Mobile Attention
 
-- **Status:** accepted; durable catch-up, streaming, and AG-UI edge adapter implemented; push staged
+- **Status:** accepted and implemented; live activation requires a provisioned VAPID key pair
 - **Date:** 2026-09-17
 - **Owners:** experience, runtime assurance, platform operations
 
@@ -59,6 +59,7 @@ GET /v2/events?cursor=...                 # bounded catch-up
 GET /v2/events/stream?cursor=...          # authenticated SSE
 GET /v2/...                               # authoritative snapshots
 POST/DELETE /v2/me/push-subscriptions/... # explicit device enrollment
+GET /v2/me/push-deliveries                # person-scoped delivery receipts
 ```
 
 The event log carries enough information to refetch or safely update a projection, not a duplicate unbounded
@@ -103,8 +104,23 @@ The public catch-up and SSE endpoints now accept `protocol=ag-ui`. The adapter u
 Python package `ag-ui-protocol==0.1.22` and emits disclosure-narrowing `CUSTOM` events; official Pydantic models
 validate the boundary in regression tests. The default Agent OS contract is unchanged. Tenant identity, audience
 membership, private payloads, approval authority, and workflow internals are not copied into the AG-UI value.
-AG-UI remains an edge representation rather than persistence or authorization truth. Provisioned Web Push remains
-staged, so the endpoint does not yet claim that every background device is live.
+AG-UI remains an edge representation rather than persistence or authorization truth.
+
+Migration 106, the PWA service worker, and the worker fleet now implement standards-based Web Push. Browser
+capability endpoints and P-256/auth material are accepted only from an explicit provider allowlist, encrypted at
+rest with tenant/person/subscription-bound AEAD, and never returned through the API. Notification publication
+transactionally creates a durable delivery only for an eligible personal subscription. The renewable-lease worker
+retries transient provider failures, deactivates expired subscriptions, and records person-scoped receipts.
+Background payloads are deliberately generic: they disclose no mission title, question, body, or customer data and
+deep-link only to the authenticated inbox, which refetches authoritative state. Quiet hours delay ordinary pushes;
+explicit safety-critical/irreversible attention may bypass them. Enrollment is a user gesture, opt-out revokes
+future queued delivery, and foreground SSE/polling remain independent fallbacks.
+
+Code readiness does not imply live delivery on every deployment. Operators must provision one matching VAPID
+public/private pair plus a contact subject. In hosted GCP, all three are stable Secret Manager inputs so a later CI
+apply cannot silently erase the configuration; only the browser-visible public half is readable by the API, while
+the private key and contact remain worker-only. Startup/preflight fails closed on partial or mismatched
+configuration.
 
 ## Acceptance
 

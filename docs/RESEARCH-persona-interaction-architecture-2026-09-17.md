@@ -217,8 +217,10 @@ lifetime attempts plus the redriving actor remain auditable.
 
 The attention feed now uses a stable opaque `(created_at, notification_id)` cursor rather than an unbounded
 offset. The workspace can page backward without duplicates, keeps decision drafts across refresh/page renders,
-and applies every cursor inside the authenticated tenant and recipient projection. The live SSE/cursor event
-plane remains P1; this pagination contract is its durable historical half, not a claim that live push exists.
+and applies every cursor inside the authenticated tenant and recipient projection. The live SSE/cursor event plane
+and the privacy-reduced Web Push adapter are now implemented. Live push still requires deployment-specific VAPID
+provisioning and a real-device smoke; the durable inbox remains authoritative when a browser or provider cannot
+deliver in the background.
 
 First use now has a server-derived, resumable readiness projection covering identity, durable admission,
 standing organization, hard spend guard, model policy, human-decision routing, optional connectors, and the

@@ -93,6 +93,9 @@ locals {
     stripe_secret_key        = "${local.prefix}-stripe-secret-key"
     stripe_webhook_secret    = "${local.prefix}-stripe-webhook-secret"
     model_provider_key       = "${local.prefix}-model-provider-key"
+    web_push_public_key      = "${local.prefix}-web-push-public-key"
+    web_push_private_key     = "${local.prefix}-web-push-private-key"
+    web_push_subject         = "${local.prefix}-web-push-subject"
   }
 
   common_environment = {
@@ -170,6 +173,7 @@ locals {
     AOS_V2_TENANT_DERIVATION_SECRET = "tenant_derivation_secret"
     AOS_V2_STRIPE_SECRET_KEY        = "stripe_secret_key"
     AOS_V2_STRIPE_WEBHOOK_SECRET    = "stripe_webhook_secret"
+    AOS_V2_WEB_PUSH_PUBLIC_KEY      = "web_push_public_key"
   }
 
   worker_secret_environment = {
@@ -177,6 +181,9 @@ locals {
     AOS_V2_APPLICATION_DATABASE_URL         = "application_database_url"
     AOS_V2_CAPABILITY_SECRET                = "capability_secret"
     (var.model_provider_secret_environment) = "model_provider_key"
+    AOS_V2_WEB_PUSH_PUBLIC_KEY              = "web_push_public_key"
+    AOS_V2_WEB_PUSH_PRIVATE_KEY             = "web_push_private_key"
+    AOS_V2_WEB_PUSH_SUBJECT                 = "web_push_subject"
   }
 }
 
@@ -326,6 +333,7 @@ resource "google_secret_manager_secret_iam_member" "api" {
   for_each = toset([
     "system_database_url", "application_database_url", "capability_secret",
     "tenant_derivation_secret", "stripe_secret_key", "stripe_webhook_secret",
+    "web_push_public_key",
   ])
 
   secret_id = google_secret_manager_secret.runtime[each.value].id
@@ -336,6 +344,7 @@ resource "google_secret_manager_secret_iam_member" "api" {
 resource "google_secret_manager_secret_iam_member" "worker" {
   for_each = toset([
     "system_database_url", "application_database_url", "capability_secret", "model_provider_key",
+    "web_push_public_key", "web_push_private_key", "web_push_subject",
   ])
 
   secret_id = google_secret_manager_secret.runtime[each.value].id

@@ -64,7 +64,7 @@ export TF_VAR_alert_notification_channels="$AOS_ALERT_NOTIFICATION_CHANNELS"
 export TF_VAR_release_id="$release_id"
 export TF_VAR_app_builder_image="$app_builder_image"
 
-.venv/bin/python deploy/gcp/launch_preflight.py
+.venv/bin/python deploy/gcp/launch_preflight.py --require-bootstrap-secrets
 
 gcloud projects describe "$GCP_PROJECT_ID" >/dev/null
 gcloud projects describe "$GCP_SANDBOX_PROJECT_ID" >/dev/null
@@ -149,6 +149,9 @@ put_secret_version tenant_derivation_secret AOS_V2_TENANT_DERIVATION_SECRET 1 0
 put_secret_version stripe_secret_key AOS_V2_STRIPE_SECRET_KEY
 put_secret_version stripe_webhook_secret AOS_V2_STRIPE_WEBHOOK_SECRET
 put_secret_version model_provider_key AOS_V2_MODEL_PROVIDER_KEY
+put_secret_version web_push_public_key AOS_V2_WEB_PUSH_PUBLIC_KEY
+put_secret_version web_push_private_key AOS_V2_WEB_PUSH_PRIVATE_KEY
+put_secret_version web_push_subject AOS_V2_WEB_PUSH_SUBJECT
 
 runtime_repository=$(tofu -chdir="$tofu_root" output -raw artifact_registry_repository)
 build_service_account=$(tofu -chdir="$tofu_root" output -raw build_service_account)

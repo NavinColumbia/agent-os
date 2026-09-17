@@ -53,6 +53,11 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert "model_provider_key" in worker_secrets
     assert "stripe_secret_key" in api_secrets
     assert "model_provider_key" not in api_secrets
+    assert "web_push_private_key" not in api_secrets
+    assert "web_push_public_key" in api_secrets
+    assert "web_push_public_key" in worker_secrets
+    assert "web_push_private_key" in worker_secrets
+    assert "web_push_subject" in worker_secrets
     assert "migration_database_url" not in worker_secrets
     assert "migration_database_url" not in api_secrets
     assert "tenant_derivation_secret" in api_secrets
@@ -60,6 +65,15 @@ def test_gcp_cell_keeps_secrets_out_of_state_and_out_of_wrong_processes():
     assert 'AOS_V2_CONNECTOR_SECRET_BACKEND' in main and '= "gcp"' in main
     assert "AOS_V2_CONNECTOR_SECRET_PROJECT_ID" in main and "= var.project_id" in main
     assert 'AOS_V2_ARTIFACT_BACKEND' in main and '= "gcs"' in main
+    assert "AOS_V2_WEB_PUSH_PUBLIC_KEY" in main
+    assert "AOS_V2_WEB_PUSH_PRIVATE_KEY" in main
+    assert 'AOS_V2_WEB_PUSH_PRIVATE_KEY' in worker_secrets
+    assert 'AOS_V2_WEB_PUSH_PUBLIC_KEY' in worker_secrets
+    assert 'AOS_V2_WEB_PUSH_SUBJECT' in worker_secrets
+    assert "put_secret_version web_push_public_key" in deploy
+    assert "put_secret_version web_push_private_key" in deploy
+    assert "put_secret_version web_push_subject" in deploy
+    assert "TF_VAR_web_push" not in deploy
     assert 'role   = "roles/storage.objectCreator"' in main
     assert 'role   = "roles/storage.objectViewer"' in main
     writers = main.split('resource "google_storage_bucket_iam_member" "artifact_writers"', 1)[1]
@@ -120,6 +134,7 @@ def test_release_order_is_migrate_then_activate_and_images_require_digests():
     assert variables.count('@sha256:[0-9a-f]{64}$') == 4
     assert 'sandbox_tag="${runtime_repository}/sandbox:${release_id}"' in deploy
     assert '-var="sandbox_image=${sandbox_image}"' in deploy
+    assert "launch_preflight.py --require-bootstrap-secrets" in deploy
 
     workflow_text = text(".github/workflows/deploy-gcp.yml")
     workflow = yaml.safe_load(workflow_text)
@@ -127,6 +142,7 @@ def test_release_order_is_migrate_then_activate_and_images_require_digests():
     assert "workflow_dispatch:" in workflow_text
     assert "\n  push:" not in workflow_text
     assert "environment: production" in workflow_text
+    assert "TF_VAR_web_push_private_key" not in workflow_text
     migration_step = workflow_text.index("-target='google_cloud_run_v2_job.migrate[0]'")
     serving_step = workflow_text.index("apply API and worker revisions")
     assert migration_step < serving_step

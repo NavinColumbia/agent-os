@@ -21,6 +21,7 @@ x-runtime-environment: &runtime-environment
   AOS_V2_OIDC_ROLES_CLAIM: ${AOS_V2_OIDC_ROLES_CLAIM:-roles}
   AOS_V2_OIDC_ALGORITHMS: ${AOS_V2_OIDC_ALGORITHMS:-RS256,ES256}
   AOS_V2_PUBLIC_BASE_URL: ${AOS_V2_PUBLIC_BASE_URL:-http://localhost:8080}
+  AOS_V2_WEB_PUSH_PUBLIC_KEY: ${AOS_V2_WEB_PUSH_PUBLIC_KEY:-}
   AOS_V2_PREVIEW_TTL_SECONDS: ${AOS_V2_PREVIEW_TTL_SECONDS:-604800}
   AOS_V2_ARTIFACT_RETENTION_DAYS: ${AOS_V2_ARTIFACT_RETENTION_DAYS:-365}
   AOS_V2_ARTIFACT_MAX_CONTENT_BYTES: ${AOS_V2_ARTIFACT_MAX_CONTENT_BYTES:-2097152}
@@ -79,6 +80,7 @@ services:
       - ../postgres/initdb/103-structured-decision-responses-v2.sql:/migrations/103-structured-decision-responses-v2.sql:ro
       - ../postgres/initdb/104-decision-response-redrive-v2.sql:/migrations/104-decision-response-redrive-v2.sql:ro
       - ../postgres/initdb/105-experience-events-v2.sql:/migrations/105-experience-events-v2.sql:ro
+      - ../postgres/initdb/106-web-push-subscriptions-v2.sql:/migrations/106-web-push-subscriptions-v2.sql:ro
     command:
       - sh
       - -ec
@@ -108,6 +110,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/103-structured-decision-responses-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/104-decision-response-redrive-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/105-experience-events-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/106-web-push-subscriptions-v2.sql
         psql -v ON_ERROR_STOP=1 \
           -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
         SELECT format(
@@ -179,6 +182,8 @@ services:
       AOS_V2_MANAGER_TURN_COST_CENTS: ${AOS_V2_MANAGER_TURN_COST_CENTS:-25}
       AOS_V2_CONNECTOR_SECRET_BACKEND: file
       AOS_V2_CONNECTOR_SECRET_DIR: /run/secrets/agent-os-connectors
+      AOS_V2_WEB_PUSH_PRIVATE_KEY: ${AOS_V2_WEB_PUSH_PRIVATE_KEY:-}
+      AOS_V2_WEB_PUSH_SUBJECT: ${AOS_V2_WEB_PUSH_SUBJECT:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}

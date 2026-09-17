@@ -149,8 +149,9 @@
               </select>
             </label>
             <label class="checkbox-label" for="browser-notifications">
-              <input id="browser-notifications" type="checkbox"> Browser alerts while this workspace is available
+              <input id="browser-notifications" type="checkbox"> Browser and mobile alerts, including when this workspace is closed
             </label>
+            <p id="push-status" class="fineprint" role="status" aria-live="polite">Background alert status will appear after sign-in.</p>
             <label for="quiet-start">Quiet hours start <input id="quiet-start" type="time"></label>
             <label for="quiet-end">Quiet hours end <input id="quiet-end" type="time"></label>
             <label for="notification-timezone">Timezone <input id="notification-timezone" value="UTC" maxlength="128"></label>
@@ -163,7 +164,7 @@
             </label>
           </div>
           <div class="preference-actions"><button id="save-inbox-preferences" class="primary" type="button">Save preferences</button></div>
-          <p class="fineprint">The in-app inbox remains immediate. Digest cadence is retained for digest-capable channels; current Slack routes deliver eligible alerts individually. For phone alerts now, connect Slack and use Slack mobile. Native background web push remains separately provisioned.</p>
+          <p class="fineprint">The in-app inbox remains the authoritative record. Background alerts contain only a generic prompt to reopen Agent OS; mission details stay behind authenticated access. Digest cadence applies only to digest-capable channels.</p>
         </section>
         <div class="inbox-filters" role="group" aria-label="Filter inbox">
           <button class="quiet active" data-inbox-filter="open" type="button">Needs me</button>

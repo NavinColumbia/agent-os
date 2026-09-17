@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 import hashlib
 import json
 import re
 from typing import Callable, Mapping, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import (
+    BigInteger,
     JSON,
     Boolean,
     Column,
@@ -18,6 +20,7 @@ from sqlalchemy import (
     Index,
     MetaData,
     Integer,
+    LargeBinary,
     String,
     Table,
     Text,
@@ -37,6 +40,7 @@ from agent_os.application.ports import (
     ExperienceEventPage,
     NotificationDeliveryLease,
     NotificationStore,
+    WebPushDeliveryLease,
 )
 from agent_os.domain.notifications import (
     Notification,
@@ -44,10 +48,16 @@ from agent_os.domain.notifications import (
     NotificationPreferences,
     notification_fingerprint,
 )
+from agent_os.domain.web_push import WebPushSubscriptionMaterial, push_endpoint_host
 from agent_os.infrastructure.dbos_lifecycle import sqlalchemy_url
 from agent_os.infrastructure.sql_experience_events import (
     SQLExperienceEventLog,
     experience_source_key,
+)
+from agent_os.infrastructure.web_push import (
+    WebPushSubscriptionProtector,
+    public_subscription_record,
+    registration_fingerprint,
 )
 
 
@@ -132,6 +142,59 @@ notification_preferences = Table(
     Column("idempotency_key", String(200), nullable=False),
     Column("updated_by", String(256), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
+push_subscriptions = Table(
+    "aos_v2_push_subscriptions",
+    notification_metadata,
+    Column("tenant_id", String(128), primary_key=True),
+    Column("subscription_id", String(96), primary_key=True),
+    Column("subject_id", String(256), nullable=False),
+    Column("device_id", String(128), nullable=False),
+    Column("device_name", String(200), nullable=False),
+    Column("audience_ids", JSON, nullable=False),
+    Column("provider", String(255), nullable=False),
+    Column("endpoint_hash", String(64), nullable=False),
+    Column("sealed_subscription", LargeBinary, nullable=False),
+    Column("expiration_time", BigInteger, nullable=True),
+    Column("active", Boolean, nullable=False),
+    Column("version", Integer, nullable=False),
+    Column("fingerprint", String(64), nullable=False),
+    Column("registration_idempotency_key", String(200), nullable=False),
+    Column("registered_by", String(256), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("revoked_by", String(256), nullable=True),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+    Column("revoked_reason", Text, nullable=True),
+    Column("revocation_idempotency_key", String(200), nullable=True),
+    UniqueConstraint("tenant_id", "subject_id", "device_id"),
+    UniqueConstraint("tenant_id", "endpoint_hash"),
+)
+
+Index(
+    "aos_v2_push_subscriptions_recipient_idx",
+    push_subscriptions.c.tenant_id,
+    push_subscriptions.c.subject_id,
+    push_subscriptions.c.active,
+)
+
+push_subscription_mutations = Table(
+    "aos_v2_push_subscription_mutations",
+    notification_metadata,
+    Column("tenant_id", String(128), primary_key=True),
+    Column("idempotency_key", String(200), primary_key=True),
+    Column("action", String(32), nullable=False),
+    Column("subscription_id", String(96), nullable=False),
+    Column("fingerprint", String(64), nullable=False),
+    Column("record", JSON, nullable=False),
+    Column("actor_id", String(256), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["tenant_id", "subscription_id"],
+        ["aos_v2_push_subscriptions.tenant_id", "aos_v2_push_subscriptions.subscription_id"],
+        ondelete="CASCADE",
+    ),
 )
 
 decision_responses = Table(
@@ -253,6 +316,40 @@ Index(
     notification_deliveries.c.available_at,
 )
 
+web_push_deliveries = Table(
+    "aos_v2_web_push_deliveries",
+    notification_metadata,
+    Column("tenant_id", String(128), primary_key=True),
+    Column("delivery_id", String(96), primary_key=True),
+    Column("notification_id", String(128), nullable=False),
+    Column("subscription_id", String(96), nullable=False),
+    Column("status", String(32), nullable=False),
+    Column("attempts", Integer, nullable=False),
+    Column("available_at", DateTime(timezone=True), nullable=False),
+    Column("lease_owner", String(256), nullable=True),
+    Column("lease_expires_at", DateTime(timezone=True), nullable=True),
+    Column("last_error", JSON, nullable=True),
+    Column("result", JSON, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("delivered_at", DateTime(timezone=True), nullable=True),
+    ForeignKeyConstraint(
+        ["tenant_id", "notification_id"],
+        ["aos_v2_notifications.tenant_id", "aos_v2_notifications.notification_id"],
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["tenant_id", "subscription_id"],
+        ["aos_v2_push_subscriptions.tenant_id", "aos_v2_push_subscriptions.subscription_id"],
+    ),
+)
+
+Index(
+    "aos_v2_web_push_deliveries_ready_idx",
+    web_push_deliveries.c.tenant_id,
+    web_push_deliveries.c.status,
+    web_push_deliveries.c.available_at,
+)
+
 _ROUTE_ID = re.compile(r"^[a-z][a-z0-9-]{0,62}[a-z0-9]$")
 _DELIVERY_FORMATS = frozenset({"agent-os", "slack"})
 _CATEGORIES = frozenset(item.value for item in NotificationCategory)
@@ -265,11 +362,52 @@ def _parse_time(value: str) -> datetime:
     return parsed
 
 
+def _push_available_at(
+    created_at: datetime,
+    preferences: Mapping[str, Any],
+    *,
+    bypass_quiet_hours: bool,
+) -> datetime:
+    """Delay non-critical interruption until the person's quiet period ends."""
+
+    start_value = preferences.get("quiet_hours_start")
+    end_value = preferences.get("quiet_hours_end")
+    if bypass_quiet_hours or not start_value or not end_value:
+        return created_at
+    try:
+        zone = ZoneInfo(str(preferences.get("timezone") or "UTC"))
+        start_hour, start_minute = (int(item) for item in str(start_value).split(":"))
+        end_hour, end_minute = (int(item) for item in str(end_value).split(":"))
+        local = created_at.astimezone(zone)
+        current_minutes = local.hour * 60 + local.minute
+        start_minutes = start_hour * 60 + start_minute
+        end_minutes = end_hour * 60 + end_minute
+        within = (
+            start_minutes <= current_minutes < end_minutes
+            if start_minutes < end_minutes
+            else current_minutes >= start_minutes or current_minutes < end_minutes
+        )
+        if not within:
+            return created_at
+        end_date = local.date()
+        if start_minutes > end_minutes and current_minutes >= start_minutes:
+            end_date += timedelta(days=1)
+        quiet_end = datetime.combine(
+            end_date, datetime_time(end_hour, end_minute), tzinfo=zone,
+        )
+        return quiet_end.astimezone(timezone.utc)
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        # Preferences are validated at write time. A legacy/corrupt projection
+        # fails safe to the durable in-app inbox instead of dropping delivery.
+        return created_at
+
+
 class SQLNotificationStore(NotificationStore):
     def __init__(
         self,
         database_url: str,
         *,
+        push_protector: WebPushSubscriptionProtector | None = None,
         create_schema: bool = False,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -277,6 +415,7 @@ class SQLNotificationStore(NotificationStore):
             raise ValueError("database_url is required")
         self._engine = create_engine(sqlalchemy_url(database_url), pool_pre_ping=True)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._push_protector = push_protector
         self._experience_events = SQLExperienceEventLog(self._tenant_connection)
         if create_schema:
             notification_metadata.create_all(self._engine)
@@ -495,6 +634,87 @@ class SQLNotificationStore(NotificationStore):
                         "available_at": created_at,
                         "created_at": created_at,
                     } for row in eligible_routes])
+                push_rows = connection.execute(select(push_subscriptions).where(and_(
+                    push_subscriptions.c.tenant_id == notification.tenant_id,
+                    push_subscriptions.c.active.is_(True),
+                )).order_by(push_subscriptions.c.subscription_id).limit(257)).mappings().all()
+                if len(push_rows) > 256:
+                    raise RuntimeError("tenant Web Push device limit was exceeded")
+                preference_rows = connection.execute(select(
+                    notification_preferences.c.subject_id,
+                    notification_preferences.c.record,
+                ).where(and_(
+                    notification_preferences.c.tenant_id == notification.tenant_id,
+                    notification_preferences.c.subject_id.in_(
+                        tuple(row["subject_id"] for row in push_rows) or ("",)
+                    ),
+                ))).mappings().all()
+                push_preferences = {
+                    str(row["subject_id"]): dict(row["record"])
+                    for row in preference_rows
+                }
+                focused_push_categories = {
+                    NotificationCategory.HUMAN_ACTION_REQUIRED.value,
+                    NotificationCategory.OPERATOR_ATTENTION.value,
+                    NotificationCategory.RUN_FAILED.value,
+                    NotificationCategory.MANAGEMENT_ATTENTION.value,
+                }
+                balanced_push_categories = focused_push_categories | {
+                    NotificationCategory.WORK_RECOVERED.value,
+                }
+                push_targets = []
+                now_millis = int(created_at.timestamp() * 1_000)
+                bypass_quiet_hours = bool(
+                    notification.payload.get("bypass_quiet_hours")
+                    or str(notification.payload.get("severity") or "").lower()
+                    in {"critical", "irreversible"}
+                )
+                for subscription in push_rows:
+                    preferences = push_preferences.get(str(subscription["subject_id"]), {})
+                    if not preferences.get("browser_notifications"):
+                        continue
+                    mode = str(preferences.get("mode") or "balanced")
+                    eligible_category = (
+                        mode == "all"
+                        or (
+                            mode == "focused"
+                            and notification.category.value in focused_push_categories
+                        )
+                        or (
+                            mode == "balanced"
+                            and notification.category.value in balanced_push_categories
+                        )
+                    )
+                    if not externally_interrupting or not eligible_category:
+                        continue
+                    if not set(notification.recipient_ids) & set(subscription["audience_ids"]):
+                        continue
+                    if (
+                        subscription["expiration_time"] is not None
+                        and int(subscription["expiration_time"]) <= now_millis
+                    ):
+                        continue
+                    push_targets.append((
+                        subscription,
+                        _push_available_at(
+                            created_at, preferences,
+                            bypass_quiet_hours=bypass_quiet_hours,
+                        ),
+                    ))
+                if push_targets:
+                    connection.execute(insert(web_push_deliveries), [{
+                        "tenant_id": notification.tenant_id,
+                        "delivery_id": "push-delivery-" + hashlib.sha256(
+                            f"agent-os:web-push-delivery:v1:{notification.notification_id}:"
+                            f"{row['subscription_id']}".encode()
+                        ).hexdigest(),
+                        "notification_id": notification.notification_id,
+                        "subscription_id": row["subscription_id"],
+                        "status": "pending",
+                        "attempts": 0,
+                        "available_at": available_at,
+                        "created_at": created_at,
+                    } for row, available_at in push_targets])
                 self._append_experience_event(
                     connection,
                     tenant_id=notification.tenant_id,
@@ -799,6 +1019,283 @@ class SQLNotificationStore(NotificationStore):
             "updated_at": now.isoformat(),
             "duplicate": False,
         }
+
+    def register_push_subscription(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        device_id: str,
+        device_name: str,
+        audience_ids: tuple[str, ...],
+        material: WebPushSubscriptionMaterial,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]:
+        protector = self._push_protector
+        if protector is None:
+            raise RuntimeError("Web Push subscription protection is unavailable")
+        device_id = device_id.strip()
+        device_name = device_name.strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{16,128}", device_id) is None:
+            raise ValueError("Web Push device ID must be an opaque 16-128 character identifier")
+        if not 1 <= len(device_name) <= 200:
+            raise ValueError("Web Push device name is required")
+        audiences = tuple(dict.fromkeys(item.strip() for item in audience_ids if item.strip()))
+        if not audiences or len(audiences) > 32 or any(len(item) > 256 for item in audiences):
+            raise ValueError("Web Push audiences are missing or invalid")
+        if not actor_id.strip() or not 8 <= len(idempotency_key) <= 200:
+            raise ValueError("Web Push actor and idempotency key are required")
+        subscription_id = protector.subscription_id(tenant_id, subject_id, device_id)
+        endpoint_hash = protector.endpoint_hash(material.endpoint)
+        provider = push_endpoint_host(material.endpoint)
+        fingerprint = registration_fingerprint(
+            tenant_id=tenant_id,
+            subject_id=subject_id,
+            device_id=device_id,
+            device_name=device_name,
+            audience_ids=audiences,
+            material=material,
+        )
+        sealed = protector.seal(
+            material,
+            tenant_id=tenant_id,
+            subject_id=subject_id,
+            subscription_id=subscription_id,
+        )
+        now = self._clock()
+        with self._tenant_connection(tenant_id) as connection:
+            mutation = connection.execute(select(push_subscription_mutations).where(and_(
+                push_subscription_mutations.c.tenant_id == tenant_id,
+                push_subscription_mutations.c.idempotency_key == idempotency_key,
+            ))).mappings().one_or_none()
+            if mutation is not None:
+                if mutation["action"] != "register" or mutation["fingerprint"] != fingerprint:
+                    raise ValueError("Web Push idempotency key was reused with different content")
+                return {**dict(mutation["record"]), "duplicate": True}
+
+            endpoint_owner = connection.execute(select(
+                push_subscriptions.c.subscription_id,
+            ).where(and_(
+                push_subscriptions.c.tenant_id == tenant_id,
+                push_subscriptions.c.endpoint_hash == endpoint_hash,
+            ))).scalar_one_or_none()
+            if endpoint_owner is not None and endpoint_owner != subscription_id:
+                raise ValueError("Web Push endpoint is already enrolled to another device")
+
+            key = and_(
+                push_subscriptions.c.tenant_id == tenant_id,
+                push_subscriptions.c.subscription_id == subscription_id,
+            )
+            prior = connection.execute(
+                select(push_subscriptions).where(key).with_for_update()
+            ).mappings().one_or_none()
+            duplicate = bool(
+                prior is not None and prior["active"] and prior["fingerprint"] == fingerprint
+            )
+            if prior is None:
+                row: dict[str, Any] = {
+                    "tenant_id": tenant_id,
+                    "subscription_id": subscription_id,
+                    "subject_id": subject_id,
+                    "device_id": device_id,
+                    "device_name": device_name,
+                    "audience_ids": list(audiences),
+                    "provider": provider,
+                    "endpoint_hash": endpoint_hash,
+                    "sealed_subscription": sealed,
+                    "expiration_time": material.expiration_time,
+                    "active": True,
+                    "version": 1,
+                    "fingerprint": fingerprint,
+                    "registration_idempotency_key": idempotency_key,
+                    "registered_by": actor_id,
+                    "created_at": now,
+                    "updated_at": now,
+                    "revoked_by": None,
+                    "revoked_at": None,
+                    "revoked_reason": None,
+                    "revocation_idempotency_key": None,
+                }
+                connection.execute(insert(push_subscriptions).values(**row))
+            elif duplicate:
+                row = dict(prior)
+            else:
+                row = dict(prior)
+                row.update({
+                    "device_name": device_name,
+                    "audience_ids": list(audiences),
+                    "provider": provider,
+                    "endpoint_hash": endpoint_hash,
+                    "sealed_subscription": sealed,
+                    "expiration_time": material.expiration_time,
+                    "active": True,
+                    "version": int(prior["version"]) + 1,
+                    "fingerprint": fingerprint,
+                    "registration_idempotency_key": idempotency_key,
+                    "registered_by": actor_id,
+                    "updated_at": now,
+                    "revoked_by": None,
+                    "revoked_at": None,
+                    "revoked_reason": None,
+                    "revocation_idempotency_key": None,
+                })
+                writable = (
+                    "device_name", "audience_ids", "provider", "endpoint_hash", "sealed_subscription",
+                    "expiration_time", "active", "version", "fingerprint",
+                    "registration_idempotency_key", "registered_by", "updated_at",
+                    "revoked_by", "revoked_at", "revoked_reason",
+                    "revocation_idempotency_key",
+                )
+                connection.execute(update(push_subscriptions).where(key).values(
+                    **{field: row[field] for field in writable}
+                ))
+            record = public_subscription_record(row, duplicate=duplicate)
+            connection.execute(insert(push_subscription_mutations).values(
+                tenant_id=tenant_id,
+                idempotency_key=idempotency_key,
+                action="register",
+                subscription_id=subscription_id,
+                fingerprint=fingerprint,
+                record={**record, "duplicate": False},
+                actor_id=actor_id,
+                created_at=now,
+            ))
+            if not duplicate:
+                self._append_experience_event(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key(
+                        "push-subscription:registered", subscription_id, str(row["version"]),
+                    ),
+                    resource_type="push_subscription",
+                    resource_id=subscription_id,
+                    projection_revision=int(row["version"]),
+                    kind="push.subscription.registered",
+                    audience_ids=(subject_id,),
+                    safe_summary="A device was enrolled for background notifications.",
+                    occurred_at=now,
+                )
+        return record
+
+    def list_push_subscriptions(
+        self,
+        tenant_id: str,
+        *,
+        subject_id: str,
+    ) -> tuple[Mapping[str, Any], ...]:
+        with self._tenant_connection(tenant_id) as connection:
+            rows = connection.execute(select(push_subscriptions).where(and_(
+                push_subscriptions.c.tenant_id == tenant_id,
+                push_subscriptions.c.subject_id == subject_id,
+            )).order_by(
+                push_subscriptions.c.updated_at.desc(),
+                push_subscriptions.c.subscription_id,
+            ).limit(100)).mappings().all()
+        return tuple(public_subscription_record(row) for row in rows)
+
+    def revoke_push_subscription(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        subscription_id: str,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None:
+        reason = reason.strip()
+        if not reason or len(reason) > 2_000:
+            raise ValueError("Web Push revocation reason is required")
+        fingerprint = hashlib.sha256(json.dumps({
+            "action": "revoke",
+            "tenant_id": tenant_id,
+            "subject_id": subject_id,
+            "subscription_id": subscription_id,
+            "reason": reason,
+        }, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+        now = self._clock()
+        with self._tenant_connection(tenant_id) as connection:
+            mutation = connection.execute(select(push_subscription_mutations).where(and_(
+                push_subscription_mutations.c.tenant_id == tenant_id,
+                push_subscription_mutations.c.idempotency_key == idempotency_key,
+            ))).mappings().one_or_none()
+            if mutation is not None:
+                if mutation["action"] != "revoke" or mutation["fingerprint"] != fingerprint:
+                    raise ValueError("Web Push idempotency key was reused with different content")
+                return {**dict(mutation["record"]), "duplicate": True}
+            key = and_(
+                push_subscriptions.c.tenant_id == tenant_id,
+                push_subscriptions.c.subscription_id == subscription_id,
+                push_subscriptions.c.subject_id == subject_id,
+            )
+            prior = connection.execute(
+                select(push_subscriptions).where(key).with_for_update()
+            ).mappings().one_or_none()
+            if prior is None:
+                return None
+            duplicate = not bool(prior["active"])
+            row = dict(prior)
+            if not duplicate:
+                row.update({
+                    "active": False,
+                    "version": int(prior["version"]) + 1,
+                    "updated_at": now,
+                    "revoked_by": actor_id,
+                    "revoked_at": now,
+                    "revoked_reason": reason,
+                    "revocation_idempotency_key": idempotency_key,
+                })
+                connection.execute(update(push_subscriptions).where(key).values(
+                    active=False,
+                    version=row["version"],
+                    updated_at=now,
+                    revoked_by=actor_id,
+                    revoked_at=now,
+                    revoked_reason=reason,
+                    revocation_idempotency_key=idempotency_key,
+                ))
+                connection.execute(update(web_push_deliveries).where(and_(
+                    web_push_deliveries.c.tenant_id == tenant_id,
+                    web_push_deliveries.c.subscription_id == subscription_id,
+                    web_push_deliveries.c.status.in_(("pending", "executing")),
+                )).values(
+                    status="cancelled",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    last_error={
+                        "type": "SubscriptionRevoked",
+                        "message": "device enrollment was revoked",
+                        "retryable": False,
+                    },
+                ))
+            record = public_subscription_record(row, duplicate=duplicate)
+            connection.execute(insert(push_subscription_mutations).values(
+                tenant_id=tenant_id,
+                idempotency_key=idempotency_key,
+                action="revoke",
+                subscription_id=subscription_id,
+                fingerprint=fingerprint,
+                record={**record, "duplicate": False},
+                actor_id=actor_id,
+                created_at=now,
+            ))
+            if not duplicate:
+                self._append_experience_event(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key(
+                        "push-subscription:revoked", subscription_id, str(row["version"]),
+                    ),
+                    resource_type="push_subscription",
+                    resource_id=subscription_id,
+                    projection_revision=int(row["version"]),
+                    kind="push.subscription.revoked",
+                    audience_ids=(subject_id,),
+                    safe_summary="Background notifications were disabled for a device.",
+                    occurred_at=now,
+                )
+        return record
 
     @staticmethod
     def _decision_record(
@@ -1443,6 +1940,286 @@ class SQLNotificationStore(NotificationStore):
                 "disable_idempotency_key": idempotency_key,
             })
         return self._route_record(updated)
+
+    @staticmethod
+    def _eligible_web_push_delivery(now: datetime):
+        return or_(
+            and_(
+                web_push_deliveries.c.status == "pending",
+                web_push_deliveries.c.available_at <= now,
+            ),
+            and_(
+                web_push_deliveries.c.status == "executing",
+                web_push_deliveries.c.lease_expires_at < now,
+            ),
+        )
+
+    def claim_web_push_delivery(
+        self,
+        tenant_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> WebPushDeliveryLease | None:
+        protector = self._push_protector
+        if protector is None:
+            raise RuntimeError("Web Push subscription protection is unavailable")
+        if not worker_id.strip() or lease_seconds < 3:
+            raise ValueError("Web Push worker and lease of at least three seconds are required")
+        now = self._clock()
+        expires = now + timedelta(seconds=lease_seconds)
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(web_push_deliveries).where(and_(
+                web_push_deliveries.c.tenant_id == tenant_id,
+                self._eligible_web_push_delivery(now),
+            )).order_by(
+                web_push_deliveries.c.available_at,
+                web_push_deliveries.c.delivery_id,
+            ).limit(1).with_for_update(skip_locked=True)).mappings().one_or_none()
+            if row is None:
+                return None
+            subscription = connection.execute(select(push_subscriptions).where(and_(
+                push_subscriptions.c.tenant_id == tenant_id,
+                push_subscriptions.c.subscription_id == row["subscription_id"],
+            ))).mappings().one()
+            if not subscription["active"]:
+                connection.execute(update(web_push_deliveries).where(and_(
+                    web_push_deliveries.c.tenant_id == tenant_id,
+                    web_push_deliveries.c.delivery_id == row["delivery_id"],
+                )).values(
+                    status="cancelled", lease_owner=None, lease_expires_at=None,
+                    last_error={
+                        "type": "SubscriptionInactive",
+                        "message": "device enrollment is inactive",
+                        "retryable": False,
+                    },
+                ))
+                return None
+            changed = connection.execute(update(web_push_deliveries).where(and_(
+                web_push_deliveries.c.tenant_id == tenant_id,
+                web_push_deliveries.c.delivery_id == row["delivery_id"],
+                self._eligible_web_push_delivery(now),
+            )).values(
+                status="executing",
+                attempts=int(row["attempts"]) + 1,
+                lease_owner=worker_id,
+                lease_expires_at=expires,
+            )).rowcount
+            if changed != 1:
+                return None
+            notification = connection.execute(select(
+                notifications.c.notification_id,
+            ).where(and_(
+                notifications.c.tenant_id == tenant_id,
+                notifications.c.notification_id == row["notification_id"],
+            ))).mappings().one()
+        material = protector.open(
+            bytes(subscription["sealed_subscription"]),
+            tenant_id=tenant_id,
+            subject_id=str(subscription["subject_id"]),
+            subscription_id=str(subscription["subscription_id"]),
+        )
+        return WebPushDeliveryLease(
+            tenant_id=tenant_id,
+            delivery_id=str(row["delivery_id"]),
+            subscription_id=str(subscription["subscription_id"]),
+            subscription=material,
+            payload={
+                "title": "Agent OS needs your attention",
+                "body": "Open Agent OS to review the update securely.",
+                "url": "/app#view=inbox",
+                "tag": str(notification["notification_id"]),
+            },
+            worker_id=worker_id,
+            attempt=int(row["attempts"]) + 1,
+            lease_expires_at=expires.isoformat(),
+        )
+
+    def heartbeat_web_push_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> bool:
+        if lease_seconds < 3:
+            raise ValueError("Web Push delivery lease must be at least three seconds")
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(web_push_deliveries).where(and_(
+                web_push_deliveries.c.tenant_id == tenant_id,
+                web_push_deliveries.c.delivery_id == delivery_id,
+                web_push_deliveries.c.status == "executing",
+                web_push_deliveries.c.lease_owner == worker_id,
+            )).values(
+                lease_expires_at=self._clock() + timedelta(seconds=lease_seconds),
+            )).rowcount
+        return changed == 1
+
+    def complete_web_push_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        result: Mapping[str, Any],
+    ) -> bool:
+        json.dumps(result, allow_nan=False)
+        now = self._clock()
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(web_push_deliveries).where(and_(
+                web_push_deliveries.c.tenant_id == tenant_id,
+                web_push_deliveries.c.delivery_id == delivery_id,
+                web_push_deliveries.c.status == "executing",
+                web_push_deliveries.c.lease_owner == worker_id,
+            )).values(
+                status="delivered",
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=None,
+                result=dict(result),
+                delivered_at=now,
+            )).rowcount
+        return changed == 1
+
+    def retry_web_push_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+        delay_seconds: int,
+    ) -> bool:
+        json.dumps(error, allow_nan=False)
+        if not 0 <= delay_seconds <= 86_400:
+            raise ValueError("Web Push retry delay is invalid")
+        with self._tenant_connection(tenant_id) as connection:
+            changed = connection.execute(update(web_push_deliveries).where(and_(
+                web_push_deliveries.c.tenant_id == tenant_id,
+                web_push_deliveries.c.delivery_id == delivery_id,
+                web_push_deliveries.c.status == "executing",
+                web_push_deliveries.c.lease_owner == worker_id,
+            )).values(
+                status="pending",
+                available_at=self._clock() + timedelta(seconds=delay_seconds),
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=dict(error),
+            )).rowcount
+        return changed == 1
+
+    def fail_web_push_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+        revoke_subscription: bool = False,
+    ) -> bool:
+        json.dumps(error, allow_nan=False)
+        now = self._clock()
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(
+                web_push_deliveries.c.subscription_id,
+            ).where(and_(
+                web_push_deliveries.c.tenant_id == tenant_id,
+                web_push_deliveries.c.delivery_id == delivery_id,
+                web_push_deliveries.c.status == "executing",
+                web_push_deliveries.c.lease_owner == worker_id,
+            )).with_for_update()).mappings().one_or_none()
+            if row is None:
+                return False
+            connection.execute(update(web_push_deliveries).where(and_(
+                web_push_deliveries.c.tenant_id == tenant_id,
+                web_push_deliveries.c.delivery_id == delivery_id,
+            )).values(
+                status="failed",
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=dict(error),
+            ))
+            if revoke_subscription:
+                subscription_id = str(row["subscription_id"])
+                connection.execute(update(push_subscriptions).where(and_(
+                    push_subscriptions.c.tenant_id == tenant_id,
+                    push_subscriptions.c.subscription_id == subscription_id,
+                    push_subscriptions.c.active.is_(True),
+                )).values(
+                    active=False,
+                    version=push_subscriptions.c.version + 1,
+                    updated_at=now,
+                    revoked_by="system:web-push-worker",
+                    revoked_at=now,
+                    revoked_reason="Push service reported an expired subscription",
+                    revocation_idempotency_key=delivery_id,
+                ))
+                connection.execute(update(web_push_deliveries).where(and_(
+                    web_push_deliveries.c.tenant_id == tenant_id,
+                    web_push_deliveries.c.subscription_id == subscription_id,
+                    web_push_deliveries.c.status == "pending",
+                )).values(
+                    status="cancelled",
+                    last_error={
+                        "type": "SubscriptionExpired",
+                        "message": "push service rejected the expired enrollment",
+                        "retryable": False,
+                    },
+                ))
+        return True
+
+    def list_web_push_deliveries(
+        self,
+        tenant_id: str,
+        *,
+        subject_id: str,
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("Web Push delivery limit must be between 1 and 500")
+        with self._tenant_connection(tenant_id) as connection:
+            rows = connection.execute(select(
+                web_push_deliveries.c.delivery_id,
+                web_push_deliveries.c.notification_id,
+                web_push_deliveries.c.subscription_id,
+                web_push_deliveries.c.status,
+                web_push_deliveries.c.attempts,
+                web_push_deliveries.c.available_at,
+                web_push_deliveries.c.last_error,
+                web_push_deliveries.c.result,
+                web_push_deliveries.c.created_at,
+                web_push_deliveries.c.delivered_at,
+            ).select_from(web_push_deliveries.join(
+                push_subscriptions,
+                and_(
+                    push_subscriptions.c.tenant_id == web_push_deliveries.c.tenant_id,
+                    push_subscriptions.c.subscription_id == web_push_deliveries.c.subscription_id,
+                ),
+            )).where(and_(
+                web_push_deliveries.c.tenant_id == tenant_id,
+                push_subscriptions.c.subject_id == subject_id,
+            )).order_by(
+                web_push_deliveries.c.created_at.desc(),
+                web_push_deliveries.c.delivery_id.desc(),
+            ).limit(limit)).mappings().all()
+        return tuple({
+            "delivery_id": str(row["delivery_id"]),
+            "notification_id": str(row["notification_id"]),
+            "subscription_id": str(row["subscription_id"]),
+            "status": str(row["status"]),
+            "attempts": int(row["attempts"]),
+            "available_at": row["available_at"].isoformat(),
+            "error_type": (
+                None if not row["last_error"]
+                else str(row["last_error"].get("type") or "DeliveryError")
+            ),
+            "result": row["result"],
+            "created_at": row["created_at"].isoformat(),
+            "delivered_at": (
+                None if row["delivered_at"] is None else row["delivered_at"].isoformat()
+            ),
+        } for row in rows)
 
     @staticmethod
     def _eligible_delivery(now: datetime):

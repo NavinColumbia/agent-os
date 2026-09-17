@@ -72,6 +72,7 @@ from agent_os.domain.notifications import (
     NotificationPreferenceMode,
     NotificationPreferences,
 )
+from agent_os.domain.web_push import WebPushSubscriptionMaterial
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.domain.workflow_runtime import (
     TokenStatus,
@@ -416,6 +417,29 @@ class NotificationPreferencesRequest(BaseModel):
     quiet_hours_end: str | None = Field(default=None, pattern=r"^[0-2][0-9]:[0-5][0-9]$")
     timezone: str = Field(default="UTC", min_length=1, max_length=128)
     digest_interval_minutes: int = Field(default=60)
+
+
+class PushSubscriptionKeysRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    p256dh: str = Field(min_length=80, max_length=160)
+    auth: str = Field(min_length=20, max_length=64)
+
+
+class PushSubscriptionRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str = Field(min_length=16, max_length=128)
+    device_name: str = Field(min_length=1, max_length=200)
+    endpoint: str = Field(min_length=1, max_length=4_096)
+    expiration_time: int | None = Field(default=None, gt=0, le=9_999_999_999_999)
+    keys: PushSubscriptionKeysRequest
+
+
+class PushSubscriptionRevokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(default="Disabled from this device", min_length=1, max_length=2_000)
 
 
 class DecisionResponseRequest(BaseModel):
@@ -787,6 +811,7 @@ def create_app(
     mission_control: MissionControlStore | None = None,
     billing_service: BillingService | None = None,
     client_identity_config: Mapping[str, str] | None = None,
+    web_push_public_key: str | None = None,
     experience_stream_seconds: float = 55.0,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
@@ -809,6 +834,17 @@ def create_app(
         lifespan=lifespan,
     )
     public_identity, token_origin_value = _browser_identity_config(client_identity_config)
+    web_push_public_key = (web_push_public_key or "").strip()
+    if web_push_public_key:
+        try:
+            decoded_push_key = base64.urlsafe_b64decode(
+                web_push_public_key + "=" * (-len(web_push_public_key) % 4)
+            )
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("Web Push public key must be valid base64url") from exc
+        if len(decoded_push_key) != 65 or decoded_push_key[0] != 4:
+            raise ValueError("Web Push public key must be an uncompressed P-256 key")
+        public_identity["web_push_public_key"] = web_push_public_key
     token_origin = f" {token_origin_value}" if token_origin_value else ""
     workspace_headers = {
         "Cache-Control": "no-store",
@@ -2126,6 +2162,114 @@ def create_app(
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        @app.get("/v2/me/push-subscriptions")
+        def list_push_subscriptions(
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            reader = getattr(notification_store, "list_push_subscriptions", None)
+            if reader is None:
+                raise HTTPException(status_code=503, detail="Web Push subscriptions are unavailable")
+            return {"items": list(reader(
+                principal.organization_id, subject_id=principal.subject_id,
+            ))}
+
+        @app.get("/v2/me/push-deliveries")
+        def list_push_deliveries(
+            principal: Annotated[Principal, Depends(current_principal)],
+            limit: Annotated[int, Query(ge=1, le=100)] = 25,
+        ) -> Mapping[str, Any]:
+            reader = getattr(notification_store, "list_web_push_deliveries", None)
+            if reader is None:
+                raise HTTPException(status_code=503, detail="Web Push delivery receipts are unavailable")
+            return {"items": list(reader(
+                principal.organization_id,
+                subject_id=principal.subject_id,
+                limit=limit,
+            ))}
+
+        @app.post("/v2/me/push-subscriptions", status_code=201)
+        def register_push_subscription(
+            body: PushSubscriptionRegistrationRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not web_push_public_key:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Web Push requires a provisioned VAPID key before enrollment",
+                )
+            writer = getattr(notification_store, "register_push_subscription", None)
+            if writer is None:
+                raise HTTPException(status_code=503, detail="Web Push subscriptions are unavailable")
+            try:
+                material = WebPushSubscriptionMaterial(
+                    endpoint=body.endpoint,
+                    p256dh=body.keys.p256dh,
+                    auth=body.keys.auth,
+                    expiration_time=body.expiration_time,
+                )
+                return writer(
+                    tenant_id=principal.organization_id,
+                    subject_id=principal.subject_id,
+                    device_id=body.device_id,
+                    device_name=body.device_name,
+                    audience_ids=tuple(sorted({
+                        principal.subject_id,
+                        "tenant:members",
+                        *(f"role:{role}" for role in principal.roles),
+                        *(
+                            {"human:ceo", "role:executive"}
+                            if "owner" in principal.roles else set()
+                        ),
+                        *(
+                            {"human:operator", "operator:on-call"}
+                            if "operator" in principal.roles else set()
+                        ),
+                        *(
+                            {f"agent:{principal.subject_id}"}
+                            if "agent" in principal.roles else set()
+                        ),
+                    })),
+                    material=material,
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        @app.delete("/v2/me/push-subscriptions/{subscription_id}")
+        def revoke_push_subscription(
+            subscription_id: str,
+            body: PushSubscriptionRevokeRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if re.fullmatch(r"push-[0-9a-f]{64}", subscription_id) is None:
+                raise HTTPException(status_code=404, detail="Web Push subscription not found")
+            writer = getattr(notification_store, "revoke_push_subscription", None)
+            if writer is None:
+                raise HTTPException(status_code=503, detail="Web Push subscriptions are unavailable")
+            try:
+                result = writer(
+                    tenant_id=principal.organization_id,
+                    subject_id=principal.subject_id,
+                    subscription_id=subscription_id,
+                    actor_id=principal.subject_id,
+                    reason=body.reason,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(status_code=404, detail="Web Push subscription not found")
+            return result
 
         @app.put("/v2/notifications/{notification_id}/state")
         def set_notification_state(

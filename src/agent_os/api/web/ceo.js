@@ -5,6 +5,7 @@ const state = {
   timer: null, session: null, inboxFilter: "open", inboxItems: [], notificationPreferences: null,
   inboxCursor: null, decisionDrafts: {}, browserAlertBaseline: null, drawerReturnFocus: null,
   eventCursor: null, eventAbort: null, eventRefreshTimer: null,
+  pushSubscriptionId: null,
 };
 const byId = (id) => document.getElementById(id);
 const el = (tag, className, text) => {
@@ -213,6 +214,7 @@ async function connect(token) {
       setFlash(billingNotice === "success" ? "Subscription received. Entitlements update after Stripe confirms it." : "Billing account refreshed.");
     }
     await refreshInboxBadge();
+    reconcileBackgroundPush().catch(() => null);
     startLiveEvents();
     state.timer = window.setInterval(() => {
       if (!document.hidden && state.token) refreshAmbient();
@@ -238,6 +240,7 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   state.notificationPreferences = null;
   state.browserAlertBaseline = null;
   state.eventCursor = null;
+  state.pushSubscriptionId = null;
   closeDrawer();
   byId("workspace").classList.add("hidden");
   byId("auth-gate").classList.remove("hidden");
@@ -749,6 +752,11 @@ function hydrateInboxPreferences(preferences) {
   byId("digest-interval").value = String(preferences.digest_interval_minutes || 60);
 }
 
+function setPushStatus(message) {
+  const node = byId("push-status");
+  if (node) node.textContent = message;
+}
+
 function withinQuietHours(preferences) {
   if (!preferences?.quiet_hours_start || !preferences?.quiet_hours_end) return false;
   try {
@@ -783,6 +791,117 @@ function deliverBrowserAlerts(items) {
     });
     notice.onclick = () => { window.focus(); selectView("inbox"); notice.close(); };
   }
+}
+
+function webPushDeviceId() {
+  const key = "aos.web-push.device-id";
+  let value = localStorage.getItem(key);
+  if (!value) {
+    value = crypto.randomUUID();
+    localStorage.setItem(key, value);
+  }
+  return value;
+}
+
+function applicationServerKey(value) {
+  const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4);
+  const raw = atob(padded);
+  return Uint8Array.from(raw, (character) => character.charCodeAt(0));
+}
+
+async function enrollBackgroundPush() {
+  if (!state.config?.web_push_public_key) {
+    setPushStatus("Background delivery is not provisioned for this deployment.");
+    return false;
+  }
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !window.Notification) {
+    setPushStatus("This browser does not support background Web Push.");
+    return false;
+  }
+  if (!window.isSecureContext) throw new Error("Background alerts require HTTPS (localhost is allowed for local testing).");
+  const permission = Notification.permission === "granted"
+    ? "granted" : await Notification.requestPermission();
+  if (permission !== "granted") throw new Error("Browser notification permission was not granted.");
+  const registration = await navigator.serviceWorker.ready;
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: applicationServerKey(state.config.web_push_public_key),
+    });
+  }
+  const encoded = subscription.toJSON();
+  if (!encoded.endpoint || !encoded.keys?.p256dh || !encoded.keys?.auth) {
+    throw new Error("The browser returned an incomplete push subscription.");
+  }
+  const record = await api("/v2/me/push-subscriptions", {
+    method: "POST",
+    headers: {"Idempotency-Key": `push-register-${crypto.randomUUID()}`},
+    body: JSON.stringify({
+      device_id: webPushDeviceId(),
+      device_name: "This browser",
+      endpoint: encoded.endpoint,
+      expiration_time: encoded.expirationTime || null,
+      keys: encoded.keys,
+    }),
+  });
+  state.pushSubscriptionId = record.subscription_id;
+  setPushStatus("Background alerts are active on this device.");
+  return true;
+}
+
+async function revokeBackgroundPush() {
+  if (!("serviceWorker" in navigator)) return;
+  const deviceId = webPushDeviceId();
+  const records = await api("/v2/me/push-subscriptions");
+  const record = (records.items || []).find((item) => item.device_id === deviceId && item.active);
+  if (record) {
+    await api(`/v2/me/push-subscriptions/${encodeURIComponent(record.subscription_id)}`, {
+      method: "DELETE",
+      headers: {"Idempotency-Key": `push-revoke-${crypto.randomUUID()}`},
+      body: JSON.stringify({reason: "Disabled by the signed-in person"}),
+    });
+  }
+  const registration = await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.getSubscription();
+  if (subscription) await subscription.unsubscribe();
+  state.pushSubscriptionId = null;
+  setPushStatus("Background alerts are off on this device.");
+}
+
+async function reconcileBackgroundPush() {
+  if (!state.token) return;
+  if (!state.config?.web_push_public_key) {
+    setPushStatus("Background delivery is not provisioned for this deployment.");
+    return;
+  }
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !window.Notification) {
+    setPushStatus("This browser does not support background Web Push.");
+    return;
+  }
+  if (!state.notificationPreferences?.browser_notifications) {
+    setPushStatus("Background alerts are off on this device.");
+    return;
+  }
+  if (Notification.permission === "denied") {
+    setPushStatus("Background alerts are blocked in this browser's site settings.");
+    return;
+  }
+  if (Notification.permission !== "granted") {
+    setPushStatus("Save notification settings to allow background alerts on this device.");
+    return;
+  }
+  const registration = await navigator.serviceWorker.ready;
+  const browserSubscription = await registration.pushManager.getSubscription();
+  const deviceId = webPushDeviceId();
+  const records = await api("/v2/me/push-subscriptions");
+  const activeRecord = (records.items || []).find((item) => item.device_id === deviceId && item.active);
+  if (browserSubscription && activeRecord) {
+    state.pushSubscriptionId = activeRecord.subscription_id;
+    setPushStatus("Background alerts are active on this device.");
+    return;
+  }
+  await enrollBackgroundPush();
 }
 
 function field(placeholder, ariaLabel, maxLength = 256) {
@@ -1482,6 +1601,8 @@ byId("organization-select").addEventListener("change", async (event) => {
   state.browserAlertBaseline = null;
   state.inboxCursor = null;
   state.decisionDrafts = {};
+  state.notificationPreferences = null;
+  state.pushSubscriptionId = null;
   state.eventCursor = null;
   sessionStorage.setItem("aos.organization", state.organization);
   closeDrawer();
@@ -1489,6 +1610,8 @@ byId("organization-select").addEventListener("change", async (event) => {
   applyRoleExperience();
   setFlash("Organization changed.");
   await refreshView();
+  await refreshInboxBadge();
+  reconcileBackgroundPush().catch((error) => setPushStatus(error.message));
   startLiveEvents();
 });
 byId("drawer-close").addEventListener("click", closeDrawer);
@@ -1542,6 +1665,11 @@ byId("save-inbox-preferences").addEventListener("click", async (event) => {
   }
   button.disabled = true;
   try {
+    if (browserNotifications && state.config?.web_push_public_key) {
+      await enrollBackgroundPush();
+    } else if (!browserNotifications && state.config?.web_push_public_key) {
+      await revokeBackgroundPush();
+    }
     state.notificationPreferences = await api("/v2/notification-preferences", {
       method: "PUT", headers: {"Idempotency-Key": `notice-preferences-${crypto.randomUUID()}`},
       body: JSON.stringify({
@@ -1579,6 +1707,11 @@ document.addEventListener("visibilitychange", () => {
   setLiveStatus("Reconnecting live updates…");
   refreshAmbient();
   startLiveEvents();
+});
+navigator.serviceWorker?.addEventListener("message", (event) => {
+  if (event.data?.type === "push-subscription-changed") {
+    reconcileBackgroundPush().catch(() => null);
+  }
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {

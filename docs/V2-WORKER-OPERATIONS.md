@@ -130,6 +130,26 @@ delivery, sends the delivery ID through the connector's upstream idempotency hea
 failed delivery explicitly. Disabling a route stops new deliveries and cancels queued ones; an already in-flight
 HTTP request cannot be retracted, so receivers must honor idempotency. Provider credentials remain external.
 
+Per-person background alerts use standards-based Web Push rather than tenant-wide connector routes. A person opts
+in from the PWA, which enrolls one browser device at `POST /v2/me/push-subscriptions`; the endpoint capability and
+browser encryption keys are encrypted before persistence and are never returned. Eligible notification commits
+create deterministic durable deliveries, and the worker leases/retries them alongside other tenant work. Only a
+generic “open Agent OS” payload leaves the system; all mission content is fetched again after authentication.
+`GET /v2/me/push-deliveries` exposes only the signed-in person's delivery receipts. A 404/410 from a push service
+deactivates that device. Normal alerts respect quiet hours; explicit critical/irreversible attention can bypass
+them. Configure all three values or none:
+
+```text
+AOS_V2_WEB_PUSH_PUBLIC_KEY       # browser-visible URL-safe P-256 public key
+AOS_V2_WEB_PUSH_PRIVATE_KEY      # worker-only secret
+AOS_V2_WEB_PUSH_SUBJECT          # mailto: or HTTPS operator contact
+```
+
+Generate a pair with `.venv/bin/python deploy/generate_web_push_keys.py`. Treat its private-key line as a secret.
+Local Compose accepts the trio from `deploy/v2.env`; hosted deployment writes only the private value to Secret
+Manager. Startup and launch preflight reject partial configuration, and the worker independently proves that the
+public/private keys match.
+
 Retry waits use an RFC 3339 due time written directly into the command outbox's `available_at`; no worker sleeps while waiting. When claimed, the explicit `schedule_retry`
 executor re-checks the exact correlation against current lifecycle state, treats cancelled/superseded timers as
 harmless, and idempotently emits the original resume command. Protocol-specific effects outside the registered
@@ -325,7 +345,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–99zzzz), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–106), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
 actual provider tenant, secrets management, production configuration, artifact garbage collection,
 usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch

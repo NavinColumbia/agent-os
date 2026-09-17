@@ -21,6 +21,7 @@ from agent_os.domain.mission_model import (
     MissionSpec,
 )
 from agent_os.domain.notifications import Notification, NotificationPreferences
+from agent_os.domain.web_push import WebPushSubscriptionMaterial
 from agent_os.domain.organization import Organization
 from agent_os.domain.organization_events import OrganizationEvent
 from agent_os.domain.workflow import WorkflowDefinition
@@ -92,6 +93,20 @@ class NotificationDeliveryLease:
     delivery_id: str
     notification: Mapping[str, Any]
     route: Mapping[str, Any]
+    worker_id: str
+    attempt: int
+    lease_expires_at: str
+
+
+@dataclass(frozen=True)
+class WebPushDeliveryLease:
+    """Crash-recoverable ownership of one privacy-reduced device push."""
+
+    tenant_id: str
+    delivery_id: str
+    subscription_id: str
+    subscription: WebPushSubscriptionMaterial
+    payload: Mapping[str, Any]
     worker_id: str
     attempt: int
     lease_expires_at: str
@@ -656,6 +671,91 @@ class NotificationStore(Protocol):
         actor_id: str,
         idempotency_key: str,
     ) -> Mapping[str, Any]: ...
+
+    def register_push_subscription(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        device_id: str,
+        device_name: str,
+        audience_ids: tuple[str, ...],
+        material: WebPushSubscriptionMaterial,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def list_push_subscriptions(
+        self,
+        tenant_id: str,
+        *,
+        subject_id: str,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def revoke_push_subscription(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        subscription_id: str,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
+
+    def claim_web_push_delivery(
+        self,
+        tenant_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> WebPushDeliveryLease | None: ...
+
+    def heartbeat_web_push_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> bool: ...
+
+    def complete_web_push_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        result: Mapping[str, Any],
+    ) -> bool: ...
+
+    def retry_web_push_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+        delay_seconds: int,
+    ) -> bool: ...
+
+    def fail_web_push_delivery(
+        self,
+        tenant_id: str,
+        delivery_id: str,
+        *,
+        worker_id: str,
+        error: Mapping[str, Any],
+        revoke_subscription: bool = False,
+    ) -> bool: ...
+
+    def list_web_push_deliveries(
+        self,
+        tenant_id: str,
+        *,
+        subject_id: str,
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
 
     def admit_decision_response(
         self,

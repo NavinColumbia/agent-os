@@ -23,6 +23,7 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
         "AOS_V2_ARTIFACT_MAX_CONTENT_BYTES",
         "AOS_V2_ARTIFACT_RETENTION_DAYS",
         "AOS_V2_OIDC_PERSONAL_TENANTS", "AOS_V2_TENANT_DERIVATION_SECRET",
+        "AOS_V2_WEB_PUSH_PUBLIC_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = ServerSettings.from_env()

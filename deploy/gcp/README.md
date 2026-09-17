@@ -78,6 +78,14 @@ export AOS_V2_MODEL=openai:gpt-5-mini
 export AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT=OPENAI_API_KEY
 export AOS_V2_MODEL_PROVIDER_KEY=replace
 
+# Required standards-based background alerts. Generate one VAPID P-256 pair;
+# the deploy script puts the trio in separately permissioned Secret Manager entries.
+# `.venv/bin/python deploy/generate_web_push_keys.py` prints matching values;
+# treat the private-key line as a secret and do not commit it.
+export AOS_V2_WEB_PUSH_PUBLIC_KEY=replace_urlsafe_base64_public_key
+export AOS_V2_WEB_PUSH_PRIVATE_KEY=replace_urlsafe_base64_private_key
+export AOS_V2_WEB_PUSH_SUBJECT=mailto:push-operations@your-domain.example
+
 # Google/Gemini is also supported: use `google:<model>` with
 # AOS_V2_MODEL_PROVIDER_SECRET_ENVIRONMENT=GEMINI_API_KEY (or GOOGLE_API_KEY).
 
@@ -212,7 +220,9 @@ After the first apply, set these GitHub repository/environment variables from th
 - `AOS_ALERT_NOTIFICATION_CHANNELS`, a JSON list of full Monitoring notification-channel resource names (or `[]`)
 
 Runtime credentials stay in GCP Secret Manager and are never copied into GitHub. The worker identity cannot read
-Stripe secrets; the API identity cannot read the model-provider key. GitHub deployment can update Cloud Run and
+Stripe secrets; the API identity cannot read the model-provider key or Web Push private key. The browser-visible
+VAPID public key is also loaded from Secret Manager so later GitHub applies cannot accidentally disable push by
+omitting a Terraform variable. GitHub deployment can update Cloud Run and
 submit builds but cannot read secret payloads.
 
 `.github/workflows/deploy-gcp.yml` is the installed, manual-only production workflow. GitHub's `production`

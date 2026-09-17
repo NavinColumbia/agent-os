@@ -10,6 +10,7 @@ psycopg[binary]==3.3.4
 psycopg-pool==3.3.1
 pydantic==2.13.4
 pydantic-ai-slim[anthropic,mcp,openai]==2.41.0
+pywebpush==2.5.0
 python-dotenv==1.2.2
 requests==2.34.2
 sqlalchemy==2.0.51

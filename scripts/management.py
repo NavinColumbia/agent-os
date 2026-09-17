@@ -260,6 +260,9 @@ def signal(dedupe_key: str, subject: str, trigger: str, state: dict | None = Non
     tenant_id = tenant_id or "_platform"
     fp = _fingerprint({"trigger": trigger, "state": semantic_state})
     cid = f"mc-{hashlib.sha256(f'{tenant_id}:{dedupe_key}'.encode()).hexdigest()[:20]}"
+    case_lock = int.from_bytes(hashlib.sha256(
+        f"agent-os:management-case-lock:v1:{tenant_id}:{dedupe_key}".encode()
+    ).digest()[:8], byteorder="big", signed=True)
     last_error = None
     for attempt in range(MANAGEMENT_SIGNAL_ATTEMPTS):
         try:
@@ -280,12 +283,20 @@ def signal(dedupe_key: str, subject: str, trigger: str, state: dict | None = Non
                     lock_ms=lock_ms,
                     statement_ms=MANAGEMENT_DB_STATEMENT_TIMEOUT_MS,
                 )
+                # PostgreSQL can arbitrate one ON CONFLICT target only, while
+                # management_cases intentionally has both a deterministic
+                # primary key and a tenant/dedupe unique key (including rows
+                # written by older case-id schemes). Serialize this one logical
+                # case before the upsert so neither constraint can race the
+                # other. The transaction-scoped lock obeys the bounded lock
+                # timeout above and is automatically released on rollback.
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (case_lock,))
                 cur.execute("""INSERT INTO management_cases
                                  (case_id,dedupe_key,tenant_id,product,work_id,subject,worker,
                                   manager_role,trigger,state,semantic_state,observation,state_fingerprint,
                                   progress_seq)
                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                               ON CONFLICT (case_id) DO UPDATE SET
+                               ON CONFLICT (tenant_id,dedupe_key) DO UPDATE SET
                                  product=COALESCE(EXCLUDED.product,management_cases.product),
                                  work_id=COALESCE(EXCLUDED.work_id,management_cases.work_id),
                                  subject=EXCLUDED.subject,
@@ -309,8 +320,6 @@ def signal(dedupe_key: str, subject: str, trigger: str, state: dict | None = Non
                                  updated_at=CASE
                                    WHEN management_cases.state_fingerprint <> EXCLUDED.state_fingerprint
                                    THEN now() ELSE management_cases.updated_at END
-                               WHERE management_cases.tenant_id = EXCLUDED.tenant_id
-                                 AND management_cases.dedupe_key = EXCLUDED.dedupe_key
                                RETURNING case_id,status,next_review_at,semantic_generation""",
                             (cid, dedupe_key, tenant_id, product, work_id, subject, worker,
                              manager_role, trigger, json.dumps(state, default=str),
@@ -318,8 +327,6 @@ def signal(dedupe_key: str, subject: str, trigger: str, state: dict | None = Non
                              json.dumps(observation, default=str), fp,
                              1 if progress else 0))
                 row = cur.fetchone()
-                if row is None:
-                    raise RuntimeError("management case identity collision")
                 cur.execute("""UPDATE management_cases
                                   SET last_event_generation=semantic_generation
                                 WHERE case_id=%s AND last_event_generation<semantic_generation

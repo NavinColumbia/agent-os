@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 from urllib.parse import urlparse
 
 from fastapi import FastAPI
@@ -29,6 +30,7 @@ from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_billing import SQLBillingStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
+from agent_os.infrastructure.sql_execution_health import SQLExecutionHealthReader
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.stripe_billing import StripeBillingGateway
 from agent_os.infrastructure.web_push import WebPushSubscriptionProtector
@@ -67,6 +69,15 @@ class ServerSettings:
     stripe_growth_model_budget_cents: int
     stripe_api_version: str
     application_version: str
+    execution_cell_id: str
+    worker_heartbeat_seconds: int
+    worker_stale_seconds: int
+    queue_probe_stale_seconds: int
+    discovery_stale_seconds: int
+    worker_no_progress_seconds: int
+    queue_backlog_max_age_seconds: int
+    discovery_error_threshold: int
+    queue_sample_cap: int
     public_base_url: str
     web_push_public_key: str
     preview_ttl_seconds: int
@@ -267,6 +278,57 @@ class ServerSettings:
         artifact_retention_days = int(os.getenv("AOS_V2_ARTIFACT_RETENTION_DAYS", "365"))
         if not 30 <= artifact_retention_days <= 3650:
             raise ValueError("AOS_V2_ARTIFACT_RETENTION_DAYS must be between 30 and 3650")
+        execution_cell_id = os.getenv("AOS_V2_EXECUTION_CELL_ID", "bootstrap").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", execution_cell_id):
+            raise ValueError("AOS_V2_EXECUTION_CELL_ID must be a safe 1 to 128 character ID")
+        worker_heartbeat_seconds = int(
+            os.getenv("AOS_V2_WORKER_HEARTBEAT_SECONDS", "15")
+        )
+        worker_stale_seconds = int(os.getenv("AOS_V2_WORKER_STALE_SECONDS", "60"))
+        queue_probe_stale_seconds = int(
+            os.getenv("AOS_V2_QUEUE_PROBE_STALE_SECONDS", "60")
+        )
+        discovery_stale_seconds = int(
+            os.getenv("AOS_V2_DISCOVERY_STALE_SECONDS", "60")
+        )
+        worker_no_progress_seconds = int(
+            os.getenv("AOS_V2_WORKER_NO_PROGRESS_SECONDS", "7200")
+        )
+        queue_backlog_max_age_seconds = int(
+            os.getenv("AOS_V2_QUEUE_BACKLOG_MAX_AGE_SECONDS", "120")
+        )
+        discovery_error_threshold = int(
+            os.getenv("AOS_V2_DISCOVERY_ERROR_THRESHOLD", "3")
+        )
+        queue_sample_cap = int(os.getenv("AOS_V2_QUEUE_SAMPLE_CAP", "1000"))
+        if not 5 <= worker_heartbeat_seconds <= 60:
+            raise ValueError("AOS_V2_WORKER_HEARTBEAT_SECONDS must be between 5 and 60")
+        for name, value in (
+            ("AOS_V2_WORKER_STALE_SECONDS", worker_stale_seconds),
+            ("AOS_V2_QUEUE_PROBE_STALE_SECONDS", queue_probe_stale_seconds),
+            ("AOS_V2_DISCOVERY_STALE_SECONDS", discovery_stale_seconds),
+        ):
+            if not 3 * worker_heartbeat_seconds <= value <= 600:
+                raise ValueError(
+                    f"{name} must be at least three heartbeats and no more than 600"
+                )
+        if not 30 <= queue_backlog_max_age_seconds <= 3600:
+            raise ValueError(
+                "AOS_V2_QUEUE_BACKLOG_MAX_AGE_SECONDS must be between 30 and 3600"
+            )
+        if not 60 <= worker_no_progress_seconds <= 86_400:
+            raise ValueError(
+                "AOS_V2_WORKER_NO_PROGRESS_SECONDS must be between 60 and 86400"
+            )
+        if not 1 <= discovery_error_threshold <= 20:
+            raise ValueError("AOS_V2_DISCOVERY_ERROR_THRESHOLD must be between 1 and 20")
+        if not 100 <= queue_sample_cap <= 10_000:
+            raise ValueError("AOS_V2_QUEUE_SAMPLE_CAP must be between 100 and 10000")
+        application_version = os.getenv("AOS_V2_APPLICATION_VERSION", "v2-dev").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", application_version):
+            raise ValueError(
+                "AOS_V2_APPLICATION_VERSION must be a safe 1 to 128 character ID"
+            )
         return cls(
             environment=environment,
             system_database_url=system_database_url,
@@ -298,7 +360,16 @@ class ServerSettings:
             stripe_starter_model_budget_cents=stripe_starter_model_budget_cents,
             stripe_growth_model_budget_cents=stripe_growth_model_budget_cents,
             stripe_api_version=stripe_api_version,
-            application_version=os.getenv("AOS_V2_APPLICATION_VERSION", "v2-dev"),
+            application_version=application_version,
+            execution_cell_id=execution_cell_id,
+            worker_heartbeat_seconds=worker_heartbeat_seconds,
+            worker_stale_seconds=worker_stale_seconds,
+            queue_probe_stale_seconds=queue_probe_stale_seconds,
+            discovery_stale_seconds=discovery_stale_seconds,
+            worker_no_progress_seconds=worker_no_progress_seconds,
+            queue_backlog_max_age_seconds=queue_backlog_max_age_seconds,
+            discovery_error_threshold=discovery_error_threshold,
+            queue_sample_cap=queue_sample_cap,
             public_base_url=public_base_url,
             web_push_public_key=web_push_public_key,
             preview_ttl_seconds=preview_ttl_seconds,
@@ -425,6 +496,11 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             create_schema=settings.create_schema,
         )
         resources.callback(usage_meter.close)
+        execution_health = SQLExecutionHealthReader(
+            settings.application_database_url,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(execution_health.close)
         billing_service = None
         billing_store = None
         if settings.billing_mode == "stripe":
@@ -490,6 +566,15 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             billing_service=billing_service,
             client_identity_config=browser_identity_config(settings),
             web_push_public_key=settings.web_push_public_key,
+            execution_health=execution_health,
+            execution_cell_id=settings.execution_cell_id,
+            application_version=settings.application_version,
+            worker_stale_seconds=settings.worker_stale_seconds,
+            queue_probe_stale_seconds=settings.queue_probe_stale_seconds,
+            discovery_stale_seconds=settings.discovery_stale_seconds,
+            worker_no_progress_seconds=settings.worker_no_progress_seconds,
+            queue_backlog_max_age_seconds=settings.queue_backlog_max_age_seconds,
+            discovery_error_threshold=settings.discovery_error_threshold,
             shutdown=resources.close,
         )
     except Exception:
@@ -508,6 +593,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.mission_work_assignment_store = mission_work_assignment_store
     app.state.tenant_model_store = tenant_model_store
     app.state.usage_meter = usage_meter
+    app.state.execution_health = execution_health
     app.state.mission_control = mission_control
     app.state.billing_store = billing_store
     app.state.billing_service = billing_service

@@ -123,18 +123,39 @@ def test_break_glass_identity_can_only_fence_generated_apps_and_has_no_secret_or
 
 def test_release_order_is_migrate_then_activate_and_images_require_digests():
     deploy = text("deploy/gcp/deploy.sh")
+    coordinator = text("deploy/gcp/release-serving.sh")
     variables = text("deploy/gcp/variables.tf")
     migration_position = deploy.index('gcloud run jobs execute "agentos-${deployment_environment}-migrate"')
-    activation_position = deploy.index('-var="activate_services=true"', migration_position + 1)
+    activation_position = deploy.index('deploy/gcp/release-serving.sh "$release_id"')
     assert migration_position < activation_position
     assert "state list | rg -q '^google_cloud_run_v2_service\\.api\\[0\\]$'" in deploy
     assert "-target='google_cloud_run_v2_job.migrate[0]'" in deploy
-    assert '--api-url "$api_url"' in deploy
-    assert '--apps-url "$apps_url"' in deploy
+    assert '--api-url "$api_url"' in coordinator
+    assert '--apps-url "$apps_url"' in coordinator
     assert variables.count('@sha256:[0-9a-f]{64}$') == 4
     assert 'sandbox_tag="${runtime_repository}/sandbox:${release_id}"' in deploy
     assert '-var="sandbox_image=${sandbox_image}"' in deploy
     assert "launch_preflight.py --require-bootstrap-secrets" in deploy
+    candidate_apply = coordinator.index("probe_started_at=$(date")
+    candidate_ready = coordinator.index(
+        'wait_for_worker_event "$rollout_worker_pool"', candidate_apply,
+    )
+    activation = coordinator.index('gcloud run jobs execute "$activation_job"', candidate_ready)
+    active_ready = coordinator.index('"worker_release_ready"', activation)
+    api_apply = coordinator.index("-target='google_cloud_run_v2_service.api[0]'", active_ready)
+    interim_edge_check = coordinator.index("run_edge_check", api_apply)
+    stable_apply = coordinator.index("stable_started_at=$(date", interim_edge_check)
+    stable_ready = coordinator.index(
+        'wait_for_worker_event "$stable_worker_pool"', stable_apply,
+    )
+    candidate_destroy = coordinator.index(
+        '-var="rollout_worker_enabled=false"', stable_ready,
+    )
+    assert candidate_apply < candidate_ready < activation < active_ready < api_apply
+    assert interim_edge_check < stable_apply < stable_ready < candidate_destroy
+    assert "worker_release_probe_ready" in coordinator
+    assert "worker_release_ready" in coordinator
+    assert "timestamp" in coordinator and "not_before" in coordinator
 
     workflow_text = text(".github/workflows/deploy-gcp.yml")
     workflow = yaml.safe_load(workflow_text)
@@ -144,11 +165,33 @@ def test_release_order_is_migrate_then_activate_and_images_require_digests():
     assert "environment: production" in workflow_text
     assert "TF_VAR_web_push_private_key" not in workflow_text
     migration_step = workflow_text.index("-target='google_cloud_run_v2_job.migrate[0]'")
-    serving_step = workflow_text.index("apply API and worker revisions")
+    serving_step = workflow_text.index("activate and verify release-fenced serving plane")
     assert migration_step < serving_step
+    assert 'deploy/gcp/release-serving.sh "$TF_VAR_release_id"' in workflow_text
     assert "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3" in workflow_text
     for floating_action in ("actions/checkout@v5", "google-github-actions/auth@v3", "setup-gcloud@v3"):
         assert floating_action not in workflow_text
+
+
+def test_release_activation_job_has_only_its_database_secret_and_exact_command():
+    main = text("deploy/gcp/main.tf")
+    job = main.split(
+        'resource "google_cloud_run_v2_job" "activate_execution_release"', 1,
+    )[1].split('resource "google_cloud_run_v2_service" "api"', 1)[0]
+
+    assert 'args    = ["activate-release"]' in job
+    assert 'google_service_account.release_operator.email' in job
+    assert 'AOS_V2_APPLICATION_DATABASE_URL' in job
+    assert 'application_database_url' in job
+    for forbidden in (
+        "SYSTEM_DATABASE", "CAPABILITY_SECRET", "MODEL", "STRIPE", "WEB_PUSH",
+    ):
+        assert forbidden not in job
+    release_secret = main.split(
+        'resource "google_secret_manager_secret_iam_member" "release_operator"', 1,
+    )[1].split("\n}\n", 1)[0]
+    assert 'application_database_url' in release_secret
+    assert 'release_operator.email' in release_secret
 
 
 def test_public_readiness_monitoring_has_multi_region_alert_and_channel_wiring():
@@ -175,16 +218,20 @@ def test_public_readiness_monitoring_has_multi_region_alert_and_channel_wiring()
 
 def test_rollback_is_digest_pinned_serving_only_and_health_checked():
     rollback = text("deploy/gcp/rollback.sh")
+    coordinator = text("deploy/gcp/release-serving.sh")
 
     assert 'current_migration_image=$(tofu -chdir="$tofu_root" output -raw migration_image)' in rollback
     assert rollback.count('@sha256:[0-9a-f]{64}$') == 4
-    assert "-target='google_cloud_run_v2_service.api[0]'" in rollback
-    assert "-target='google_cloud_run_v2_worker_pool.worker[0]'" in rollback
+    assert "-target='google_cloud_run_v2_service.api[0]'" in coordinator
+    assert "-target='google_cloud_run_v2_worker_pool.worker[0]'" in coordinator
     assert "google_cloud_run_v2_job.migrate" not in rollback
     assert "gcloud run jobs execute" not in rollback
-    assert '--api-url "$api_url"' in rollback
-    assert '--apps-url "$apps_url"' in rollback
+    assert 'AOS_SERVING_ONLY=1' in rollback
+    assert 'deploy/gcp/release-serving.sh "$rollback_release_id"' in rollback
+    assert '--api-url "$api_url"' in coordinator
+    assert '--apps-url "$apps_url"' in coordinator
     subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/rollback.sh")], check=True)
+    subprocess.run(["bash", "-n", str(ROOT / "deploy/gcp/release-serving.sh")], check=True)
 
 
 def test_hosted_sandbox_is_cross_project_secretless_and_network_denied():
@@ -257,14 +304,16 @@ def test_generated_apps_use_a_separate_secretless_origin_and_prefix_scoped_stora
     assert 'resource "google_monitoring_uptime_check_config" "static_apps"' in monitoring
     assert 'path           = "/health"' in monitoring
     assert "AOS_V2_APPS_BASE_URL" in deploy
-    assert '--apps-url "$apps_url"' in deploy
+    assert '--apps-url "$apps_url"' in text("deploy/gcp/release-serving.sh")
 
 
 def test_rollback_keeps_public_app_router_on_the_same_known_good_revision():
     rollback = text("deploy/gcp/rollback.sh")
+    coordinator = text("deploy/gcp/release-serving.sh")
 
-    assert "-target='google_cloud_run_v2_service.static_router[0]'" in rollback
-    assert '--apps-url "$apps_url"' in rollback
+    assert "-target='google_cloud_run_v2_service.static_router[0]'" in coordinator
+    assert '--apps-url "$apps_url"' in coordinator
+    assert "release-serving.sh" in rollback
 
 
 def test_generated_backend_apps_have_a_third_least_privilege_scale_to_zero_plane():

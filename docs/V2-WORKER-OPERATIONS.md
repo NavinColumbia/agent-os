@@ -23,6 +23,58 @@ same action ID; recovery after a committed result does not execute the node twic
 is committed as a graph failure instead of leaving a permanently running token. Timer and unregistered production
 release actions stay fail-closed until an idempotent adapter is registered.
 
+## Execution-plane readiness
+
+`/health` is process liveness. `/ready` is the stricter serving contract: it composes database readiness with a
+durable, release-aware worker lease. Every worker generation registers `(cell, worker, release)` and an independent
+thread refreshes its heartbeat plus a bounded scheduling-only probe across all six durable queues. Because the
+publisher is independent of the command loop, a legitimate long model, sandbox, build, or deployment action does
+not look like a dead worker.
+
+Each cell also has one durable active execution release. Every claim/execution window holds a cell-scoped shared
+PostgreSQL advisory lock while activation takes the exclusive lock and changes the durable fence. A candidate
+release therefore starts in read-only standby, proves queue/database connectivity, and claims zero customer work
+until the deployment coordinator activates it. Activation waits for genuine in-flight work rather than terminating
+it; once the exclusive lock commits, old workers cannot claim new work. Rolling API revisions check the active
+execution release, which avoids a false outage while old and new stateless API instances briefly overlap.
+
+Readiness fails closed when the active cell has no configured release, its active release has no fresh running
+worker, its queue probe is stale, tenant discovery repeatedly fails, execution has reported no main-loop progress
+within the operational SLO, or eligible work has remained unclaimed beyond the backlog SLO. A standby or old
+release cannot make the execution plane ready, and a superseded process generation cannot overwrite its successor.
+The public response exposes only a coarse execution state and reason. Worker IDs, tenant IDs, timestamps, queue
+cardinality, payloads, prompts, and exception text never cross that endpoint. Exact operational details remain in
+restricted logs and the database projection.
+
+Defaults and bounds:
+
+```text
+AOS_V2_EXECUTION_CELL_ID=bootstrap
+AOS_V2_WORKER_HEARTBEAT_SECONDS=15       # 5..60
+AOS_V2_WORKER_STALE_SECONDS=60           # >= 3 heartbeats, <= 600
+AOS_V2_QUEUE_PROBE_STALE_SECONDS=60      # >= 3 heartbeats, <= 600
+AOS_V2_DISCOVERY_STALE_SECONDS=60        # >= 3 heartbeats, <= 600
+AOS_V2_WORKER_NO_PROGRESS_SECONDS=7200   # 60..86400; alerts, never terminates work
+AOS_V2_QUEUE_BACKLOG_MAX_AGE_SECONDS=120 # 30..3600
+AOS_V2_DISCOVERY_ERROR_THRESHOLD=3       # 1..20
+AOS_V2_QUEUE_SAMPLE_CAP=1000             # 100..10000
+```
+
+The queue probe is intentionally capped. It reads only scheduling columns through `agentos_worker`, uses separate
+indexable pending/expired branches, and never performs a full exact count. A fresh heartbeat proves that a process
+and its database path are alive; the oldest eligible timestamp proves that capacity is actually keeping up.
+Production infrastructure requires at least one worker instance, and the existing multi-region `/ready` monitor
+pages when this contract becomes unavailable. There is still no whole-story timeout: backlog health requests
+capacity or diagnosis without fabricating a terminal business result.
+
+`deploy/gcp/release-serving.sh` is the single serving-plane coordinator used by both local release and GitHub
+Actions. It applies migrations first (the caller's responsibility), starts a fenced candidate, waits for a
+current-stage standby proof, activates the release through a dedicated least-privilege Cloud Run Job, waits for
+the candidate to publish durable running health, rolls the API/router, verifies the public edge, rolls the stable
+pool, and removes the temporary pool. Rollback uses the same sequence and explicitly removes a leftover candidate.
+Health activity is coalesced to the configured heartbeat interval, so an idle one-second poll loop does not turn
+the 12-branch scheduling probe into a per-second database query.
+
 Before any lifecycle or graph agent calls a model provider, the worker creates an idempotent tenant usage
 reservation keyed by the durable command/action ID. A per-tenant monthly ceiling serializes concurrent reservations,
 so replicas cannot race past it. Successful calls settle request/tool/token counts and provider cost in integer USD

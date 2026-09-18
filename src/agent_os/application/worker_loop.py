@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 from threading import Event
 from typing import Any, Mapping, Protocol
 
 from agent_os.application.command_worker import CommandRunReport, CommandRunStatus
-from agent_os.application.ports import ReadyTenantSource
+from agent_os.application.ports import (
+    ExecutionReleaseGate,
+    ReadyTenantSource,
+    WorkerActivitySink,
+)
 
 
 WorkerObserver = Callable[[Mapping[str, Any]], None]
@@ -30,6 +35,8 @@ class CommandWorkerLoop:
         idle_poll_seconds: float = 1,
         error_backoff_seconds: float = 5,
         observer: WorkerObserver | None = None,
+        activity: WorkerActivitySink | None = None,
+        execution_gate: ExecutionReleaseGate | None = None,
     ) -> None:
         organizations = tuple(dict.fromkeys(item.strip() for item in organization_ids if item.strip()))
         if bool(organizations) == (organization_source is not None):
@@ -46,6 +53,8 @@ class CommandWorkerLoop:
         self._idle_poll_seconds = idle_poll_seconds
         self._error_backoff_seconds = error_backoff_seconds
         self._observer = observer or (lambda _: None)
+        self._activity = activity
+        self._execution_gate = execution_gate
         self._last_cycle_had_error = False
 
     @property
@@ -55,6 +64,25 @@ class CommandWorkerLoop:
     def run_cycle(self) -> tuple[CommandRunReport, ...]:
         reports: list[CommandRunReport] = []
         self._last_cycle_had_error = False
+        if self._execution_gate is not None:
+            try:
+                active = self._execution_gate.is_active()
+            except Exception as exc:
+                self._last_cycle_had_error = True
+                self._observer({
+                    "event": "worker_release_gate_error",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc)[:2000],
+                })
+                if self._activity is not None:
+                    self._activity.discovery_failed(
+                        datetime.now(timezone.utc), type(exc).__name__,
+                    )
+                return ()
+            if not active:
+                if self._activity is not None:
+                    self._activity.standby_succeeded(datetime.now(timezone.utc))
+                return ()
         organizations = self._organizations
         if self._organization_source is not None:
             try:
@@ -77,30 +105,57 @@ class CommandWorkerLoop:
                     "error_type": type(exc).__name__,
                     "message": str(exc)[:2000],
                 })
+                if self._activity is not None:
+                    self._activity.discovery_failed(
+                        datetime.now(timezone.utc), type(exc).__name__,
+                    )
                 return ()
-        for organization_id in organizations:
-            try:
-                report = self._worker.run_one(organization_id)
-            except Exception as exc:
-                self._last_cycle_had_error = True
-                self._observer({
-                    "event": "worker_cycle_error",
-                    "organization_id": organization_id,
-                    "error_type": type(exc).__name__,
-                    "message": str(exc)[:2000],
-                })
-                continue
-            reports.append(report)
-            if report.status is not CommandRunStatus.IDLE:
-                self._observer({
-                    "event": "command_run",
-                    "organization_id": organization_id,
-                    "command_id": report.command_id,
-                    "status": report.status.value,
-                    "attempt": report.attempt,
-                    "retry_after_seconds": report.retry_after_seconds,
-                    "error_type": report.error_type,
-                })
+        if self._activity is not None:
+            self._activity.discovery_succeeded(datetime.now(timezone.utc))
+            self._activity.work_started(datetime.now(timezone.utc))
+        try:
+            for organization_id in organizations:
+                try:
+                    if self._execution_gate is None:
+                        report = self._worker.run_one(organization_id)
+                    else:
+                        # PostgreSQL holds a cell-scoped shared advisory lock
+                        # across this one claim/execution. Release activation
+                        # takes the exclusive lock, so it waits for genuine
+                        # in-flight work and then fences every later claim.
+                        with self._execution_gate.claim_window() as active:
+                            if not active:
+                                if self._activity is not None:
+                                    self._activity.standby_succeeded(
+                                        datetime.now(timezone.utc),
+                                    )
+                                break
+                            report = self._worker.run_one(organization_id)
+                except Exception as exc:
+                    self._last_cycle_had_error = True
+                    self._observer({
+                        "event": "worker_cycle_error",
+                        "organization_id": organization_id,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:2000],
+                    })
+                    continue
+                reports.append(report)
+                if self._activity is not None:
+                    self._activity.work_progressed(datetime.now(timezone.utc))
+                if report.status is not CommandRunStatus.IDLE:
+                    self._observer({
+                        "event": "command_run",
+                        "organization_id": organization_id,
+                        "command_id": report.command_id,
+                        "status": report.status.value,
+                        "attempt": report.attempt,
+                        "retry_after_seconds": report.retry_after_seconds,
+                        "error_type": report.error_type,
+                    })
+        finally:
+            if self._activity is not None:
+                self._activity.work_finished(datetime.now(timezone.utc))
         return tuple(reports)
 
     def run_forever(self, stop: Event) -> None:

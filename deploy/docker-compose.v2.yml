@@ -5,6 +5,15 @@ x-runtime-environment: &runtime-environment
   AOS_V2_SYSTEM_DATABASE_URL: postgresql://agentos_runtime:${AOS_V2_DATABASE_RUNTIME_PASSWORD}@postgres:5432/agentos
   AOS_V2_APPLICATION_DATABASE_URL: postgresql://agentos_runtime:${AOS_V2_DATABASE_RUNTIME_PASSWORD}@postgres:5432/agentos
   AOS_V2_APPLICATION_VERSION: ${AOS_V2_APPLICATION_VERSION:-v2-local}
+  AOS_V2_EXECUTION_CELL_ID: ${AOS_V2_EXECUTION_CELL_ID:-local}
+  AOS_V2_WORKER_HEARTBEAT_SECONDS: ${AOS_V2_WORKER_HEARTBEAT_SECONDS:-15}
+  AOS_V2_WORKER_STALE_SECONDS: ${AOS_V2_WORKER_STALE_SECONDS:-60}
+  AOS_V2_QUEUE_PROBE_STALE_SECONDS: ${AOS_V2_QUEUE_PROBE_STALE_SECONDS:-60}
+  AOS_V2_DISCOVERY_STALE_SECONDS: ${AOS_V2_DISCOVERY_STALE_SECONDS:-60}
+  AOS_V2_WORKER_NO_PROGRESS_SECONDS: ${AOS_V2_WORKER_NO_PROGRESS_SECONDS:-7200}
+  AOS_V2_QUEUE_BACKLOG_MAX_AGE_SECONDS: ${AOS_V2_QUEUE_BACKLOG_MAX_AGE_SECONDS:-120}
+  AOS_V2_DISCOVERY_ERROR_THRESHOLD: ${AOS_V2_DISCOVERY_ERROR_THRESHOLD:-3}
+  AOS_V2_QUEUE_SAMPLE_CAP: ${AOS_V2_QUEUE_SAMPLE_CAP:-1000}
   AOS_V2_CREATE_SCHEMA: "0"
   AOS_V2_IDENTITY_MODE: ${AOS_V2_IDENTITY_MODE:-hmac}
   AOS_V2_AUTH_SECRET: ${AOS_V2_AUTH_SECRET:-}
@@ -84,6 +93,7 @@ services:
       - ../postgres/initdb/105-experience-events-v2.sql:/migrations/105-experience-events-v2.sql:ro
       - ../postgres/initdb/106-web-push-subscriptions-v2.sql:/migrations/106-web-push-subscriptions-v2.sql:ro
       - ../postgres/initdb/107-mission-work-accountability-v2.sql:/migrations/107-mission-work-accountability-v2.sql:ro
+      - ../postgres/initdb/108-execution-health-v2.sql:/migrations/108-execution-health-v2.sql:ro
     command:
       - sh
       - -ec
@@ -117,6 +127,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/105-experience-events-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/106-web-push-subscriptions-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/107-mission-work-accountability-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/108-execution-health-v2.sql
         psql -v ON_ERROR_STOP=1 \
           -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
         SELECT format(

@@ -116,14 +116,8 @@ jobs:
             --project "${{ vars.GCP_PROJECT_ID }}" \
             --region "${{ vars.GCP_REGION }}" --wait
 
-      - name: apply API and worker revisions, including app router
-        run: tofu -chdir=deploy/gcp apply -auto-approve -input=false
-
-      - name: verify deployed readiness
-        run: |
-          api_url=$(tofu -chdir=deploy/gcp output -raw api_url)
-          apps_url=$(tofu -chdir=deploy/gcp output -raw static_apps_url)
-          edge_ip=$(tofu -chdir=deploy/gcp output -raw public_edge_ipv4)
-          python deploy/gcp/edge_check.py \
-            --api-url "$api_url" --apps-url "$apps_url" --expected-ip "$edge_ip" \
-            --timeout-seconds 900 --interval-seconds 15
+      - name: activate and verify release-fenced serving plane
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+        run: deploy/gcp/release-serving.sh "$TF_VAR_release_id"

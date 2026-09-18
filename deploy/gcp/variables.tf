@@ -311,9 +311,15 @@ variable "worker_instances" {
   default = 1
 
   validation {
-    condition     = var.worker_instances >= 0 && var.worker_instances <= 10
-    error_message = "worker_instances must be between 0 and 10 for the bootstrap cell."
+    condition     = var.worker_instances >= 1 && var.worker_instances <= 10
+    error_message = "worker_instances must be between 1 and 10 for the bootstrap cell."
   }
+}
+
+variable "rollout_worker_enabled" {
+  description = "Temporarily run a second release-fenced worker during a zero-gap API rollout."
+  type        = bool
+  default     = false
 }
 
 variable "deletion_protection" {

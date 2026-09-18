@@ -113,17 +113,7 @@ export TF_VAR_release_id="$rollback_release_id"
 
 # Roll back serving revisions only. The migration job is not updated or run;
 # production migrations are required to be backward-compatible expand/contract changes.
-tofu -chdir="$tofu_root" apply -auto-approve -input=false \
-    -target='google_cloud_run_v2_service.api[0]' \
-    -target='google_cloud_run_v2_service.static_router[0]' \
-    -target='google_cloud_run_v2_worker_pool.worker[0]'
-
-api_url=$(tofu -chdir="$tofu_root" output -raw api_url)
-apps_url=$(tofu -chdir="$tofu_root" output -raw static_apps_url)
-edge_ip=$(tofu -chdir="$tofu_root" output -raw public_edge_ipv4)
-.venv/bin/python deploy/gcp/edge_check.py \
-    --api-url "$api_url" --apps-url "$apps_url" --expected-ip "$edge_ip" \
-    --timeout-seconds "${AOS_V2_EDGE_READY_TIMEOUT_SECONDS:-600}" \
-    --interval-seconds "${AOS_V2_EDGE_READY_INTERVAL_SECONDS:-15}"
+AOS_PYTHON_BIN=.venv/bin/python AOS_SERVING_ONLY=1 \
+    deploy/gcp/release-serving.sh "$rollback_release_id"
 echo
 echo "Agent OS serving plane rolled back to ${rollback_image}; API and app router are healthy"

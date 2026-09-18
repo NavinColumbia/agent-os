@@ -62,6 +62,7 @@ def test_packaged_cli_exposes_api_and_worker_processes():
     assert result.exit_code == 0
     assert "serve" in result.output
     assert "worker" in result.output
+    assert "activate-release" in result.output
     assert "connector-secret-name" in result.output
     assert "deployment-control" in result.output
 

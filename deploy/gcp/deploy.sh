@@ -171,6 +171,9 @@ sandbox_digest=$(gcloud artifacts docker images describe "$sandbox_tag" \
 application_image="${runtime_repository}/agent-os@${application_digest}"
 migration_image="${runtime_repository}/migrations@${migration_digest}"
 sandbox_image="${runtime_repository}/sandbox@${sandbox_digest}"
+export TF_VAR_application_image="$application_image"
+export TF_VAR_migration_image="$migration_image"
+export TF_VAR_sandbox_image="$sandbox_image"
 
 # Create or update only the migration job first. Targeting prevents a repeat
 # release from rolling (or removing) the currently serving API/worker before
@@ -183,18 +186,11 @@ tofu -chdir="$tofu_root" apply -auto-approve \
     -var="sandbox_image=${sandbox_image}"
 gcloud run jobs execute "agentos-${deployment_environment}-migrate" \
     --project "$GCP_PROJECT_ID" --region "$gcp_region" --wait
-tofu -chdir="$tofu_root" apply -auto-approve \
-    -var="activate_services=true" \
-    -var="application_image=${application_image}" \
-    -var="migration_image=${migration_image}" \
-    -var="sandbox_image=${sandbox_image}"
+
+AOS_PYTHON_BIN=.venv/bin/python deploy/gcp/release-serving.sh "$release_id"
 
 api_url=$(tofu -chdir="$tofu_root" output -raw api_url)
 apps_url=$(tofu -chdir="$tofu_root" output -raw static_apps_url)
-.venv/bin/python deploy/gcp/edge_check.py \
-    --api-url "$api_url" --apps-url "$apps_url" --expected-ip "$edge_ip" \
-    --timeout-seconds "${AOS_V2_EDGE_READY_TIMEOUT_SECONDS:-3600}" \
-    --interval-seconds "${AOS_V2_EDGE_READY_INTERVAL_SECONDS:-15}"
 echo
 echo "Agent OS ${release_id} is healthy at ${api_url}; app router: ${apps_url}"
 if [[ -z "${GCP_DNS_MANAGED_ZONE:-}" ]]; then

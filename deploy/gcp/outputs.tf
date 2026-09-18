@@ -18,6 +18,10 @@ output "migration_job" {
   value = try(google_cloud_run_v2_job.migrate[0].name, null)
 }
 
+output "execution_release_activation_job" {
+  value = try(google_cloud_run_v2_job.activate_execution_release[0].name, null)
+}
+
 output "api_url" {
   value = var.activate_services ? var.public_base_url : null
 }
@@ -87,6 +91,10 @@ output "readiness_alert_policy" {
 
 output "worker_pool" {
   value = try(google_cloud_run_v2_worker_pool.worker[0].name, null)
+}
+
+output "rollout_worker_pool" {
+  value = try(google_cloud_run_v2_worker_pool.rollout_worker[0].name, null)
 }
 
 output "build_service_account" {

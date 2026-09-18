@@ -20,6 +20,7 @@ from agent_os.infrastructure.http_connector_tools import (
     GCPConnectorSecretResolver,
 )
 from agent_os.infrastructure.deployment_operations import GCPDeploymentOperator
+from agent_os.infrastructure.sql_execution_health import SQLExecutionReleaseGate
 
 
 @click.group()
@@ -71,6 +72,34 @@ def worker(organizations: tuple[str, ...], once: bool) -> None:
     stop = Event()
     install_shutdown_handlers(stop)
     run_worker(settings, once=once, stop=stop)
+
+
+@main.command("activate-release")
+def activate_release() -> None:
+    """Atomically permit this exact application release to claim new work."""
+
+    database_url = os.getenv("AOS_V2_APPLICATION_DATABASE_URL", "").strip()
+    cell_id = os.getenv("AOS_V2_EXECUTION_CELL_ID", "").strip()
+    application_version = os.getenv("AOS_V2_APPLICATION_VERSION", "").strip()
+    try:
+        gate = SQLExecutionReleaseGate(
+            database_url,
+            cell_id=cell_id,
+            application_version=application_version,
+            statement_timeout_seconds=86_400,
+        )
+        try:
+            generation = gate.activate()
+        finally:
+            gate.close()
+    except (RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps({
+        "event": "execution_release_activated",
+        "execution_cell_id": cell_id,
+        "application_version": application_version,
+        "activation_generation": generation,
+    }, sort_keys=True))
 
 
 @main.command("issue-local-token")

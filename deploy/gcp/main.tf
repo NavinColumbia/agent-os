@@ -101,6 +101,15 @@ locals {
   common_environment = {
     AOS_ENVIRONMENT                              = var.environment
     AOS_V2_APPLICATION_VERSION                   = var.release_id
+    AOS_V2_EXECUTION_CELL_ID                     = local.prefix
+    AOS_V2_WORKER_HEARTBEAT_SECONDS              = "15"
+    AOS_V2_WORKER_STALE_SECONDS                  = "60"
+    AOS_V2_QUEUE_PROBE_STALE_SECONDS             = "60"
+    AOS_V2_DISCOVERY_STALE_SECONDS               = "60"
+    AOS_V2_WORKER_NO_PROGRESS_SECONDS            = "7200"
+    AOS_V2_QUEUE_BACKLOG_MAX_AGE_SECONDS         = "120"
+    AOS_V2_DISCOVERY_ERROR_THRESHOLD             = "3"
+    AOS_V2_QUEUE_SAMPLE_CAP                      = "1000"
     AOS_V2_CREATE_SCHEMA                         = "0"
     AOS_V2_IDENTITY_MODE                         = "oidc"
     AOS_V2_OIDC_ISSUER                           = var.oidc_issuer
@@ -302,6 +311,11 @@ resource "google_service_account" "migrate" {
   display_name = "Agent OS ${var.environment} migration job"
 }
 
+resource "google_service_account" "release_operator" {
+  account_id   = "${local.prefix}-release"
+  display_name = "Agent OS ${var.environment} execution-release operator"
+}
+
 resource "google_service_account" "builder" {
   account_id   = "${local.prefix}-builder"
   display_name = "Agent OS ${var.environment} Cloud Build"
@@ -358,11 +372,18 @@ resource "google_secret_manager_secret_iam_member" "migrate" {
   member    = "serviceAccount:${google_service_account.migrate.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "release_operator" {
+  secret_id = google_secret_manager_secret.runtime["application_database_url"].id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.release_operator.email}"
+}
+
 resource "google_artifact_registry_repository_iam_member" "runtime_readers" {
   for_each = {
     api           = google_service_account.api.email
     worker        = google_service_account.worker.email
     migrate       = google_service_account.migrate.email
+    release       = google_service_account.release_operator.email
     static_router = google_service_account.static_router.email
   }
 
@@ -498,6 +519,63 @@ resource "google_cloud_run_v2_job" "migrate" {
   depends_on = [
     google_project_service.required,
     google_secret_manager_secret_iam_member.migrate,
+    google_artifact_registry_repository_iam_member.runtime_readers,
+  ]
+}
+
+resource "google_cloud_run_v2_job" "activate_execution_release" {
+  count = var.activate_services ? 1 : 0
+
+  name                = "${local.prefix}-activate-release"
+  location            = var.region
+  deletion_protection = var.deletion_protection
+  labels              = local.labels
+
+  template {
+    task_count = 1
+    template {
+      service_account = google_service_account.release_operator.email
+      max_retries     = 0
+      timeout         = "86400s"
+
+      containers {
+        image   = var.application_image
+        command = ["agentos-v2"]
+        args    = ["activate-release"]
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "512Mi"
+          }
+        }
+
+        env {
+          name  = "AOS_V2_EXECUTION_CELL_ID"
+          value = local.prefix
+        }
+
+        env {
+          name  = "AOS_V2_APPLICATION_VERSION"
+          value = var.release_id
+        }
+
+        env {
+          name = "AOS_V2_APPLICATION_DATABASE_URL"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.runtime["application_database_url"].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.required,
+    google_secret_manager_secret_iam_member.release_operator,
     google_artifact_registry_repository_iam_member.runtime_readers,
   ]
 }
@@ -703,6 +781,84 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
   location            = var.region
   deletion_protection = var.deletion_protection
   labels              = local.labels
+
+  scaling {
+    scaling_mode          = "MANUAL"
+    manual_instance_count = var.worker_instances
+  }
+
+  template {
+    service_account = google_service_account.worker.email
+
+    containers {
+      name    = "worker"
+      image   = var.application_image
+      command = ["agentos-v2"]
+      args    = ["worker"]
+
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "1Gi"
+        }
+      }
+
+      dynamic "env" {
+        for_each = local.worker_environment
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
+        for_each = local.worker_secret_environment
+        content {
+          name = env.key
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.runtime[env.value].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
+      env {
+        name  = "AOS_V2_ARTIFACT_BUCKET"
+        value = google_storage_bucket.artifacts.name
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.required,
+    google_secret_manager_secret_iam_member.worker,
+    google_artifact_registry_repository_iam_member.runtime_readers,
+    google_storage_bucket_iam_member.artifact_readers,
+    google_storage_bucket_iam_member.artifact_writers,
+    google_storage_bucket_iam_member.published_app_release_writer,
+    google_storage_bucket_iam_member.published_app_route_writer,
+    google_cloud_run_v2_job_iam_member.worker_sandbox_runner,
+    google_service_account_iam_member.worker_self_signer,
+    google_project_iam_member.worker_app_build_controller,
+    google_project_iam_member.worker_app_service_controller,
+    google_storage_bucket_iam_member.worker_app_source,
+    google_service_account_iam_member.worker_app_builder_act_as,
+    google_service_account_iam_member.worker_app_runtime_act_as,
+  ]
+}
+
+# A deployment-only worker keeps the target release executable before API
+# traffic moves. It is removed after the stable pool has rolled and published
+# its own release-fenced health row, so steady-state cost remains one pool.
+resource "google_cloud_run_v2_worker_pool" "rollout_worker" {
+  count = var.activate_services && var.rollout_worker_enabled ? 1 : 0
+
+  name                = "${local.prefix}-worker-rollout"
+  location            = var.region
+  deletion_protection = false
+  labels              = merge(local.labels, { rollout = "temporary" })
 
   scaling {
     scaling_mode          = "MANUAL"

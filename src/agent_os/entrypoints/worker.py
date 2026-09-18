@@ -65,6 +65,10 @@ from agent_os.infrastructure.sql_mission_control import SQLMissionControl
 from agent_os.infrastructure.sql_mission_participants import SQLMissionParticipantStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
 from agent_os.infrastructure.sql_ready_tenants import SQLReadyTenantSource
+from agent_os.infrastructure.sql_execution_health import (
+    SQLExecutionReleaseGate,
+    SQLWorkerHealthReporter,
+)
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.tenant_model_resolver import TenantModelResolver
@@ -724,26 +728,53 @@ def run_worker(
             decision_worker=decision_worker,
         )
         loop_options: dict[str, Any] = {"organization_ids": settings.organization_ids}
+        tenant_source = SQLReadyTenantSource(settings.server.application_database_url)
+        resources.callback(tenant_source.close)
+        execution_gate = SQLExecutionReleaseGate(
+            settings.server.application_database_url,
+            cell_id=settings.server.execution_cell_id,
+            application_version=settings.server.application_version,
+        )
+        resources.callback(execution_gate.close)
+        if (
+            settings.server.environment in {"development", "test"}
+            and not execution_gate.is_active()
+        ):
+            execution_gate.activate()
         if not settings.organization_ids:
-            tenant_source = SQLReadyTenantSource(settings.server.application_database_url)
-            resources.callback(tenant_source.close)
             loop_options = {
                 "organization_source": tenant_source,
                 "tenant_batch_size": settings.tenant_discovery_limit,
             }
+        health_reporter = SQLWorkerHealthReporter(
+            settings.server.application_database_url,
+            ready_source=tenant_source,
+            cell_id=settings.server.execution_cell_id,
+            worker_id=settings.worker_id,
+            application_version=settings.server.application_version,
+            heartbeat_seconds=settings.server.worker_heartbeat_seconds,
+            queue_sample_cap=settings.server.queue_sample_cap,
+            create_schema=settings.server.create_schema,
+            observer=_emit,
+        )
         loop = CommandWorkerLoop(
             worker=tenant_worker,
             idle_poll_seconds=settings.idle_poll_seconds,
             error_backoff_seconds=settings.error_backoff_seconds,
             observer=_emit,
+            activity=health_reporter,
+            execution_gate=execution_gate,
             **loop_options,
         )
+        health_reporter.start()
         _emit({
             "event": "worker_started",
             "worker_id": settings.worker_id,
             "tenant_mode": "static" if settings.organization_ids else "dynamic",
             "organizations": list(settings.organization_ids),
             "model": settings.model,
+            "execution_cell_id": settings.server.execution_cell_id,
+            "application_version": settings.server.application_version,
             "management_check_seconds": settings.management_check_seconds,
             "slow_work_seconds": settings.slow_work_seconds,
         })
@@ -759,7 +790,10 @@ def run_worker(
             loop.run_forever(stop)
             return None
         finally:
-            _emit({"event": "worker_stopped", "worker_id": settings.worker_id})
+            try:
+                health_reporter.stop()
+            finally:
+                _emit({"event": "worker_stopped", "worker_id": settings.worker_id})
 
 
 def install_shutdown_handlers(stop: Event) -> None:

@@ -42,6 +42,7 @@ from agent_os.application.ports import (
     ArtifactStore,
     CompanyDirectory,
     ConnectorRegistry,
+    ExecutionHealthReader,
     GraphWorkflowEngine,
     GraphRunInspector,
     MembershipStore,
@@ -949,6 +950,15 @@ def create_app(
     client_identity_config: Mapping[str, str] | None = None,
     web_push_public_key: str | None = None,
     experience_stream_seconds: float = 55.0,
+    execution_health: ExecutionHealthReader | None = None,
+    execution_cell_id: str = "bootstrap",
+    application_version: str = "v2-dev",
+    worker_stale_seconds: int = 60,
+    queue_probe_stale_seconds: int = 60,
+    discovery_stale_seconds: int = 60,
+    worker_no_progress_seconds: int = 7200,
+    queue_backlog_max_age_seconds: int = 120,
+    discovery_error_threshold: int = 3,
     shutdown: Callable[[], None] | None = None,
 ) -> FastAPI:
     if not 0.01 <= experience_stream_seconds <= 300:
@@ -1132,6 +1142,29 @@ def create_app(
     @app.get("/ready")
     def ready() -> JSONResponse:
         report = dict(engine.health())
+        if execution_health is not None:
+            try:
+                execution = execution_health.readiness(
+                    now=datetime.now(timezone.utc),
+                    cell_id=execution_cell_id,
+                    application_version=application_version,
+                    heartbeat_max_age_seconds=worker_stale_seconds,
+                    queue_probe_max_age_seconds=queue_probe_stale_seconds,
+                    discovery_max_age_seconds=discovery_stale_seconds,
+                    no_progress_max_age_seconds=worker_no_progress_seconds,
+                    backlog_max_age_seconds=queue_backlog_max_age_seconds,
+                    discovery_failure_limit=discovery_error_threshold,
+                )
+                execution_ok = bool(execution.get("ok"))
+                report["execution_plane"] = str(execution.get("state") or "unavailable")
+                report["execution_reason"] = str(
+                    execution.get("reason") or "worker_unavailable"
+                )
+            except Exception:
+                execution_ok = False
+                report["execution_plane"] = "unavailable"
+                report["execution_reason"] = "health_probe_failed"
+            report["ok"] = bool(report.get("ok")) and execution_ok
         return JSONResponse(status_code=200 if report.get("ok") else 503, content=report)
 
     @app.get("/v2/me")

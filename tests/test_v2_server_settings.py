@@ -24,6 +24,11 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
         "AOS_V2_ARTIFACT_RETENTION_DAYS",
         "AOS_V2_OIDC_PERSONAL_TENANTS", "AOS_V2_TENANT_DERIVATION_SECRET",
         "AOS_V2_WEB_PUSH_PUBLIC_KEY",
+        "AOS_V2_EXECUTION_CELL_ID", "AOS_V2_WORKER_HEARTBEAT_SECONDS",
+        "AOS_V2_WORKER_STALE_SECONDS", "AOS_V2_QUEUE_PROBE_STALE_SECONDS",
+        "AOS_V2_DISCOVERY_STALE_SECONDS", "AOS_V2_QUEUE_BACKLOG_MAX_AGE_SECONDS",
+        "AOS_V2_WORKER_NO_PROGRESS_SECONDS",
+        "AOS_V2_DISCOVERY_ERROR_THRESHOLD", "AOS_V2_QUEUE_SAMPLE_CAP",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = ServerSettings.from_env()
@@ -42,6 +47,36 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
     assert settings.artifact_max_content_bytes == 2 * 1024 * 1024
     assert settings.artifact_retention_days == 365
     assert settings.oidc_personal_tenants is False
+    assert settings.execution_cell_id == "bootstrap"
+    assert settings.worker_heartbeat_seconds == 15
+    assert settings.worker_stale_seconds == 60
+    assert settings.worker_no_progress_seconds == 7200
+    assert settings.queue_backlog_max_age_seconds == 120
+    assert settings.queue_sample_cap == 1000
+
+
+def test_execution_health_settings_reject_unsafe_windows(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AOS_ENVIRONMENT", "development")
+    monkeypatch.setenv("AOS_V2_WORKER_HEARTBEAT_SECONDS", "20")
+    monkeypatch.setenv("AOS_V2_WORKER_STALE_SECONDS", "59")
+    with pytest.raises(ValueError, match="at least three heartbeats"):
+        ServerSettings.from_env()
+
+    monkeypatch.setenv("AOS_V2_WORKER_STALE_SECONDS", "60")
+    monkeypatch.setenv("AOS_V2_EXECUTION_CELL_ID", "bad cell")
+    with pytest.raises(ValueError, match="safe 1 to 128"):
+        ServerSettings.from_env()
+
+
+def test_execution_health_settings_reject_unsafe_application_version(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AOS_ENVIRONMENT", "development")
+    monkeypatch.setenv("AOS_V2_APPLICATION_VERSION", "unsafe/version")
+    with pytest.raises(ValueError, match="APPLICATION_VERSION"):
+        ServerSettings.from_env()
 
 
 def test_production_fails_closed_without_postgres_migrations_and_strong_secret(monkeypatch):

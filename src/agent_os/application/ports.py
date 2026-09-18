@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, ContextManager, Mapping, Protocol, runtime_checkable
 
 from agent_os.domain.lifecycle import Event, LifecycleState
 from agent_os.domain.mission_model import (
@@ -148,6 +148,17 @@ class ExperienceEventPage:
     reset_required: bool = False
 
 
+@dataclass(frozen=True)
+class ReadyWorkSummary:
+    """Privacy-safe, bounded view of globally eligible worker queue entries."""
+
+    observed_at: datetime
+    ready_count_capped: int
+    truncated: bool
+    oldest_ready_at: datetime | None
+    oldest_queue_kind: str | None
+
+
 @runtime_checkable
 class WorkflowEngine(Protocol):
     """Durable lifecycle execution used by the control API."""
@@ -204,6 +215,53 @@ class ReadyTenantSource(Protocol):
         after_tenant_id: str | None = None,
         limit: int = 128,
     ) -> tuple[str, ...]: ...
+
+    def summarize_ready_work(self, *, limit: int = 1_000) -> ReadyWorkSummary: ...
+
+
+@runtime_checkable
+class ExecutionReleaseGate(Protocol):
+    """Fences new queue claims to one explicitly activated worker release."""
+
+    def is_active(self) -> bool: ...
+
+    def claim_window(self) -> ContextManager[bool]: ...
+
+
+@runtime_checkable
+class WorkerActivitySink(Protocol):
+    """Reports main-loop progress without coupling it to health publication."""
+
+    def discovery_succeeded(self, at: datetime) -> None: ...
+
+    def discovery_failed(self, at: datetime, error_type: str) -> None: ...
+
+    def standby_succeeded(self, at: datetime) -> None: ...
+
+    def work_started(self, at: datetime) -> None: ...
+
+    def work_progressed(self, at: datetime) -> None: ...
+
+    def work_finished(self, at: datetime) -> None: ...
+
+
+@runtime_checkable
+class ExecutionHealthReader(Protocol):
+    """Release-aware worker health used by the service readiness contract."""
+
+    def readiness(
+        self,
+        *,
+        now: datetime,
+        cell_id: str,
+        application_version: str,
+        heartbeat_max_age_seconds: int,
+        queue_probe_max_age_seconds: int,
+        discovery_max_age_seconds: int,
+        no_progress_max_age_seconds: int,
+        backlog_max_age_seconds: int,
+        discovery_failure_limit: int,
+    ) -> Mapping[str, Any]: ...
 
 
 @runtime_checkable

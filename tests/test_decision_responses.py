@@ -77,6 +77,9 @@ def publish_decision(store: SQLNotificationStore) -> None:
         correlation_id="release-approval",
         payload={
             "risk": "production",
+            "request_kind": "workflow_blocking",
+            "request_recipient_id": "human:ceo",
+            "requested_by": "system:workflow-runtime",
             "decision_context": {
                 "kind": "approval",
                 "request": "Approve the production release?",
@@ -113,6 +116,7 @@ def test_structured_decision_is_durable_authorized_and_applied_once(tmp_path: Pa
             "/v2/notifications", headers={"Authorization": "Bearer owner"},
         ).json()["items"][0]
         assert before["actionable"] is True
+        assert before["human_request"]["status"] == "open"
         assert before["decision_context"]["requesting_role"] == "release-manager"
         assert before["decision_context"]["allowed_actions"] == [
             "approve", "decline", "request_changes",
@@ -161,6 +165,10 @@ def test_structured_decision_is_durable_authorized_and_applied_once(tmp_path: Pa
         )
         assert accepted.status_code == 202
         assert accepted.json()["status"] == "pending"
+        assert accepted.json()["request_id"] == before["human_request"]["request_id"]
+        assert notifications.get_human_request(
+            "tenant-a", notification_id="notice-release",
+        )["status"] == "response_pending"
         assert "expected_version" not in accepted.json()
 
         replay = api.post(
@@ -191,6 +199,9 @@ def test_structured_decision_is_durable_authorized_and_applied_once(tmp_path: Pa
             "tenant-a", notification_id="notice-release",
         )
         assert settled is not None and settled["status"] == "applied"
+        assert notifications.get_human_request(
+            "tenant-a", notification_id="notice-release",
+        )["status"] == "answered"
         state = notifications.list_notification_states(
             "tenant-a", subject_id="ceo-subject", notification_ids=("notice-release",),
         )
@@ -296,6 +307,9 @@ def test_failed_decision_can_be_authoritatively_redriven_with_a_fresh_retry_budg
             "tenant-a", lease.response_id, worker_id="broken-worker",
             error={"type": "DependencyError", "message": "provider unavailable"},
         ) is True
+        assert notifications.get_human_request(
+            "tenant-a", notification_id="notice-release",
+        )["status"] == "recovery_required"
 
         failed_item = api.get(
             "/v2/notifications", headers={"Authorization": "Bearer owner"},
@@ -330,6 +344,9 @@ def test_failed_decision_can_be_authoritatively_redriven_with_a_fresh_retry_budg
             "redriven_by": "operator-subject",
             "duplicate": False,
         }
+        assert notifications.get_human_request(
+            "tenant-a", notification_id="notice-release",
+        )["status"] == "response_pending"
         assert "Ship after recovery" not in redriven.text
         replay = api.post(
             "/v2/decisions/notice-release/redrive", headers=headers,
@@ -352,6 +369,9 @@ def test_failed_decision_can_be_authoritatively_redriven_with_a_fresh_retry_budg
             "tenant-a", second_lease.response_id, worker_id="still-broken-worker",
             error={"type": "DependencyError", "message": "provider still unavailable"},
         ) is True
+        assert notifications.get_human_request(
+            "tenant-a", notification_id="notice-release",
+        )["status"] == "recovery_required"
         second_redrive = api.post(
             "/v2/decisions/notice-release/redrive",
             headers={
@@ -382,6 +402,9 @@ def test_failed_decision_can_be_authoritatively_redriven_with_a_fresh_retry_budg
         assert settled["attempts"] == 1
         assert settled["total_attempts"] == 3
         assert settled["redrive_count"] == 2
+        assert notifications.get_human_request(
+            "tenant-a", notification_id="notice-release",
+        )["status"] == "answered"
         completed_replay = api.post(
             "/v2/decisions/notice-release/redrive", headers=headers,
         )

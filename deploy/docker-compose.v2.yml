@@ -94,6 +94,7 @@ services:
       - ../postgres/initdb/106-web-push-subscriptions-v2.sql:/migrations/106-web-push-subscriptions-v2.sql:ro
       - ../postgres/initdb/107-mission-work-accountability-v2.sql:/migrations/107-mission-work-accountability-v2.sql:ro
       - ../postgres/initdb/108-execution-health-v2.sql:/migrations/108-execution-health-v2.sql:ro
+      - ../postgres/initdb/109-human-requests-v2.sql:/migrations/109-human-requests-v2.sql:ro
     command:
       - sh
       - -ec
@@ -128,6 +129,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/106-web-push-subscriptions-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/107-mission-work-accountability-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/108-execution-health-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/109-human-requests-v2.sql
         psql -v ON_ERROR_STOP=1 \
           -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
         SELECT format(

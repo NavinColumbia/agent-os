@@ -66,7 +66,7 @@ class Secrets:
         return "private-operator-token"
 
 
-def stores(tmp_path: Path, clock):
+def stores(tmp_path: Path, clock, **route_changes):
     database_url = f"sqlite:///{tmp_path / 'delivery.sqlite3'}"
     registry = SQLConnectorRegistry(database_url, create_schema=True)
     notifications = SQLNotificationStore(database_url, create_schema=True, clock=clock)
@@ -78,7 +78,7 @@ def stores(tmp_path: Path, clock):
     )
     notifications.register_notification_route(
         tenant_id="tenant-a",
-        definition=route_definition(),
+        definition=route_definition(**route_changes),
         actor_id="human:ceo",
         idempotency_key="register-route",
     )
@@ -87,7 +87,9 @@ def stores(tmp_path: Path, clock):
 
 def test_notification_publication_enqueues_only_matching_routes_and_delivers_secret_free(tmp_path):
     now = [datetime(2026, 9, 13, 12, tzinfo=timezone.utc)]
-    registry, notifications = stores(tmp_path, lambda: now[0])
+    registry, notifications = stores(
+        tmp_path, lambda: now[0], redaction_policy="full",
+    )
     calls = []
 
     def transport(method, url, headers, body, timeout, max_bytes):

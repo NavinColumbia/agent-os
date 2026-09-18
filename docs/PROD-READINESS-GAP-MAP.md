@@ -1,6 +1,36 @@
 # Production Readiness Gap Map
 
-Last updated: 2026-09-14
+Last updated: 2026-09-17
+
+## 2026-09-17 Authoritative Human Collaboration Closure
+
+This increment removes notification fan-out as implicit human-decision authority. Migration 109 adds a
+tenant-fenced human-request ledger with one authoritative recipient address and explicit advisory versus
+workflow-blocking semantics. Advisory requests continue work; governed workflow decisions retain durable
+response, failure, redrive, supersession, and terminal-closure state. Legacy notices remain readable but do
+not silently invent authority.
+
+- The CEO workspace can select an exact active mission participant, preserve the request draft, and create a
+  non-blocking request. The addressed person answers from the personal inbox; requester and monitoring
+  fallbacks can see status but cannot impersonate the recipient.
+- Human waits are rejected before `NODE_WAITED` unless they have exactly one recipient. Terminal graph runs,
+  cancelled/succeeded lifecycle runs, and nonrecoverable lifecycle failures close stale requests; recoverable
+  failures keep requests open. Failed recorded responses can be redriven only while the request remains
+  recoverable.
+- Human-request content never leaves through webhook, chat, email, or push delivery, even when a route is
+  configured for full payloads. External delivery is an opaque reopen-the-app hint.
+- A real PostgreSQL proof applied migration 109 using the local migration owner after the runtime role was
+  correctly denied DDL. Under `agentos_app`, tenant A saw its rollback-only proof row and tenant B saw zero;
+  `agentos_worker` had neither SELECT nor INSERT while `agentos_app` retained governed UPDATE.
+- The frozen repository suite passes **1,500 tests with 2 intentional skips**. The invariant security scan
+  reports zero findings. The headless CEO/reviewer proof reports request creation, exact participant routing,
+  inbox response, and idempotency all true.
+- Both pinned production images build. The application image runs as UID/GID `10001:10001`, and its packaged
+  `agentos-v2` CLI smoke passes. The migration image contains revision 109.
+
+This closes the repository-owned human-request slice, not public activation. External cloud/OIDC/DNS/payment/
+provider credentials and production monitoring destinations remain deployment inputs, and commercial revenue
+remains $0 until a customer purchases and uses the service.
 
 ## 2026-09-14 V2 Production-Readiness Closure
 

@@ -148,6 +148,10 @@ authorization, and one person may hold several personas.
 
 ### Attention and communication
 
+- Human requests use the authoritative lifecycle in
+  [ADR-009](ADR-009-authoritative-human-request-ledger.md): one exact recipient, explicit advisory versus
+  workflow-blocking semantics, durable response/recovery state, and terminal closure. Notifications and
+  external channels are delivery hints, never request authority.
 - Immutable events remain separate from mutable per-recipient read, acknowledged, snoozed, resolved, and
   dismissed projections.
 - Routing evaluates recipient, category, urgency, channel, quiet hours, digest cadence, escalation, redaction,
@@ -275,6 +279,15 @@ temporary unavailability. Builder assurance no longer exposes mission-wide evide
 authorizes only evidence attached to that work. Production packaging now includes participation, conversation,
 and accountability migrations, with a real PostgreSQL RLS test. The same hardening also removed an
 executive-only directory request from non-executive sign-in.
+
+Human collaboration now also has an authoritative request ledger as specified in
+[ADR-009](ADR-009-authoritative-human-request-ledger.md). Agents and authorized managers can ask one exact
+person for non-blocking input without falsifying a workflow pause; a real workflow wait creates its blocking
+request only after durable `NODE_WAITED`. The personal inbox shows ownership and request state, accepts an
+answer only from the addressed subject/role inside mission scope, and preserves recorded intent through
+failure/redrive. Terminal runs cancel unanswered requests and supersede no-longer-applicable responses.
+External delivery is always a content-free hint for this category, including routes configured for full
+payloads.
 
 ## Satisfaction and evolution loop
 

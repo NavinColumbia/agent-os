@@ -66,7 +66,13 @@ class GovernedNotificationSender:
     def _body(lease: NotificationDeliveryLease) -> bytes:
         notification = dict(lease.notification)
         route = lease.route
-        if route.get("redaction_policy", "summary") == "summary":
+        # Human requests can contain proprietary decisions, credentials, or
+        # personal context. External channels are hints only, even when a
+        # tenant chose full delivery for lower-risk notification categories.
+        if (
+            notification.get("category") == "human_action_required"
+            or route.get("redaction_policy", "summary") == "summary"
+        ):
             notification = {
                 key: notification.get(key)
                 for key in (

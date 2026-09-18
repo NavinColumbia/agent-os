@@ -96,7 +96,7 @@ def test_mission_role_notifications_expand_to_assigned_subjects_or_safe_manager_
         }
         assert records["assigned-review-action"]["recipient_ids"] == ["reviewer-a"]
         assert set(records["missing-review-action"]["recipient_ids"]) == {
-            "role:manager", "human:ceo",
+            "role:reviewer", "role:manager", "human:ceo",
         }
         assert records["missing-review-action"]["payload"][
             "participant_routing_fallback"

@@ -180,8 +180,10 @@ class DurableGraphActionExecutor(GraphActionExecutor):
             recipients = [str(item) for item in result.get("recipient_ids", ()) if str(item)]
             correlation_id = str(result.get("correlation_id") or "")
             reason = str(result.get("reason") or "")
-            if not recipients or not correlation_id or not reason:
-                raise FatalCommandError("graph wait requires recipients, correlation ID, and reason")
+            if len(recipients) != 1 or not correlation_id or not reason:
+                raise FatalCommandError(
+                    "graph wait requires exactly one recipient, correlation ID, and reason"
+                )
             payload.update({
                 "recipient_ids": recipients,
                 "correlation_id": correlation_id,

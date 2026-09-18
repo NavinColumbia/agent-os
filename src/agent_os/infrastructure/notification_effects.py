@@ -62,6 +62,14 @@ class NotificationEffectHandlers:
         ]
         governed_payload = dict(payload)
         if not matched:
+            # Retain the authoritative role address so a later valid mission
+            # assignment can discover and answer the still-open request. The
+            # manager/CEO aliases are monitoring fallbacks, not substitute
+            # decision owners.
+            expanded.extend(
+                recipient for recipient in recipients
+                if recipient.removeprefix("role:") in requested_roles
+            )
             expanded.extend(("role:manager", "human:ceo"))
             governed_payload["participant_routing_fallback"] = sorted(requested_roles)
         else:
@@ -84,6 +92,16 @@ class NotificationEffectHandlers:
         correlation_id: str | None,
         payload: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        payload = dict(payload)
+        if category is NotificationCategory.HUMAN_ACTION_REQUIRED:
+            if len(recipients) != 1:
+                raise ValueError(
+                    "a human request requires exactly one authoritative recipient"
+                )
+            payload["request_recipient_id"] = recipients[0]
+            payload["request_kind"] = (
+                "workflow_blocking" if correlation_id else "advisory"
+            )
         recipients, payload = self._mission_recipients(
             tenant_id, run_id, recipients, payload,
         )
@@ -141,7 +159,16 @@ class NotificationEffectHandlers:
     def _lifecycle_operator(self, item: CommandEnvelope) -> Mapping[str, Any]:
         payload = dict(item.command.payload)
         reason = str(payload.get("reason") or "A mission operation needs attention.")
-        return self._publish(
+        close_requests = getattr(self._store, "close_active_human_requests", None)
+        closed_requests = 0
+        if payload.get("recoverable") is False and close_requests is not None:
+            closed_requests = close_requests(
+                tenant_id=item.organization_id,
+                run_id=item.run_id,
+                actor_id="system:lifecycle-runtime",
+                reason="run_failed_terminally",
+            )
+        result = self._publish(
             tenant_id=item.organization_id,
             run_id=item.run_id,
             source_id=item.command_id,
@@ -152,10 +179,20 @@ class NotificationEffectHandlers:
             correlation_id=None,
             payload=payload,
         )
+        return {**result, "closed_human_requests": closed_requests}
 
     def _lifecycle_completion(self, item: CommandEnvelope) -> Mapping[str, Any]:
         payload = dict(item.command.payload)
-        return self._publish(
+        close_requests = getattr(self._store, "close_active_human_requests", None)
+        closed_requests = 0
+        if close_requests is not None:
+            closed_requests = close_requests(
+                tenant_id=item.organization_id,
+                run_id=item.run_id,
+                actor_id="system:lifecycle-runtime",
+                reason="run_succeeded",
+            )
+        result = self._publish(
             tenant_id=item.organization_id,
             run_id=item.run_id,
             source_id=item.command_id,
@@ -166,6 +203,7 @@ class NotificationEffectHandlers:
             correlation_id=None,
             payload=payload,
         )
+        return {**result, "closed_human_requests": closed_requests}
 
     @staticmethod
     def _graph_identity(envelope: Mapping[str, Any], action: WorkflowAction) -> tuple[str, str, dict[str, Any]]:
@@ -178,6 +216,12 @@ class NotificationEffectHandlers:
     def _graph_human(self, envelope: Mapping[str, Any], action: WorkflowAction) -> Mapping[str, Any]:
         tenant_id, run_id, payload = self._graph_identity(envelope, action)
         recipients = tuple(str(value) for value in payload.get("recipient_ids", ()))
+        if len(recipients) != 1:
+            raise ValueError("graph human request requires exactly one authoritative recipient")
+        payload.update({
+            "request_recipient_id": recipients[0],
+            "request_kind": "workflow_blocking",
+        })
         return self._publish(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -198,7 +242,16 @@ class NotificationEffectHandlers:
         subject: str,
     ) -> Mapping[str, Any]:
         tenant_id, run_id, payload = self._graph_identity(envelope, action)
-        return self._publish(
+        close_requests = getattr(self._store, "close_active_human_requests", None)
+        closed_requests = 0
+        if close_requests is not None:
+            closed_requests = close_requests(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                actor_id="system:workflow-runtime",
+                reason=category.value,
+            )
+        result = self._publish(
             tenant_id=tenant_id,
             run_id=run_id,
             source_id=action.action_id,
@@ -209,6 +262,7 @@ class NotificationEffectHandlers:
             correlation_id=None,
             payload=payload,
         )
+        return {**result, "closed_human_requests": closed_requests}
 
     def _graph_succeeded(self, envelope: Mapping[str, Any], action: WorkflowAction) -> Mapping[str, Any]:
         return self._graph_status(

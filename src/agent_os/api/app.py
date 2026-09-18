@@ -459,6 +459,14 @@ class DecisionResponseRequest(BaseModel):
     response: dict[str, Any] = Field(min_length=1, max_length=32)
 
 
+class HumanRequestCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    recipient_id: str = Field(min_length=1, max_length=256)
+    subject: str = Field(min_length=1, max_length=500)
+    body: str = Field(min_length=1, max_length=16_384)
+
+
 class InvitationCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2429,9 +2437,34 @@ def create_app(
             )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="run not found") from exc
+        request_closer = (
+            None if notification_store is None else getattr(
+                notification_store, "close_active_human_requests", None,
+            )
+        )
+        if request_closer is not None:
+            request_closer(
+                tenant_id=principal.organization_id,
+                run_id=run_id,
+                actor_id=principal.subject_id,
+                reason="lifecycle_cancelled",
+            )
         return _response(receipt, run_id)
 
     if notification_store is not None:
+        def principal_notification_audiences(principal: Principal) -> set[str]:
+            admitted = {
+                principal.subject_id,
+                *(f"role:{role}" for role in principal.roles),
+            }
+            if "owner" in principal.roles:
+                admitted.update({"human:ceo", "role:owner", "role:executive"})
+            if "operator" in principal.roles:
+                admitted.update({"human:operator", "operator:on-call", "role:operator"})
+            if "agent" in principal.roles:
+                admitted.add(f"agent:{principal.subject_id}")
+            return admitted
+
         def notification_visible_to(
             raw: Mapping[str, Any], principal: Principal,
         ) -> bool:
@@ -2451,17 +2484,7 @@ def create_app(
                     principal.organization_id, mission_id, principal.subject_id,
                 ):
                     return False
-            admitted = {
-                principal.subject_id,
-                *(f"role:{role}" for role in principal.roles),
-            }
-            if "owner" in principal.roles:
-                admitted.update({"human:ceo", "role:owner", "role:executive"})
-            if "operator" in principal.roles:
-                admitted.update({"human:operator", "operator:on-call", "role:operator"})
-            if "agent" in principal.roles:
-                admitted.add(f"agent:{principal.subject_id}")
-            return bool(recipients & admitted)
+            return bool(recipients & principal_notification_audiences(principal))
 
         def notification_decision_context(
             raw: Mapping[str, Any],
@@ -2943,6 +2966,160 @@ def create_app(
                 raise HTTPException(status_code=404, detail="Web Push subscription not found")
             return result
 
+        @app.get("/v2/human-requests")
+        def list_human_requests(
+            principal: Annotated[Principal, Depends(current_principal)],
+            run_id: Annotated[str | None, Query(max_length=256)] = None,
+            limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        ) -> Mapping[str, Any]:
+            reader = getattr(notification_store, "list_human_requests", None)
+            if reader is None:
+                raise HTTPException(status_code=503, detail="human requests are unavailable")
+            audiences = principal_notification_audiences(principal)
+            kwargs: dict[str, Any] = {
+                "run_id": run_id,
+                # Visibility can also depend on mission participation, which
+                # is evaluated against the linked notification below. Fetch a
+                # bounded candidate page before applying the caller's limit so
+                # other missions cannot crowd out their first visible item.
+                "limit": 500,
+            }
+            if "system" not in principal.roles:
+                kwargs.update({
+                    "audience_ids": tuple(sorted(audiences)),
+                    "requested_by": principal.subject_id,
+                })
+            items = []
+            for item in reader(principal.organization_id, **kwargs):
+                raw = notification_store.get_notification(
+                    principal.organization_id, str(item["notification_id"]),
+                )
+                if (
+                    item.get("requested_by") == principal.subject_id
+                    or "system" in principal.roles
+                    or (raw is not None and notification_visible_to(raw, principal))
+                ):
+                    items.append(item)
+                    if len(items) == limit:
+                        break
+            return {"items": items}
+
+        @app.post("/v2/runs/{run_id}/human-requests", status_code=201)
+        def create_advisory_human_request(
+            run_id: str,
+            body: HumanRequestCreateRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "mission.steer"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="creating a human request requires mission steering authority",
+                )
+            lifecycle = engine.get_run(principal.organization_id, run_id)
+            if lifecycle is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            if lifecycle.status.value in {"cancelled", "succeeded"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="terminal runs cannot accept new human requests",
+                )
+            require_mission_access(principal, run_id)
+            recipient_id = body.recipient_id.strip()
+            request_subject = body.subject.strip()
+            request_body = body.body.strip()
+            if not recipient_id or not request_subject or not request_body:
+                raise HTTPException(
+                    status_code=422,
+                    detail="human request recipient, subject, and body are required",
+                )
+            request_reader = getattr(notification_store, "get_human_request", None)
+            if request_reader is None:
+                raise HTTPException(status_code=503, detail="human requests are unavailable")
+            digest = hashlib.sha256(
+                f"agent-os:advisory-request:v1:{principal.organization_id}:"
+                f"{run_id}:{idempotency_key}".encode()
+            ).hexdigest()
+            notification = Notification(
+                notification_id=f"notification-{digest}",
+                tenant_id=principal.organization_id,
+                run_id=run_id,
+                category=NotificationCategory.HUMAN_ACTION_REQUIRED,
+                recipient_ids=(recipient_id,),
+                subject=request_subject,
+                body=request_body,
+                source_id=f"human-request-api-{digest}",
+                created_at=datetime.now(timezone.utc).isoformat(),
+                correlation_id=None,
+                payload={
+                    "request_kind": "advisory",
+                    "request_recipient_id": recipient_id,
+                    "requested_by": principal.subject_id,
+                    "attention_disposition": "batch",
+                    "attention_reason": "A teammate requested non-blocking input.",
+                },
+            )
+            try:
+                created = notification_store.publish_notification(notification)
+                result = request_reader(
+                    principal.organization_id,
+                    notification_id=notification.notification_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="human request ledger did not confirm publication",
+                )
+            return {**result, "duplicate": not created}
+
+        @app.post("/v2/human-requests/{request_id}/responses", status_code=200)
+        def answer_advisory_human_request(
+            request_id: str,
+            body: DecisionResponseRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            reader = getattr(notification_store, "get_human_request", None)
+            writer = getattr(notification_store, "answer_advisory_human_request", None)
+            if reader is None or writer is None:
+                raise HTTPException(status_code=503, detail="human requests are unavailable")
+            request_record = reader(
+                principal.organization_id, request_id=request_id,
+            )
+            raw = (
+                None if request_record is None else notification_store.get_notification(
+                    principal.organization_id,
+                    str(request_record["notification_id"]),
+                )
+            )
+            if (
+                request_record is None
+                or raw is None
+                or not notification_visible_to(raw, principal)
+                or request_record.get("recipient_id")
+                not in principal_notification_audiences(principal)
+            ):
+                raise HTTPException(status_code=404, detail="human request not found")
+            try:
+                result = writer(
+                    tenant_id=principal.organization_id,
+                    request_id=request_id,
+                    response=body.response,
+                    actor_id=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(status_code=404, detail="human request not found")
+            return result
+
         @app.put("/v2/notifications/{notification_id}/state")
         def set_notification_state(
             notification_id: str,
@@ -2995,6 +3172,20 @@ def create_app(
                     or not notification_visible_to(raw, principal)
                     or raw.get("category") != "human_action_required"
                 ):
+                    raise HTTPException(status_code=404, detail="decision not found")
+                request_reader = getattr(notification_store, "get_human_request", None)
+                human_request = (
+                    None if request_reader is None else request_reader(
+                        principal.organization_id, notification_id=notification_id,
+                    )
+                )
+                if human_request is not None and (
+                    human_request.get("request_kind") != "workflow_blocking"
+                    or human_request.get("recipient_id")
+                    not in principal_notification_audiences(principal)
+                ):
+                    # Delivery aliases and escalation fallbacks may see a hint;
+                    # only the authoritative recipient address can answer it.
                     raise HTTPException(status_code=404, detail="decision not found")
                 decision_context = notification_decision_context(raw)
                 raw_payload = raw.get("payload")
@@ -3083,6 +3274,9 @@ def create_app(
                 return {
                     "response_id": admitted["response_id"],
                     "notification_id": admitted["notification_id"],
+                    "request_id": (
+                        None if human_request is None else human_request["request_id"]
+                    ),
                     "status": admitted["status"],
                     "actor_id": admitted["actor_id"],
                     "accepted": admitted["status"] in {"pending", "executing", "applied"},
@@ -3144,6 +3338,13 @@ def create_app(
                 principal.organization_id,
                 notification_ids=notification_ids,
             )
+            request_reader = getattr(
+                notification_store, "list_human_requests_by_notification", None,
+            )
+            human_requests = {} if request_reader is None else request_reader(
+                principal.organization_id,
+                notification_ids=notification_ids,
+            )
             preference_reader = getattr(notification_store, "get_notification_preferences", None)
             preferences = (
                 NotificationPreferences(
@@ -3163,6 +3364,16 @@ def create_app(
             for raw in items:
                 item = dict(raw)
                 if item.get("category") == "human_action_required":
+                    human_request = human_requests.get(
+                        str(item.get("notification_id") or ""),
+                    )
+                    if human_request is not None:
+                        item["human_request"] = human_request
+                    request_addressed_here = bool(
+                        human_request is None
+                        or human_request.get("recipient_id")
+                        in principal_notification_audiences(principal)
+                    )
                     decision_context = notification_decision_context(item)
                     if decision_context is not None:
                         item["decision_context"] = decision_context
@@ -3187,9 +3398,19 @@ def create_app(
                                 and token.wait_correlation_id == correlation
                                 for token in graph_state.tokens
                             )
+                            and (
+                                human_request is None
+                                or human_request.get("status") == "open"
+                            )
+                            and request_addressed_here
                         )
                     else:
-                        item["actionable"] = False
+                        item["actionable"] = bool(
+                            human_request is not None
+                            and human_request.get("request_kind") == "advisory"
+                            and human_request.get("status") == "open"
+                            and request_addressed_here
+                        )
                 else:
                     item["actionable"] = False
                 if item.get("decision_context_error"):

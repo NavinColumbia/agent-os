@@ -87,6 +87,21 @@ def test_agent_designed_graph_loops_waits_for_a_correlated_human_and_finishes():
     assert finished.actions[-1].kind is WorkflowActionKind.RUN_SUCCEEDED
 
 
+def test_human_wait_rejects_ambiguous_multi_recipient_authority():
+    graph = definition()
+    started = start_workflow(graph, run_id="run-ambiguous-recipient")
+    running = begin_node(
+        started.state, started.state.ready()[0].token_id, expected_version=0,
+    ).state
+
+    with pytest.raises(WorkflowTransitionRejected, match="exactly one recipient"):
+        wait_node(
+            running, running.tokens[0].token_id, expected_version=1,
+            correlation_id="question-ambiguous", reason="Who owns this decision?",
+            recipient_ids=("role:owner", "role:reviewer"),
+        )
+
+
 def test_multiple_satisfied_edges_fan_out_into_parallel_work():
     graph = WorkflowDefinition(
         "parallel", "tenant-1", "Parallel", 1, "manager",

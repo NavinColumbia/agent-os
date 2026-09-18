@@ -7,7 +7,7 @@ const state = {
   eventCursor: null, eventAbort: null, eventRefreshTimer: null,
   pushSubscriptionId: null,
   focusedNotificationId: null, focusInboxItemPending: false,
-  missionMessageDrafts: {},
+  missionMessageDrafts: {}, humanRequestDrafts: {},
   readiness: null, readinessCheckedAt: 0, missionAdmissionBlocked: true,
   missionSubmission: null,
 };
@@ -292,6 +292,7 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   state.eventCursor = null;
   state.pushSubscriptionId = null;
   state.missionMessageDrafts = {};
+  state.humanRequestDrafts = {};
   state.readiness = null;
   state.readinessCheckedAt = 0;
   state.missionAdmissionBlocked = true;
@@ -906,7 +907,29 @@ function renderInbox() {
       contextError.setAttribute("role", "alert");
       node.append(contextError);
     }
-    if (item.category === "human_action_required" && item.actionable && item.correlation_id) {
+    const humanRequest = item.human_request;
+    if (
+      item.category === "human_action_required"
+      && item.actionable
+      && humanRequest?.request_kind === "advisory"
+    ) {
+      const actions = el("div", "human-actions");
+      const answer = document.createElement("input");
+      answer.type = "text"; answer.maxLength = 2000;
+      answer.placeholder = "Reply to this request";
+      answer.setAttribute("aria-label", "Human request response");
+      answer.value = state.decisionDrafts[humanRequest.request_id] || "";
+      answer.addEventListener("input", () => {
+        state.decisionDrafts[humanRequest.request_id] = answer.value;
+      });
+      const reply = el("button", "quiet", "Send response"); reply.type = "button";
+      reply.addEventListener("click", () => {
+        const value = answer.value.trim();
+        if (!value) return setFlash("Enter a response first.", "error");
+        answerAdvisoryRequest(item, {answer: value}, actions);
+      });
+      actions.append(answer, reply); node.append(actions);
+    } else if (item.category === "human_action_required" && item.actionable && item.correlation_id) {
       const actions = el("div", "human-actions");
       const answer = document.createElement("input");
       answer.type = "text"; answer.maxLength = 2000; answer.placeholder = "Optional decision context";
@@ -955,11 +978,18 @@ function renderInbox() {
       node.append(actions);
     } else if (item.category === "human_action_required" && !item.decision_context_error) {
       const decisionStatus = item.decision_response?.status;
+      const requestStatus = humanRequest?.status;
       const decisionMessage = decisionStatus === "pending" || decisionStatus === "executing"
         ? "Your response is durably queued and will resume this work."
         : (decisionStatus === "failed"
           ? "The response could not be applied. Your intent remains recorded and can be retried safely."
-          : "Resolved or no longer actionable");
+          : (requestStatus === "open" && humanRequest?.recipient_id
+            ? `This request is addressed to ${label(humanRequest.recipient_id)}; you can monitor it but cannot answer for them.`
+            : (requestStatus === "answered"
+            ? "This request was answered."
+            : (requestStatus === "cancelled" || requestStatus === "superseded"
+              ? "This request is no longer active."
+              : "Resolved or no longer actionable"))));
       node.append(el("small", "", decisionMessage));
       if (decisionStatus === "failed" && can("decision.redrive")) {
         const recover = el("button", "quiet", "Retry recorded response");
@@ -1063,6 +1093,22 @@ async function resolveHumanRequest(item, response, actions) {
       ? "Your response was applied and the team can continue."
       : "Your response is durably queued. The team will resume from the exact decision point.");
     delete state.decisionDrafts[item.notification_id];
+    await loadInbox({refresh: true});
+  } catch (error) {
+    for (const control of actions.querySelectorAll("button,input")) control.disabled = false;
+    setFlash(error.message, "error");
+  }
+}
+
+async function answerAdvisoryRequest(item, response, actions) {
+  for (const control of actions.querySelectorAll("button,input")) control.disabled = true;
+  try {
+    await api(`/v2/human-requests/${encodeURIComponent(item.human_request.request_id)}/responses`, {
+      method: "POST", headers: {"Idempotency-Key": `human-response-${crypto.randomUUID()}`},
+      body: JSON.stringify({response}),
+    });
+    delete state.decisionDrafts[item.human_request.request_id];
+    setFlash("Your response was recorded for the requester.");
     await loadInbox({refresh: true});
   } catch (error) {
     for (const control of actions.querySelectorAll("button,input")) control.disabled = false;
@@ -1736,6 +1782,7 @@ async function loadMissionDetail(item, silent = false) {
         "p", "program-rationale",
         "Give a teammate access only to this mission. Their organization role must match the mission role.",
       ));
+      const activeParticipants = (participantsFetch.items || []).filter((value) => value.active);
       for (const participant of participantsFetch.items || []) {
         const row = el("div", "work-row");
         row.append(
@@ -1784,6 +1831,71 @@ async function loadMissionDetail(item, silent = false) {
         finally { grant.disabled = false; }
       });
       assign.append(subject, role, grant); collaboration.append(assign); content.append(collaboration);
+      if (activeParticipants.length) {
+        const request = el("div", "access-form");
+        request.append(el(
+          "p", "program-rationale",
+          "Request a response without pausing the mission. Only the selected teammate can answer; you can monitor the durable request in the inbox.",
+        ));
+        const draft = state.humanRequestDrafts[item.run_id] || {
+          recipient_id: activeParticipants[0].subject_id, subject: "", body: "",
+        };
+        const recipient = document.createElement("select");
+        recipient.setAttribute("aria-label", "Human request recipient");
+        for (const participant of activeParticipants) {
+          const option = el(
+            "option", "",
+            `${participant.subject_id} · ${label(participant.participation_role)}`,
+          );
+          option.value = participant.subject_id;
+          option.selected = draft.recipient_id === participant.subject_id;
+          recipient.append(option);
+        }
+        if (![...recipient.options].some((option) => option.selected)) {
+          recipient.options[0].selected = true;
+        }
+        const requestSubject = field("What do you need?", "Human request subject", 500);
+        requestSubject.value = draft.subject;
+        const requestBody = document.createElement("textarea");
+        requestBody.rows = 3; requestBody.maxLength = 16384;
+        requestBody.setAttribute("aria-label", "Human request details");
+        requestBody.placeholder = "Give the context and describe a useful response…";
+        requestBody.value = draft.body;
+        const retainRequest = () => {
+          state.humanRequestDrafts[item.run_id] = {
+            recipient_id: recipient.value,
+            subject: requestSubject.value,
+            body: requestBody.value,
+          };
+        };
+        recipient.addEventListener("change", retainRequest);
+        requestSubject.addEventListener("input", retainRequest);
+        requestBody.addEventListener("input", retainRequest);
+        const ask = el("button", "quiet", "Request response"); ask.type = "button";
+        ask.addEventListener("click", async () => {
+          if (!requestSubject.value.trim() || !requestBody.value.trim()) {
+            return setFlash("Describe both the request and the context first.", "error");
+          }
+          ask.disabled = true;
+          try {
+            await api(`/v2/runs/${encodeURIComponent(item.run_id)}/human-requests`, {
+              method: "POST",
+              headers: {"Idempotency-Key": `human-request-${crypto.randomUUID()}`},
+              body: JSON.stringify({
+                recipient_id: recipient.value,
+                subject: requestSubject.value.trim(),
+                body: requestBody.value.trim(),
+              }),
+            });
+            delete state.humanRequestDrafts[item.run_id];
+            setFlash("The response request is in the selected teammate's inbox.");
+            await loadMissionDetail(item);
+          } catch (error) { setFlash(error.message, "error"); }
+          finally { ask.disabled = false; }
+        });
+        request.append(recipient, requestSubject, requestBody, ask);
+        collaboration.append(request);
+      }
     }
 
     const program = managementResult?.program || missionResult?.program;

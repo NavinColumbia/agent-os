@@ -976,6 +976,51 @@ class NotificationStore(Protocol):
         self, tenant_id: str, *, notification_ids: tuple[str, ...],
     ) -> Mapping[str, Mapping[str, Any]]: ...
 
+    def get_human_request(
+        self,
+        tenant_id: str,
+        *,
+        request_id: str | None = None,
+        notification_id: str | None = None,
+    ) -> Mapping[str, Any] | None: ...
+
+    def list_human_requests(
+        self,
+        tenant_id: str,
+        *,
+        run_id: str | None = None,
+        statuses: tuple[str, ...] | None = None,
+        audience_ids: tuple[str, ...] | None = None,
+        requested_by: str | None = None,
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def list_human_requests_by_notification(
+        self,
+        tenant_id: str,
+        *,
+        notification_ids: tuple[str, ...],
+    ) -> Mapping[str, Mapping[str, Any]]: ...
+
+    def answer_advisory_human_request(
+        self,
+        *,
+        tenant_id: str,
+        request_id: str,
+        response: Mapping[str, Any],
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None: ...
+
+    def close_active_human_requests(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        actor_id: str,
+        reason: str,
+    ) -> int: ...
+
     def claim_decision_response(
         self,
         tenant_id: str,

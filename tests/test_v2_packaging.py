@@ -145,6 +145,8 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "99zzzzzz-mission-participants-v2.sql" in compose
     assert "99zzzzzzz-mission-conversations-v2.sql" in compose
     assert "107-mission-work-accountability-v2.sql" in compose
+    assert "108-execution-health-v2.sql" in compose
+    assert "109-human-requests-v2.sql" in compose
     migration_image = (ROOT / "deploy" / "Dockerfile.migrations-v2").read_text()
     assert "99zzzzz-notification-delivery-v2.sql" in migration_image
     assert "100-mission-assurance-kernel-v2.sql" in migration_image
@@ -157,6 +159,8 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "99zzzzzz-mission-participants-v2.sql" in migration_image
     assert "99zzzzzzz-mission-conversations-v2.sql" in migration_image
     assert "107-mission-work-accountability-v2.sql" in migration_image
+    assert "108-execution-health-v2.sql" in migration_image
+    assert "109-human-requests-v2.sql" in migration_image
     required_v2_migrations = [
         path.name for path in (ROOT / "postgres" / "initdb").glob("*.sql")
         if int(path.name.split("-", 1)[0].rstrip("z")) >= 86

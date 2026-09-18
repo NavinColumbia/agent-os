@@ -378,8 +378,10 @@ def wait_node(
     token = state.token(token_id)
     if token.status is not TokenStatus.RUNNING:
         raise WorkflowTransitionRejected("only a running workflow token can wait")
-    if not correlation_id.strip() or not reason.strip() or not recipient_ids:
-        raise WorkflowTransitionRejected("a human wait requires correlation, reason, and recipients")
+    if not correlation_id.strip() or not reason.strip() or len(recipient_ids) != 1:
+        raise WorkflowTransitionRejected(
+            "a human wait requires correlation, reason, and exactly one recipient"
+        )
     normalized_context: dict[str, Any] | None = None
     if decision_context is not None:
         try:

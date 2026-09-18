@@ -123,6 +123,56 @@ notification_states = Table(
     ),
 )
 
+human_requests = Table(
+    "aos_v2_human_requests",
+    notification_metadata,
+    Column("tenant_id", String(128), primary_key=True),
+    Column("request_id", String(96), primary_key=True),
+    Column("run_id", String(256), nullable=False),
+    Column("notification_id", String(128), nullable=False),
+    Column("source_id", String(256), nullable=False),
+    Column("request_kind", String(32), nullable=False),
+    Column("recipient_id", String(256), nullable=False),
+    Column("requested_by", String(256), nullable=False),
+    Column("subject", Text, nullable=False),
+    Column("body", Text, nullable=False),
+    Column("correlation_id", String(256)),
+    Column("status", String(32), nullable=False),
+    Column("response", JSON),
+    Column("responded_by", String(256)),
+    Column("response_idempotency_key", String(200)),
+    Column("fingerprint", String(64), nullable=False),
+    Column("version", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("answered_at", DateTime(timezone=True)),
+    UniqueConstraint("tenant_id", "notification_id"),
+    UniqueConstraint("tenant_id", "source_id"),
+    ForeignKeyConstraint(
+        ["tenant_id", "notification_id"],
+        ["aos_v2_notifications.tenant_id", "aos_v2_notifications.notification_id"],
+        ondelete="CASCADE",
+    ),
+)
+
+Index(
+    "aos_v2_human_requests_recipient_open_idx",
+    human_requests.c.tenant_id,
+    human_requests.c.recipient_id,
+    human_requests.c.status,
+    human_requests.c.created_at.desc(),
+    human_requests.c.request_id.desc(),
+)
+
+Index(
+    "aos_v2_human_requests_correlation_idx",
+    human_requests.c.tenant_id,
+    human_requests.c.correlation_id,
+    unique=True,
+    postgresql_where=human_requests.c.correlation_id.is_not(None),
+    sqlite_where=human_requests.c.correlation_id.is_not(None),
+)
+
 Index(
     "aos_v2_notification_states_inbox_idx",
     notification_states.c.tenant_id,
@@ -550,6 +600,141 @@ class SQLNotificationStore(NotificationStore):
             limit=limit,
         )
 
+    @staticmethod
+    def _human_request_values(
+        notification: Notification,
+    ) -> dict[str, Any] | None:
+        if notification.category is not NotificationCategory.HUMAN_ACTION_REQUIRED:
+            return None
+        payload = notification.payload
+        explicit_recipient = str(payload.get("request_recipient_id") or "").strip()
+        if not explicit_recipient:
+            # Legacy notifications remain delivery hints. Only producers that
+            # explicitly opt into the authoritative request contract may
+            # create ledger state; inferring a request from old notification
+            # fields can alias reused correlation IDs and invent authority.
+            return None
+        recipient_id = explicit_recipient
+        if not 1 <= len(recipient_id) <= 256:
+            raise ValueError("human request recipient is invalid")
+        correlation_id = (
+            str(notification.correlation_id).strip()
+            if notification.correlation_id is not None else None
+        )
+        request_kind = str(payload.get("request_kind") or (
+            "workflow_blocking" if correlation_id else "advisory"
+        ))
+        if request_kind not in {"advisory", "workflow_blocking"}:
+            raise ValueError("human request kind is invalid")
+        if (request_kind == "workflow_blocking") != (correlation_id is not None):
+            raise ValueError("workflow-blocking human requests require a correlation ID")
+        identity = correlation_id or notification.source_id
+        requested_by = str(payload.get("requested_by") or "system").strip() or "system"
+        if len(requested_by) > 256:
+            raise ValueError("human request requester is invalid")
+        request_id = "human-request-" + hashlib.sha256(
+            f"agent-os:human-request:v1:{notification.tenant_id}:{identity}".encode()
+        ).hexdigest()
+        semantic = {
+            "tenant_id": notification.tenant_id,
+            "request_id": request_id,
+            "run_id": notification.run_id,
+            "notification_id": notification.notification_id,
+            "source_id": notification.source_id,
+            "request_kind": request_kind,
+            "recipient_id": recipient_id,
+            "requested_by": requested_by,
+            "subject": notification.subject,
+            "body": notification.body,
+            "correlation_id": correlation_id,
+        }
+        fingerprint = hashlib.sha256(json.dumps(
+            semantic, allow_nan=False, ensure_ascii=False,
+            separators=(",", ":"), sort_keys=True,
+        ).encode()).hexdigest()
+        created_at = _parse_time(notification.created_at)
+        return {
+            **semantic,
+            "status": "open",
+            "response": None,
+            "responded_by": None,
+            "response_idempotency_key": None,
+            "fingerprint": fingerprint,
+            "version": 1,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "answered_at": None,
+        }
+
+    @staticmethod
+    def _human_request_record(
+        row: Mapping[str, Any], *, duplicate: bool = False,
+    ) -> Mapping[str, Any]:
+        return {
+            "request_id": str(row["request_id"]),
+            "tenant_id": str(row["tenant_id"]),
+            "run_id": str(row["run_id"]),
+            "notification_id": str(row["notification_id"]),
+            "source_id": str(row["source_id"]),
+            "request_kind": str(row["request_kind"]),
+            "recipient_id": str(row["recipient_id"]),
+            "requested_by": str(row["requested_by"]),
+            "subject": str(row["subject"]),
+            "body": str(row["body"]),
+            "correlation_id": row["correlation_id"],
+            "status": str(row["status"]),
+            "response": None if row["response"] is None else dict(row["response"]),
+            "responded_by": row["responded_by"],
+            "version": int(row["version"]),
+            "created_at": row["created_at"].isoformat(),
+            "updated_at": row["updated_at"].isoformat(),
+            "answered_at": (
+                None if row["answered_at"] is None else row["answered_at"].isoformat()
+            ),
+            "duplicate": duplicate,
+        }
+
+    def _ensure_human_request(
+        self, connection, notification: Notification,
+    ) -> Mapping[str, Any] | None:
+        values = self._human_request_values(notification)
+        if values is None:
+            return None
+        prior = connection.execute(select(human_requests).where(and_(
+            human_requests.c.tenant_id == notification.tenant_id,
+            or_(
+                human_requests.c.request_id == values["request_id"],
+                human_requests.c.notification_id == notification.notification_id,
+                human_requests.c.source_id == notification.source_id,
+            ),
+        )).limit(2).with_for_update()).mappings().all()
+        if len(prior) > 1 or (
+            prior and prior[0]["fingerprint"] != values["fingerprint"]
+        ):
+            raise ValueError("human request identity was reused with different content")
+        if prior:
+            return self._human_request_record(prior[0], duplicate=True)
+        connection.execute(insert(human_requests).values(**values))
+        audiences = tuple(dict.fromkeys((
+            str(values["recipient_id"]), str(values["requested_by"]),
+        )))
+        self._append_experience_event(
+            connection,
+            tenant_id=notification.tenant_id,
+            source_key=experience_source_key(
+                "human-request:created", str(values["request_id"]),
+                str(values["fingerprint"]),
+            ),
+            resource_type="human_request",
+            resource_id=str(values["request_id"]),
+            projection_revision=1,
+            kind="human_request.created",
+            audience_ids=audiences,
+            safe_summary="A human request was created.",
+            occurred_at=values["created_at"],
+        )
+        return self._human_request_record(values)
+
     def publish_notification(self, notification: Notification) -> bool:
         raw = notification.to_dict()
         fingerprint = notification_fingerprint(notification)
@@ -559,12 +744,16 @@ class SQLNotificationStore(NotificationStore):
         )
         try:
             with self._tenant_connection(notification.tenant_id) as connection:
-                prior = connection.execute(
-                    select(notifications.c.fingerprint).where(key)
-                ).scalar_one_or_none()
+                prior = connection.execute(select(
+                    notifications.c.fingerprint,
+                    notifications.c.record,
+                ).where(key)).mappings().one_or_none()
                 if prior is not None:
-                    if prior != fingerprint:
+                    if prior["fingerprint"] != fingerprint:
                         raise ValueError("notification_id was reused with different content")
+                    self._ensure_human_request(
+                        connection, Notification.from_dict(prior["record"]),
+                    )
                     return False
                 created_at = _parse_time(notification.created_at)
                 connection.execute(insert(notifications).values(
@@ -591,6 +780,7 @@ class SQLNotificationStore(NotificationStore):
                     }
                     for recipient_id in notification.recipient_ids
                 ])
+                self._ensure_human_request(connection, notification)
                 route_rows = connection.execute(select(
                     notification_routes.c.route_id,
                     notification_routes.c.categories,
@@ -741,6 +931,9 @@ class SQLNotificationStore(NotificationStore):
                 raise
             if prior != fingerprint:
                 raise ValueError("notification_id was reused with different content") from exc
+            # The winning publisher inserts request + notification in one
+            # transaction, so a matching notification implies a matching
+            # authoritative request when this category requires one.
             return False
         return True
 
@@ -809,6 +1002,227 @@ class SQLNotificationStore(NotificationStore):
                 notifications.c.notification_id == notification_id,
             ))).scalar_one_or_none()
         return None if raw is None else dict(raw)
+
+    def get_human_request(
+        self,
+        tenant_id: str,
+        *,
+        request_id: str | None = None,
+        notification_id: str | None = None,
+    ) -> Mapping[str, Any] | None:
+        if bool(request_id) == bool(notification_id):
+            raise ValueError("select a human request by exactly one identity")
+        criterion = (
+            human_requests.c.request_id == request_id
+            if request_id is not None
+            else human_requests.c.notification_id == notification_id
+        )
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(human_requests).where(and_(
+                human_requests.c.tenant_id == tenant_id,
+                criterion,
+            ))).mappings().one_or_none()
+        return None if row is None else self._human_request_record(row)
+
+    def list_human_requests(
+        self,
+        tenant_id: str,
+        *,
+        run_id: str | None = None,
+        statuses: tuple[str, ...] | None = None,
+        audience_ids: tuple[str, ...] | None = None,
+        requested_by: str | None = None,
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("human request limit must be 1..500")
+        allowed = {
+            "open", "response_pending", "answered", "cancelled",
+            "superseded", "recovery_required",
+        }
+        bounded_statuses = tuple(dict.fromkeys(statuses or ()))
+        if set(bounded_statuses) - allowed:
+            raise ValueError("human request status filter is invalid")
+        bounded_audiences = tuple(dict.fromkeys(audience_ids or ()))
+        if len(bounded_audiences) > 64 or any(
+            not value.strip() or len(value) > 256 for value in bounded_audiences
+        ):
+            raise ValueError("human request audience filter is invalid")
+        if requested_by is not None and (
+            not requested_by.strip() or len(requested_by) > 256
+        ):
+            raise ValueError("human request requester filter is invalid")
+        criteria = [human_requests.c.tenant_id == tenant_id]
+        if run_id is not None:
+            criteria.append(human_requests.c.run_id == run_id)
+        if bounded_statuses:
+            criteria.append(human_requests.c.status.in_(bounded_statuses))
+        visibility = []
+        if bounded_audiences:
+            visibility.append(human_requests.c.recipient_id.in_(bounded_audiences))
+        if requested_by is not None:
+            visibility.append(human_requests.c.requested_by == requested_by)
+        if visibility:
+            criteria.append(or_(*visibility))
+        with self._tenant_connection(tenant_id) as connection:
+            rows = connection.execute(select(human_requests).where(and_(
+                *criteria,
+            )).order_by(
+                human_requests.c.created_at.desc(),
+                human_requests.c.request_id.desc(),
+            ).limit(limit)).mappings().all()
+        return tuple(self._human_request_record(row) for row in rows)
+
+    def list_human_requests_by_notification(
+        self,
+        tenant_id: str,
+        *,
+        notification_ids: tuple[str, ...],
+    ) -> Mapping[str, Mapping[str, Any]]:
+        bounded = tuple(dict.fromkeys(notification_ids))
+        if len(bounded) > 500:
+            raise ValueError("human request lookup exceeds 500 notifications")
+        if not bounded:
+            return {}
+        with self._tenant_connection(tenant_id) as connection:
+            rows = connection.execute(select(human_requests).where(and_(
+                human_requests.c.tenant_id == tenant_id,
+                human_requests.c.notification_id.in_(bounded),
+            ))).mappings().all()
+        return {
+            str(row["notification_id"]): self._human_request_record(row)
+            for row in rows
+        }
+
+    def answer_advisory_human_request(
+        self,
+        *,
+        tenant_id: str,
+        request_id: str,
+        response: Mapping[str, Any],
+        actor_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any] | None:
+        actor_id = actor_id.strip()
+        idempotency_key = idempotency_key.strip()
+        if not actor_id or not 8 <= len(idempotency_key) <= 200:
+            raise ValueError("human request response identity is invalid")
+        if not 1 <= len(response) <= 32:
+            raise ValueError("human request response must contain 1..32 fields")
+        try:
+            encoded = json.dumps(
+                response, allow_nan=False, ensure_ascii=False,
+                separators=(",", ":"), sort_keys=True,
+            ).encode()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("human request response must be JSON-compatible") from exc
+        if len(encoded) > 64 * 1024:
+            raise ValueError("human request response exceeds 64 KiB")
+        now = self._clock()
+        with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(human_requests).where(and_(
+                human_requests.c.tenant_id == tenant_id,
+                human_requests.c.request_id == request_id,
+            )).with_for_update()).mappings().one_or_none()
+            if row is None:
+                return None
+            if row["request_kind"] != "advisory":
+                raise ValueError("workflow-blocking requests require a governed decision response")
+            if row["status"] == "answered":
+                if (
+                    row["response_idempotency_key"] == idempotency_key
+                    and row["responded_by"] == actor_id
+                    and row["response"] == dict(response)
+                ):
+                    return self._human_request_record(row, duplicate=True)
+                raise ValueError("human request was already answered")
+            if row["status"] != "open":
+                raise ValueError("human request is no longer answerable")
+            values = {
+                "status": "answered",
+                "response": dict(response),
+                "responded_by": actor_id,
+                "response_idempotency_key": idempotency_key,
+                "version": int(row["version"]) + 1,
+                "updated_at": now,
+                "answered_at": now,
+            }
+            connection.execute(update(human_requests).where(and_(
+                human_requests.c.tenant_id == tenant_id,
+                human_requests.c.request_id == request_id,
+                human_requests.c.status == "open",
+            )).values(**values))
+            updated = dict(row)
+            updated.update(values)
+            self._append_experience_event(
+                connection,
+                tenant_id=tenant_id,
+                source_key=experience_source_key(
+                    "human-request:answered", request_id, idempotency_key,
+                ),
+                resource_type="human_request",
+                resource_id=request_id,
+                projection_revision=int(values["version"]),
+                kind="human_request.answered",
+                audience_ids=(str(row["recipient_id"]), actor_id),
+                safe_summary="A human request was answered.",
+                occurred_at=now,
+            )
+        return self._human_request_record(updated)
+
+    def close_active_human_requests(
+        self,
+        *,
+        tenant_id: str,
+        run_id: str,
+        actor_id: str,
+        reason: str,
+    ) -> int:
+        """Close stale requests and preserve any response when their run terminates."""
+
+        actor_id = actor_id.strip()
+        run_id = run_id.strip()
+        reason = reason.strip()
+        if not actor_id or not run_id or not reason:
+            raise ValueError("human request cancellation identity and reason are required")
+        now = self._clock()
+        with self._tenant_connection(tenant_id) as connection:
+            rows = connection.execute(select(human_requests).where(and_(
+                human_requests.c.tenant_id == tenant_id,
+                human_requests.c.run_id == run_id,
+                human_requests.c.status.in_((
+                    "open", "response_pending", "recovery_required",
+                )),
+            )).order_by(human_requests.c.request_id).with_for_update()).mappings().all()
+            for row in rows:
+                next_version = int(row["version"]) + 1
+                next_status = (
+                    "cancelled" if row["status"] == "open" else "superseded"
+                )
+                connection.execute(update(human_requests).where(and_(
+                    human_requests.c.tenant_id == tenant_id,
+                    human_requests.c.request_id == row["request_id"],
+                    human_requests.c.status == row["status"],
+                )).values(
+                    status=next_status,
+                    version=next_version,
+                    updated_at=now,
+                ))
+                self._append_experience_event(
+                    connection,
+                    tenant_id=tenant_id,
+                    source_key=experience_source_key(
+                        "human-request:closed", str(row["request_id"]), reason,
+                    ),
+                    resource_type="human_request",
+                    resource_id=str(row["request_id"]),
+                    projection_revision=next_version,
+                    kind=f"human_request.{next_status}",
+                    audience_ids=(str(row["recipient_id"]), actor_id),
+                    safe_summary="A stale human request was closed because its run ended.",
+                    occurred_at=now,
+                )
+        return len(rows)
 
     def list_notification_states(
         self,
@@ -1434,6 +1848,15 @@ class SQLNotificationStore(NotificationStore):
                     or notification["correlation_id"] != correlation_id
                 ):
                     raise ValueError("notification is not the requested human decision")
+                request_row = connection.execute(select(human_requests).where(and_(
+                    human_requests.c.tenant_id == tenant_id,
+                    human_requests.c.notification_id == notification_id,
+                )).with_for_update()).mappings().one_or_none()
+                if request_row is not None and (
+                    request_row["request_kind"] != "workflow_blocking"
+                    or request_row["correlation_id"] != correlation_id
+                ):
+                    raise ValueError("human request is not the requested workflow decision")
                 priors = connection.execute(
                     select(decision_responses).where(prior_filter).limit(2).with_for_update()
                 ).mappings().all()
@@ -1443,8 +1866,36 @@ class SQLNotificationStore(NotificationStore):
                 if prior is not None:
                     if prior["fingerprint"] != fingerprint:
                         raise ValueError("human decision was already answered differently")
+                    if request_row is not None and request_row["status"] == "open":
+                        connection.execute(update(human_requests).where(and_(
+                            human_requests.c.tenant_id == tenant_id,
+                            human_requests.c.request_id == request_row["request_id"],
+                            human_requests.c.status == "open",
+                        )).values(
+                            status="response_pending",
+                            response=dict(prior["response"]),
+                            responded_by=prior["actor_id"],
+                            response_idempotency_key=prior["idempotency_key"],
+                            version=int(request_row["version"]) + 1,
+                            updated_at=now,
+                        ))
                     return self._decision_record(prior, duplicate=True)
                 connection.execute(insert(decision_responses).values(**values))
+                if request_row is not None:
+                    if request_row["status"] != "open":
+                        raise ValueError("human request is no longer answerable")
+                    connection.execute(update(human_requests).where(and_(
+                        human_requests.c.tenant_id == tenant_id,
+                        human_requests.c.request_id == request_row["request_id"],
+                        human_requests.c.status == "open",
+                    )).values(
+                        status="response_pending",
+                        response=dict(response),
+                        responded_by=actor_id,
+                        response_idempotency_key=idempotency_key,
+                        version=int(request_row["version"]) + 1,
+                        updated_at=now,
+                    ))
                 self._append_experience_event(
                     connection,
                     tenant_id=tenant_id,
@@ -1619,6 +2070,22 @@ class SQLNotificationStore(NotificationStore):
                 result=dict(result),
                 completed_at=now,
             ))
+            request_row = connection.execute(select(human_requests).where(and_(
+                human_requests.c.tenant_id == tenant_id,
+                human_requests.c.notification_id == row["notification_id"],
+            )).with_for_update()).mappings().one_or_none()
+            if request_row is not None:
+                request_status = "answered" if outcome == "applied" else "superseded"
+                connection.execute(update(human_requests).where(and_(
+                    human_requests.c.tenant_id == tenant_id,
+                    human_requests.c.request_id == request_row["request_id"],
+                    human_requests.c.status == "response_pending",
+                )).values(
+                    status=request_status,
+                    version=int(request_row["version"]) + 1,
+                    updated_at=now,
+                    answered_at=now if outcome == "applied" else None,
+                ))
             state_key = and_(
                 notification_states.c.tenant_id == tenant_id,
                 notification_states.c.subject_id == row["actor_id"],
@@ -1699,6 +2166,14 @@ class SQLNotificationStore(NotificationStore):
     ) -> bool:
         json.dumps(error, allow_nan=False)
         with self._tenant_connection(tenant_id) as connection:
+            row = connection.execute(select(decision_responses).where(and_(
+                decision_responses.c.tenant_id == tenant_id,
+                decision_responses.c.response_id == response_id,
+                decision_responses.c.status == "executing",
+                decision_responses.c.lease_owner == worker_id,
+            )).with_for_update()).mappings().one_or_none()
+            if row is None:
+                return False
             changed = connection.execute(update(decision_responses).where(and_(
                 decision_responses.c.tenant_id == tenant_id,
                 decision_responses.c.response_id == response_id,
@@ -1710,6 +2185,20 @@ class SQLNotificationStore(NotificationStore):
                 lease_expires_at=None,
                 last_error=dict(error),
             )).rowcount
+            request_row = connection.execute(select(human_requests).where(and_(
+                human_requests.c.tenant_id == tenant_id,
+                human_requests.c.notification_id == row["notification_id"],
+            )).with_for_update()).mappings().one_or_none()
+            if request_row is not None:
+                connection.execute(update(human_requests).where(and_(
+                    human_requests.c.tenant_id == tenant_id,
+                    human_requests.c.request_id == request_row["request_id"],
+                    human_requests.c.status == "response_pending",
+                )).values(
+                    status="recovery_required",
+                    version=int(request_row["version"]) + 1,
+                    updated_at=self._clock(),
+                ))
         return changed == 1
 
     def redrive_decision_response(
@@ -1747,6 +2236,12 @@ class SQLNotificationStore(NotificationStore):
                 return self._decision_record(row, duplicate=True)
             if row["status"] != "failed":
                 raise ValueError("only failed decision responses can be redriven")
+            request_row = connection.execute(select(human_requests).where(and_(
+                human_requests.c.tenant_id == tenant_id,
+                human_requests.c.notification_id == notification_id,
+            )).with_for_update()).mappings().one_or_none()
+            if request_row is not None and request_row["status"] != "recovery_required":
+                raise ValueError("human request is no longer recoverable")
             now = self._clock()
             redrive_number = int(row["redrive_count"]) + 1
             connection.execute(insert(decision_response_redrives).values(
@@ -1774,6 +2269,16 @@ class SQLNotificationStore(NotificationStore):
                 "redriven_by": actor_id,
             }
             connection.execute(update(decision_responses).where(key).values(**values))
+            if request_row is not None:
+                connection.execute(update(human_requests).where(and_(
+                    human_requests.c.tenant_id == tenant_id,
+                    human_requests.c.request_id == request_row["request_id"],
+                    human_requests.c.status == "recovery_required",
+                )).values(
+                    status="response_pending",
+                    version=int(request_row["version"]) + 1,
+                    updated_at=now,
+                ))
             updated = dict(row)
             updated.update(values)
         return self._decision_record(updated)

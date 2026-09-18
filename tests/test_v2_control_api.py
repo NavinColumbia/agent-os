@@ -60,6 +60,17 @@ class FakeIdentity:
         raise ValueError("authentication required")
 
 
+class MutableExecutionHealth:
+    def __init__(self, status: Mapping[str, Any]) -> None:
+        self.status = dict(status)
+        self.fail = False
+
+    def readiness(self, **_: Any) -> Mapping[str, Any]:
+        if self.fail:
+            raise RuntimeError("private probe failure")
+        return dict(self.status)
+
+
 def client() -> TestClient:
     return TestClient(create_app(engine=InMemoryWorkflowEngine(), identity=FakeIdentity()))
 
@@ -333,6 +344,12 @@ def test_ceo_workspace_assets_are_public_but_api_data_stays_authenticated():
     assert 'parameters.get("run")' in script.text
     assert "Copy authorized mission link" in script.text
     assert "PushManager" in script.text
+    assert "renderExecutionReadiness" in script.text
+    assert "execution_plane_unavailable" in script.text
+    assert "missionSubmission" in script.text
+    assert 'id="execution-banner"' in page.text
+    assert 'id="directive-submit"' in page.text
+    assert "Checking execution" in page.text
     assert "AbortController" in script.text
     assert "EventSource" not in script.text
     service_worker = api.get("/service-worker.js").text
@@ -826,6 +843,82 @@ def test_first_mission_readiness_is_honest_role_aware_and_resumable(tmp_path):
         notifications.close()
         connectors.close()
         company.close()
+
+
+def test_execution_readiness_blocks_only_new_admission_and_preserves_retries():
+    engine = InMemoryWorkflowEngine()
+    execution = MutableExecutionHealth({
+        "ok": False,
+        "state": "degraded",
+        "reason": "worker_stalled",
+        "private_diagnostic": "must-not-leak",
+    })
+    api = TestClient(create_app(
+        engine=engine,
+        identity=FakeIdentity(),
+        execution_health=execution,
+    ))
+    headers = {
+        "Authorization": "Bearer org-a",
+        "Idempotency-Key": "execution-admission-one",
+    }
+
+    projected = api.get(
+        "/v2/readiness", headers={"Authorization": "Bearer org-a"},
+    ).json()
+    execution_step = next(
+        item for item in projected["steps"] if item["id"] == "execution_plane"
+    )
+    assert execution_step["status"] == "blocked"
+    assert execution_step["reason"] == "worker_stalled"
+    assert "must-not-leak" not in str(projected)
+    assert projected["can_start_mission"] is False
+
+    blocked = api.post(
+        "/v2/runs", headers=headers, json={"prompt": "Keep this draft safe"},
+    )
+    assert blocked.status_code == 503
+    assert blocked.headers["retry-after"] == "15"
+    assert blocked.json()["detail"] == {
+        "code": "execution_plane_unavailable",
+        "message": (
+            "New mission admission is temporarily paused because execution "
+            "availability is not verified. Your draft was not submitted."
+        ),
+        "state": "degraded",
+        "reason": "worker_stalled",
+    }
+    assert engine.list_runs("org-a") == ()
+
+    execution.status = {"ok": True, "state": "ready", "reason": "ready"}
+    admitted = api.post(
+        "/v2/runs", headers=headers, json={"prompt": "Keep this draft safe"},
+    )
+    assert admitted.status_code == 202
+
+    execution.status = {
+        "ok": False, "state": "unavailable", "reason": "worker_unavailable",
+    }
+    retried = api.post(
+        "/v2/runs", headers=headers, json={"prompt": "Keep this draft safe"},
+    )
+    assert retried.status_code == 202
+    assert retried.json()["duplicate"] is True
+    assert api.post(
+        "/v2/runs",
+        headers={**headers, "Idempotency-Key": "execution-admission-two"},
+        json={"prompt": "A genuinely new mission"},
+    ).status_code == 503
+
+    execution.fail = True
+    failed_probe = api.get(
+        "/v2/readiness", headers={"Authorization": "Bearer org-a"},
+    ).json()
+    failed_step = next(
+        item for item in failed_probe["steps"] if item["id"] == "execution_plane"
+    )
+    assert failed_step["reason"] == "health_probe_failed"
+    assert "private probe failure" not in str(failed_probe)
 
 
 def test_readiness_fails_closed_when_required_production_adapters_are_absent():

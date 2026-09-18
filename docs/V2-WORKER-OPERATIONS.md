@@ -383,6 +383,15 @@ standing company, notification inbox, and published previews. Its CSP permits AP
 validated token origin, with no inline script/style execution or framing. `GET /v2/runs` is tenant-scoped and returns
 bounded summaries; the full directive is available only from the authenticated single-run view.
 
+Mission admission and execution readiness use the same release-fenced health projection. When the active worker is
+missing, stale, unable to discover work, stalled without progress, or carrying an overdue ready backlog,
+`GET /v2/readiness` reports the required `execution_plane` step as blocked and `POST /v2/runs` rejects only brand-new
+missions with a retryable `503`. Existing mission inspection, cancellation, inbox decisions, and idempotent retries
+remain available. The CEO workspace shows this condition globally, keeps the user's complete draft in the browser,
+and reuses one in-memory idempotency key for an unchanged draft so a lost success response cannot create a second
+mission. `scripts/ceo_execution_admission_e2e.cjs` verifies outage, API-race, draft-retention, and recovery behavior
+with every network request intercepted and no real work created.
+
 With no static allowlist, staging/production workers use the narrow `agentos_worker` database role to discover
 only tenant IDs with due or abandoned lifecycle, graph, management, or notification-delivery work. That role receives column-level access to scheduling metadata,
 not customer command/action payloads. Actual claims and mutations still enter the existing `agentos_app` tenant
@@ -399,7 +408,7 @@ cp deploy/v2.env.example deploy/v2.env
 docker compose --env-file deploy/v2.env -f deploy/docker-compose.v2.yml up --build
 ```
 
-It starts PostgreSQL, applies only the isolated V2 migrations (86–106), and then starts the API and worker from the
+It starts PostgreSQL, applies only the isolated V2 migrations (86–108), and then starts the API and worker from the
 exact same non-root image. Hosted OIDC access-token verification and the PKCE browser client are implemented, but an
 actual provider tenant, secrets management, production configuration, artifact garbage collection,
 usage-invoice export/prepaid credits, and a real managed-cloud apply/smoke are still launch

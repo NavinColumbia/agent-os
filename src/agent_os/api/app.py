@@ -1139,32 +1139,43 @@ def create_app(
     def health() -> Mapping[str, str]:
         return {"status": "ok", "service": "agent-os-v2"}
 
+    def execution_plane_readiness() -> Mapping[str, Any] | None:
+        """Return the same coarse, fail-closed execution fact to every consumer."""
+
+        if execution_health is None:
+            return None
+        try:
+            status = execution_health.readiness(
+                now=datetime.now(timezone.utc),
+                cell_id=execution_cell_id,
+                application_version=application_version,
+                heartbeat_max_age_seconds=worker_stale_seconds,
+                queue_probe_max_age_seconds=queue_probe_stale_seconds,
+                discovery_max_age_seconds=discovery_stale_seconds,
+                no_progress_max_age_seconds=worker_no_progress_seconds,
+                backlog_max_age_seconds=queue_backlog_max_age_seconds,
+                discovery_failure_limit=discovery_error_threshold,
+            )
+            return {
+                "ok": bool(status.get("ok")),
+                "state": str(status.get("state") or "unavailable"),
+                "reason": str(status.get("reason") or "worker_unavailable"),
+            }
+        except Exception:
+            return {
+                "ok": False,
+                "state": "unavailable",
+                "reason": "health_probe_failed",
+            }
+
     @app.get("/ready")
     def ready() -> JSONResponse:
         report = dict(engine.health())
-        if execution_health is not None:
-            try:
-                execution = execution_health.readiness(
-                    now=datetime.now(timezone.utc),
-                    cell_id=execution_cell_id,
-                    application_version=application_version,
-                    heartbeat_max_age_seconds=worker_stale_seconds,
-                    queue_probe_max_age_seconds=queue_probe_stale_seconds,
-                    discovery_max_age_seconds=discovery_stale_seconds,
-                    no_progress_max_age_seconds=worker_no_progress_seconds,
-                    backlog_max_age_seconds=queue_backlog_max_age_seconds,
-                    discovery_failure_limit=discovery_error_threshold,
-                )
-                execution_ok = bool(execution.get("ok"))
-                report["execution_plane"] = str(execution.get("state") or "unavailable")
-                report["execution_reason"] = str(
-                    execution.get("reason") or "worker_unavailable"
-                )
-            except Exception:
-                execution_ok = False
-                report["execution_plane"] = "unavailable"
-                report["execution_reason"] = "health_probe_failed"
-            report["ok"] = bool(report.get("ok")) and execution_ok
+        execution = execution_plane_readiness()
+        if execution is not None:
+            report["execution_plane"] = execution["state"]
+            report["execution_reason"] = execution["reason"]
+            report["ok"] = bool(report.get("ok")) and bool(execution["ok"])
         return JSONResponse(status_code=200 if report.get("ok") else 503, content=report)
 
     @app.get("/v2/me")
@@ -1189,6 +1200,7 @@ def create_app(
             tenant_model_store=tenant_model_store,
             usage_meter=usage_meter,
             billing_enabled=billing_service is not None,
+            execution_plane=execution_plane_readiness(),
         )
 
     if membership_store is not None:
@@ -2236,6 +2248,24 @@ def create_app(
         if not _principal_can(principal, "mission.create"):
             raise HTTPException(status_code=403, detail="mission creation requires mission authority")
         run_id = _run_id(principal.organization_id, idempotency_key)
+        # Preserve retries for an already-admitted mission, but do not add new
+        # durable work when no release-fenced worker can execute it.
+        if engine.get_run(principal.organization_id, run_id) is None:
+            execution = execution_plane_readiness()
+            if execution is not None and not execution["ok"]:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "execution_plane_unavailable",
+                        "message": (
+                            "New mission admission is temporarily paused because "
+                            "execution availability is not verified. Your draft was not submitted."
+                        ),
+                        "state": execution["state"],
+                        "reason": execution["reason"],
+                    },
+                    headers={"Retry-After": "15"},
+                )
         if mission_control is not None:
             try:
                 mission_spec = MissionSpec(

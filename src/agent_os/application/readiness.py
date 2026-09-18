@@ -27,6 +27,7 @@ def project_tenant_readiness(
     tenant_model_store: TenantModelStore | None,
     usage_meter: UsageMeter | None,
     billing_enabled: bool,
+    execution_plane: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Return facts and explicit unknowns; never infer worker-only credential health."""
 
@@ -54,6 +55,58 @@ def project_tenant_readiness(
         ),
         "action_view": None,
     })
+
+    if execution_plane is not None:
+        execution_ready = bool(execution_plane.get("ok"))
+        execution_reason = str(
+            execution_plane.get("reason") or "worker_unavailable"
+        )
+        reason_detail = {
+            "release_unconfigured": (
+                "No execution release is active yet. An operator must complete "
+                "release activation before new missions can start."
+            ),
+            "worker_unavailable": (
+                "No current execution worker is available. Existing mission state is "
+                "safe, but new work is paused until a worker recovers."
+            ),
+            "probe_stale": (
+                "The execution worker is no longer proving queue access. New work is "
+                "paused until its health proof recovers."
+            ),
+            "queue_stalled": (
+                "Ready work is not advancing within the operating window. New mission "
+                "admission is paused while operations investigates."
+            ),
+            "worker_stalled": (
+                "An execution worker stopped reporting meaningful progress. Long-running "
+                "work is not cancelled, but new missions are paused."
+            ),
+            "discovery_failing": (
+                "The worker cannot reliably discover runnable work. New missions are "
+                "paused until discovery recovers."
+            ),
+            "health_probe_failed": (
+                "Execution availability could not be verified. The platform fails closed "
+                "for new missions while existing state remains accessible."
+            ),
+        }.get(
+            execution_reason,
+            "Execution availability is not currently verified; new mission admission is paused.",
+        )
+        steps.append({
+            "id": "execution_plane",
+            "title": "Autonomous execution",
+            "status": "complete" if execution_ready else "blocked",
+            "required": True,
+            "detail": (
+                "A release-fenced worker is healthy and accepting durable work."
+                if execution_ready else reason_detail
+            ),
+            "action_view": None,
+            "reason": execution_reason,
+            "retryable": not execution_ready,
+        })
 
     organization = None
     if company_directory is not None:

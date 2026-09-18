@@ -80,6 +80,10 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .organization-picker select { max-width: 230px; padding: .48rem .65rem; }
 .avatar { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 50%; background: #242c28; border: 1px solid var(--line); color: var(--lime); font-size: .68rem; font-weight: 900; }
 .flash { position: sticky; top: 1rem; z-index: 4; margin-bottom: 1rem; padding: .8rem 1rem; border: 1px solid var(--line); border-radius: 10px; background: #161d1c; box-shadow: 0 12px 40px rgba(0,0,0,.35); }
+.execution-banner { position: sticky; top: 1rem; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; padding: .9rem 1rem; border: 1px solid rgba(255,189,89,.4); border-radius: 11px; background: #251d12; box-shadow: 0 12px 40px rgba(0,0,0,.28); }
+.execution-banner strong { color: #ffd89b; font-size: .82rem; }
+.execution-banner p { margin: .25rem 0 0; color: #d8c6aa; font-size: .7rem; line-height: 1.45; }
+.execution-banner button { flex: 0 0 auto; color: #ffd89b; }
 .panel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: inset 0 1px rgba(255,255,255,.02), 0 18px 55px rgba(0,0,0,.15); }
 .composer { padding: 1.4rem; }
 .composer-copy { display: flex; gap: .8rem; align-items: flex-start; margin-bottom: 1.1rem; }
@@ -216,6 +220,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .readiness-step div { display: grid; gap: .25rem; }
 .readiness-step small { color: var(--muted); line-height: 1.45; }
 @media (max-width: 640px) { .readiness-step { grid-template-columns: minmax(0,1fr) auto; } .readiness-step button { grid-column: 1 / -1; justify-self: start; } }
+@media (max-width: 640px) { .execution-banner { align-items: flex-start; flex-direction: column; } .execution-banner button { min-height: 44px; } }
 .good-note { display: block; margin-top: .75rem; color: var(--lime); font-size: .68rem; }
 .work-row { padding: .8rem 0; border-top: 1px solid var(--line); }
 .work-row:first-of-type { border-top: 0; }

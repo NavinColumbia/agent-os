@@ -8,6 +8,8 @@ const state = {
   pushSubscriptionId: null,
   focusedNotificationId: null, focusInboxItemPending: false,
   missionMessageDrafts: {},
+  readiness: null, readinessCheckedAt: 0, missionAdmissionBlocked: true,
+  missionSubmission: null,
 };
 const byId = (id) => document.getElementById(id);
 const el = (tag, className, text) => {
@@ -56,7 +58,15 @@ async function api(path, options = {}) {
   const payload = contentType.includes("json") ? await response.json() : await response.text();
   if (!response.ok) {
     const detail = payload && typeof payload === "object" ? payload.detail : payload;
-    throw new Error(detail || `Request failed (${response.status})`);
+    const message = detail && typeof detail === "object"
+      ? (detail.message || detail.code) : detail;
+    const error = new Error(message || `Request failed (${response.status})`);
+    error.status = response.status;
+    if (detail && typeof detail === "object") {
+      error.code = detail.code || "";
+      error.reason = detail.reason || "";
+    }
+    throw error;
   }
   return payload;
 }
@@ -282,6 +292,11 @@ function disconnect(message = "Disconnected. No credential was stored.") {
   state.eventCursor = null;
   state.pushSubscriptionId = null;
   state.missionMessageDrafts = {};
+  state.readiness = null;
+  state.readinessCheckedAt = 0;
+  state.missionAdmissionBlocked = true;
+  state.missionSubmission = null;
+  renderExecutionReadiness(null);
   closeDrawer({updateRoute: false});
   history.replaceState({}, document.title, "/app");
   byId("workspace").classList.add("hidden");
@@ -371,6 +386,9 @@ async function loadMissions() {
     api("/v2/runs?limit=100"), api("/v2/usage/summary").catch(() => null),
     api("/v2/readiness").catch(() => null),
   ]);
+  state.readiness = readiness;
+  state.readinessCheckedAt = Date.now();
+  renderExecutionReadiness(readiness);
   renderReadiness(readiness);
   const items = payload.items || [];
   const counts = {
@@ -547,6 +565,36 @@ function renderReadiness(readiness) {
     }
     content.append(row);
   }
+}
+
+function renderExecutionReadiness(readiness) {
+  const banner = byId("execution-banner");
+  const submit = byId("directive-submit");
+  const execution = (readiness?.steps || []).find((step) => step.id === "execution_plane");
+  const unavailable = !readiness;
+  const blocked = unavailable || execution?.status === "blocked";
+  state.missionAdmissionBlocked = blocked;
+  banner.classList.toggle("hidden", !blocked);
+  if (blocked) {
+    byId("execution-banner-title").textContent = unavailable
+      ? "Cannot verify execution right now" : "New missions are temporarily paused";
+    byId("execution-banner-detail").textContent = unavailable
+      ? "The workspace could not verify execution availability. Existing missions and drafts remain accessible."
+      : execution.detail;
+  }
+  submit.disabled = blocked || submit.dataset.submitting === "true";
+  submit.querySelector("span").textContent = blocked ? "Execution paused" : "Start mission";
+}
+
+async function refreshExecutionReadiness({force = false, onboarding = false} = {}) {
+  if (!force && Date.now() - state.readinessCheckedAt < 15000) return state.readiness;
+  let readiness = null;
+  try { readiness = await api("/v2/readiness"); } catch (_) { readiness = null; }
+  state.readiness = readiness;
+  state.readinessCheckedAt = Date.now();
+  renderExecutionReadiness(readiness);
+  if (onboarding) renderReadiness(readiness);
+  return readiness;
 }
 
 async function loadCompany() {
@@ -1462,6 +1510,7 @@ async function loadBilling() {
 
 async function refreshView(silent = false) {
   try {
+    if (state.view !== "missions") await refreshExecutionReadiness({force: true});
     if (state.view === "missions") await loadMissions();
     if (state.view === "work") await loadMyWork();
     if (state.view === "company") await loadCompany();
@@ -1478,6 +1527,7 @@ async function refreshView(silent = false) {
 
 async function refreshAmbient() {
   await refreshInboxBadge();
+  await refreshExecutionReadiness();
   if (userIsEditing()) return;
   try {
     if (state.view === "missions") await loadMissions();
@@ -2170,9 +2220,24 @@ byId("mobile-more-toggle").addEventListener("click", () => {
 });
 document.querySelectorAll("[data-mobile-view]").forEach((node) => node.addEventListener("click", () => selectView(node.dataset.mobileView)));
 byId("refresh").addEventListener("click", () => refreshView());
+byId("execution-retry").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await refreshExecutionReadiness({force: true, onboarding: state.view === "missions"});
+    setFlash(state.missionAdmissionBlocked
+      ? "Execution is still unavailable. Your draft remains unchanged."
+      : "Execution recovered. New missions can start.", state.missionAdmissionBlocked ? "error" : "");
+  } finally { button.disabled = false; }
+});
 byId("organization-select").addEventListener("change", async (event) => {
   stopLiveEvents();
   state.organization = event.target.value;
+  state.readiness = null;
+  state.readinessCheckedAt = 0;
+  state.missionAdmissionBlocked = true;
+  state.missionSubmission = null;
+  renderExecutionReadiness(null);
   state.browserAlertBaseline = null;
   state.inboxCursor = null;
   state.decisionDrafts = {};
@@ -2200,23 +2265,49 @@ byId("directive-human-mode").addEventListener("change", (event) => {
 });
 byId("directive-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const button = event.submitter; button.disabled = true;
+  const button = event.submitter;
+  if (state.missionAdmissionBlocked) {
+    await refreshExecutionReadiness({force: true, onboarding: true});
+    if (state.missionAdmissionBlocked) {
+      setFlash("Execution is unavailable. Your mission draft has not been submitted.", "error");
+      return;
+    }
+  }
+  button.dataset.submitting = "true"; button.disabled = true;
   try {
+    const mission = {
+      prompt: byId("directive").value.trim(),
+      title: byId("directive-title").value.trim() || null,
+      budget_limit_cents: Math.round(Number(byId("directive-budget").value || 0) * 100),
+      human_involvement_mode: byId("directive-human-mode").value,
+      daily_interrupt_limit: Number(byId("directive-interrupt-limit").value || 0),
+    };
+    const missionFingerprint = JSON.stringify(mission);
+    if (state.missionSubmission?.fingerprint !== missionFingerprint) {
+      state.missionSubmission = {
+        fingerprint: missionFingerprint,
+        idempotencyKey: `ceo-${crypto.randomUUID()}`,
+      };
+    }
     const result = await api("/v2/runs", {
-      method: "POST", headers: { "Idempotency-Key": `ceo-${crypto.randomUUID()}` },
-      body: JSON.stringify({
-        prompt: byId("directive").value.trim(),
-        title: byId("directive-title").value.trim() || null,
-        budget_limit_cents: Math.round(Number(byId("directive-budget").value || 0) * 100),
-        human_involvement_mode: byId("directive-human-mode").value,
-        daily_interrupt_limit: Number(byId("directive-interrupt-limit").value || 0),
-      }),
+      method: "POST",
+      headers: {"Idempotency-Key": state.missionSubmission.idempotencyKey},
+      body: missionFingerprint,
     });
+    state.missionSubmission = null;
     byId("directive").value = ""; byId("directive-title").value = ""; byId("directive-budget").value = "0"; byId("directive-count").textContent = "0 / 50,000";
     setFlash("Mission accepted. Your team is planning it now."); await loadMissions();
     openMission({ run_id: result.run_id, title: "New mission" });
-  } catch (error) { setFlash(error.message, "error"); }
-  finally { button.disabled = false; }
+  } catch (error) {
+    if (error.code === "execution_plane_unavailable") {
+      await refreshExecutionReadiness({force: true, onboarding: true});
+    }
+    setFlash(error.message, "error");
+  }
+  finally {
+    button.dataset.submitting = "false";
+    button.disabled = state.missionAdmissionBlocked;
+  }
 });
 byId("inbox-preferences-toggle").addEventListener("click", () => {
   const panel = byId("inbox-preferences");

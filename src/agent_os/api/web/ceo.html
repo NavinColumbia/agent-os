@@ -80,6 +80,14 @@
 
       <div id="flash" class="flash hidden" role="status" aria-live="polite"></div>
 
+      <section id="execution-banner" class="execution-banner hidden" role="status" aria-live="polite" aria-labelledby="execution-banner-title">
+        <div>
+          <strong id="execution-banner-title">New missions are paused</strong>
+          <p id="execution-banner-detail">Execution availability is being verified. Your draft stays here.</p>
+        </div>
+        <button id="execution-retry" class="quiet" type="button">Check again</button>
+      </section>
+
       <section id="missions-view" class="view">
         <form id="directive-form" class="composer panel requires-mission-create">
           <div class="composer-copy">
@@ -110,7 +118,7 @@
           </details>
           <div class="composer-actions">
             <span id="directive-count">0 / 50,000</span>
-            <button class="primary" type="submit"><span>Start mission</span><b>→</b></button>
+            <button id="directive-submit" class="primary" type="submit" disabled><span>Checking execution…</span><b>→</b></button>
           </div>
         </form>
 

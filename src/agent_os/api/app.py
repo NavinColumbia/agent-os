@@ -53,6 +53,7 @@ from agent_os.application.ports import (
     NotificationStore,
     OrganizationLedger,
     PreviewDeploymentStore,
+    ProductEvidenceStore,
     UsageMeter,
     TenantModelStore,
     WorkflowEngine,
@@ -83,6 +84,7 @@ from agent_os.domain.notifications import (
     NotificationPreferenceMode,
     NotificationPreferences,
 )
+from agent_os.domain.product_evidence import EvidenceKind as ProductEvidenceKind
 from agent_os.domain.web_push import WebPushSubscriptionMaterial
 from agent_os.domain.workflow import NodeKind, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from agent_os.domain.workflow_runtime import (
@@ -329,6 +331,74 @@ class ArtifactUploadRequest(BaseModel):
 
     content_base64: str = Field(max_length=3_000_000)
     media_type: str = Field(min_length=1, max_length=256)
+
+
+class ProductMetricRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    metric_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    direction: str = Field(pattern=r"^(higher|lower)$")
+    minimum_delta: float = Field(default=0, ge=0)
+    hard_gate: bool = False
+
+
+class ProductStudyCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    study_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    revision: int = Field(default=1, ge=1)
+    hypothesis: str = Field(min_length=1, max_length=8_000)
+    baseline_variant_id: str = Field(min_length=1, max_length=128)
+    candidate_variant_id: str = Field(min_length=1, max_length=128)
+    canonical_task_ids: list[str] = Field(min_length=1, max_length=256)
+    metrics: list[ProductMetricRequest] = Field(min_length=1, max_length=64)
+    representative_segments: list[str] = Field(min_length=1, max_length=64)
+    synthetic_repetitions: int = Field(default=3, ge=3, le=100)
+    require_human_or_production: bool = True
+
+
+class ProductObservationCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observation_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$",
+    )
+    task_id: str = Field(min_length=1, max_length=128)
+    segment_id: str = Field(min_length=1, max_length=128)
+    variant_id: str = Field(min_length=1, max_length=128)
+    evaluator_id: str = Field(min_length=1, max_length=255)
+    evidence_kind: ProductEvidenceKind
+    metrics: dict[str, float] = Field(min_length=1, max_length=64)
+    evidence_ids: list[str] = Field(min_length=1, max_length=128)
+    repeat_index: int = Field(default=0, ge=0, le=10_000)
+    presentation_position: int | None = Field(default=None, ge=1, le=2)
+    blinded: bool = False
+    critical_failures: list[str] = Field(default_factory=list, max_length=64)
+
+
+class SystemOutcomeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    system_id: str = Field(min_length=1, max_length=128)
+    task_count: int = Field(ge=1, le=10_000_000)
+    success_rate: float = Field(ge=0, le=1)
+    quality_score: float = Field(ge=0, le=1)
+    reliability_rate: float = Field(ge=0, le=1)
+    p95_latency_seconds: float = Field(ge=0)
+    model_cost_cents: float = Field(ge=0)
+    human_minutes: float = Field(ge=0)
+    interventions: int = Field(ge=0)
+    evidence_ids: list[str] = Field(min_length=1, max_length=256)
+
+
+class ValueReceiptCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    baseline: SystemOutcomeRequest
+    candidate: SystemOutcomeRequest
+    customer_price_cents: float = Field(ge=0)
+    human_hourly_value_cents: float = Field(ge=0)
+    maximum_latency_regression_seconds: float | None = Field(default=None, ge=0)
 
 
 class AgentHireRequest(BaseModel):
@@ -944,6 +1014,7 @@ def create_app(
     graph_engine: GraphWorkflowEngine | None = None,
     notification_store: NotificationStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    product_evidence_store: ProductEvidenceStore | None = None,
     preview_deployments: PreviewDeploymentStore | None = None,
     company_directory: CompanyDirectory | None = None,
     connector_registry: ConnectorRegistry | None = None,
@@ -961,6 +1032,7 @@ def create_app(
     execution_health: ExecutionHealthReader | None = None,
     execution_cell_id: str = "bootstrap",
     application_version: str = "v2-dev",
+    request_tracer: Any | None = None,
     worker_stale_seconds: int = 60,
     queue_probe_stale_seconds: int = 60,
     discovery_stale_seconds: int = 60,
@@ -971,6 +1043,8 @@ def create_app(
 ) -> FastAPI:
     if not 0.01 <= experience_stream_seconds <= 300:
         raise ValueError("experience stream lifetime must be between 0.01 and 300 seconds")
+    if product_evidence_store is not None and artifact_store is None:
+        raise ValueError("product evidence requires a durable artifact store")
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
@@ -987,6 +1061,28 @@ def create_app(
         openapi_url="/v2/openapi.json",
         lifespan=lifespan,
     )
+    if request_tracer is not None:
+        @app.middleware("http")
+        async def trace_http_request(request: Request, call_next):
+            method = request.method.upper()
+            with request_tracer.start_as_current_span(f"HTTP {method}") as span:
+                span.set_attribute("http.request.method", method)
+                try:
+                    response = await call_next(request)
+                except Exception as exc:
+                    span.set_attribute("error.type", type(exc).__name__)
+                    span.set_attribute("http.response.status_code", 500)
+                    span.record_exception(exc)
+                    raise
+                route = request.scope.get("route")
+                route_template = str(getattr(route, "path", "unmatched"))
+                span.update_name(f"{method} {route_template}")
+                span.set_attribute("http.route", route_template)
+                span.set_attribute("http.response.status_code", response.status_code)
+                context = span.get_span_context()
+                if context.is_valid:
+                    response.headers["X-Trace-ID"] = format(context.trace_id, "032x")
+                return response
     public_identity, token_origin_value = _browser_identity_config(client_identity_config)
     web_push_public_key = (web_push_public_key or "").strip()
     if web_push_public_key:
@@ -1608,6 +1704,202 @@ def create_app(
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if product_evidence_store is not None:
+        def require_product_evidence_artifacts(
+            principal: Principal, evidence_ids: list[str],
+        ) -> None:
+            if len(set(evidence_ids)) != len(evidence_ids):
+                raise HTTPException(
+                    status_code=409, detail="product evidence IDs must be unique",
+                )
+            missing = [
+                evidence_id for evidence_id in evidence_ids
+                if artifact_store.describe(principal.organization_id, evidence_id) is None
+            ]
+            if missing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"durable evidence artifacts do not exist: {', '.join(missing[:20])}",
+                )
+
+        @app.get("/v2/product-studies")
+        def list_product_studies(
+            principal: Annotated[Principal, Depends(current_principal)],
+            limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "product.evidence.read"):
+                raise HTTPException(
+                    status_code=403, detail="product studies require evidence authority",
+                )
+            return {"items": list(product_evidence_store.list_studies(
+                principal.organization_id, limit=limit,
+            ))}
+
+        @app.post("/v2/product-studies", status_code=201)
+        def create_product_study(
+            body: ProductStudyCreateRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "product.evidence.contribute"):
+                raise HTTPException(
+                    status_code=403, detail="product study creation requires evidence authority",
+                )
+            try:
+                return product_evidence_store.create_study(
+                    tenant_id=principal.organization_id,
+                    study=body.model_dump(mode="json"),
+                    created_by=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.get("/v2/product-studies/{study_id}/revisions/{revision}")
+        def get_product_study(
+            study_id: str,
+            revision: int,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "product.evidence.read"):
+                raise HTTPException(
+                    status_code=403, detail="product studies require evidence authority",
+                )
+            result = product_evidence_store.get_study(
+                principal.organization_id, study_id, revision,
+            )
+            if result is None:
+                raise HTTPException(status_code=404, detail="product study not found")
+            return result
+
+        @app.get(
+            "/v2/product-studies/{study_id}/revisions/{revision}/calibration",
+        )
+        def get_product_evidence_calibration(
+            study_id: str,
+            revision: int,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "product.evidence.read"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="product calibration requires evidence authority",
+                )
+            result = product_evidence_store.calibration_report(
+                principal.organization_id, study_id, revision,
+            )
+            if result is None:
+                raise HTTPException(status_code=404, detail="product study not found")
+            return result
+
+        @app.post(
+            "/v2/product-studies/{study_id}/revisions/{revision}/observations",
+            status_code=201,
+        )
+        def append_product_observation(
+            study_id: str,
+            revision: int,
+            body: ProductObservationCreateRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "product.evidence.contribute"):
+                raise HTTPException(
+                    status_code=403, detail="product observations require evidence authority",
+                )
+            if (
+                body.evidence_kind in {
+                    ProductEvidenceKind.HUMAN, ProductEvidenceKind.PRODUCTION,
+                }
+                and not _principal_can(principal, "product.evidence.manage")
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="human and production evidence require product management authority",
+                )
+            require_product_evidence_artifacts(principal, body.evidence_ids)
+            observation = body.model_dump(mode="json")
+            observation.update({"study_id": study_id, "study_revision": revision})
+            try:
+                return product_evidence_store.append_observation(
+                    tenant_id=principal.organization_id,
+                    observation=observation,
+                    recorded_by=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        @app.post("/v2/product-studies/{study_id}/revisions/{revision}/evaluate")
+        def evaluate_product_study_revision(
+            study_id: str,
+            revision: int,
+            principal: Annotated[Principal, Depends(current_principal)],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "product.evidence.manage"):
+                raise HTTPException(
+                    status_code=403, detail="product evaluation requires management authority",
+                )
+            try:
+                result = product_evidence_store.evaluate_study(
+                    tenant_id=principal.organization_id,
+                    study_id=study_id,
+                    revision=revision,
+                    decided_by=principal.subject_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if result is None:
+                raise HTTPException(status_code=404, detail="product study not found")
+            return result
+
+        @app.get("/v2/value-receipts")
+        def list_value_receipts(
+            principal: Annotated[Principal, Depends(current_principal)],
+            limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "product.evidence.read"):
+                raise HTTPException(
+                    status_code=403, detail="value receipts require evidence authority",
+                )
+            return {"items": list(product_evidence_store.list_value_receipts(
+                principal.organization_id, limit=limit,
+            ))}
+
+        @app.post("/v2/value-receipts", status_code=201)
+        def create_value_receipt(
+            body: ValueReceiptCreateRequest,
+            principal: Annotated[Principal, Depends(current_principal)],
+            idempotency_key: Annotated[
+                str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+            ],
+        ) -> Mapping[str, Any]:
+            if not _principal_can(principal, "product.evidence.manage"):
+                raise HTTPException(
+                    status_code=403, detail="value receipt creation requires management authority",
+                )
+            require_product_evidence_artifacts(principal, body.baseline.evidence_ids)
+            require_product_evidence_artifacts(principal, body.candidate.evidence_ids)
+            try:
+                return product_evidence_store.record_value_receipt(
+                    tenant_id=principal.organization_id,
+                    baseline=body.baseline.model_dump(mode="json"),
+                    candidate=body.candidate.model_dump(mode="json"),
+                    customer_price_cents=body.customer_price_cents,
+                    human_hourly_value_cents=body.human_hourly_value_cents,
+                    maximum_latency_regression_seconds=(
+                        body.maximum_latency_regression_seconds
+                    ),
+                    created_by=principal.subject_id,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     if billing_service is not None:
         @app.post("/v2/billing/webhooks/stripe", include_in_schema=False)

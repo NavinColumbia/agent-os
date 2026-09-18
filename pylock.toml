@@ -640,6 +640,39 @@ url = "https://files.pythonhosted.org/packages/ca/6f/a04e900f465ff3221ccc3955225
 sha256 = "94b98c893a91b88657eaac1e3ba89618cdb85be6918196705354f34728b2cdef"
 
 [[packages]]
+name = "opentelemetry-exporter-otlp-proto-common"
+version = "1.44.0"
+
+[[packages.wheels]]
+name = "opentelemetry_exporter_otlp_proto_common-1.44.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/5e/71/65fd9d54c10b860f87c045ccee1264cab7011268895d3528818a29c1172a/opentelemetry_exporter_otlp_proto_common-1.44.0-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "9a9fe61bba73d802904bc989f1d6b4a7b1ee40f06c40e98d6f85af65aaebb694"
+
+[[packages]]
+name = "opentelemetry-exporter-otlp-proto-http"
+version = "1.44.0"
+
+[[packages.wheels]]
+name = "opentelemetry_exporter_otlp_proto_http-1.44.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/cd/d0/fdeb1a98d8d3a6205f5f297c51b4a9bfe65126ab60339669bbe3dd54c2e2/opentelemetry_exporter_otlp_proto_http-1.44.0-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "838592fce774c1c8bb7b9a0a7facbfa82e17be5a8a4e94cef10cb84ae026bae3"
+
+[[packages]]
+name = "opentelemetry-proto"
+version = "1.44.0"
+
+[[packages.wheels]]
+name = "opentelemetry_proto-1.44.0-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/d1/7c/8be563d68e93bbefa5c8affb82ddcff91b3ad858ce49957ba7b16fd3e0ab/opentelemetry_proto-1.44.0-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "898b155a0e1557afd867478fb6158e8122a46329ca0bb8dc53cc55e98f017f56"
+
+[[packages]]
 name = "opentelemetry-sdk"
 version = "1.44.0"
 

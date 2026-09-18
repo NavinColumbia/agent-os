@@ -341,6 +341,32 @@ variable "alert_notification_channels" {
   }
 }
 
+variable "otlp_traces_endpoint" {
+  description = "Optional OTLP/HTTP traces endpoint, normally an HTTPS collector or a localhost sidecar."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.otlp_traces_endpoint == "" ||
+      can(regex("^https://[^[:space:]]+$", var.otlp_traces_endpoint)) ||
+      can(regex("^http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]+)?/", var.otlp_traces_endpoint))
+    )
+    error_message = "otlp_traces_endpoint must be empty, HTTPS, or an HTTP localhost sidecar URL."
+  }
+}
+
+variable "otlp_trace_sample_ratio" {
+  description = "Parent-based probability for exported API traces."
+  type        = number
+  default     = 0.1
+
+  validation {
+    condition     = var.otlp_trace_sample_ratio > 0 && var.otlp_trace_sample_ratio <= 1
+    error_message = "otlp_trace_sample_ratio must be greater than zero and at most one."
+  }
+}
+
 variable "state_bucket_name" {
   description = "Existing versioned GCS bucket used by the gcs backend and CI deploy identity."
   type        = string

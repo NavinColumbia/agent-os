@@ -46,6 +46,8 @@ def test_development_defaults_to_scale_zero_local_storage(monkeypatch, tmp_path)
     assert settings.artifact_bucket == ""
     assert settings.artifact_max_content_bytes == 2 * 1024 * 1024
     assert settings.artifact_retention_days == 365
+    assert settings.otlp_traces_endpoint == ""
+    assert settings.otlp_trace_sample_ratio == 0.1
     assert settings.oidc_personal_tenants is False
     assert settings.execution_cell_id == "bootstrap"
     assert settings.worker_heartbeat_seconds == 15

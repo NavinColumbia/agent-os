@@ -147,6 +147,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "107-mission-work-accountability-v2.sql" in compose
     assert "108-execution-health-v2.sql" in compose
     assert "109-human-requests-v2.sql" in compose
+    assert "110-product-evidence-v2.sql" in compose
     migration_image = (ROOT / "deploy" / "Dockerfile.migrations-v2").read_text()
     assert "99zzzzz-notification-delivery-v2.sql" in migration_image
     assert "100-mission-assurance-kernel-v2.sql" in migration_image
@@ -161,6 +162,7 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
     assert "107-mission-work-accountability-v2.sql" in migration_image
     assert "108-execution-health-v2.sql" in migration_image
     assert "109-human-requests-v2.sql" in migration_image
+    assert "110-product-evidence-v2.sql" in migration_image
     required_v2_migrations = [
         path.name for path in (ROOT / "postgres" / "initdb").glob("*.sql")
         if int(path.name.split("-", 1)[0].rstrip("z")) >= 86
@@ -171,6 +173,10 @@ def test_evaluation_compose_runs_api_and_worker_from_the_same_image():
         assert migration_name in migration_image, f"migration image omits {migration_name}"
     assert '127.0.0.1:${AOS_V2_PUBLIC_PORT:-8080}:8080' in compose
     assert "GEMINI_API_KEY" in compose
+    assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" in compose
+    environment_example = (ROOT / "deploy" / "v2.env.example").read_text()
+    assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=" in environment_example
+    assert "AOS_V2_OTLP_TRACE_SAMPLE_RATIO=0.1" in environment_example
     assert "AOS_V2_DATABASE_RUNTIME_PASSWORD" in compose
     assert "postgresql://agentos_runtime:" in compose
     assert "NOINHERIT" in compose

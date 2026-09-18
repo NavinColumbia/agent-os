@@ -28,16 +28,19 @@ ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
     "client": frozenset({"review.read"}),
     "billing": frozenset({"billing.read", "billing.manage", "usage.read"}),
     "reviewer": frozenset({
-        "artifact.read", "company.read", "hazard.report", "review.read", "work.read",
+        "artifact.read", "company.read", "hazard.report", "product.evidence.contribute",
+        "product.evidence.read", "review.read", "work.read",
     }),
     "builder": frozenset({
         "artifact.publish", "artifact.read", "company.read", "effect.request",
-        "hazard.report", "work.execute", "work.read",
+        "hazard.report", "product.evidence.contribute", "product.evidence.read",
+        "work.execute", "work.read",
     }),
     "manager": frozenset({
         "artifact.publish", "artifact.read", "authority.manage", "company.read",
         "decision.redrive", "effect.request", "effect.settle", "hazard.report",
         "mission.cancel", "mission.create", "mission.read.all", "mission.steer",
+        "product.evidence.contribute", "product.evidence.manage", "product.evidence.read",
         "release.manage", "release.read",
         "review.read", "usage.read", "work.assign", "work.execute", "work.read",
         "workflow.manage", "workforce.manage",
@@ -48,7 +51,8 @@ ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
         "hazard.report", "integration.manage", "membership.read", "mission.cancel",
         "mission.create", "mission.read.all", "mission.steer", "model.read", "notification.read.all",
         "operations.read",
-        "operations.recover", "release.manage", "release.read", "review.read", "usage.read",
+        "operations.recover", "product.evidence.contribute", "product.evidence.manage",
+        "product.evidence.read", "release.manage", "release.read", "review.read", "usage.read",
         "work.assign", "work.execute", "work.read", "workflow.manage",
         "workforce.manage",
     }),
@@ -59,7 +63,8 @@ ROLE_CAPABILITIES: dict[str, frozenset[str]] = {
     # Runtime agents use the builder projection but remain non-invitable service identities.
     "agent": frozenset({
         "artifact.publish", "artifact.read", "company.read", "effect.request",
-        "hazard.report", "work.execute", "work.read",
+        "hazard.report", "product.evidence.contribute", "product.evidence.read",
+        "work.execute", "work.read",
     }),
 }
 

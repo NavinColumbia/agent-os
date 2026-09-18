@@ -185,6 +185,20 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: 0 3rem 5rem; }
 .plan-card .muted { min-height: 3rem; font-size: .74rem; line-height: 1.55; }
 .plan-card button { margin-top: 1rem; }
 .release a { color: var(--lime); font-size: .72rem; }
+.evidence-intro { margin-bottom: 2rem; padding: 1.15rem; }
+.evidence-intro h3 { margin: 0; font-size: 1rem; }
+.evidence-intro > p { margin: .55rem 0 0; max-width: 760px; color: var(--muted); font-size: .74rem; line-height: 1.6; }
+.evidence-receipt-heading { margin-top: 2rem; }
+.evidence-card { padding: 1rem; border: 1px solid var(--line); border-radius: 13px; background: rgba(18,23,25,.62); }
+.evidence-card header { display: flex; justify-content: space-between; align-items: flex-start; gap: .75rem; }
+.evidence-card h4 { margin: 0; font-size: .88rem; }
+.evidence-card > p { margin: .5rem 0; color: var(--muted); font-size: .72rem; line-height: 1.55; }
+.evidence-card .notice-context { margin-top: .45rem; }
+.evidence-card .quiet { margin-top: .7rem; }
+.evidence-reasons { margin: .65rem 0 0; padding-left: 1.15rem; color: #cbd1ce; font-size: .68rem; line-height: 1.5; }
+.calibration-report { display: grid; gap: .25rem; margin-top: .7rem; padding: .75rem; border: 1px solid var(--line); border-radius: .75rem; background: rgba(18,23,25,.82); }
+.value-positive { border-color: rgba(198,255,69,.3); }
+.value-negative { border-color: rgba(255,189,89,.3); }
 .drawer { position: fixed; z-index: 8; top: 0; right: 0; width: min(620px,100%); height: 100vh; padding: 1.4rem; border-left: 1px solid var(--line); background: rgba(12,16,18,.98); box-shadow: -25px 0 80px rgba(0,0,0,.48); transform: translateX(105%); transition: transform .2s ease; overflow-y: auto; }
 .drawer.open { transform: translateX(0); }
 .drawer-head { position: sticky; top: -1.4rem; z-index: 2; display: flex; justify-content: space-between; align-items: center; padding: 1.2rem 0; background: rgba(12,16,18,.96); }

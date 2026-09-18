@@ -10,6 +10,7 @@ from agent_os.domain.product_evidence import (
     ProductObservation,
     ProductStudy,
     SystemOutcome,
+    calibrate_synthetic_judgments,
     compare_system_value,
     evaluate_product_study,
 )
@@ -206,6 +207,48 @@ def test_real_human_regression_cannot_be_swamped_by_synthetic_votes():
 
     assert decision.disposition is ProductDisposition.REJECT
     assert "human evidence" in decision.reasons[0]
+
+
+def test_synthetic_judgments_are_calibrated_against_paired_human_results():
+    rows = valid_synthetic_rows() + [
+        observation(
+            "human-current", "current", kind=EvidenceKind.HUMAN,
+            completion=0.75, seconds=62, evaluator_id="participant-1",
+        ),
+        observation(
+            "human-guided", "guided", kind=EvidenceKind.HUMAN,
+            completion=0.9, seconds=50, evaluator_id="participant-1",
+        ),
+    ]
+
+    report = calibrate_synthetic_judgments(study(), rows)
+
+    assert report.synthetic_protocol_valid is True
+    assert report.paired_cells == report.total_cells == 2
+    assert report.preference_agreement_rate == 1.0
+    assert report.disagreements == ()
+    assert report.mean_absolute_delta_error == pytest.approx(2.525)
+
+
+def test_calibration_exposes_disagreement_instead_of_laundering_model_votes():
+    rows = valid_synthetic_rows() + [
+        observation(
+            "human-current", "current", kind=EvidenceKind.HUMAN,
+            completion=0.9, seconds=45, evaluator_id="participant-1",
+        ),
+        observation(
+            "human-guided", "guided", kind=EvidenceKind.HUMAN,
+            completion=0.7, seconds=70, evaluator_id="participant-1",
+        ),
+    ]
+
+    report = calibrate_synthetic_judgments(study(), rows)
+
+    assert report.preference_agreement_rate == 0.0
+    assert report.disagreements == (
+        "create-company/nontechnical-founder/completion",
+        "create-company/nontechnical-founder/seconds",
+    )
 
 
 def test_every_registered_segment_requires_variant_evidence():

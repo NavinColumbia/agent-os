@@ -110,6 +110,8 @@ locals {
     AOS_V2_QUEUE_BACKLOG_MAX_AGE_SECONDS         = "120"
     AOS_V2_DISCOVERY_ERROR_THRESHOLD             = "3"
     AOS_V2_QUEUE_SAMPLE_CAP                      = "1000"
+    AOS_V2_OTLP_TRACE_SAMPLE_RATIO               = tostring(var.otlp_trace_sample_ratio)
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT            = var.otlp_traces_endpoint
     AOS_V2_CREATE_SCHEMA                         = "0"
     AOS_V2_IDENTITY_MODE                         = "oidc"
     AOS_V2_OIDC_ISSUER                           = var.oidc_issuer

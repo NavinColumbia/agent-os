@@ -9,6 +9,16 @@ from threading import Event
 import click
 
 from agent_os.api.auth import HMACTokenIdentity
+from agent_os.domain.benchmark import (
+    evaluate_benchmark,
+    parse_benchmark_manifest,
+    parse_benchmark_trial,
+)
+from agent_os.domain.resilience import (
+    evaluate_fault_campaign,
+    parse_fault_campaign,
+    parse_fault_observation,
+)
 from agent_os.entrypoints.server import ServerSettings, build_app
 from agent_os.entrypoints.static_site_router import (
     StaticSiteRouterSettings,
@@ -26,6 +36,76 @@ from agent_os.infrastructure.sql_execution_health import SQLExecutionReleaseGate
 @click.group()
 def main() -> None:
     """Operate the Agent OS V2 service."""
+
+
+@main.command("benchmark-report")
+@click.option(
+    "--manifest", "manifest_file", required=True,
+    type=click.File("r", encoding="utf-8"),
+    help="Frozen JSON benchmark manifest.",
+)
+@click.option(
+    "--trials", "trials_file", required=True,
+    type=click.File("r", encoding="utf-8"),
+    help="JSON array, or object with a trials array, containing measured outcomes.",
+)
+@click.option("--customer-price-cents", type=click.FloatRange(min=0), default=0.0)
+@click.option(
+    "--human-hourly-value-cents", type=click.FloatRange(min=0),
+    default=6000.0, show_default=True,
+)
+def benchmark_report(
+    manifest_file, trials_file, customer_price_cents: float,
+    human_hourly_value_cents: float,
+) -> None:
+    """Validate a matched benchmark and emit an immutable value-report payload."""
+
+    try:
+        manifest_raw = json.load(manifest_file)
+        trials_raw = json.load(trials_file)
+        if isinstance(trials_raw, dict):
+            trials_raw = trials_raw.get("trials")
+        if not isinstance(manifest_raw, dict) or not isinstance(trials_raw, list):
+            raise ValueError("manifest must be an object and trials must be an array")
+        report = evaluate_benchmark(
+            parse_benchmark_manifest(manifest_raw),
+            (parse_benchmark_trial(item) for item in trials_raw),
+            customer_price_cents=customer_price_cents,
+            human_hourly_value_cents=human_hourly_value_cents,
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+
+
+@main.command("resilience-report")
+@click.option(
+    "--campaign", "campaign_file", required=True,
+    type=click.File("r", encoding="utf-8"),
+    help="Frozen JSON fault-campaign contract.",
+)
+@click.option(
+    "--observations", "observations_file", required=True,
+    type=click.File("r", encoding="utf-8"),
+    help="JSON array, or object with an observations array, of measured fault outcomes.",
+)
+def resilience_report(campaign_file, observations_file) -> None:
+    """Validate a six-class recovery campaign without upgrading local evidence."""
+
+    try:
+        campaign_raw = json.load(campaign_file)
+        observations_raw = json.load(observations_file)
+        if isinstance(observations_raw, dict):
+            observations_raw = observations_raw.get("observations")
+        if not isinstance(campaign_raw, dict) or not isinstance(observations_raw, list):
+            raise ValueError("campaign must be an object and observations must be an array")
+        report = evaluate_fault_campaign(
+            parse_fault_campaign(campaign_raw),
+            (parse_fault_observation(item) for item in observations_raw),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
 
 
 @main.command()

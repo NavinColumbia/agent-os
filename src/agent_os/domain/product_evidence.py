@@ -229,6 +229,35 @@ class ValueReceipt:
         }
 
 
+@dataclass(frozen=True)
+class CalibrationReport:
+    study_id: str
+    study_revision: int
+    total_cells: int
+    paired_cells: int
+    preference_agreement_rate: float | None
+    cohens_kappa: float | None
+    mean_absolute_delta_error: float | None
+    synthetic_protocol_valid: bool
+    protocol_reasons: tuple[str, ...]
+    disagreements: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "study_id": self.study_id,
+            "study_revision": self.study_revision,
+            "total_cells": self.total_cells,
+            "paired_cells": self.paired_cells,
+            "coverage_rate": round(self.paired_cells / self.total_cells, 8),
+            "preference_agreement_rate": self.preference_agreement_rate,
+            "cohens_kappa": self.cohens_kappa,
+            "mean_absolute_delta_error": self.mean_absolute_delta_error,
+            "synthetic_protocol_valid": self.synthetic_protocol_valid,
+            "protocol_reasons": list(self.protocol_reasons),
+            "disagreements": list(self.disagreements),
+        }
+
+
 def _means(
     observations: Iterable[ProductObservation],
     variant_id: str,
@@ -477,6 +506,93 @@ def evaluate_product_study(
         ProductDisposition.ADOPT,
         ("representative production evidence meets every pre-registered measure",),
         deltas, mix,
+    )
+
+
+def calibrate_synthetic_judgments(
+    study: ProductStudy,
+    observations: Iterable[ProductObservation],
+) -> CalibrationReport:
+    """Measure synthetic/human disagreement without treating either as a product vote."""
+
+    rows = tuple(observations)
+    synthetic_rows = tuple(
+        row for row in rows if row.evidence_kind is EvidenceKind.SYNTHETIC
+    )
+    human_rows = tuple(row for row in rows if row.evidence_kind is EvidenceKind.HUMAN)
+    protocol_reasons = tuple(dict.fromkeys(_synthetic_validity_reasons(study, rows)))
+    cells = [
+        (task_id, segment_id, metric)
+        for task_id in study.canonical_task_ids
+        for segment_id in study.representative_segments
+        for metric in study.metrics
+    ]
+    paired: list[tuple[str, float, float, bool, bool]] = []
+    variants = (study.baseline_variant_id, study.candidate_variant_id)
+    for task_id, segment_id, metric in cells:
+        deltas: dict[EvidenceKind, float] = {}
+        for evidence_kind, kind_rows in (
+            (EvidenceKind.SYNTHETIC, synthetic_rows),
+            (EvidenceKind.HUMAN, human_rows),
+        ):
+            scoped = [
+                row for row in kind_rows
+                if row.task_id == task_id and row.segment_id == segment_id
+            ]
+            if {row.variant_id for row in scoped} != set(variants):
+                continue
+            baseline = _means(scoped, variants[0], metric.metric_id, evidence_kind)
+            candidate = _means(scoped, variants[1], metric.metric_id, evidence_kind)
+            deltas[evidence_kind] = (
+                candidate - baseline
+                if metric.direction is MetricDirection.HIGHER
+                else baseline - candidate
+            )
+        if set(deltas) != {EvidenceKind.SYNTHETIC, EvidenceKind.HUMAN}:
+            continue
+        synthetic_delta = deltas[EvidenceKind.SYNTHETIC]
+        human_delta = deltas[EvidenceKind.HUMAN]
+        paired.append((
+            f"{task_id}/{segment_id}/{metric.metric_id}",
+            synthetic_delta,
+            human_delta,
+            synthetic_delta >= metric.minimum_delta,
+            human_delta >= metric.minimum_delta,
+        ))
+    if not paired:
+        return CalibrationReport(
+            study.study_id, study.revision, len(cells), 0,
+            None, None, None, not protocol_reasons, protocol_reasons, (),
+        )
+    agreements = [synthetic == human for _, _, _, synthetic, human in paired]
+    agreement_rate = fmean(float(value) for value in agreements)
+    synthetic_positive = fmean(float(item[3]) for item in paired)
+    human_positive = fmean(float(item[4]) for item in paired)
+    expected_agreement = (
+        synthetic_positive * human_positive
+        + (1 - synthetic_positive) * (1 - human_positive)
+    )
+    kappa = (
+        None if expected_agreement == 1
+        else (agreement_rate - expected_agreement) / (1 - expected_agreement)
+    )
+    return CalibrationReport(
+        study_id=study.study_id,
+        study_revision=study.revision,
+        total_cells=len(cells),
+        paired_cells=len(paired),
+        preference_agreement_rate=round(agreement_rate, 8),
+        cohens_kappa=None if kappa is None else round(kappa, 8),
+        mean_absolute_delta_error=round(fmean(
+            abs(synthetic_delta - human_delta)
+            for _, synthetic_delta, human_delta, _, _ in paired
+        ), 8),
+        synthetic_protocol_valid=not protocol_reasons,
+        protocol_reasons=protocol_reasons,
+        disagreements=tuple(
+            cell_id for cell_id, _, _, synthetic, human in paired
+            if synthetic != human
+        ),
     )
 
 

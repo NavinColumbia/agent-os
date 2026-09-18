@@ -33,6 +33,7 @@ COPY --chmod=0444 postgres/initdb/106-web-push-subscriptions-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/107-mission-work-accountability-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/108-execution-health-v2.sql /migrations/
 COPY --chmod=0444 postgres/initdb/109-human-requests-v2.sql /migrations/
+COPY --chmod=0444 postgres/initdb/110-product-evidence-v2.sql /migrations/
 COPY --chmod=0555 deploy/migrate-v2.sh /usr/local/bin/agentos-migrate-v2
 
 USER 999:999

@@ -35,6 +35,9 @@ x-runtime-environment: &runtime-environment
   AOS_V2_ARTIFACT_RETENTION_DAYS: ${AOS_V2_ARTIFACT_RETENTION_DAYS:-365}
   AOS_V2_ARTIFACT_MAX_CONTENT_BYTES: ${AOS_V2_ARTIFACT_MAX_CONTENT_BYTES:-2097152}
   AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS: ${AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS:-10000}
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}
+  OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+  AOS_V2_OTLP_TRACE_SAMPLE_RATIO: ${AOS_V2_OTLP_TRACE_SAMPLE_RATIO:-0.1}
 
 services:
   postgres:
@@ -95,6 +98,7 @@ services:
       - ../postgres/initdb/107-mission-work-accountability-v2.sql:/migrations/107-mission-work-accountability-v2.sql:ro
       - ../postgres/initdb/108-execution-health-v2.sql:/migrations/108-execution-health-v2.sql:ro
       - ../postgres/initdb/109-human-requests-v2.sql:/migrations/109-human-requests-v2.sql:ro
+      - ../postgres/initdb/110-product-evidence-v2.sql:/migrations/110-product-evidence-v2.sql:ro
     command:
       - sh
       - -ec
@@ -130,6 +134,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f /migrations/107-mission-work-accountability-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/108-execution-health-v2.sql
         psql -v ON_ERROR_STOP=1 -f /migrations/109-human-requests-v2.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/110-product-evidence-v2.sql
         psql -v ON_ERROR_STOP=1 \
           -v runtime_password="$$AOS_V2_DATABASE_RUNTIME_PASSWORD" <<'SQL'
         SELECT format(

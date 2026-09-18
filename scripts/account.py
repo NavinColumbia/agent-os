@@ -46,6 +46,10 @@ _EXPORT_TABLES = [
     ("budget_alert_state", "tenant_id"),
     ("onboarding_state", "tenant_id"),
     ("product_versions", "tenant_id"),
+    ("aos_v2_product_studies", "tenant_id"),
+    ("aos_v2_product_observations", "tenant_id"),
+    ("aos_v2_product_decisions", "tenant_id"),
+    ("aos_v2_product_value_receipts", "tenant_id"),
 ]
 
 # The tamper-evident audit chain is an explicit compliance record. Deleting or

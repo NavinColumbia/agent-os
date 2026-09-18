@@ -262,6 +262,24 @@ recommend the simpler alternative instead of defending its own complexity.
   guidance.
 - Added focused tests for synthetic-evidence validity, human/production gates, deterministic failures,
   customer value, topology coherence, and coordination-budget oversubscription.
+- Added an append-only SQL Evidence Lab with tenant RLS, immutable idempotency, artifact-backed observations,
+  observation-set-bound decisions, portable tenant export, role-scoped APIs, and an executive Evidence Lab
+  view. Agents and reviewers may contribute discovery evidence; only accountable management may label
+  human/production evidence, evaluate a study, or publish a value receipt.
+- Added a provider-neutral matched-task benchmark evaluator. It rejects incomplete baseline/candidate matrices,
+  self-evaluation, unregistered tasks/repetitions, unclassified failures, and evidence-free results; its output
+  includes immutable manifest/trial digests and the conservative value receipt.
+- Added a six-class resilience-campaign evaluator for provider throttling, partial tool failure, process death,
+  stale leases, duplicate events, and artifact corruption. Local campaigns can pass but cannot masquerade as
+  production-release evidence.
+- Added opt-in OTLP/HTTP tracing for the control API and durable worker, route-template/worker-outcome spans,
+  response correlation IDs, privacy/cardinality bounds, parent-based sampling, and local/GCP configuration.
+- Added tenant-scoped synthetic-versus-human calibration reports with paired-cell coverage, preference
+  agreement, Cohen's kappa, metric-delta error, protocol failures, and visible disagreements in the Evidence
+  Lab. The report cannot manufacture missing human observations.
+- Applied migration 110 to real PostgreSQL and verified `agentos_app` RLS isolation with a rollback-only tenant
+  probe. The final complete repository suite passed with 1,541 tests and two optional skips on 2026-09-18;
+  the locked runtime and ordered migration container images also built successfully.
 
 ### Already present and retained
 
@@ -276,12 +294,13 @@ recommend the simpler alternative instead of defending its own complexity.
 
 The system is not entitled to claim world-class product fit or public-production readiness until it has:
 
-1. persisted and exposed product studies/observations/decisions in a tenant-scoped Evidence Lab;
-2. run a versioned benchmark against direct Codex/Claude-class baselines on representative paid-customer
+1. ~~persisted and exposed product studies/observations/decisions in a tenant-scoped Evidence Lab;~~ implemented
+   and locally/PostgreSQL verified; deployment remains subject to the external staging gate below;
+2. run the implemented versioned benchmark against direct Codex/Claude-class baselines on representative paid-customer
    tasks, publishing value receipts including failures;
-3. calibrated synthetic personas/judges with real target users and maintained disagreement statistics;
-4. exercised fault injection for provider throttling, partial tool failure, process death, stale leases,
-   duplicate events, and artifact corruption in the production-shaped environment;
+3. populated the implemented calibration report with consented observations from representative target users;
+4. exercised the implemented six-class fault contract in the production-shaped environment, retaining the raw
+   injection, diagnosis, containment, and recovery evidence;
 5. connected the production telemetry exporter and tested alert-to-diagnosis-to-recovery workflows;
 6. run external staging with real OIDC, secrets, model/provider credentials, storage, email/push, billing,
    sandbox, deployment, backup/restore, and domain/TLS configuration;
@@ -292,11 +311,13 @@ The system is not entitled to claim world-class product fit or public-production
 
 ### P0 — prove the product, not only the runtime
 
-1. Persist the new Evidence Lab contracts behind tenant-scoped ports and RLS; add API projections and a
-   role-aware UI for product, design, reviewer, and executive views.
-2. Build the direct-model/single-agent/Agent-OS benchmark harness with matched tasks and blinded artifacts.
-3. Add a failure taxonomy and first-failure localization to eval packets; run deterministic fault campaigns.
-4. Add real-user consent, recruitment, session retention/redaction, and calibration reports.
+1. **Complete in code:** persist the Evidence Lab behind tenant-scoped ports/RLS and expose role-aware APIs/UI.
+2. **Harness complete; execution pending external credentials and representative tasks:** run direct-model,
+   single-agent, and Agent-OS trials with matched tasks and retained artifacts.
+3. **Contract complete; production-shaped execution pending deployment:** classify first failure and run all six
+   deterministic fault scenarios.
+4. **Calibration code complete; human execution pending:** recruit and consent representative users, retain
+   redacted session artifacts, and populate the synthetic/human calibration reports.
 5. Turn the value receipt into the executive outcome card and usage invoice explanation.
 
 ### P1 — deepen collaboration and operations

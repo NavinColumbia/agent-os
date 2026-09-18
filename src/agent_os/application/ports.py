@@ -634,6 +634,67 @@ class TenantModelStore(Protocol):
 
 
 @runtime_checkable
+class ProductEvidenceStore(Protocol):
+    """Append-only product studies, observations, decisions, and value receipts."""
+
+    def create_study(
+        self,
+        *,
+        tenant_id: str,
+        study: Mapping[str, Any],
+        created_by: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def append_observation(
+        self,
+        *,
+        tenant_id: str,
+        observation: Mapping[str, Any],
+        recorded_by: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def evaluate_study(
+        self,
+        *,
+        tenant_id: str,
+        study_id: str,
+        revision: int,
+        decided_by: str,
+    ) -> Mapping[str, Any] | None: ...
+
+    def get_study(
+        self, tenant_id: str, study_id: str, revision: int,
+    ) -> Mapping[str, Any] | None: ...
+
+    def list_studies(
+        self, tenant_id: str, *, limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+    def calibration_report(
+        self, tenant_id: str, study_id: str, revision: int,
+    ) -> Mapping[str, Any] | None: ...
+
+    def record_value_receipt(
+        self,
+        *,
+        tenant_id: str,
+        baseline: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        customer_price_cents: float,
+        human_hourly_value_cents: float,
+        maximum_latency_regression_seconds: float | None,
+        created_by: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]: ...
+
+    def list_value_receipts(
+        self, tenant_id: str, *, limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]: ...
+
+
+@runtime_checkable
 class GraphWorkflowEngine(Protocol):
     """Persistence boundary for arbitrary versioned customer workflow graphs."""
 

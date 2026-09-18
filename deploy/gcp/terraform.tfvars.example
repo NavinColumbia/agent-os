@@ -20,6 +20,8 @@ stripe_growth_price_id  = "price_replace_growth"
 
 model                 = "openai:gpt-5-mini"
 artifact_retention_days = 365
+otlp_traces_endpoint   = "" # Set to an HTTPS OTLP/HTTP collector when production tracing is connected.
+otlp_trace_sample_ratio = 0.1
 database_runtime_role = "agentos_runtime"
 github_repository_id  = "1276674620"
 app_builder_image      = "gcr.io/cloud-builders/docker@sha256:3d00b6c1a9b862621c30fc74d4f2abfc62bcbdee631ed3febd31e7edbdf6252c"

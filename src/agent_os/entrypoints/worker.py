@@ -72,6 +72,7 @@ from agent_os.infrastructure.sql_execution_health import (
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.tenant_model_resolver import TenantModelResolver
+from agent_os.infrastructure.telemetry import build_otlp_telemetry
 from agent_os.infrastructure.tool_node_router import GraphToolNodeRouter
 from agent_os.infrastructure.web_push import WebPushSubscriptionProtector
 from agent_os.infrastructure.web_push_delivery import (
@@ -392,6 +393,15 @@ def run_worker(
 
     stop = stop or Event()
     with ExitStack() as resources:
+        telemetry = build_otlp_telemetry(
+            endpoint=settings.server.otlp_traces_endpoint,
+            service_name="agent-os-worker",
+            service_version=settings.server.application_version,
+            environment=settings.server.environment,
+            sample_ratio=settings.server.otlp_trace_sample_ratio,
+        )
+        if telemetry is not None:
+            resources.callback(telemetry.close)
         engine = DBOSLifecycleEngine(
             system_database_url=settings.server.system_database_url,
             application_database_url=settings.server.application_database_url,
@@ -764,6 +774,7 @@ def run_worker(
             observer=_emit,
             activity=health_reporter,
             execution_gate=execution_gate,
+            tracer=None if telemetry is None else telemetry.tracer,
             **loop_options,
         )
         health_reporter.start()

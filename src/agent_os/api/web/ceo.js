@@ -340,11 +340,12 @@ function personaDefaultView() {
 }
 
 function viewAllowed(name) {
-  if (!["missions", "work", "company", "inbox", "integrations", "previews", "billing"].includes(name)) return false;
+  if (!["missions", "work", "company", "inbox", "integrations", "previews", "evidence", "billing"].includes(name)) return false;
   if (name === "work") return can("work.read");
   if (name === "company") return can("company.read");
   if (name === "integrations") return can("integration.manage");
   if (name === "previews") return can("release.read");
+  if (name === "evidence") return can("product.evidence.read");
   if (name === "billing") return can("billing.manage") && state.config?.billing_mode === "stripe";
   return true;
 }
@@ -366,6 +367,7 @@ function applyRoleExperience() {
   document.querySelectorAll(".requires-work-read").forEach((node) => node.classList.toggle("hidden", !can("work.read")));
   document.querySelectorAll(".requires-company-read").forEach((node) => node.classList.toggle("hidden", !can("company.read")));
   document.querySelectorAll(".requires-release-read").forEach((node) => node.classList.toggle("hidden", !can("release.read")));
+  document.querySelectorAll(".requires-product-evidence-read").forEach((node) => node.classList.toggle("hidden", !can("product.evidence.read")));
   document.querySelectorAll(".requires-integration-manage").forEach((node) => node.classList.toggle("hidden", !can("integration.manage")));
   const billingAvailable = state.config?.billing_mode === "stripe";
   document.querySelectorAll(".requires-billing-manage").forEach((node) => node.classList.toggle("hidden", !can("billing.manage") || !billingAvailable));
@@ -1512,6 +1514,112 @@ async function loadPreviews() {
   }
 }
 
+function evidenceDispositionTone(disposition) {
+  if (disposition === "adopt") return "succeeded";
+  if (["reject", "insufficient_evidence"].includes(disposition)) return "failed";
+  return "waiting";
+}
+
+async function loadEvidence() {
+  const [studyPayload, receiptPayload] = await Promise.all([
+    api("/v2/product-studies?limit=100"), api("/v2/value-receipts?limit=100"),
+  ]);
+  const studies = studyPayload.items || [];
+  const receipts = receiptPayload.items || [];
+  const decisions = studies.map((item) => item.latest_decision).filter(Boolean);
+  byId("evidence-summary").replaceChildren(
+    stat("Registered studies", studies.length),
+    stat("Adopt decisions", decisions.filter((item) => item.disposition === "adopt").length, "good"),
+    stat("Needs more evidence", studies.filter((item) => !item.latest_decision || ["insufficient_evidence", "human_validation_required"].includes(item.latest_decision.disposition)).length, "warn"),
+    stat("Value proven", receipts.filter((item) => item.dominates_baseline).length, receipts.some((item) => item.dominates_baseline) ? "good" : ""),
+  );
+
+  const studyList = byId("evidence-studies");
+  studyList.replaceChildren();
+  if (!studies.length) {
+    studyList.append(el("div", "empty", "No product experiment is registered yet. Agent teams can register a measured baseline/candidate study through the governed API."));
+  }
+  for (const item of studies) {
+    const decision = item.latest_decision;
+    const card = el("article", "evidence-card");
+    const header = el("header");
+    header.append(
+      el("h4", "", `${item.study_id} · revision ${item.revision}`),
+      el("span", `health ${evidenceDispositionTone(decision?.disposition)}`, label(decision?.disposition || "not evaluated")),
+    );
+    card.append(
+      header,
+      el("p", "", item.hypothesis),
+      el("div", "notice-context", `${item.baseline_variant_id} → ${item.candidate_variant_id} · ${item.observation_count || 0} observations · ${(item.canonical_task_ids || []).length} canonical tasks`),
+    );
+    if (decision?.reasons?.length) {
+      const reasons = el("ul", "evidence-reasons");
+      for (const reason of decision.reasons) reasons.append(el("li", "", reason));
+      card.append(reasons);
+    }
+    const calibration = el("button", "quiet", "Check synthetic/human calibration");
+    calibration.type = "button";
+    calibration.addEventListener("click", async () => {
+      calibration.disabled = true;
+      try {
+        const result = await api(`/v2/product-studies/${encodeURIComponent(item.study_id)}/revisions/${item.revision}/calibration`);
+        const panel = el("div", "calibration-report");
+        const agreement = result.preference_agreement_rate == null
+          ? "Not enough paired human evidence"
+          : `${(Number(result.preference_agreement_rate) * 100).toFixed(1)}% preference agreement`;
+        panel.append(
+          el("strong", "", result.synthetic_protocol_valid ? "Synthetic protocol valid" : "Synthetic protocol needs correction"),
+          el("small", "", `${agreement} · ${result.paired_cells}/${result.total_cells} metric cells calibrated`),
+          el("small", "", result.cohens_kappa == null ? "Cohen’s κ unavailable" : `Cohen’s κ ${Number(result.cohens_kappa).toFixed(3)}`),
+        );
+        if ((result.protocol_reasons || []).length || (result.disagreements || []).length) {
+          const findings = el("ul", "evidence-reasons");
+          for (const reason of result.protocol_reasons || []) findings.append(el("li", "", reason));
+          for (const cell of result.disagreements || []) findings.append(el("li", "", `Synthetic/human disagreement: ${cell}`));
+          panel.append(findings);
+        }
+        calibration.replaceWith(panel);
+      } catch (error) {
+        setFlash(error.message, "error"); calibration.disabled = false;
+      }
+    });
+    card.append(calibration);
+    if (can("product.evidence.manage")) {
+      const evaluate = el("button", "quiet", decision ? "Re-evaluate current evidence" : "Evaluate current evidence");
+      evaluate.type = "button";
+      evaluate.addEventListener("click", async () => {
+        evaluate.disabled = true;
+        try {
+          await api(`/v2/product-studies/${encodeURIComponent(item.study_id)}/revisions/${item.revision}/evaluate`, {method: "POST"});
+          setFlash("Evidence decision recorded against the current observation set.");
+          await loadEvidence();
+        } catch (error) { setFlash(error.message, "error"); evaluate.disabled = false; }
+      });
+      card.append(evaluate);
+    }
+    studyList.append(card);
+  }
+
+  const receiptList = byId("value-receipts");
+  receiptList.replaceChildren();
+  if (!receipts.length) receiptList.append(el("div", "empty", "No matched-baseline value receipt has been recorded yet."));
+  for (const item of receipts) {
+    const card = el("article", `evidence-card ${item.dominates_baseline ? "value-positive" : "value-negative"}`);
+    card.append(
+      el("h4", "", `${item.baseline_system_id} → ${item.candidate_system_id}`),
+      el("p", "", item.dominates_baseline ? "Measured value exceeds the admitted baseline." : "The candidate has not yet proven incremental value."),
+      el("div", "notice-context", `Quality ${Number(item.quality_delta || 0).toFixed(3)} · Success ${Number(item.success_delta || 0).toFixed(3)} · Reliability ${Number(item.reliability_delta || 0).toFixed(3)}`),
+      el("div", "notice-context", `${Number(item.human_minutes_saved || 0).toFixed(1)} human minutes saved · $${(Number(item.incremental_cost_cents || 0) / 100).toFixed(2)} incremental cost`),
+    );
+    if (item.reasons?.length) {
+      const reasons = el("ul", "evidence-reasons");
+      for (const reason of item.reasons) reasons.append(el("li", "", reason));
+      card.append(reasons);
+    }
+    receiptList.append(card);
+  }
+}
+
 async function openBillingDestination(path, body) {
   const result = await api(path, {
     method: "POST", headers: { "Idempotency-Key": `billing-${crypto.randomUUID()}` },
@@ -1563,6 +1671,7 @@ async function refreshView(silent = false) {
     if (state.view === "inbox") await loadInbox({refresh: true});
     if (state.view === "integrations") await loadIntegrations();
     if (state.view === "previews") await loadPreviews();
+    if (state.view === "evidence") await loadEvidence();
     if (state.view === "billing") await loadBilling();
     byId("last-refresh").textContent = `Updated ${new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
     if (state.selectedRun) await loadMissionDetail(state.selectedRun, true);
@@ -1580,6 +1689,7 @@ async function refreshAmbient() {
     if (state.view === "work") await loadMyWork();
     if (state.view === "inbox") await loadInbox({refresh: true});
     if (state.view === "previews") await loadPreviews();
+    if (state.view === "evidence") await loadEvidence();
     byId("last-refresh").textContent = `Updated ${new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}`;
     if (state.selectedRun) await loadMissionDetail(state.selectedRun, true);
   } catch (_) {
@@ -2287,10 +2397,10 @@ function selectView(name) {
     if (node.dataset.mobileView === name) node.setAttribute("aria-current", "page");
     else node.removeAttribute("aria-current");
   });
-  byId("mobile-more-toggle").classList.toggle("active", ["company", "integrations", "previews", "billing"].includes(name));
+  byId("mobile-more-toggle").classList.toggle("active", ["company", "integrations", "previews", "evidence", "billing"].includes(name));
   document.querySelectorAll(".view").forEach((node) => node.classList.add("hidden"));
   byId(`${name}-view`).classList.remove("hidden");
-  byId("view-title").textContent = { missions: "Missions", work: "My Work", company: "Company", inbox: "Inbox", integrations: "Integrations", previews: "Releases", billing: "Billing" }[name];
+  byId("view-title").textContent = { missions: "Missions", work: "My Work", company: "Company", inbox: "Inbox", integrations: "Integrations", previews: "Releases", evidence: "Evidence Lab", billing: "Billing" }[name];
   byId("workspace-main").focus({preventScroll: true});
   history.replaceState({}, document.title, workspaceRoute(name));
   closeDrawer({updateRoute: false}); return refreshView();

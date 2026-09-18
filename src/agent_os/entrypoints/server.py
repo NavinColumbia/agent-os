@@ -28,11 +28,13 @@ from agent_os.infrastructure.sql_mission_control import SQLMissionControl
 from agent_os.infrastructure.sql_tenant_models import SQLTenantModelStore
 from agent_os.infrastructure.sql_notifications import SQLNotificationStore
 from agent_os.infrastructure.sql_preview_deployments import SQLStaticPreviewDeployer
+from agent_os.infrastructure.sql_product_evidence import SQLProductEvidenceStore
 from agent_os.infrastructure.sql_billing import SQLBillingStore
 from agent_os.infrastructure.sql_usage_meter import SQLUsageMeter
 from agent_os.infrastructure.sql_execution_health import SQLExecutionHealthReader
 from agent_os.infrastructure.sql_workflow_graph import SQLGraphWorkflowEngine
 from agent_os.infrastructure.stripe_billing import StripeBillingGateway
+from agent_os.infrastructure.telemetry import build_otlp_telemetry
 from agent_os.infrastructure.web_push import WebPushSubscriptionProtector
 
 
@@ -85,6 +87,8 @@ class ServerSettings:
     artifact_bucket: str
     artifact_max_content_bytes: int
     artifact_retention_days: int
+    otlp_traces_endpoint: str
+    otlp_trace_sample_ratio: float
     host: str
     port: int
     create_schema: bool
@@ -172,6 +176,10 @@ class ServerSettings:
         create_schema = os.getenv(
             "AOS_V2_CREATE_SCHEMA", "1" if environment in {"development", "test"} else "0"
         ).lower() in {"1", "true", "yes", "on"}
+        otlp_traces_endpoint = os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+        otlp_trace_sample_ratio = float(os.getenv("AOS_V2_OTLP_TRACE_SAMPLE_RATIO", "0.1"))
+        if not 0 < otlp_trace_sample_ratio <= 1:
+            raise ValueError("AOS_V2_OTLP_TRACE_SAMPLE_RATIO must be greater than zero and at most one")
         if environment in {"staging", "production"}:
             if not system_database_url.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
                 raise ValueError("staging/production DBOS system database must be PostgreSQL")
@@ -377,6 +385,8 @@ class ServerSettings:
             artifact_bucket=artifact_bucket,
             artifact_max_content_bytes=artifact_max_content_bytes,
             artifact_retention_days=artifact_retention_days,
+            otlp_traces_endpoint=otlp_traces_endpoint,
+            otlp_trace_sample_ratio=otlp_trace_sample_ratio,
             host=os.getenv("AOS_V2_HOST", "127.0.0.1"),
             port=port,
             create_schema=create_schema,
@@ -421,10 +431,20 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     settings = settings or ServerSettings.from_env()
     resources = ExitStack()
     try:
+        telemetry = build_otlp_telemetry(
+            endpoint=settings.otlp_traces_endpoint,
+            service_name="agent-os-control-api",
+            service_version=settings.application_version,
+            environment=settings.environment,
+            sample_ratio=settings.otlp_trace_sample_ratio,
+        )
+        if telemetry is not None:
+            resources.callback(telemetry.close)
         engine = DBOSLifecycleEngine(
             system_database_url=settings.system_database_url,
             application_database_url=settings.application_database_url,
             application_version=settings.application_version,
+            request_tracer=None if telemetry is None else telemetry.tracer,
             create_schema=settings.create_schema,
         )
         resources.callback(engine.close)
@@ -490,6 +510,11 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             retention_days=settings.artifact_retention_days,
         )
         resources.callback(artifact_store.close)
+        product_evidence_store = SQLProductEvidenceStore(
+            settings.application_database_url,
+            create_schema=settings.create_schema,
+        )
+        resources.callback(product_evidence_store.close)
         usage_meter = SQLUsageMeter(
             settings.application_database_url,
             monthly_budget_cents=settings.tenant_monthly_model_budget_cents,
@@ -553,6 +578,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
             graph_engine=graph_engine,
             notification_store=notification_store,
             artifact_store=artifact_store,
+            product_evidence_store=product_evidence_store,
             preview_deployments=preview_deployments,
             company_directory=company_directory,
             connector_registry=connector_registry,
@@ -584,6 +610,7 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.graph_workflow_engine = graph_engine
     app.state.notification_store = notification_store
     app.state.artifact_store = artifact_store
+    app.state.product_evidence_store = product_evidence_store
     app.state.preview_deployments = preview_deployments
     app.state.company_directory = company_directory
     app.state.connector_registry = connector_registry
@@ -598,4 +625,5 @@ def build_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.billing_store = billing_store
     app.state.billing_service = billing_service
     app.state.settings = settings
+    app.state.telemetry = telemetry
     return app

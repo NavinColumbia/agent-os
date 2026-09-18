@@ -37,6 +37,7 @@ class CommandWorkerLoop:
         observer: WorkerObserver | None = None,
         activity: WorkerActivitySink | None = None,
         execution_gate: ExecutionReleaseGate | None = None,
+        tracer: Any | None = None,
     ) -> None:
         organizations = tuple(dict.fromkeys(item.strip() for item in organization_ids if item.strip()))
         if bool(organizations) == (organization_source is not None):
@@ -55,6 +56,7 @@ class CommandWorkerLoop:
         self._observer = observer or (lambda _: None)
         self._activity = activity
         self._execution_gate = execution_gate
+        self._tracer = tracer
         self._last_cycle_had_error = False
 
     @property
@@ -117,7 +119,7 @@ class CommandWorkerLoop:
             for organization_id in organizations:
                 try:
                     if self._execution_gate is None:
-                        report = self._worker.run_one(organization_id)
+                        report = self._run_tenant_once(organization_id)
                     else:
                         # PostgreSQL holds a cell-scoped shared advisory lock
                         # across this one claim/execution. Release activation
@@ -130,7 +132,7 @@ class CommandWorkerLoop:
                                         datetime.now(timezone.utc),
                                     )
                                 break
-                            report = self._worker.run_one(organization_id)
+                            report = self._run_tenant_once(organization_id)
                 except Exception as exc:
                     self._last_cycle_had_error = True
                     self._observer({
@@ -157,6 +159,23 @@ class CommandWorkerLoop:
             if self._activity is not None:
                 self._activity.work_finished(datetime.now(timezone.utc))
         return tuple(reports)
+
+    def _run_tenant_once(self, organization_id: str) -> CommandRunReport:
+        if self._tracer is None:
+            return self._worker.run_one(organization_id)
+        with self._tracer.start_as_current_span("agent_os.worker.tenant_cycle") as span:
+            # Tenant IDs, prompts, tool inputs, and model outputs stay out of telemetry.
+            try:
+                report = self._worker.run_one(organization_id)
+            except Exception as exc:
+                span.set_attribute("error.type", type(exc).__name__)
+                span.record_exception(exc)
+                raise
+            span.set_attribute("agent_os.command.status", report.status.value)
+            span.set_attribute("agent_os.command.attempt", report.attempt)
+            if report.error_type:
+                span.set_attribute("error.type", report.error_type)
+            return report
 
     def run_forever(self, stop: Event) -> None:
         while not stop.is_set():

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 
 import pytest
-from pydantic_ai import ModelRetry
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.messages import ModelResponse, ToolCallPart
@@ -536,13 +535,35 @@ def test_handoff_preserves_original_labels_and_follows_source_dependencies(tmp_p
                 "objective": {"summary": "Build"},
                 "authorized_budget_cents": 0,
                 "success_measures": ["Verified"],
-                "workstreams": [{"large": "duplicated executable graph"}],
+                "workstreams": [{
+                    "workstream_id": "build",
+                    "objective": "Build the admitted product",
+                    "accountable_role_id": "engineer",
+                    "workflow_node_ids": ["large", "duplicated", "executable", "graph"],
+                    "acceptance_criteria": ["Verified"],
+                    "coordination": {
+                        "strategy": "single_agent",
+                        "comparison_baseline": "direct_model",
+                        "expected_benefit": "Durable recovery",
+                    },
+                }],
                 "roles": [{"role": "engineer"}],
             },
         })
         assert compact_context["mission_program"]["objective"] == {"summary": "Build"}
         assert "workstreams" not in compact_context["mission_program"]
         assert compact_context["mission_program_omitted_sections"] == ["roles", "workstreams"]
+        assert compact_context["mission_coordination"] == [{
+            "workstream_id": "build",
+            "objective": "Build the admitted product",
+            "accountable_role_id": "engineer",
+            "acceptance_criteria": ["Verified"],
+            "coordination": {
+                "strategy": "single_agent",
+                "comparison_baseline": "direct_model",
+                "expected_benefit": "Durable recovery",
+            },
+        }]
     finally:
         artifacts.close()
 
@@ -824,11 +845,9 @@ def test_resumed_agent_receives_the_durable_wait_response():
     ).state
     observed: dict[str, str] = {}
 
-    def respond(messages, info):
+    async def respond(messages, info):
         prompt = str(messages[-1].parts[0].content)
         observed["prompt"] = prompt
-        if "8388608 bytes" not in prompt:
-            raise ModelRetry("durable wait response was not supplied")
         return ModelResponse(parts=[ToolCallPart(
             info.output_tools[0].name,
             {

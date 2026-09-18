@@ -3,14 +3,13 @@
 docs/blueprint/AGENTIC-ORCHESTRATION.md § "Recursive, elastic org scaling").
 
 The org tree is NOT fixed-depth: any supervisor can spawn sub-supervisors, a sub-team, or more
-agents. This module is the AI that makes that structural call. Two entry points, BOTH pure AI
-decisions (factory.agent — every decision is a model call; cost is NOT a constraint):
+agents. This module is the AI that proposes that structural call. Deterministic normalization keeps
+an ambiguous or malformed proposal from silently creating paid work:
 
   should_expand(scope, current_structure, signals) -> {expand, how, detail, rationale}
-      Called at EVERY decision point ("is our current team enough, or do we expand?"). BIASED
-      toward expansion whenever the answer is uncertain — under-provisioning an org is the costly
-      failure here, not spawning one more lead. Ambiguity, an unparseable model reply, or a failed
-      call all DEFAULT TO EXPAND.
+      Called when material scope/load signals suggest the current team may be insufficient. Expansion
+      needs an explicit, coherent proposal; ambiguity, an unparseable reply, or a failed call safely
+      retains the current organization for re-evaluation.
 
   plan_org(vision) -> a recursive org tree (controller -> domains -> teams -> devs) for a vision.
       Decomposes a large vision into a DEEP, nested structure; normalized so callers always get a
@@ -92,9 +91,11 @@ You may expand in one of these ways (field `how`):
 - "more_agents"    : add more individual-contributor agents to an existing team (grow WIDTH).
 - "none"           : the current structure is genuinely sufficient; do NOT expand.
 
-HARD BIAS: prefer EXPANSION whenever you are the least bit uncertain. Cost is NOT a constraint;
-under-staffing the org is the expensive failure, over-staffing is cheap and reversible. Only answer
-"none" when you are confident the current team already covers the scope with headroom.
+Choose the SMALLEST sufficient organization. Expand only when observed scope/load/blocker signals show
+that a distinct domain, independently governed team, or genuinely low-coupling parallel worker will
+produce a concrete coverage, quality, or latency benefit. Coordination, context fragmentation, and
+model spend are real failure surfaces. When evidence is insufficient, answer "none" and explain what
+signal should trigger re-evaluation; never speculate by adding staff.
 
 SCOPE (what we're taking on now):
 {scope}
@@ -116,7 +117,7 @@ def should_expand(scope, current_structure, signals=None) -> dict:
     """Ask the AI whether the org should grow to meet `scope`, given `current_structure` and live
     `signals`. Returns a normalized decision dict:
         {expand: bool, how: 'new_supervisor'|'sub_team'|'more_agents'|'none', detail, rationale}
-    BIASED toward expansion: an ambiguous, missing, or unparseable model reply defaults to expand."""
+    Ambiguous, missing, inconsistent, or unparseable replies retain the current org."""
     prompt = _EXPAND_PROMPT.format(
         scope=_as_text(scope),
         structure=_as_text(current_structure),
@@ -127,37 +128,30 @@ def should_expand(scope, current_structure, signals=None) -> dict:
 
 
 def _normalize_decision(parsed) -> dict:
-    """Coerce the model's reply into the decision contract, applying the expansion bias.
-    Anything ambiguous/unparseable -> expand=True (safer to over-provision)."""
+    """Coerce the proposal into a fail-closed organizational decision."""
     if not isinstance(parsed, dict):
-        # No parse at all -> bias to expand with the most conservative growth (more agents).
-        return {"expand": True, "how": "more_agents", "detail": "",
-                "rationale": "ambiguous/unparseable decision — defaulting to EXPAND (bias to scale)",
+        return {"expand": False, "how": "none", "detail": "",
+                "rationale": "ambiguous/unparseable decision — retaining current organization",
                 "ambiguous": True}
     raw_expand = parsed.get("expand", None)
     how = str(parsed.get("how", "") or "").strip().lower()
     detail = str(parsed.get("detail", "") or "").strip()
     rationale = str(parsed.get("rationale", "") or "").strip()
 
-    # Resolve `expand` — treat missing/None/unrecognized as ambiguous -> bias to True.
-    if isinstance(raw_expand, bool):
-        expand = raw_expand
-    elif isinstance(raw_expand, str):
-        expand = raw_expand.strip().lower() not in ("false", "no", "0", "")
-    else:
-        expand = True  # ambiguous -> expand
-
-    # Reconcile `how` with `expand`.
+    expand = raw_expand if isinstance(raw_expand, bool) else False
+    ambiguous = not isinstance(raw_expand, bool)
     if how not in HOW_KINDS:
-        how = "none" if not expand else "more_agents"  # unknown how -> derive from expand
-    if expand and how == "none":
-        how = "more_agents"           # inconsistent: said expand but how=none -> pick a growth
-    if not expand and how != "none":
-        expand = True                 # inconsistent: gave a growth kind -> honor it (bias to scale)
-
-    ambiguous = raw_expand is None or not isinstance(raw_expand, bool)
+        ambiguous = True
+        expand, how = False, "none"
+    elif (expand and how == "none") or (not expand and how != "none"):
+        ambiguous = True
+        expand, how = False, "none"
+    if expand and (not detail or not rationale):
+        ambiguous = True
+        expand, how = False, "none"
+        rationale = "incomplete expansion proposal — retaining current organization"
     if not rationale:
-        rationale = "no rationale given"
+        rationale = "no rationale given — retaining current organization"
     return {"expand": expand, "how": how, "detail": detail, "rationale": rationale,
             "ambiguous": ambiguous}
 
@@ -173,9 +167,10 @@ below into an INITIAL org tree that can build it. The tree is RECURSIVE and DEEP
        -> TEAMS     (each has a HEAD and can itself contain sub-teams for a big domain)
           -> DEVS   (individual-contributor agents; each has a role like backend-engineer)
 
-BIAS toward MORE structure, not less — cost is not a constraint and the tree can always be pruned.
-For a large vision, prefer several domains, multiple teams per domain, and real devs per team; nest
-sub-teams where a domain is broad. Give every node a role/title.
+Choose the SMALLEST organization that still has explicit ownership and independent verification.
+Split domains only when their work, authority, or evidence can be independently owned. Add parallel
+teams only for low-coupling work with a concrete coverage, quality, or latency benefit; needless
+hierarchy is a reliability and coordination defect. Give every node a role/title.
 
 VISION:
 {vision}
@@ -344,20 +339,21 @@ def _selftest() -> int:
         d = should_expand("tiny tweak", {"teams": ["core"]}, None)
         check(d["expand"] is False and d["how"] == "none", "should_expand honors confident 'none'")
 
-        # ---- should_expand: AMBIGUITY (unparseable) -> BIAS TO EXPAND ----
+        # ---- should_expand: ambiguity cannot silently create paid work ----
         def stub_garbage(role, repo, task, **k):
             return {"rc": 0, "out": "hmm, I think maybe we could add some people? unclear."}
         factory.agent = stub_garbage
         d = should_expand("unclear scope", {}, None)
-        check(d["expand"] is True and d["how"] in HOW_KINDS and d.get("ambiguous"),
-              "should_expand defaults to EXPAND under ambiguity")
+        check(d["expand"] is False and d["how"] == "none" and d.get("ambiguous"),
+              "should_expand retains current org under ambiguity")
 
-        # ---- should_expand: inconsistent reply (expand true but how none) reconciled to a growth ----
+        # ---- should_expand: inconsistent reply fails closed ----
         def stub_inconsistent(role, repo, task, **k):
             return {"rc": 0, "out": '{"expand": true, "how": "none"}'}
         factory.agent = stub_inconsistent
         d = should_expand("x", {}, None)
-        check(d["expand"] is True and d["how"] != "none", "should_expand reconciles expand+none")
+        check(d["expand"] is False and d["how"] == "none" and d.get("ambiguous"),
+              "should_expand rejects expand+none")
 
         # ---- plan_org: model returns a nested tree ----
         def stub_plan(role, repo, task, **k):

@@ -226,7 +226,7 @@ class Supervisor(Actor):
     # --- (1) decompose --------------------------------------------------
     def decompose(self, task: str) -> list[dict]:
         """AI call: split `task` into subtasks and DECIDE the org shape — how many children, and which (if
-        any) should be sub-Supervisors (recursive expansion; bias toward expanding when the scope is large).
+        any) should be sub-Supervisors (recursive expansion only when its benefit is explicit).
         Returns a list of child specs: {name, role, kind: 'worker'|'supervisor', task}."""
         self.task = task
         self._audit("Decompose", "executed", {"task": task[:160]})
@@ -234,8 +234,10 @@ class Supervisor(Actor):
                      "You are a LEAD decomposing a task for your team in a recursive, elastic agent-org. "
                      "Decide (a) the INDEPENDENT subtasks, (b) HOW MANY children to staff, and (c) for each "
                      "child whether it is a single IC ('worker') or, if its subtask is itself broad enough to "
-                     "need its OWN team, a sub-lead ('supervisor'). Bias toward EXPANDING structure when the "
-                     "scope is large (cost is not a constraint). Reply ONLY JSON:\n"
+                     "need its OWN team, a sub-lead ('supervisor'). Choose the SMALLEST sufficient team. "
+                     "Parallelize only genuinely independent, low-coupling work; keep tightly coupled work "
+                     "in one context. Every extra child needs a distinct scope and measurable coverage, "
+                     "quality, or latency benefit. Reply ONLY JSON:\n"
                      '{"org_note":"...", "children":[{"role":"<role>","kind":"worker|supervisor","task":"..."}]}\n'
                      f"TASK:\n{task}", spawner=self.role)
         specs = d.get("children") or []

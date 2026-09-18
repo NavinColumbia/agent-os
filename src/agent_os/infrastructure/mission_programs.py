@@ -230,6 +230,71 @@ class CapabilityPlan(BaseModel):
         return self
 
 
+class CoordinationPlan(BaseModel):
+    """Admitted reason for using a particular execution topology.
+
+    Multi-agent fan-out is not intrinsically better than a direct tool call or
+    one agent.  The planner must name the simpler comparison, predict the
+    bounded cost/latency, and tie the extra coordination to mission measures.
+    Defaults preserve old admitted programs as a conservative single-agent
+    topology; newly proposed programs are instructed to fill this explicitly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: Literal[
+        "deterministic_workflow", "single_agent", "parallel_agents",
+        "evaluator_optimizer", "subworkflow",
+    ] = "single_agent"
+    rationale: str = Field(
+        default="Legacy program: retain one bounded execution thread.",
+        min_length=1,
+        max_length=4_000,
+    )
+    coupling: Literal["low", "medium", "high"] = "high"
+    parallelism: int = Field(default=1, ge=1, le=32)
+    comparison_baseline: Literal[
+        "direct_model", "single_agent", "current_system", "human_workflow",
+        "not_applicable",
+    ] = "current_system"
+    expected_benefit: str = Field(
+        default="Preserve the behavior of an already admitted program.",
+        min_length=1,
+        max_length=4_000,
+    )
+    measure_ids: list[str] = Field(default_factory=list, max_length=64)
+    estimated_model_cost_cents: int = Field(default=0, ge=0, le=100_000_000_000)
+    latency_budget_seconds: int | None = Field(default=None, ge=1, le=31_536_000)
+    fallback: str = Field(
+        default="Return to the admitted single execution thread.",
+        min_length=1,
+        max_length=4_000,
+    )
+
+    @model_validator(mode="after")
+    def topology_is_coherent(self) -> "CoordinationPlan":
+        governed_topologies = {
+            "parallel_agents", "evaluator_optimizer", "subworkflow",
+        }
+        if self.strategy in governed_topologies:
+            if not self.measure_ids:
+                raise ValueError(f"{self.strategy.replace('_', '-')} requires a measured benefit")
+            if self.comparison_baseline == "not_applicable":
+                raise ValueError(
+                    f"{self.strategy.replace('_', '-')} requires a simpler comparison baseline"
+                )
+            if self.latency_budget_seconds is None:
+                raise ValueError(f"{self.strategy.replace('_', '-')} requires a latency budget")
+        if self.strategy == "parallel_agents":
+            if self.coupling != "low":
+                raise ValueError("parallel agents require low-coupling work")
+            if self.parallelism < 2:
+                raise ValueError("parallel agents require parallelism of at least two")
+        elif self.parallelism != 1:
+            raise ValueError("only the parallel-agents strategy may request parallelism above one")
+        return self
+
+
 class WorkstreamPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -241,6 +306,7 @@ class WorkstreamPlan(BaseModel):
     required_resource_ids: list[str] = Field(default_factory=list, max_length=64)
     required_capability_ids: list[str] = Field(default_factory=list, max_length=64)
     acceptance_criteria: list[str] = Field(min_length=1, max_length=64)
+    coordination: CoordinationPlan = Field(default_factory=CoordinationPlan)
 
 
 class VerificationClaim(BaseModel):
@@ -370,6 +436,12 @@ def validate_program_graph(
     )
     if child_budget > program.authorized_budget_cents:
         raise ValueError("mission child-program budgets exceed admitted budget authority")
+    coordination_budget = sum(
+        workstream.coordination.estimated_model_cost_cents
+        for workstream in program.workstreams
+    )
+    if coordination_budget > program.authorized_budget_cents:
+        raise ValueError("mission coordination estimates exceed admitted budget authority")
     if program.feasibility.cost_estimate.likely > program.authorized_budget_cents and not any(
         resource.kind == "budget" and resource.status in {"missing", "requested"}
         for resource in program.resources
@@ -446,8 +518,48 @@ def validate_program_graph(
         _require_known(workstream.depends_on_workstream_ids, workstream_ids, "workstream dependency")
         _require_known(workstream.required_resource_ids, resource_ids, "workstream resource")
         _require_known(workstream.required_capability_ids, capability_ids, "workstream capability")
+        _require_known(
+            workstream.coordination.measure_ids,
+            measure_ids,
+            "workstream coordination measure",
+        )
         if workstream.workstream_id in workstream.depends_on_workstream_ids:
             raise ValueError("mission program workstream cannot depend on itself")
+        topology = workstream.coordination
+        workstream_nodes = [node_by_id[node_id] for node_id in workstream.workflow_node_ids]
+        parallel_workers = [
+            node for node in workstream_nodes if node.kind in {"agent", "subworkflow"}
+        ]
+        if topology.strategy == "parallel_agents" and len(parallel_workers) < topology.parallelism:
+            raise ValueError(
+                f"workstream {workstream.workstream_id} has fewer parallel workers than admitted"
+            )
+        if topology.strategy == "parallel_agents":
+            parallel_ids = {node.node_id for node in parallel_workers}
+            maximum_branch_width = max((
+                len({edge.target for edge in program.workflow.edges if edge.source == source}
+                    & parallel_ids)
+                for source in node_ids
+            ), default=0)
+            if maximum_branch_width < topology.parallelism:
+                raise ValueError(
+                    f"workstream {workstream.workstream_id} does not expose its admitted parallel branch"
+                )
+        if topology.strategy == "subworkflow" and not any(
+            node.kind == "subworkflow" for node in workstream_nodes
+        ):
+            raise ValueError(
+                f"workstream {workstream.workstream_id} declares subworkflow without a subworkflow node"
+            )
+        if topology.strategy == "evaluator_optimizer" and len(workstream.workflow_node_ids) < 2:
+            raise ValueError(
+                f"workstream {workstream.workstream_id} evaluator-optimizer needs maker and evaluator nodes"
+            )
+        if topology.strategy == "deterministic_workflow" and parallel_workers:
+            raise ValueError(
+                f"workstream {workstream.workstream_id} deterministic workflow contains an "
+                "agent or subworkflow"
+            )
         covered_nodes.update(workstream.workflow_node_ids)
         for node_id in workstream.workflow_node_ids:
             owner = node_by_id[node_id].owner_role

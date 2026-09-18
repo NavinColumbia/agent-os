@@ -153,8 +153,13 @@ def mission_bootstrap_definition(
             "obsolete live work in the same run. For work that needs an independently governed team or would "
             "make this graph too large, use a subworkflow node sourced from a complete child mission-program "
             "artifact; delegate an explicit bounded budget and provide both success and failure paths. Child "
-            "programs may recursively decompose work within the admitted depth bound. Design the smallest "
-            "sufficient non-linear program for the CEO directive."
+            "programs may recursively decompose work within the admitted depth bound. For every workstream, "
+            "explicitly choose the smallest sufficient coordination strategy, name the simpler comparison "
+            "baseline, coupling, expected measurable benefit, cost estimate, latency budget, and fallback. "
+            "Use parallel agents only for low-coupling branches with a registered measure; use an "
+            "evaluator-optimizer loop only when an objective measured rubric exists. Synthetic personas and "
+            "model judges may discover issues, but never treat their preference alone as customer validation "
+            "or release authority. Design the smallest sufficient non-linear program for the CEO directive."
         ),
         "plan_schema": MissionProgramPlan.model_json_schema(),
         "available_tools": sorted(tools),
@@ -342,6 +347,13 @@ def mission_bootstrap_definition(
                 "All referenced role, node, workstream, resource, capability, measure, and claim "
                 "IDs must exist and IDs must be unique within their section. Role, resource, and "
                 "workstream dependency graphs must be acyclic and contain no self-dependencies."
+            ),
+            (
+                "Every workstream coordination plan must name a simpler comparison baseline, expected "
+                "benefit, bounded cost, latency budget when material, and fallback. Parallel agents require "
+                "low-coupling work, at least two agent/subworkflow workers, and registered success measures. "
+                "Evaluator-optimizer loops require distinct maker/evaluator nodes and registered measures; "
+                "a deterministic workflow cannot contain agent or subworkflow nodes."
             ),
             (
                 "Every success measure must be covered by verification; verification nodes must "

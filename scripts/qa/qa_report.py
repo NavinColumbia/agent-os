@@ -7,12 +7,12 @@ judge EXPECTED-vs-ACTUAL. This module is where that whole run is turned into an 
 controller) can read: what was tested, what each step was SUPPOSED to do vs what it ACTUALLY did, every bug
 found (with its screenshot, whether it BLOCKS, whether it was FIXED), and a final VERDICT.
 
-Design stance (owner-mandated): every DECISION in this system is an AI call. The report's core FACTS
+Design stance: open-ended interpretation may use an AI call. The report's core FACTS
 (pass/fail counts, open-bug counts, the verdict) are computed DETERMINISTICALLY from the run — you never
 want a summary that HALLUCINATES a green light. But the human-facing one-liner is polished by an AI call
 (factory.agent) that reads the vision + the tallies and writes the sentence a founder actually wants to
 read; it degrades to a deterministic sentence if the model is unavailable. So: facts are grounded, prose
-is AI. Cost is not a concern.
+is AI when available. Coverage and evidence cannot be weakened to save cost; redundant narrative calls can.
 
     qa_report.py selftest      # offline: canned run -> asserts md+json written with bugs + verdict
 Run with the agent-os venv python.

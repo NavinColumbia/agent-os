@@ -563,6 +563,24 @@ class PydanticGraphNodeRuntime(GraphNodeRuntime):
         compact = dict(context)
         mission_program = compact.get("mission_program")
         if isinstance(mission_program, Mapping):
+            workstreams = mission_program.get("workstreams")
+            if isinstance(workstreams, list):
+                coordination = []
+                for workstream in workstreams:
+                    if not isinstance(workstream, Mapping):
+                        continue
+                    item = {
+                        key: workstream[key]
+                        for key in (
+                            "workstream_id", "objective", "accountable_role_id",
+                            "acceptance_criteria", "coordination",
+                        )
+                        if key in workstream
+                    }
+                    if item:
+                        coordination.append(item)
+                if coordination:
+                    compact["mission_coordination"] = coordination
             retained_keys = {
                 "format",
                 "revision",

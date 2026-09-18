@@ -32,8 +32,9 @@ AI-routed owner + SLA and a stored re-verification recipe (the originating story
 bugs' is the ship bar; blocking-only is merely the emergency bar. No bug can reach a human as a footnote
 in a report nobody owns.
 
-Design stance (owner-mandated): cost is NOT a concern — be maximally AI-driven; the loop is STATE-BASED
-(observe -> decide -> act -> observe -> evaluate); and it judges EXPECTED-vs-ACTUAL against the vision.
+Design stance: coverage and trustworthy evidence are non-negotiable, but needless model calls are not quality.
+The loop is STATE-BASED (observe -> decide -> act -> observe -> evaluate), uses deterministic checks for stable
+facts, and reserves model judgment for ambiguous expected-vs-actual decisions against the vision.
 
     python qa_run.py selftest    # offline wiring check — stubs every AI call + the browser, no network
     python qa_run.py smoke       # BOUNDED end-to-end: live console + one tiny REAL story (real AI calls)

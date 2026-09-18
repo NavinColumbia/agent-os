@@ -1994,8 +1994,10 @@ _DECOMPOSE_PROMPT = (
     "You are a LEAD decomposing a task for your team in a recursive, elastic agent-org. Decide "
     "(a) the INDEPENDENT subtasks, (b) HOW MANY children to staff, and (c) for each child whether "
     "it is a single IC ('worker') or, if its subtask is itself broad enough to need its OWN team, "
-    "a sub-lead ('supervisor'). Bias toward EXPANDING structure when the scope is large (cost is "
-    "not a constraint). Reply ONLY JSON:\n"
+    "a sub-lead ('supervisor'). Choose the SMALLEST sufficient team. Parallelize only genuinely "
+    "independent, low-coupling work; keep tightly coupled implementation in one context. Every extra "
+    "child needs a distinct scope and a measurable coverage, quality, or latency benefit. Cost is not "
+    "a hard blocker, but needless fan-out is a reliability defect. Reply ONLY JSON:\n"
     '{{"org_note":"...", "children":[{{"role":"<role>","kind":"worker|supervisor","task":"..."}}]}}\n'
     "TASK:\n{task}")
 

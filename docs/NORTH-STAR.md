@@ -69,6 +69,12 @@ companies with tens of thousands of employees:
   proposal. Identity, tenancy, permissions, budgets, recipients, evidence, decision authority, and side-effect
   policy are verified deterministically. Hallucinated people, tools, success claims, or evidence cannot become
   company facts merely because an agent said them.
+- **Agent scale and product taste must earn authority.** Use the smallest sufficient organization and expand
+  only when low-coupling work, independent assurance, or a measured evaluator loop justifies it against a named
+  simpler baseline. Synthetic customers and model judges may discover problems but cannot impersonate real
+  users, manufacture market demand, or vote away deterministic failures. Product decisions require versioned
+  tasks, durable evidence, bias controls, representative human calibration, and production feedback appropriate
+  to the claim. See [ADR-010](ADR-010-evidence-backed-product-council.md).
 - **One truth, many human workspaces.** CEOs, product and engineering leaders, builders, reviewers, operators,
   administrators, clients, and integrators see role-appropriate projections over the same durable mission
   truth. The primary interface shows outcomes, ownership, decisions, progress, evidence, and next actions;

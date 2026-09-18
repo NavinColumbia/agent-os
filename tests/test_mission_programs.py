@@ -323,3 +323,156 @@ def test_recursive_child_programs_cannot_oversubscribe_parent_budget():
             proposal, tenant_id="tenant-a", planning_run_id="planning-a",
             artifact_id="artifact-program", allowed_tools=set(),
         )
+
+
+def test_parallel_agents_require_low_coupling_and_a_registered_measure():
+    proposal = mission_program()
+    proposal["workstreams"][1]["coordination"] = {
+        "strategy": "parallel_agents",
+        "rationale": "Search independent source families concurrently.",
+        "coupling": "high",
+        "parallelism": 2,
+        "comparison_baseline": "single_agent",
+        "expected_benefit": "Reduce research latency without reducing source coverage.",
+        "measure_ids": ["release-ready"],
+        "estimated_model_cost_cents": 500,
+        "latency_budget_seconds": 900,
+        "fallback": "Use one researcher sequentially.",
+    }
+
+    with pytest.raises(FatalCommandError, match="parallel agents require low-coupling work"):
+        materialize_mission_program(
+            proposal, tenant_id="tenant-a", planning_run_id="planning-a",
+            artifact_id="artifact-program", allowed_tools=set(),
+        )
+
+
+def test_parallelism_must_be_backed_by_real_workers():
+    proposal = mission_program()
+    proposal["workstreams"][1]["coordination"] = {
+        "strategy": "parallel_agents",
+        "rationale": "Search independent source families concurrently.",
+        "coupling": "low",
+        "parallelism": 2,
+        "comparison_baseline": "single_agent",
+        "expected_benefit": "Reduce research latency without reducing source coverage.",
+        "measure_ids": ["release-ready"],
+        "estimated_model_cost_cents": 500,
+        "latency_budget_seconds": 900,
+        "fallback": "Use one researcher sequentially.",
+    }
+
+    with pytest.raises(FatalCommandError, match="fewer parallel workers than admitted"):
+        materialize_mission_program(
+            proposal, tenant_id="tenant-a", planning_run_id="planning-a",
+            artifact_id="artifact-program", allowed_tools=set(),
+        )
+
+
+def test_parallel_agents_require_an_executable_fanout_and_accept_a_real_branch():
+    proposal = mission_program()
+    proposal["workflow"]["nodes"].append({
+        "node_id": "research-alt", "kind": "agent",
+        "purpose": "Research an independent source family.",
+        "owner_role": "researcher", "configuration": {"max_iterations": 3},
+    })
+    proposal["workflow"]["edges"].extend((
+        {"source": "triage", "target": "research-alt", "condition": "always"},
+        {"source": "research-alt", "target": "replan", "condition": "researched"},
+    ))
+    proposal["workstreams"][1]["workflow_node_ids"].append("research-alt")
+    proposal["workstreams"][1]["coordination"] = {
+        "strategy": "parallel_agents",
+        "rationale": "Search two independent source families concurrently.",
+        "coupling": "low",
+        "parallelism": 2,
+        "comparison_baseline": "single_agent",
+        "expected_benefit": "Reduce research latency without reducing source coverage.",
+        "measure_ids": ["release-ready"],
+        "estimated_model_cost_cents": 500,
+        "latency_budget_seconds": 900,
+        "fallback": "Use one researcher sequentially.",
+    }
+
+    program, _ = materialize_mission_program(
+        proposal, tenant_id="tenant-a", planning_run_id="planning-a",
+        artifact_id="artifact-program", allowed_tools=set(),
+    )
+
+    assert program.workstreams[1].coordination.strategy == "parallel_agents"
+
+
+def test_parallel_workers_without_a_graph_branch_are_rejected():
+    proposal = mission_program()
+    proposal["workflow"]["nodes"].append({
+        "node_id": "research-alt", "kind": "agent",
+        "purpose": "Research another source family after the first.",
+        "owner_role": "researcher", "configuration": {"max_iterations": 3},
+    })
+    proposal["workflow"]["edges"].extend((
+        {"source": "research", "target": "research-alt", "condition": "researched"},
+        {"source": "research-alt", "target": "replan", "condition": "researched"},
+    ))
+    proposal["workstreams"][1]["workflow_node_ids"].append("research-alt")
+    proposal["workstreams"][1]["coordination"] = {
+        "strategy": "parallel_agents",
+        "rationale": "Claim two source searches are concurrent.",
+        "coupling": "low",
+        "parallelism": 2,
+        "comparison_baseline": "single_agent",
+        "expected_benefit": "Reduce research latency.",
+        "measure_ids": ["release-ready"],
+        "estimated_model_cost_cents": 500,
+        "latency_budget_seconds": 900,
+        "fallback": "Use one researcher sequentially.",
+    }
+
+    with pytest.raises(FatalCommandError, match="does not expose its admitted parallel branch"):
+        materialize_mission_program(
+            proposal, tenant_id="tenant-a", planning_run_id="planning-a",
+            artifact_id="artifact-program", allowed_tools=set(),
+        )
+
+
+def test_coordination_estimates_cannot_hide_budget_oversubscription():
+    proposal = mission_program()
+    proposal["workstreams"][1]["coordination"] = {
+        "strategy": "single_agent",
+        "rationale": "Keep tightly coupled research in one context.",
+        "coupling": "high",
+        "parallelism": 1,
+        "comparison_baseline": "direct_model",
+        "expected_benefit": "Retain durable evidence and recovery.",
+        "measure_ids": ["release-ready"],
+        "estimated_model_cost_cents": 20_001,
+        "latency_budget_seconds": 900,
+        "fallback": "Return the direct-model research packet.",
+    }
+
+    with pytest.raises(FatalCommandError, match="coordination estimates exceed"):
+        materialize_mission_program(
+            proposal, tenant_id="tenant-a", planning_run_id="planning-a",
+            artifact_id="artifact-program", allowed_tools=set(),
+        )
+
+
+def test_declared_subworkflow_requires_an_executable_subworkflow_node():
+    proposal = mission_program()
+    proposal["workstreams"][1]["coordination"] = {
+        "strategy": "subworkflow",
+        "rationale": "Delegate a separately governed specialist program.",
+        "coupling": "medium",
+        "parallelism": 1,
+        "comparison_baseline": "single_agent",
+        "expected_benefit": "Isolate specialist authority and evidence.",
+        "measure_ids": ["release-ready"],
+        "estimated_model_cost_cents": 500,
+        "latency_budget_seconds": 900,
+        "fallback": "Keep specialist work in the parent program.",
+    }
+
+    with pytest.raises(FatalCommandError, match="without a subworkflow node"):
+        materialize_mission_program(
+            proposal, tenant_id="tenant-a", planning_run_id="planning-a",
+            artifact_id="artifact-program", allowed_tools=set(),
+        )

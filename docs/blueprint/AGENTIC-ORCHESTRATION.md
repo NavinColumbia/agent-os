@@ -1,5 +1,10 @@
 # Agentic Orchestration — the "very smart system" (NEXT BUILD after the agentic-QA loop)
 
+> **2026-09-18 correction:** [ADR-010](../ADR-010-evidence-backed-product-council.md) supersedes this
+> document's old expand-by-default and cost-unbounded language. The durable V2 mission-program contract is
+> authoritative. Agent topology must be the smallest sufficient shape, explicitly budgeted, and measured
+> against a simpler baseline. The description below remains historical context for the actor/event model.
+
 **North star:** a human prompts a *vision*; an adaptive controller orchestrates hierarchical, self-organizing
 agent fleets that research → plan (with the human) → build → exhaustively self-test → fix — and a **bug-free
 product comes out, with no human ever filing a bug.** Every decision along the way is an AI call (see
@@ -75,7 +80,8 @@ The hierarchy is NOT fixed-depth — it is recursive and self-scaling, like a re
   fintech supervisor just spawns another head. An IC can become a lead; a lead can spin up a team.
 - **Org-structure decision at EVERY prompt/decision point** (an AI call): *"is the current team structure
   sufficient for this scope, or do we need to expand — a new supervisor, a new sub-team, more agents?"*
-  **Bias toward expansion/scalability** when uncertain (cost is not a constraint).
+  Expand only for distinct low-coupling work, independent authority/assurance, or measured capacity need;
+  ambiguity retains the current org and triggers re-evaluation rather than paid speculative fan-out.
 - **Escalation + events work at every level** (§ execution model): IC → team-head → domain-supervisor →
   controller → human. A blocker or correction routes up only as far as needed and resolves there.
 - **No fixed depth or width.** The system decomposes a large vision (e.g. "Google-scale fintech suite")
@@ -84,7 +90,8 @@ The hierarchy is NOT fixed-depth — it is recursive and self-scaling, like a re
   agents that scales itself to whatever the vision demands.
 
 ## Design principles
-- Every state decision = an AI call (maximally agentic; cost is not a constraint).
+- Open-ended judgments use agents; deterministic identity, authority, budget, state, and evidence checks remain
+  code-enforced. Every model decision is metered and bounded by admitted authority.
 - Supervisors are recursive: a child can itself become a supervisor for a sub-decomposition.
 - All agent↔agent comms + shared docs are logged (like the InvoiceFlow PLAN.json + handoff notes) so the
   whole run is auditable — the owner can inspect who did what and what was shared.

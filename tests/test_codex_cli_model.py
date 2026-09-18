@@ -108,6 +108,10 @@ def test_founder_local_profile_is_loopback_unpaid_and_subscription_backed():
     assert "AOS_V2_MODEL=codex-cli:default" in operator
     assert "Logged in using ChatGPT" in operator
     assert "postgres migrate api" in operator
+    assert "AOS_V2_EXECUTION_CELL_ID=local" in operator
+    assert "agentos-v2 activate-release" in operator
+    assert operator.index("agentos-v2 activate-release") < operator.index("wait_api", operator.index("up(){"))
+    assert 'AOS_V2_EXECUTION_CELL_ID="${AOS_V2_EXECUTION_CELL_ID:-local}"' in worker
     assert "tmux new-session" in operator
     assert 'exec "$ROOT/.venv/bin/agentos-v2" worker' in worker
     assert '127.0.0.1:${AOS_V2_POSTGRES_HOST_PORT:-55432}:5432' in overlay

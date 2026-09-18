@@ -96,6 +96,7 @@ init(){
     printf 'AOS_V2_POSTGRES_HOST_PORT=55432\n'
     printf 'AOS_V2_PUBLIC_BASE_URL=http://127.0.0.1:8088\n'
     printf 'AOS_V2_APPLICATION_VERSION=founder-local\n'
+    printf 'AOS_V2_EXECUTION_CELL_ID=local\n'
     printf 'AOS_V2_IDENTITY_MODE=hmac\n'
     printf 'AOS_V2_BILLING_MODE=disabled\n'
     printf 'AOS_V2_TENANT_MONTHLY_MODEL_BUDGET_CENTS=10000\n'
@@ -128,6 +129,10 @@ preflight(){
     || die "founder rehearsal requires signed local invitations"
   [ "$(value AOS_V2_MODEL)" = "codex-cli:default" ] \
     || die "founder rehearsal requires the subscription-backed Codex model"
+  [ -n "$(value AOS_V2_EXECUTION_CELL_ID)" ] \
+    || replace_value AOS_V2_EXECUTION_CELL_ID local
+  [ "$(value AOS_V2_EXECUTION_CELL_ID)" = "local" ] \
+    || die "founder rehearsal API, activation job, and worker must share execution cell local"
   compose config >/dev/null
   printf 'founder-local preflight: ok\n'
 }
@@ -213,8 +218,10 @@ up(){
     docker pull "$sandbox_image" >/dev/null
   fi
   compose up --build --detach postgres migrate api
-  wait_api
+  compose run --rm --no-deps -T api agentos-v2 activate-release
+  stop_worker
   start_worker
+  wait_api
   local invite
   invite="$(issue_invite)"
   printf 'founder rehearsal ready: http://127.0.0.1:%s/app\n' "$(value AOS_V2_PUBLIC_PORT)"
